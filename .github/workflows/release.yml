@@ -171,10 +171,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
-        if: "${{ secrets.CARGO_REGISTRY_TOKEN != '' }}"
         run: |
           sed -i 's/^version = ".*"/version = "${{ needs.calculate-version.outputs.version }}"/' Cargo.toml
-          cargo publish --allow-dirty --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+          cargo publish --allow-dirty --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" || echo "crates.io publish skipped (no token or error)"
         continue-on-error: true
 
       - name: Generate artifact attestation
