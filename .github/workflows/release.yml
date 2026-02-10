@@ -15,15 +15,18 @@ on:
           - minor
           - major
 
+# Serialize releases so two quick merges get sequential versions
 concurrency:
   group: release
   cancel-in-progress: false
 
 permissions:
   contents: write
+  id-token: write
   attestations: write
 
 jobs:
+  # ── Derive next version from latest git tag ──────────────────────
   calculate-version:
     name: Calculate version
     runs-on: ubuntu-latest
@@ -49,6 +52,8 @@ jobs:
           IFS='.' read -r major minor patch <<< "$version"
 
           bump="${{ inputs.bump_type || 'patch' }}"
+          echo "Bump type: $bump"
+
           case "$bump" in
             major) major=$((major + 1)); minor=0; patch=0 ;;
             minor) minor=$((minor + 1)); patch=0 ;;
@@ -67,6 +72,7 @@ jobs:
           echo "version=$new_version" >> "$GITHUB_OUTPUT"
           echo "tag=$new_tag" >> "$GITHUB_OUTPUT"
 
+  # ── Build release binaries for all platforms ─────────────────────
   build:
     name: Build (${{ matrix.target }})
     needs: [calculate-version]
@@ -91,6 +97,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - name: Set version
         shell: bash
         run: |
@@ -117,19 +124,14 @@ jobs:
         run: |
           mkdir -p release
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp target/${{ matrix.target }}/release/*.exe release/ 2>/dev/null || true
+            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
+              cp "target/${{ matrix.target }}/release/${bin}.exe" release/ 2>/dev/null || true
+            done
             7z a coreutils-rs-${{ matrix.target }}.zip release/*
           else
-            cp target/${{ matrix.target }}/release/fwc release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fcut release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fbase64 release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fsha256sum release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fsort release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/ftr release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/funiq release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fb2sum release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/ftac release/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/fmd5sum release/ 2>/dev/null || true
+            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
+              cp "target/${{ matrix.target }}/release/${bin}" release/ 2>/dev/null || true
+            done
             tar -czf coreutils-rs-${{ matrix.target }}.tar.gz -C release .
           fi
 
@@ -139,6 +141,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: coreutils-rs-*
 
+  # ── Publish: tag, crates.io, GitHub Release ──────────────────────
   publish:
     name: Publish
     needs: [calculate-version, build]
@@ -168,9 +171,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
+        if: "${{ secrets.CARGO_REGISTRY_TOKEN != '' }}"
         run: |
           sed -i 's/^version = ".*"/version = "${{ needs.calculate-version.outputs.version }}"/' Cargo.toml
-          cargo publish --allow-dirty --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" || echo "crates.io publish skipped (no token)"
+          cargo publish --allow-dirty --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        continue-on-error: true
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
