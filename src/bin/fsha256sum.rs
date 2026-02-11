@@ -269,7 +269,7 @@ fn run_check_mode(
             filename.clone()
         };
 
-        let (file_ok, file_fail, file_fmt, file_read) =
+        let (file_ok, file_fail, file_fmt, file_read, file_ignored) =
             check_one(cli, algo, reader, &display_name, out);
 
         _total_ok += file_ok;
@@ -285,7 +285,7 @@ fn run_check_mode(
         }
 
         // "no properly formatted checksum lines found" when no valid lines
-        if file_ok == 0 && file_fail == 0 && file_read == 0 && file_fmt > 0 {
+        if file_ok == 0 && file_fail == 0 && file_read == 0 && file_ignored == 0 && file_fmt > 0 {
             if !cli.status {
                 let _ = out.flush();
                 eprintln!(
@@ -296,6 +296,13 @@ fn run_check_mode(
             // Don't count these in total_fmt_errors for the summary WARNING
             // since the "no properly formatted" message subsumes it
             total_fmt_errors -= file_fmt;
+            *had_error = true;
+        }
+
+        // GNU compat: when --ignore-missing is used and no file was verified
+        if cli.ignore_missing && file_ok == 0 && file_fail == 0 && file_ignored > 0 {
+            let _ = out.flush();
+            eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
             *had_error = true;
         }
     }
@@ -340,18 +347,19 @@ fn run_check_mode(
     }
 }
 
-/// Check checksums from one input source. Returns (ok, fail, fmt_errors, read_errors).
+/// Check checksums from one input source. Returns (ok, fail, fmt_errors, read_errors, ignored_missing).
 fn check_one(
     cli: &Cli,
     algo: HashAlgorithm,
     reader: Box<dyn BufRead>,
     display_name: &str,
     out: &mut impl Write,
-) -> (usize, usize, usize, usize) {
+) -> (usize, usize, usize, usize, usize) {
     let mut ok_count: usize = 0;
     let mut mismatch_count: usize = 0;
     let mut format_errors: usize = 0;
     let mut read_errors: usize = 0;
+    let mut ignored_missing: usize = 0;
     let mut line_num: usize = 0;
 
     for line_result in reader.lines() {
@@ -415,6 +423,7 @@ fn check_one(
             Ok(h) => h,
             Err(e) => {
                 if cli.ignore_missing && e.kind() == io::ErrorKind::NotFound {
+                    ignored_missing += 1;
                     continue;
                 }
                 read_errors += 1;
@@ -440,5 +449,11 @@ fn check_one(
         }
     }
 
-    (ok_count, mismatch_count, format_errors, read_errors)
+    (
+        ok_count,
+        mismatch_count,
+        format_errors,
+        read_errors,
+        ignored_missing,
+    )
 }

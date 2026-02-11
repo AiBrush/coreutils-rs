@@ -485,6 +485,7 @@ fn test_check_file_ignore_missing() {
     assert_eq!(r.mismatches, 0);
     assert_eq!(r.read_errors, 0);
     assert_eq!(r.format_errors, 0);
+    assert_eq!(r.ignored_missing, 1);
     // No output for missing files when ignore_missing is true
     assert!(String::from_utf8(out).unwrap().is_empty());
 }

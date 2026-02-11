@@ -7,6 +7,8 @@ use rayon::prelude::*;
 
 use coreutils_rs::hash::{self, HashAlgorithm};
 
+const TOOL_NAME: &str = "fmd5sum";
+
 #[derive(Parser)]
 #[command(name = "fmd5sum", about = "Compute and check MD5 message digest")]
 struct Cli {
@@ -54,9 +56,49 @@ struct Cli {
     files: Vec<String>,
 }
 
+/// Check if a filename needs escaping (contains backslash or newline).
+#[inline]
+fn needs_escape(name: &str) -> bool {
+    name.bytes().any(|b| b == b'\\' || b == b'\n')
+}
+
+/// Escape a filename: replace `\` with `\\` and newline with `\n` (literal).
+fn escape_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 8);
+    for b in name.bytes() {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// Format an IO error message without the "(os error N)" suffix.
+fn io_error_msg(e: &io::Error) -> String {
+    if let Some(raw) = e.raw_os_error() {
+        let os_err = io::Error::from_raw_os_error(raw);
+        format!("{}", os_err).replace(&format!(" (os error {})", raw), "")
+    } else {
+        format!("{}", e)
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let algo = HashAlgorithm::Md5;
+
+    // Validate flag combinations
+    if cli.tag && cli.check {
+        eprintln!(
+            "{}: the --tag option is meaningless when verifying checksums",
+            TOOL_NAME
+        );
+        eprintln!("Try '{} --help' for more information.", TOOL_NAME);
+        process::exit(1);
+    }
+
     let files = if cli.files.is_empty() {
         vec!["-".to_string()]
     } else {
@@ -81,7 +123,7 @@ fn main() {
                 match std::fs::File::open(filename) {
                     Ok(f) => Box::new(BufReader::new(f)),
                     Err(e) => {
-                        eprintln!("fmd5sum: {}: {}", filename, e);
+                        eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                         had_error = true;
                         continue;
                     }
@@ -99,7 +141,7 @@ fn main() {
                 strict: cli.strict,
                 warn: cli.warn,
                 ignore_missing: cli.ignore_missing,
-                warn_prefix: format!("fmd5sum: {}", display_name),
+                warn_prefix: format!("{}: {}", TOOL_NAME, display_name),
             };
             match hash::check_file(algo, reader, &opts, &mut out, &mut err_out) {
                 Ok(r) => {
@@ -113,9 +155,18 @@ fn main() {
                     if cli.strict && r.format_errors > 0 {
                         had_error = true;
                     }
+
+                    // GNU compat: when --ignore-missing is used and no file was verified
+                    // for this checkfile, print warning and set error
+                    if cli.ignore_missing && r.ok == 0 && r.mismatches == 0 && r.ignored_missing > 0
+                    {
+                        let _ = out.flush();
+                        eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
+                        had_error = true;
+                    }
                 }
                 Err(e) => {
-                    eprintln!("fmd5sum: {}: {}", filename, e);
+                    eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                     had_error = true;
                 }
             }
@@ -134,27 +185,36 @@ fn main() {
                     &files[0]
                 };
                 eprintln!(
-                    "fmd5sum: {}: no properly formatted checksum lines found",
-                    name
+                    "{}: {}: no properly formatted MD5 checksum lines found",
+                    TOOL_NAME, name
                 );
                 had_error = true;
             } else {
                 if total_mismatches > 0 {
-                    eprintln!(
-                        "fmd5sum: WARNING: {} computed checksum did NOT match",
-                        total_mismatches
-                    );
+                    let word = if total_mismatches == 1 {
+                        "computed checksum did NOT match"
+                    } else {
+                        "computed checksums did NOT match"
+                    };
+                    eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_mismatches, word);
                 }
                 if total_read_errors > 0 {
-                    eprintln!(
-                        "fmd5sum: WARNING: {} listed file could not be read",
-                        total_read_errors
-                    );
+                    let word = if total_read_errors == 1 {
+                        "listed file could not be read"
+                    } else {
+                        "listed files could not be read"
+                    };
+                    eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_read_errors, word);
                 }
                 if total_format_errors > 0 {
+                    let line_word = if total_format_errors == 1 {
+                        "line is"
+                    } else {
+                        "lines are"
+                    };
                     eprintln!(
-                        "fmd5sum: WARNING: {} line is improperly formatted",
-                        total_format_errors
+                        "{}: WARNING: {} {} improperly formatted",
+                        TOOL_NAME, total_format_errors, line_word
                     );
                 }
             }
@@ -178,14 +238,11 @@ fn main() {
                         } else {
                             filename.as_str()
                         };
-                        if cli.tag {
-                            write_tag(&mut out, algo, &h, name, cli.zero);
-                        } else {
-                            write_hash(&mut out, &h, name, cli.binary, cli.zero);
-                        }
+                        write_output(&mut out, &cli, algo, &h, name);
                     }
                     Err(e) => {
-                        eprintln!("fmd5sum: {}: {}", filename, e);
+                        let _ = out.flush();
+                        eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                         had_error = true;
                     }
                 }
@@ -207,14 +264,11 @@ fn main() {
             for (filename, result) in results {
                 match result {
                     Ok(h) => {
-                        if cli.tag {
-                            write_tag(&mut out, algo, &h, filename, cli.zero);
-                        } else {
-                            write_hash(&mut out, &h, filename, cli.binary, cli.zero);
-                        }
+                        write_output(&mut out, &cli, algo, &h, filename);
                     }
                     Err(e) => {
-                        eprintln!("fmd5sum: {}: {}", filename, e);
+                        let _ = out.flush();
+                        eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                         had_error = true;
                     }
                 }
@@ -229,20 +283,22 @@ fn main() {
 }
 
 #[inline]
-fn write_hash(out: &mut impl Write, hash: &str, filename: &str, binary: bool, zero: bool) {
-    let mode_char = if binary { '*' } else { ' ' };
-    if zero {
+fn write_output(out: &mut impl Write, cli: &Cli, algo: HashAlgorithm, hash: &str, filename: &str) {
+    if cli.tag {
+        if cli.zero {
+            let _ = write!(out, "{} ({}) = {}\0", algo.name(), filename, hash);
+        } else {
+            let _ = writeln!(out, "{} ({}) = {}", algo.name(), filename, hash);
+        }
+    } else if cli.zero {
+        let mode_char = if cli.binary { '*' } else { ' ' };
         let _ = write!(out, "{} {}{}\0", hash, mode_char, filename);
+    } else if needs_escape(filename) {
+        let escaped = escape_filename(filename);
+        let mode_char = if cli.binary { '*' } else { ' ' };
+        let _ = writeln!(out, "\\{} {}{}", hash, mode_char, escaped);
     } else {
+        let mode_char = if cli.binary { '*' } else { ' ' };
         let _ = writeln!(out, "{} {}{}", hash, mode_char, filename);
-    }
-}
-
-#[inline]
-fn write_tag(out: &mut impl Write, algo: HashAlgorithm, hash: &str, filename: &str, zero: bool) {
-    if zero {
-        let _ = write!(out, "{} ({}) = {}\0", algo.name(), filename, hash);
-    } else {
-        let _ = writeln!(out, "{} ({}) = {}", algo.name(), filename, hash);
     }
 }

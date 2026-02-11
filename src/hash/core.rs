@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
-use blake2::Blake2b512;
 use md5::Md5;
 use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
@@ -54,7 +53,10 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     match algo {
         HashAlgorithm::Sha256 => hash_digest::<Sha256>(data),
         HashAlgorithm::Md5 => hash_digest::<Md5>(data),
-        HashAlgorithm::Blake2b => hash_digest::<Blake2b512>(data),
+        HashAlgorithm::Blake2b => {
+            let hash = blake2b_simd::blake2b(data);
+            hex_encode(hash.as_bytes())
+        }
     }
 }
 
@@ -63,7 +65,7 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
     match algo {
         HashAlgorithm::Sha256 => hash_reader_impl::<Sha256>(reader),
         HashAlgorithm::Md5 => hash_reader_impl::<Md5>(reader),
-        HashAlgorithm::Blake2b => hash_reader_impl::<Blake2b512>(reader),
+        HashAlgorithm::Blake2b => blake2b_hash_reader(reader, 64),
     }
 }
 
@@ -132,35 +134,31 @@ pub fn readahead_files(_paths: &[&Path]) {
     // No-op on non-Linux
 }
 
-// --- BLAKE2b variable-length functions ---
+// --- BLAKE2b variable-length functions (using blake2b_simd) ---
 
 /// Hash raw data with BLAKE2b variable output length.
 /// `output_bytes` is the output size in bytes (e.g., 32 for 256-bit).
 pub fn blake2b_hash_data(data: &[u8], output_bytes: usize) -> String {
-    use blake2::Blake2bVar;
-    use blake2::digest::{Update, VariableOutput};
-
-    let mut hasher = Blake2bVar::new(output_bytes).expect("Invalid BLAKE2b output size");
-    Update::update(&mut hasher, data);
-    let result = hasher.finalize_boxed();
-    hex_encode(&result)
+    let hash = blake2b_simd::Params::new()
+        .hash_length(output_bytes)
+        .hash(data);
+    hex_encode(hash.as_bytes())
 }
 
 /// Hash a reader with BLAKE2b variable output length.
 pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::Result<String> {
-    use blake2::Blake2bVar;
-    use blake2::digest::{Update, VariableOutput};
-
-    let mut hasher = Blake2bVar::new(output_bytes).expect("Invalid BLAKE2b output size");
+    let mut state = blake2b_simd::Params::new()
+        .hash_length(output_bytes)
+        .to_state();
     let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        Update::update(&mut hasher, &buf[..n]);
+        state.update(&buf[..n]);
     }
-    Ok(hex_encode(&hasher.finalize_boxed()))
+    Ok(hex_encode(state.finalize().as_bytes()))
 }
 
 /// Hash a file with BLAKE2b variable output length using mmap.
@@ -292,6 +290,8 @@ pub struct CheckResult {
     pub mismatches: usize,
     pub format_errors: usize,
     pub read_errors: usize,
+    /// Number of files skipped because they were missing and --ignore-missing was set.
+    pub ignored_missing: usize,
 }
 
 /// Verify checksums from a check file.
@@ -311,6 +311,7 @@ pub fn check_file<R: BufRead>(
     let mut mismatch_count = 0;
     let mut format_errors = 0;
     let mut read_errors = 0;
+    let mut ignored_missing_count = 0;
     let mut line_num = 0;
 
     for line_result in reader.lines() {
@@ -355,6 +356,7 @@ pub fn check_file<R: BufRead>(
             Ok(h) => h,
             Err(e) => {
                 if ignore_missing && e.kind() == io::ErrorKind::NotFound {
+                    ignored_missing_count += 1;
                     continue;
                 }
                 read_errors += 1;
@@ -385,6 +387,7 @@ pub fn check_file<R: BufRead>(
         mismatches: mismatch_count,
         format_errors,
         read_errors,
+        ignored_missing: ignored_missing_count,
     })
 }
 

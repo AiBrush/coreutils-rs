@@ -80,9 +80,11 @@ memmap2 = "0.9"
 # Parallelism
 rayon = "1"
 
-# Hashing (with hardware acceleration)
+# Hashing
+blake2b_simd = "1"
+
+# Base sha2/md-5 (always needed)
 sha2 = "0.10"
-blake2 = "0.10"
 md-5 = "0.10"
 
 # Base64 (SIMD-accelerated)
@@ -122,3 +124,9 @@ opt-level = 3
 inherits = "release"
 debug = true
 strip = false
+
+# Enable ASM acceleration for hash crates on non-MSVC targets
+# (sha2-asm/md5-asm use .S assembly files that MSVC cl.exe can't compile)
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+md-5 = { version = "0.10", features = ["asm"] }
