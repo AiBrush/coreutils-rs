@@ -8,16 +8,25 @@
 
 High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
 
-## Performance (100MB text file)
+## Performance (100MB text file, hyperfine)
 
 | Command | GNU | fcoreutils | Speedup |
-|---------|-----|-------------|---------|
-| `wc -l` | 42ms | 28ms | **1.5x** |
-| `wc -w` | 297ms | 117ms | **2.5x** |
-| `wc -c` | ~0ms | ~0ms | instant |
-| `wc` (default) | 302ms | 135ms | **2.2x** |
-| `cut -d: -f5` | 325ms | 161ms | **2.0x** |
-| `cut -b1-20` | 310ms | 49ms | **6.3x** |
+|---------|-----|------------|---------|
+| `wc` (default) | 339ms | 29ms | **11.7x** |
+| `wc -w` | 339ms | 19ms | **17.8x** |
+| `wc -l` | 39ms | 23ms | **1.7x** |
+| `cut -b1-20` | 309ms | 29ms | **10.6x** |
+| `cut -d' ' -f1` | 339ms | 82ms | **4.1x** |
+| `sort` (100MB) | 1851ms | 399ms | **4.6x** |
+| `sort` (10MB) | 157ms | 33ms | **4.8x** |
+| `uniq` (10MB) | 33ms | 7ms | **4.8x** |
+| `tac` | 133ms | 59ms | **2.3x** |
+| `base64` encode | 188ms | 116ms | **1.6x** |
+| `base64` decode | 539ms | 346ms | **1.6x** |
+| `b2sum` | 272ms | 222ms | **1.2x** |
+| `sha256sum` | 104ms | 103ms | **1.0x** |
+| `tr a-z A-Z` | 97ms | 90ms | **1.1x** |
+| `md5sum` | 211ms | 263ms | 0.8x |
 
 ## Tools
 

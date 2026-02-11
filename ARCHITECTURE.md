@@ -1,98 +1,114 @@
 # coreutils-rs Architecture
 
+## Common Infrastructure
+
+### File I/O: Zero-Copy mmap
+All tools use a common `FileData` enum that provides zero-copy file access:
+- Files >64KB are memory-mapped via `mmap()`, avoiding copies entirely
+- Small files use `fs::read()` into an owned `Vec<u8>`
+- `FileData` implements `Deref<Target=[u8]>` so all code sees a unified `&[u8]`
+- Hash tools additionally use `madvise(MADV_SEQUENTIAL)` and `readahead()` hints
+
+### Release Profile
+Aggressive optimization: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `opt-level = 3`.
+
+---
+
 ## wc (Word Count)
 
-### GNU wc Internals (from studying coreutils 9.7 src/wc.c)
+**Core strategy:** Single-pass scanning with specialized SIMD paths per metric.
 
-**Flags:** `-c` (bytes), `-m` (chars), `-l` (lines), `-w` (words), `-L` (max line length),
-`--files0-from=F`, `--total=WHEN`, `--debug` (undocumented: shows SIMD tier)
+- **Line counting:** `memchr::memchr_iter(b'\n', data).count()` — auto-detects AVX2/SSE2/NEON
+- **Word counting:** SIMD SSE2 whitespace classification. Tracks whitespace-to-non-whitespace transitions. Whitespace set: space, tab, newline, CR, form feed (0x0C), vertical tab (0x0B)
+- **Byte counting:** `stat()` file size for regular files — never reads the file for `-c` only
+- **Char counting:** UTF-8 leading byte detection (bytes not matching `10xxxxxx` pattern)
+- **Max line length:** Tab expansion to 8-column stops, zero width for `\r` and `\v`, `wcwidth` for multibyte
+- **Multi-file:** Parallel processing with thread pool when multiple files given
+- **GNU compat:** Right-aligned columns, output order: lines, words, chars, bytes, max_line_length. `--total` modes, `--files0-from` support
 
-**Default:** When no flags given, defaults to `-lwc` (lines + words + bytes).
+## cut (Field Extraction)
 
-**Output order:** lines, words, chars, bytes, max_line_length (always fixed).
+**Core strategy:** Zero-copy field extraction with SIMD delimiter scanning.
 
-**Column width:** Computed from `stat()` file sizes (sum of all files), not from actual counts.
-Non-regular files (stdin, pipes, /proc) force minimum width of 7.
+- **Delimiter scanning:** Uses SIMD byte search to find delimiter positions in each line
+- **Field extraction:** Outputs byte slices directly from mmap'd data — no per-line allocation
+- **Byte/char ranges:** Direct byte offset slicing from mmap'd buffer
+- **GNU compat:** `--complement` inverts selection, `--output-delimiter` for custom output, `-s` suppresses lines without delimiters
 
-**Line counting (4 tiers):**
-1. AVX-512: `_mm512_cmpeq_epi8_mask` + `popcountll` (64 bytes/cycle)
-2. AVX-2: `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8` + popcount (32 bytes/cycle)
-3. Scalar long-lines: `rawmemchr(p, '\n')` when avg line > 15 chars
-4. Scalar short-lines: byte-by-byte `*p == '\n'`
+## base64 (Base64 Encode/Decode)
 
-**Word counting:** Tracks whitespace→non-whitespace transitions.
-- C locale: `isspace()` for bytes 0-255
-- UTF-8 locale: `c32isspace()` for multibyte + hardcoded ASCII switch
-- Non-breaking spaces (U+00A0 etc.) treated as separators unless POSIXLY_CORRECT
+**Core strategy:** SIMD vectorized codec with chunked streaming.
 
-**Character counting (-m):**
-- MB_CUR_MAX == 1 (C locale): chars = bytes
-- MB_CUR_MAX > 1: uses `mbrtoc32()`, invalid bytes NOT counted as chars
+- **Encoding:** `base64-simd` crate provides vectorized base64 encoding
+- **Decoding:** Same crate for SIMD-accelerated decoding with `-i` for ignoring garbage
+- **Streaming:** 4MB chunks allow processing arbitrarily large files without loading entirely
+- **Output:** Raw fd stdout write bypasses Rust's BufWriter lock overhead
+- **GNU compat:** 76-character line wrapping (configurable with `-w`), decode ignores newlines
 
-**Max line length (-L):**
-- `\n`: resets line position, checks max
-- `\r`, `\f`: resets line position (no line increment)
-- `\t`: `linepos += 8 - (linepos % 8)` (standard 8-column tabs)
-- `\v`: zero display width
-- Printable ASCII: width 1
-- Multibyte: `c32width(wide_char)` (equivalent to wcwidth)
+## sha256sum (SHA-256 Checksums)
 
-**Byte counting (-c only):** Uses `lseek()` for regular files — never reads the file!
-For /proc files (size is page-aligned), seeks near EOF and reads remainder to verify.
+**Core strategy:** mmap + hardware acceleration + parallel multi-file.
 
-**Buffer:** 256 KiB stack-allocated (`IO_BUFSIZE = 256 * 1024`).
+- **Hashing:** `sha2` crate auto-detects SHA-NI x86 instructions for hardware-accelerated SHA-256
+- **I/O:** mmap with `madvise(MADV_SEQUENTIAL)` tells kernel to prefetch pages linearly
+- **Readahead:** Explicit `readahead()` syscall pre-populates page cache
+- **Multi-file:** Thread pool hashes multiple files concurrently
+- **GNU compat:** `--check` mode parses GNU checksum files, `--status`/`--quiet`/`--strict` modes
 
-### Our Approach vs GNU
+## md5sum (MD5 Checksums)
 
-| Feature | GNU wc | coreutils-rs |
-|---------|--------|-------------|
-| Line counting | AVX-512/AVX-2/scalar | memchr (auto-detects AVX2/NEON/SSE2) |
-| Word counting | scalar with lookup table | scalar (TODO: SIMD via PSHUFB) |
-| Byte counting | lseek for regular files | data.len() after read |
-| Char counting | mbrtoc32() | UTF-8 leading byte detection |
-| File I/O | read() with 256KB buffer | mmap for >64KB, fs::read for small |
-| Max line length | c32width() for multibyte | byte counting (C locale only) |
+**Core strategy:** Same architecture as sha256sum with MD5 digest.
 
-### SIMD Word Counting (from fastlwc research)
+- **Hashing:** `md-5` crate for MD5 computation
+- **I/O:** Identical mmap + madvise + readahead pipeline
+- **Multi-file:** Parallel processing via thread pool
+- **GNU compat:** Same check/verify interface as sha256sum
 
-fastlwc achieves 30x speedup using PSHUFB for parallel whitespace classification:
+## b2sum (BLAKE2b Checksums)
 
-1. **Whitespace lookup:** Load 16-byte lookup table into SIMD register.
-   Use `_mm_shuffle_epi8` (PSHUFB) with input byte lower nibbles as indices.
-   Two-step approach: lower nibble lookup + upper nibble mask verification.
+**Core strategy:** Same mmap pipeline with BLAKE2b hardware-optimized implementation.
 
-2. **Transition detection:** Given whitespace mask `ws`:
-   - `first_chars = ~ws & ((ws << 1) | carry_from_previous_chunk)`
-   - Each set bit in `first_chars` marks a word start
+- **Hashing:** `blake2` crate with optimized BLAKE2b implementation
+- **I/O:** mmap + madvise + readahead
+- **Variable length:** `-l` flag for custom digest length (default 512 bits)
+- **GNU compat:** Same check/verify interface, supports `--length` for digest size
 
-3. **Count:** Use `popcnt` on the mask to count word starts.
+## sort (Line Sorting)
 
-For our Rust implementation, memchr handles line counting optimally.
-Word counting could benefit from similar SIMD approach in the future.
+**Core strategy:** Parallel merge sort with efficient key extraction.
 
-### Edge Cases Verified Against GNU wc 9.7
+- **Sorting:** Rayon-based parallel merge sort distributes work across CPU cores
+- **Key extraction:** `-k` fields parsed and cached for efficient comparison
+- **Sort modes:** Numeric (`-n`), general numeric (`-g`), human-numeric (`-h`), version (`-V`), month (`-M`), random (`-R`)
+- **Stability:** `-s` flag for stable sort (preserves input order for equal keys)
+- **GNU compat:** Field separators (`-t`), unique output (`-u`), merge mode (`-m`), check-sorted (`-c`/`-C`), output file (`-o`)
 
-| Case | Expected | Status |
-|------|----------|--------|
-| Empty file | `0 0 0 file` | Verified |
-| Single newline | `1 0 1 file` | Verified |
-| No trailing newline | `0 1 5 file` (for "hello") | Verified |
-| CRLF endings | \r not counted as line, \r display width 0 | Verified |
-| Binary data (NUL bytes) | NUL is non-whitespace | Verified |
-| Form feed / vertical tab | Both are word separators | Verified |
-| Tab in -L | Advances to next multiple of 8 | Verified |
-| -cm together | Shows chars then bytes (fixed order) | Verified |
-| --total=only | No individual files, no "total" label | Verified |
-| --total=always | Shows total even for single file | Verified |
-| --total=never | No total even for multiple files | Verified |
-| UTF-8 -m | Counts characters, not bytes | Verified |
-| Stdin default | Width 7, no filename | Verified |
+## tr (Character Translation)
 
-### Performance Targets
+**Core strategy:** 256-byte lookup tables for O(1) per-byte translation.
 
-| Metric | GNU wc | Target | Technique |
-|--------|--------|--------|-----------|
-| Line count | ~1 GB/s | ~10 GB/s | memchr SIMD |
-| Word count | ~200 MB/s | ~2 GB/s | scalar (future: PSHUFB) |
-| Byte count | instant (lseek) | ~instant | data.len() |
-| Char count | ~200 MB/s | ~2 GB/s | UTF-8 lead byte detection |
+- **Translation table:** Pre-built 256-byte array maps each input byte to its output byte — branch-free
+- **Delete mode:** Lookup table marks bytes for deletion, tight output loop
+- **Squeeze mode:** Tracks previous output byte to collapse repeats
+- **I/O:** mmap for stdin when possible, 4MB output buffers minimize write syscalls
+- **Character classes:** `[:alpha:]`, `[:digit:]`, `[:space:]`, etc. expanded at table build time
+- **GNU compat:** `-c`/`-C` complement, `-t` truncate SET2, ranges (`a-z`), repeats (`[c*n]`)
+
+## uniq (Deduplicate Lines)
+
+**Core strategy:** Sequential line comparison with mmap I/O.
+
+- **Comparison:** Adjacent line comparison with optional case-insensitive (`-i`), skip-fields (`-f`), skip-chars (`-s`), compare-width (`-w`)
+- **I/O:** mmap input, 1MB BufWriter output buffer
+- **Modes:** Count (`-c`), duplicates-only (`-d`), all-duplicates (`-D`), unique-only (`-u`)
+- **GNU compat:** All output format flags, field/char skipping matches GNU behavior
+
+## tac (Reverse Lines)
+
+**Core strategy:** Forward SIMD scan, reversed output.
+
+- **Scanning:** `memchr` finds all newline positions scanning forward (SIMD-accelerated)
+- **Reversal:** Iterates found positions in reverse, outputting line slices
+- **I/O:** 1MB BufWriter for efficient output
+- **Separator:** Custom separator with `-s`, before-separator mode with `-b`
+- **GNU compat:** Matches GNU tac output for all separator modes
