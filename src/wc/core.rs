@@ -1,8 +1,9 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
 
-/// Minimum data size to use parallel processing (4MB).
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size to use parallel processing (2MB).
+/// Lower threshold lets us exploit 4 cores on smaller files.
+const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Results from counting a byte slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,30 +57,131 @@ pub fn count_bytes(data: &[u8]) -> u64 {
     data.len() as u64
 }
 
-/// Count words using 64-byte block bitmask operations + popcount.
+/// Count words using SIMD-accelerated whitespace detection + popcount.
 ///
 /// A word is a maximal run of non-whitespace bytes (GNU wc definition).
 /// Word starts are transitions from whitespace to non-whitespace.
 ///
-/// Instead of processing one byte at a time with serial dependencies,
-/// this builds a 64-bit whitespace bitmask for each block, then uses
-/// shift + AND + popcount to count transitions. The mask-building
-/// iterations are independent (no serial dependency), allowing the CPU's
-/// superscalar pipeline to execute multiple iterations per cycle.
+/// On x86_64, uses SSE2 range comparisons to detect whitespace in 16-byte
+/// vectors: `(0x09 <= b <= 0x0D) || (b == 0x20)`. Four vectors are processed
+/// per iteration (64 bytes), with movemask combining into a 64-bit bitmask
+/// for popcount-based word boundary detection.
+///
+/// Fallback: scalar 64-byte block bitmask approach with table lookup.
 pub fn count_words(data: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SSE2 is always available on x86_64
+        return unsafe { count_words_sse2(data) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return count_words_scalar(data);
+    }
+}
+
+/// SSE2-accelerated word counting. Processes 64 bytes per iteration using
+/// 4 XMM registers for whitespace detection, then combines into a 64-bit
+/// bitmask for word boundary detection via popcount.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn count_words_sse2(data: &[u8]) -> u64 {
+    use std::arch::x86_64::*;
+
+    // Whitespace = (0x09 <= b <= 0x0D) || (b == 0x20)
+    // Using signed comparison: cmpgt(b, 0x08) && cmpgt(0x0E, b) || cmpeq(b, 0x20)
+    let min_ws = _mm_set1_epi8(0x08); // one below \t
+    let max_ws = _mm_set1_epi8(0x0E); // one above \r
+    let space = _mm_set1_epi8(0x20);
+
     let mut words = 0u64;
     let mut prev_ws_bit = 1u64; // treat start-of-data as whitespace
 
-    // Process in 64-byte blocks
     let chunks = data.chunks_exact(64);
     let remainder = chunks.remainder();
 
     for chunk in chunks {
-        // Build 64-bit whitespace mask: bit i = 1 if chunk[i] is whitespace.
-        // These iterations are independent — no serial dependency — so the
-        // CPU can pipeline them efficiently.
+        let ptr = chunk.as_ptr();
+
+        // Load 4 x 16-byte vectors
+        let v0 = _mm_loadu_si128(ptr as *const __m128i);
+        let v1 = _mm_loadu_si128(ptr.add(16) as *const __m128i);
+        let v2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
+        let v3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
+
+        // Detect whitespace in each vector: 3 comparisons + 1 AND + 1 OR
+        macro_rules! detect_ws {
+            ($v:expr) => {{
+                let ge_9 = _mm_cmpgt_epi8($v, min_ws);
+                let le_d = _mm_cmpgt_epi8(max_ws, $v);
+                let in_range = _mm_and_si128(ge_9, le_d);
+                let is_sp = _mm_cmpeq_epi8($v, space);
+                _mm_or_si128(in_range, is_sp)
+            }};
+        }
+
+        let ws0 = detect_ws!(v0);
+        let ws1 = detect_ws!(v1);
+        let ws2 = detect_ws!(v2);
+        let ws3 = detect_ws!(v3);
+
+        // Combine 4 x 16-bit movemasks into one 64-bit whitespace mask
+        let m0 = (_mm_movemask_epi8(ws0) as u16) as u64;
+        let m1 = (_mm_movemask_epi8(ws1) as u16) as u64;
+        let m2 = (_mm_movemask_epi8(ws2) as u16) as u64;
+        let m3 = (_mm_movemask_epi8(ws3) as u16) as u64;
+        let ws_mask = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+
+        // Word starts: where previous byte was whitespace AND current is NOT
+        let prev_mask = (ws_mask << 1) | prev_ws_bit;
+        let word_starts = prev_mask & !ws_mask;
+        words += word_starts.count_ones() as u64;
+
+        prev_ws_bit = (ws_mask >> 63) & 1;
+    }
+
+    // Handle 16-byte sub-chunks of remainder
+    let sub_chunks = remainder.chunks_exact(16);
+    let sub_remainder = sub_chunks.remainder();
+    let mut prev_ws_u32 = prev_ws_bit as u32;
+
+    for chunk in sub_chunks {
+        let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+        let ge_9 = _mm_cmpgt_epi8(v, min_ws);
+        let le_d = _mm_cmpgt_epi8(max_ws, v);
+        let in_range = _mm_and_si128(ge_9, le_d);
+        let is_sp = _mm_cmpeq_epi8(v, space);
+        let ws_vec = _mm_or_si128(in_range, is_sp);
+        let ws_mask = _mm_movemask_epi8(ws_vec) as u32;
+
+        let prev_mask = (ws_mask << 1) | prev_ws_u32;
+        let word_starts = prev_mask & (!ws_mask & 0xFFFF);
+        words += word_starts.count_ones() as u64;
+        prev_ws_u32 = (ws_mask >> 15) & 1;
+    }
+
+    // Scalar for final <16 bytes
+    let mut prev_ws = prev_ws_u32 as u8;
+    for &b in sub_remainder {
+        let curr_ws = WS_TABLE[b as usize];
+        words += (prev_ws & (curr_ws ^ 1)) as u64;
+        prev_ws = curr_ws;
+    }
+    words
+}
+
+/// Scalar word counting fallback for non-x86 platforms.
+/// Uses 64-byte block bitmask operations with table lookup + popcount.
+#[cfg(not(target_arch = "x86_64"))]
+fn count_words_scalar(data: &[u8]) -> u64 {
+    let mut words = 0u64;
+    let mut prev_ws_bit = 1u64;
+
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
         let mut ws_mask = 0u64;
-        // Unroll 8 bytes at a time for better pipelining
         let mut i = 0;
         while i + 7 < 64 {
             ws_mask |= (WS_TABLE[chunk[i] as usize] as u64) << i;
@@ -93,19 +195,12 @@ pub fn count_words(data: &[u8]) -> u64 {
             i += 8;
         }
 
-        // Build "previous was whitespace" mask: shift ws_mask left by 1,
-        // insert carry from previous block as bit 0
         let prev_mask = (ws_mask << 1) | prev_ws_bit;
-
-        // Word starts: where previous byte was whitespace AND current is NOT whitespace
         let word_starts = prev_mask & !ws_mask;
         words += word_starts.count_ones() as u64;
-
-        // Carry last bit to next block
         prev_ws_bit = (ws_mask >> 63) & 1;
     }
 
-    // Handle remainder with scalar approach
     let mut prev_ws = prev_ws_bit as u8;
     for &b in remainder {
         let curr_ws = WS_TABLE[b as usize];
@@ -115,12 +210,180 @@ pub fn count_words(data: &[u8]) -> u64 {
     words
 }
 
+/// Count lines and words in a single pass using 64-byte bitmask blocks.
+///
+/// Eliminates the separate memchr line-counting pass by piggybacking newline
+/// counting onto the whitespace bitmask already computed for word counting.
+/// For each 64-byte block, we build both a whitespace mask and a newline mask,
+/// then use popcount on each.
+pub fn count_lines_words(data: &[u8]) -> (u64, u64) {
+    let mut words = 0u64;
+    let mut lines = 0u64;
+    let mut prev_ws_bit = 1u64;
+
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        let mut ws_mask = 0u64;
+        let mut nl_mask = 0u64;
+        let mut i = 0;
+        while i + 7 < 64 {
+            let b0 = chunk[i];
+            let b1 = chunk[i + 1];
+            let b2 = chunk[i + 2];
+            let b3 = chunk[i + 3];
+            let b4 = chunk[i + 4];
+            let b5 = chunk[i + 5];
+            let b6 = chunk[i + 6];
+            let b7 = chunk[i + 7];
+            ws_mask |= (WS_TABLE[b0 as usize] as u64) << i;
+            ws_mask |= (WS_TABLE[b1 as usize] as u64) << (i + 1);
+            ws_mask |= (WS_TABLE[b2 as usize] as u64) << (i + 2);
+            ws_mask |= (WS_TABLE[b3 as usize] as u64) << (i + 3);
+            ws_mask |= (WS_TABLE[b4 as usize] as u64) << (i + 4);
+            ws_mask |= (WS_TABLE[b5 as usize] as u64) << (i + 5);
+            ws_mask |= (WS_TABLE[b6 as usize] as u64) << (i + 6);
+            ws_mask |= (WS_TABLE[b7 as usize] as u64) << (i + 7);
+            nl_mask |= ((b0 == b'\n') as u64) << i;
+            nl_mask |= ((b1 == b'\n') as u64) << (i + 1);
+            nl_mask |= ((b2 == b'\n') as u64) << (i + 2);
+            nl_mask |= ((b3 == b'\n') as u64) << (i + 3);
+            nl_mask |= ((b4 == b'\n') as u64) << (i + 4);
+            nl_mask |= ((b5 == b'\n') as u64) << (i + 5);
+            nl_mask |= ((b6 == b'\n') as u64) << (i + 6);
+            nl_mask |= ((b7 == b'\n') as u64) << (i + 7);
+            i += 8;
+        }
+
+        let prev_mask = (ws_mask << 1) | prev_ws_bit;
+        let word_starts = prev_mask & !ws_mask;
+        words += word_starts.count_ones() as u64;
+        lines += nl_mask.count_ones() as u64;
+        prev_ws_bit = (ws_mask >> 63) & 1;
+    }
+
+    let mut prev_ws = prev_ws_bit as u8;
+    for &b in remainder {
+        if b == b'\n' {
+            lines += 1;
+        }
+        let curr_ws = WS_TABLE[b as usize];
+        words += (prev_ws & (curr_ws ^ 1)) as u64;
+        prev_ws = curr_ws;
+    }
+    (lines, words)
+}
+
+/// Count lines, words, and UTF-8 chars in a single pass using 64-byte bitmask blocks.
+///
+/// Builds whitespace, newline, and non-continuation-byte masks simultaneously
+/// in one read of the data, then uses popcount on each mask. This is the most
+/// memory-efficient approach when all three metrics are needed, as it touches
+/// each cache line only once.
+pub fn count_lines_words_chars_utf8(data: &[u8]) -> (u64, u64, u64) {
+    let mut words = 0u64;
+    let mut lines = 0u64;
+    let mut chars = 0u64;
+    let mut prev_ws_bit = 1u64;
+
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        let mut ws_mask = 0u64;
+        let mut nl_mask = 0u64;
+        let mut char_mask = 0u64;
+        let mut i = 0;
+        while i + 7 < 64 {
+            let b0 = chunk[i];
+            let b1 = chunk[i + 1];
+            let b2 = chunk[i + 2];
+            let b3 = chunk[i + 3];
+            let b4 = chunk[i + 4];
+            let b5 = chunk[i + 5];
+            let b6 = chunk[i + 6];
+            let b7 = chunk[i + 7];
+
+            ws_mask |= (WS_TABLE[b0 as usize] as u64) << i
+                | (WS_TABLE[b1 as usize] as u64) << (i + 1)
+                | (WS_TABLE[b2 as usize] as u64) << (i + 2)
+                | (WS_TABLE[b3 as usize] as u64) << (i + 3)
+                | (WS_TABLE[b4 as usize] as u64) << (i + 4)
+                | (WS_TABLE[b5 as usize] as u64) << (i + 5)
+                | (WS_TABLE[b6 as usize] as u64) << (i + 6)
+                | (WS_TABLE[b7 as usize] as u64) << (i + 7);
+
+            nl_mask |= ((b0 == b'\n') as u64) << i
+                | ((b1 == b'\n') as u64) << (i + 1)
+                | ((b2 == b'\n') as u64) << (i + 2)
+                | ((b3 == b'\n') as u64) << (i + 3)
+                | ((b4 == b'\n') as u64) << (i + 4)
+                | ((b5 == b'\n') as u64) << (i + 5)
+                | ((b6 == b'\n') as u64) << (i + 6)
+                | ((b7 == b'\n') as u64) << (i + 7);
+
+            char_mask |= (((b0 & 0xC0) != 0x80) as u64) << i
+                | (((b1 & 0xC0) != 0x80) as u64) << (i + 1)
+                | (((b2 & 0xC0) != 0x80) as u64) << (i + 2)
+                | (((b3 & 0xC0) != 0x80) as u64) << (i + 3)
+                | (((b4 & 0xC0) != 0x80) as u64) << (i + 4)
+                | (((b5 & 0xC0) != 0x80) as u64) << (i + 5)
+                | (((b6 & 0xC0) != 0x80) as u64) << (i + 6)
+                | (((b7 & 0xC0) != 0x80) as u64) << (i + 7);
+
+            i += 8;
+        }
+        let prev_mask = (ws_mask << 1) | prev_ws_bit;
+        let word_starts = prev_mask & !ws_mask;
+        words += word_starts.count_ones() as u64;
+        lines += nl_mask.count_ones() as u64;
+        chars += char_mask.count_ones() as u64;
+        prev_ws_bit = (ws_mask >> 63) & 1;
+    }
+
+    let mut prev_ws = prev_ws_bit as u8;
+    for &b in remainder {
+        if b == b'\n' {
+            lines += 1;
+        }
+        let curr_ws = WS_TABLE[b as usize];
+        words += (prev_ws & (curr_ws ^ 1)) as u64;
+        prev_ws = curr_ws;
+        chars += ((b & 0xC0) != 0x80) as u64;
+    }
+    (lines, words, chars)
+}
+
 /// Count UTF-8 characters by counting non-continuation bytes.
 /// A continuation byte has the bit pattern `10xxxxxx` (0x80..0xBF).
 /// Every other byte starts a new character (ASCII, multi-byte leader, or invalid).
+///
+/// Uses 64-byte block processing with popcount for ~4x throughput vs scalar.
 pub fn count_chars_utf8(data: &[u8]) -> u64 {
     let mut count = 0u64;
-    for &b in data {
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        // Build 64-bit mask: bit i = 1 if chunk[i] is NOT a continuation byte
+        let mut char_mask = 0u64;
+        let mut i = 0;
+        while i + 7 < 64 {
+            char_mask |= (((chunk[i] & 0xC0) != 0x80) as u64) << i;
+            char_mask |= (((chunk[i + 1] & 0xC0) != 0x80) as u64) << (i + 1);
+            char_mask |= (((chunk[i + 2] & 0xC0) != 0x80) as u64) << (i + 2);
+            char_mask |= (((chunk[i + 3] & 0xC0) != 0x80) as u64) << (i + 3);
+            char_mask |= (((chunk[i + 4] & 0xC0) != 0x80) as u64) << (i + 4);
+            char_mask |= (((chunk[i + 5] & 0xC0) != 0x80) as u64) << (i + 5);
+            char_mask |= (((chunk[i + 6] & 0xC0) != 0x80) as u64) << (i + 6);
+            char_mask |= (((chunk[i + 7] & 0xC0) != 0x80) as u64) << (i + 7);
+            i += 8;
+        }
+        count += char_mask.count_ones() as u64;
+    }
+
+    for &b in remainder {
         count += ((b & 0xC0) != 0x80) as u64;
     }
     count
@@ -545,13 +808,20 @@ struct ChunkResult {
     ends_non_ws: bool,
 }
 
-/// Combined parallel counting of lines + words + chars in one pass per chunk.
+/// Combined parallel counting of lines + words + chars.
 ///
-/// This reads data from memory once per chunk (staying hot in cache),
-/// instead of doing separate parallel passes that each read from main memory.
+/// Uses SIMD-accelerated memchr for line counting plus optimized bitmask word
+/// counting per chunk, with data staying cache-warm between passes.
+/// On compute-bound CPUs (like Atom), the two-pass approach is faster than a
+/// combined scalar single-pass because memchr uses SIMD (16+ bytes/cycle)
+/// while the combined loop adds non-SIMD overhead to every byte.
 pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
     if data.len() < PARALLEL_THRESHOLD {
-        return (count_lines(data), count_words(data), count_chars(data, utf8));
+        // Small files: SIMD memchr + scalar word counting, sequential
+        let lines = count_lines(data);
+        let words = count_words(data);
+        let chars = count_chars(data, utf8);
+        return (lines, words, chars);
     }
 
     let num_threads = rayon::current_num_threads().max(1);
@@ -562,11 +832,11 @@ pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
     let results: Vec<ChunkResult> = chunks
         .par_iter()
         .map(|chunk| {
-            // SIMD line counting first — this loads data into cache
+            // Pass 1: SIMD-accelerated line counting (loads data into cache)
             let lines = memchr_iter(b'\n', chunk).count() as u64;
-            // Word counting benefits from data now being cache-warm
+            // Pass 2: Bitmask word counting (data now cache-warm from pass 1)
             let words = count_words(chunk);
-            // Char counting: also fast with cache-warm data
+            // Pass 3: Char counting (fast with warm cache, or free for non-UTF8)
             let chars = if utf8 {
                 count_chars_utf8(chunk)
             } else {

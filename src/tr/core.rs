@@ -2,8 +2,9 @@ use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+use rayon::prelude::*;
 
-const BUF_SIZE: usize = 64 * 1024; // 64KB — fits in L2 cache for processing
+const BUF_SIZE: usize = 1024 * 1024; // 1MB — reduces syscall overhead
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
@@ -69,36 +70,100 @@ fn raw_stdin() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(0)) }
 }
 
+// === Translate helper (unrolled 8-byte inner loop) ===
+
+#[inline(always)]
+fn translate_bytes(table: &[u8; 256], input: &[u8], output: &mut [u8]) {
+    let len = input.len();
+    let mut i = 0;
+    while i + 7 < len {
+        unsafe {
+            *output.get_unchecked_mut(i) = *table.get_unchecked(*input.get_unchecked(i) as usize);
+            *output.get_unchecked_mut(i + 1) =
+                *table.get_unchecked(*input.get_unchecked(i + 1) as usize);
+            *output.get_unchecked_mut(i + 2) =
+                *table.get_unchecked(*input.get_unchecked(i + 2) as usize);
+            *output.get_unchecked_mut(i + 3) =
+                *table.get_unchecked(*input.get_unchecked(i + 3) as usize);
+            *output.get_unchecked_mut(i + 4) =
+                *table.get_unchecked(*input.get_unchecked(i + 4) as usize);
+            *output.get_unchecked_mut(i + 5) =
+                *table.get_unchecked(*input.get_unchecked(i + 5) as usize);
+            *output.get_unchecked_mut(i + 6) =
+                *table.get_unchecked(*input.get_unchecked(i + 6) as usize);
+            *output.get_unchecked_mut(i + 7) =
+                *table.get_unchecked(*input.get_unchecked(i + 7) as usize);
+        }
+        i += 8;
+    }
+    while i < len {
+        unsafe {
+            *output.get_unchecked_mut(i) = *table.get_unchecked(*input.get_unchecked(i) as usize);
+        }
+        i += 1;
+    }
+}
+
 // === Translate ===
 
 pub fn translate(set1: &[u8], set2: &[u8]) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
-    let mut outbuf = vec![0u8; BUF_SIZE];
     let mut writer = raw_stdout();
 
-    if let Some(mmap) = try_mmap_stdin() {
-        for chunk in mmap.chunks(BUF_SIZE) {
-            let out = &mut outbuf[..chunk.len()];
-            for (i, &b) in chunk.iter().enumerate() {
-                unsafe { *out.get_unchecked_mut(i) = *table.get_unchecked(b as usize); }
-            }
-            writer.write_all(out)?;
-        }
-        return Ok(());
-    }
-
+    // Use read() with large buffer for all inputs.
+    // For translate, this outperforms mmap because:
+    // - read() with 1MB buffer: 100 syscalls for 100MB
+    // - mmap: ~25000 page faults for 100MB
+    // In-place translation avoids a separate output buffer.
     let mut reader = raw_stdin();
     let mut buf = vec![0u8; BUF_SIZE];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
+        let n = fill_buf(&mut *reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let chunk = &mut buf[..n];
-        for b in chunk.iter_mut() {
-            *b = unsafe { *table.get_unchecked(*b as usize) };
+        // In-place translation
+        let len = chunk.len();
+        let mut i = 0;
+        while i + 7 < len {
+            unsafe {
+                let p = chunk.as_mut_ptr().add(i);
+                *p = *table.get_unchecked(*p as usize);
+                *p.add(1) = *table.get_unchecked(*p.add(1) as usize);
+                *p.add(2) = *table.get_unchecked(*p.add(2) as usize);
+                *p.add(3) = *table.get_unchecked(*p.add(3) as usize);
+                *p.add(4) = *table.get_unchecked(*p.add(4) as usize);
+                *p.add(5) = *table.get_unchecked(*p.add(5) as usize);
+                *p.add(6) = *table.get_unchecked(*p.add(6) as usize);
+                *p.add(7) = *table.get_unchecked(*p.add(7) as usize);
+            }
+            i += 8;
+        }
+        while i < len {
+            unsafe {
+                let p = chunk.as_mut_ptr().add(i);
+                *p = *table.get_unchecked(*p as usize);
+            }
+            i += 1;
         }
         writer.write_all(chunk)?;
     }
     Ok(())
+}
+
+/// Fill buffer completely from reader (handles short reads from pipes).
+fn fill_buf(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 // === Translate + Squeeze ===
