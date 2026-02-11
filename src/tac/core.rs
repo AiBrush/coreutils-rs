@@ -94,7 +94,7 @@ pub fn tac_string_separator(
         let last_end = positions.last().unwrap() + sep_len;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing chunk without separator
+        // Trailing chunk without separator — GNU tac appends the separator
         if !has_trailing_sep {
             buf.write_all(&data[last_end..])?;
             buf.write_all(separator)?;
@@ -135,8 +135,53 @@ pub fn tac_string_separator(
     Ok(())
 }
 
+/// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
+/// GNU tac scans backward from the end, finding the rightmost starting position first.
+/// This produces different matches than forward scanning for patterns like [0-9]+.
+/// The matches are returned in left-to-right order.
+fn find_regex_matches_backward(data: &[u8], re: &regex::bytes::Regex) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    let mut past_end = data.len();
+
+    while past_end > 0 {
+        let buf = &data[..past_end];
+        let mut found = false;
+
+        // Scan backward: try positions from past_end-1 down to 0
+        // We need the LAST match starting position in buf, so we try from the end
+        let mut pos = past_end;
+        while pos > 0 {
+            pos -= 1;
+            if let Some(m) = re.find_at(buf, pos) {
+                if m.start() == pos {
+                    // Match starts at exactly this position — this is the rightmost match start
+                    matches.push((m.start(), m.end()));
+                    past_end = m.start();
+                    found = true;
+                    break;
+                }
+                // Match starts later than pos — skip to before that match
+                // No point checking positions between pos and m.start() since
+                // find_at already told us the leftmost match from pos starts at m.start()
+                // But we need matches that START before m.start(), so continue decrementing
+            }
+            // If None, there's no match at pos or later, but there might be one earlier
+            // (find_at only searches forward from pos)
+        }
+
+        if !found {
+            break;
+        }
+    }
+
+    matches.reverse(); // Convert from backward order to left-to-right order
+    matches
+}
+
 /// Reverse records using a regex separator.
 /// Uses regex::bytes for direct byte-level matching (no UTF-8 conversion needed).
+/// NOTE: GNU tac uses POSIX Basic Regular Expressions (BRE), so we convert to ERE first.
+/// Uses backward scanning to match GNU tac's re_search behavior.
 pub fn tac_regex_separator(
     data: &[u8],
     pattern: &str,
@@ -157,8 +202,8 @@ pub fn tac_regex_separator(
         }
     };
 
-    // Collect all match positions (start, end) in forward order
-    let matches: Vec<(usize, usize)> = re.find_iter(data).map(|m| (m.start(), m.end())).collect();
+    // Use backward scanning to match GNU tac's re_search behavior
+    let matches = find_regex_matches_backward(data, &re);
 
     if matches.is_empty() {
         out.write_all(data)?;
@@ -171,7 +216,7 @@ pub fn tac_regex_separator(
         let last_end = matches.last().unwrap().1;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing content after last separator
+        // Trailing content after last separator — GNU tac appends the last separator match
         if !has_trailing_sep {
             buf.write_all(&data[last_end..])?;
             // Append the last separator match to close this record
@@ -179,7 +224,7 @@ pub fn tac_regex_separator(
             buf.write_all(&data[last_match.0..last_match.1])?;
         }
 
-        // Records in reverse
+        // Records in reverse: each record = text + separator
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
@@ -188,7 +233,7 @@ pub fn tac_regex_separator(
             buf.write_all(&data[rec_start..rec_end])?;
         }
     } else {
-        // Before mode
+        // Before mode: separator before record
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
