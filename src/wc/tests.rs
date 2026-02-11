@@ -128,8 +128,8 @@ fn test_count_words_crlf_separated() {
 
 #[test]
 fn test_count_words_binary_data() {
-    // NUL bytes are not whitespace
-    assert_eq!(count_words(b"\x00hello\x00world"), 1); // NUL is not ws, so all one "word"
+    // NUL bytes act as word separators (GNU compat)
+    assert_eq!(count_words(b"\x00hello\x00world"), 2);
 }
 
 #[test]
@@ -386,7 +386,8 @@ fn test_count_all_binary_data() {
     let counts = count_all(data, false);
     assert_eq!(counts.lines, 2);
     assert_eq!(counts.bytes, 7);
-    assert_eq!(counts.words, 2); // "\x00\x01\x02" then "\xff\xfe"
+    // C locale: all bytes here are non-printable, so 0 words
+    assert_eq!(counts.words, 0);
     // C locale: each byte is a char
     assert_eq!(counts.chars, 7);
 }
@@ -406,12 +407,18 @@ fn test_gnu_trailing_newline() {
 
 #[test]
 fn test_gnu_word_definition() {
-    // GNU wc defines a word as a maximal sequence of non-isspace() bytes.
-    // isspace() in C locale: space, tab, newline, CR, form feed, vertical tab.
-    // NUL bytes are NOT whitespace.
-    assert_eq!(count_words(b"\x00"), 1); // NUL is a word
-    assert_eq!(count_words(b"\x01"), 1); // SOH is a word
-    assert_eq!(count_words(b"\x7f"), 1); // DEL is a word
+    // All C0 control chars (0x00-0x1F) and DEL (0x7F) are non-word in both locales
+    assert_eq!(count_words(b"\x00"), 0); // NUL
+    assert_eq!(count_words(b"\x01"), 0); // SOH (control char)
+    assert_eq!(count_words(b"\x7f"), 0); // DEL (control char)
+    // Printable ASCII is always word content
+    assert_eq!(count_words(b"!"), 1);
+    assert_eq!(count_words(b"hello"), 1);
+    // In UTF-8 mode, valid multi-byte sequences are word content
+    assert_eq!(count_words("café".as_bytes()), 1);
+    // In C locale, high bytes are non-word
+    assert_eq!(count_words_locale(b"\x80", false), 0);
+    assert_eq!(count_words_locale(b"hello", false), 1);
 }
 
 #[test]

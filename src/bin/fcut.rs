@@ -63,6 +63,7 @@ fn main() {
     }
     if mode_count > 1 {
         eprintln!("fcut: only one type of list may be specified");
+        eprintln!("Try 'fcut --help' for more information.");
         process::exit(1);
     }
 
@@ -85,6 +86,7 @@ fn main() {
     let delim = if let Some(ref d) = cli.delimiter {
         if d.len() != 1 {
             eprintln!("fcut: the delimiter must be a single character");
+            eprintln!("Try 'fcut --help' for more information.");
             process::exit(1);
         }
         d.as_bytes()[0]

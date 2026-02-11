@@ -15,21 +15,58 @@ pub struct WcCounts {
     pub max_line_length: u64,
 }
 
-/// Whitespace lookup table for branchless word boundary detection.
-/// GNU wc uses C locale `isspace()`: space, tab, newline, CR, form feed, vertical tab.
-const fn make_ws_table() -> [u8; 256] {
+/// Non-word lookup table for UTF-8 locale word boundary detection.
+/// In UTF-8 locale, GNU wc uses mbrtowc() + iswspace(). Non-word bytes:
+/// - C0 control chars (0x00-0x1F): non-printable, iswprint() = false
+/// - Space (0x20): iswspace() = true
+/// - DEL (0x7F): non-printable
+/// - Invalid standalone UTF-8: 0xC0, 0xC1, 0xFE, 0xFF (mbrtowc fails)
+/// Valid UTF-8 continuation (0x80-0xBF) and leader bytes (0xC2-0xFD) remain as word content.
+const fn make_ws_table_utf8() -> [u8; 256] {
     let mut t = [0u8; 256];
-    t[0x09] = 1; // \t  horizontal tab
-    t[0x0A] = 1; // \n  newline
-    t[0x0B] = 1; // \v  vertical tab
-    t[0x0C] = 1; // \f  form feed
-    t[0x0D] = 1; // \r  carriage return
-    t[0x20] = 1; //     space
+    // All C0 control characters (0x00-0x1F) are non-word
+    let mut i = 0u16;
+    while i <= 0x1F {
+        t[i as usize] = 1;
+        i += 1;
+    }
+    t[0x20] = 1; // space
+    t[0x7F] = 1; // DEL
+    // Invalid UTF-8 standalone bytes
+    t[0xC0] = 1; // overlong encoding
+    t[0xC1] = 1; // overlong encoding
+    t[0xFE] = 1; // invalid UTF-8
+    t[0xFF] = 1; // invalid UTF-8
     t
 }
 
-/// Precomputed whitespace lookup: `WS_TABLE[byte] == 1` if whitespace, `0` otherwise.
-const WS_TABLE: [u8; 256] = make_ws_table();
+/// Non-word lookup table for C/POSIX locale word boundary detection.
+/// In C locale, GNU wc uses mbrtowc() which fails on bytes >= 0x80, treating them
+/// as non-word characters. Also treats all control chars (0x01-0x08, 0x0E-0x1F, 0x7F)
+/// as non-word, matching the behavior where only printable ASCII forms words.
+const fn make_ws_table_c() -> [u8; 256] {
+    let mut t = [1u8; 256]; // default: non-word
+    // Only printable ASCII (0x21-0x7E) are word characters (not space 0x20)
+    let mut i = 0x21u16;
+    while i <= 0x7E {
+        t[i as usize] = 0;
+        i += 1;
+    }
+    t
+}
+
+/// UTF-8 locale: only standard whitespace + null are non-word
+const WS_TABLE_UTF8: [u8; 256] = make_ws_table_utf8();
+
+/// C locale: all non-printable-ASCII bytes are non-word (bytes >= 0x80, controls, etc.)
+const WS_TABLE_C: [u8; 256] = make_ws_table_c();
+
+/// Get the appropriate word-boundary table for the current locale.
+/// This is set once at startup and used throughout.
+#[inline]
+pub fn ws_table(utf8: bool) -> &'static [u8; 256] {
+    if utf8 { &WS_TABLE_UTF8 } else { &WS_TABLE_C }
+}
 
 /// Printable ASCII lookup table: 0x20 (space) through 0x7E (~) are printable.
 const fn make_printable_table() -> [u8; 256] {
@@ -57,40 +94,161 @@ pub fn count_bytes(data: &[u8]) -> u64 {
     data.len() as u64
 }
 
-/// Count words using SIMD-accelerated whitespace detection + popcount.
+/// Count words using locale-aware whitespace detection.
 ///
-/// A word is a maximal run of non-whitespace bytes (GNU wc definition).
-/// Word starts are transitions from whitespace to non-whitespace.
+/// A word is a maximal run of word-character bytes.
+/// In UTF-8 locale: word chars are non-whitespace bytes (high bytes are part of multi-byte chars).
+/// In C locale: word chars are only printable ASCII (0x21-0x7E). High bytes are non-word.
 ///
-/// On x86_64, uses SSE2 range comparisons to detect whitespace in 16-byte
-/// vectors: `(0x09 <= b <= 0x0D) || (b == 0x20)`. Four vectors are processed
-/// per iteration (64 bytes), with movemask combining into a 64-bit bitmask
-/// for popcount-based word boundary detection.
-///
-/// Fallback: scalar 64-byte block bitmask approach with table lookup.
+/// On x86_64 in UTF-8 mode, uses SSE2 SIMD acceleration.
+/// In C locale or non-x86_64, uses scalar table lookup with 64-byte block bitmasks.
 pub fn count_words(data: &[u8]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SSE2 is always available on x86_64
-        return unsafe { count_words_sse2(data) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        return count_words_scalar(data);
+    count_words_locale(data, true)
+}
+
+/// Count words with explicit locale control.
+/// C locale uses scalar table-based path.
+/// UTF-8 locale uses a state machine for correct multi-byte sequence handling.
+pub fn count_words_locale(data: &[u8], utf8: bool) -> u64 {
+    if utf8 {
+        count_words_utf8(data)
+    } else {
+        count_words_with_table(data, &WS_TABLE_C)
     }
 }
 
-/// SSE2-accelerated word counting. Processes 64 bytes per iteration using
-/// 4 XMM registers for whitespace detection, then combines into a 64-bit
-/// bitmask for word boundary detection via popcount.
+/// Count words in UTF-8 locale using a state machine.
+/// Correctly handles:
+/// - Valid multi-byte UTF-8 sequences (word content)
+/// - Invalid standalone continuation bytes (non-word, mbrtowc fails)
+/// - Control characters (non-word)
+/// - Invalid UTF-8 leaders without proper continuations (non-word)
+fn count_words_utf8(data: &[u8]) -> u64 {
+    let mut words = 0u64;
+    let mut in_word = false;
+    let mut i = 0;
+
+    while i < data.len() {
+        let b = data[i];
+
+        if b <= 0x20 || b == 0x7F {
+            // Control chars (0x00-0x1F), space (0x20), DEL (0x7F): non-word
+            in_word = false;
+            i += 1;
+        } else if b < 0x80 {
+            // Printable ASCII (0x21-0x7E): word content
+            if !in_word {
+                in_word = true;
+                words += 1;
+            }
+            i += 1;
+        } else if b < 0xC2 {
+            // 0x80-0xBF: standalone continuation byte (invalid UTF-8)
+            // 0xC0-0xC1: overlong 2-byte (invalid UTF-8)
+            in_word = false;
+            i += 1;
+        } else if b < 0xE0 {
+            // 2-byte sequence: need 1 continuation byte
+            if i + 1 < data.len() && (data[i + 1] & 0xC0) == 0x80 {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 2;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else if b < 0xF0 {
+            // 3-byte sequence: need 2 continuation bytes
+            if i + 2 < data.len() && (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 3;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else if b < 0xF5 {
+            // 4-byte sequence: need 3 continuation bytes
+            if i + 3 < data.len()
+                && (data[i + 1] & 0xC0) == 0x80
+                && (data[i + 2] & 0xC0) == 0x80
+                && (data[i + 3] & 0xC0) == 0x80
+            {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 4;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else {
+            // 0xF5-0xFF: invalid UTF-8
+            in_word = false;
+            i += 1;
+        }
+    }
+
+    words
+}
+
+/// Scalar word counting with a given non-word lookup table.
+fn count_words_with_table(data: &[u8], table: &[u8; 256]) -> u64 {
+    let mut words = 0u64;
+    let mut prev_ws_bit = 1u64;
+
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        let mut ws_mask = 0u64;
+        let mut i = 0;
+        while i + 7 < 64 {
+            ws_mask |= (table[chunk[i] as usize] as u64) << i;
+            ws_mask |= (table[chunk[i + 1] as usize] as u64) << (i + 1);
+            ws_mask |= (table[chunk[i + 2] as usize] as u64) << (i + 2);
+            ws_mask |= (table[chunk[i + 3] as usize] as u64) << (i + 3);
+            ws_mask |= (table[chunk[i + 4] as usize] as u64) << (i + 4);
+            ws_mask |= (table[chunk[i + 5] as usize] as u64) << (i + 5);
+            ws_mask |= (table[chunk[i + 6] as usize] as u64) << (i + 6);
+            ws_mask |= (table[chunk[i + 7] as usize] as u64) << (i + 7);
+            i += 8;
+        }
+
+        let prev_mask = (ws_mask << 1) | prev_ws_bit;
+        let word_starts = prev_mask & !ws_mask;
+        words += word_starts.count_ones() as u64;
+        prev_ws_bit = (ws_mask >> 63) & 1;
+    }
+
+    let mut prev_ws = prev_ws_bit as u8;
+    for &b in remainder {
+        let curr_ws = table[b as usize];
+        words += (prev_ws & (curr_ws ^ 1)) as u64;
+        prev_ws = curr_ws;
+    }
+    words
+}
+
+/// SSE2-accelerated word counting (UTF-8 locale only).
+/// NOTE: Currently unused in favor of scalar table-based approach for correctness.
+/// Kept for potential future re-enablement after updating to handle all non-word bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 unsafe fn count_words_sse2(data: &[u8]) -> u64 {
     use std::arch::x86_64::*;
 
     unsafe {
-        // Whitespace = (0x09 <= b <= 0x0D) || (b == 0x20)
-        // Using signed comparison: cmpgt(b, 0x08) && cmpgt(0x0E, b) || cmpeq(b, 0x20)
+        // Whitespace = (b == 0x00) || (0x09 <= b <= 0x0D) || (b == 0x20)
+        // Null bytes are word separators in GNU wc.
+        // Using signed comparison: cmpgt(b, 0x08) && cmpgt(0x0E, b) || cmpeq(b, 0x20) || cmpeq(b, 0x00)
+        let zero = _mm_setzero_si128();
         let min_ws = _mm_set1_epi8(0x08); // one below \t
         let max_ws = _mm_set1_epi8(0x0E); // one above \r
         let space = _mm_set1_epi8(0x20);
@@ -110,14 +268,16 @@ unsafe fn count_words_sse2(data: &[u8]) -> u64 {
             let v2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
             let v3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
 
-            // Detect whitespace in each vector: 3 comparisons + 1 AND + 1 OR
+            // Detect whitespace in each vector: range check + space + null
             macro_rules! detect_ws {
                 ($v:expr) => {{
                     let ge_9 = _mm_cmpgt_epi8($v, min_ws);
                     let le_d = _mm_cmpgt_epi8(max_ws, $v);
                     let in_range = _mm_and_si128(ge_9, le_d);
                     let is_sp = _mm_cmpeq_epi8($v, space);
-                    _mm_or_si128(in_range, is_sp)
+                    let is_null = _mm_cmpeq_epi8($v, zero);
+                    let ws = _mm_or_si128(in_range, is_sp);
+                    _mm_or_si128(ws, is_null)
                 }};
             }
 
@@ -152,7 +312,8 @@ unsafe fn count_words_sse2(data: &[u8]) -> u64 {
             let le_d = _mm_cmpgt_epi8(max_ws, v);
             let in_range = _mm_and_si128(ge_9, le_d);
             let is_sp = _mm_cmpeq_epi8(v, space);
-            let ws_vec = _mm_or_si128(in_range, is_sp);
+            let is_null = _mm_cmpeq_epi8(v, zero);
+            let ws_vec = _mm_or_si128(_mm_or_si128(in_range, is_sp), is_null);
             let ws_mask = _mm_movemask_epi8(ws_vec) as u32;
 
             let prev_mask = (ws_mask << 1) | prev_ws_u32;
@@ -164,7 +325,7 @@ unsafe fn count_words_sse2(data: &[u8]) -> u64 {
         // Scalar for final <16 bytes
         let mut prev_ws = prev_ws_u32 as u8;
         for &b in sub_remainder {
-            let curr_ws = WS_TABLE[b as usize];
+            let curr_ws = WS_TABLE_UTF8[b as usize];
             words += (prev_ws & (curr_ws ^ 1)) as u64;
             prev_ws = curr_ws;
         }
@@ -172,53 +333,9 @@ unsafe fn count_words_sse2(data: &[u8]) -> u64 {
     }
 }
 
-/// Scalar word counting fallback for non-x86 platforms.
-/// Uses 64-byte block bitmask operations with table lookup + popcount.
-#[cfg(not(target_arch = "x86_64"))]
-fn count_words_scalar(data: &[u8]) -> u64 {
-    let mut words = 0u64;
-    let mut prev_ws_bit = 1u64;
-
-    let chunks = data.chunks_exact(64);
-    let remainder = chunks.remainder();
-
-    for chunk in chunks {
-        let mut ws_mask = 0u64;
-        let mut i = 0;
-        while i + 7 < 64 {
-            ws_mask |= (WS_TABLE[chunk[i] as usize] as u64) << i;
-            ws_mask |= (WS_TABLE[chunk[i + 1] as usize] as u64) << (i + 1);
-            ws_mask |= (WS_TABLE[chunk[i + 2] as usize] as u64) << (i + 2);
-            ws_mask |= (WS_TABLE[chunk[i + 3] as usize] as u64) << (i + 3);
-            ws_mask |= (WS_TABLE[chunk[i + 4] as usize] as u64) << (i + 4);
-            ws_mask |= (WS_TABLE[chunk[i + 5] as usize] as u64) << (i + 5);
-            ws_mask |= (WS_TABLE[chunk[i + 6] as usize] as u64) << (i + 6);
-            ws_mask |= (WS_TABLE[chunk[i + 7] as usize] as u64) << (i + 7);
-            i += 8;
-        }
-
-        let prev_mask = (ws_mask << 1) | prev_ws_bit;
-        let word_starts = prev_mask & !ws_mask;
-        words += word_starts.count_ones() as u64;
-        prev_ws_bit = (ws_mask >> 63) & 1;
-    }
-
-    let mut prev_ws = prev_ws_bit as u8;
-    for &b in remainder {
-        let curr_ws = WS_TABLE[b as usize];
-        words += (prev_ws & (curr_ws ^ 1)) as u64;
-        prev_ws = curr_ws;
-    }
-    words
-}
-
 /// Count lines and words in a single pass using 64-byte bitmask blocks.
-///
-/// Eliminates the separate memchr line-counting pass by piggybacking newline
-/// counting onto the whitespace bitmask already computed for word counting.
-/// For each 64-byte block, we build both a whitespace mask and a newline mask,
-/// then use popcount on each.
-pub fn count_lines_words(data: &[u8]) -> (u64, u64) {
+pub fn count_lines_words(data: &[u8], utf8: bool) -> (u64, u64) {
+    let table = ws_table(utf8);
     let mut words = 0u64;
     let mut lines = 0u64;
     let mut prev_ws_bit = 1u64;
@@ -239,14 +356,14 @@ pub fn count_lines_words(data: &[u8]) -> (u64, u64) {
             let b5 = chunk[i + 5];
             let b6 = chunk[i + 6];
             let b7 = chunk[i + 7];
-            ws_mask |= (WS_TABLE[b0 as usize] as u64) << i;
-            ws_mask |= (WS_TABLE[b1 as usize] as u64) << (i + 1);
-            ws_mask |= (WS_TABLE[b2 as usize] as u64) << (i + 2);
-            ws_mask |= (WS_TABLE[b3 as usize] as u64) << (i + 3);
-            ws_mask |= (WS_TABLE[b4 as usize] as u64) << (i + 4);
-            ws_mask |= (WS_TABLE[b5 as usize] as u64) << (i + 5);
-            ws_mask |= (WS_TABLE[b6 as usize] as u64) << (i + 6);
-            ws_mask |= (WS_TABLE[b7 as usize] as u64) << (i + 7);
+            ws_mask |= (table[b0 as usize] as u64) << i;
+            ws_mask |= (table[b1 as usize] as u64) << (i + 1);
+            ws_mask |= (table[b2 as usize] as u64) << (i + 2);
+            ws_mask |= (table[b3 as usize] as u64) << (i + 3);
+            ws_mask |= (table[b4 as usize] as u64) << (i + 4);
+            ws_mask |= (table[b5 as usize] as u64) << (i + 5);
+            ws_mask |= (table[b6 as usize] as u64) << (i + 6);
+            ws_mask |= (table[b7 as usize] as u64) << (i + 7);
             nl_mask |= ((b0 == b'\n') as u64) << i;
             nl_mask |= ((b1 == b'\n') as u64) << (i + 1);
             nl_mask |= ((b2 == b'\n') as u64) << (i + 2);
@@ -270,20 +387,16 @@ pub fn count_lines_words(data: &[u8]) -> (u64, u64) {
         if b == b'\n' {
             lines += 1;
         }
-        let curr_ws = WS_TABLE[b as usize];
+        let curr_ws = table[b as usize];
         words += (prev_ws & (curr_ws ^ 1)) as u64;
         prev_ws = curr_ws;
     }
     (lines, words)
 }
 
-/// Count lines, words, and UTF-8 chars in a single pass using 64-byte bitmask blocks.
-///
-/// Builds whitespace, newline, and non-continuation-byte masks simultaneously
-/// in one read of the data, then uses popcount on each mask. This is the most
-/// memory-efficient approach when all three metrics are needed, as it touches
-/// each cache line only once.
-pub fn count_lines_words_chars_utf8(data: &[u8]) -> (u64, u64, u64) {
+/// Count lines, words, and chars in a single pass using 64-byte bitmask blocks.
+pub fn count_lines_words_chars(data: &[u8], utf8: bool) -> (u64, u64, u64) {
+    let table = ws_table(utf8);
     let mut words = 0u64;
     let mut lines = 0u64;
     let mut chars = 0u64;
@@ -307,14 +420,14 @@ pub fn count_lines_words_chars_utf8(data: &[u8]) -> (u64, u64, u64) {
             let b6 = chunk[i + 6];
             let b7 = chunk[i + 7];
 
-            ws_mask |= (WS_TABLE[b0 as usize] as u64) << i
-                | (WS_TABLE[b1 as usize] as u64) << (i + 1)
-                | (WS_TABLE[b2 as usize] as u64) << (i + 2)
-                | (WS_TABLE[b3 as usize] as u64) << (i + 3)
-                | (WS_TABLE[b4 as usize] as u64) << (i + 4)
-                | (WS_TABLE[b5 as usize] as u64) << (i + 5)
-                | (WS_TABLE[b6 as usize] as u64) << (i + 6)
-                | (WS_TABLE[b7 as usize] as u64) << (i + 7);
+            ws_mask |= (table[b0 as usize] as u64) << i
+                | (table[b1 as usize] as u64) << (i + 1)
+                | (table[b2 as usize] as u64) << (i + 2)
+                | (table[b3 as usize] as u64) << (i + 3)
+                | (table[b4 as usize] as u64) << (i + 4)
+                | (table[b5 as usize] as u64) << (i + 5)
+                | (table[b6 as usize] as u64) << (i + 6)
+                | (table[b7 as usize] as u64) << (i + 7);
 
             nl_mask |= ((b0 == b'\n') as u64) << i
                 | ((b1 == b'\n') as u64) << (i + 1)
@@ -325,14 +438,16 @@ pub fn count_lines_words_chars_utf8(data: &[u8]) -> (u64, u64, u64) {
                 | ((b6 == b'\n') as u64) << (i + 6)
                 | ((b7 == b'\n') as u64) << (i + 7);
 
-            char_mask |= (((b0 & 0xC0) != 0x80) as u64) << i
-                | (((b1 & 0xC0) != 0x80) as u64) << (i + 1)
-                | (((b2 & 0xC0) != 0x80) as u64) << (i + 2)
-                | (((b3 & 0xC0) != 0x80) as u64) << (i + 3)
-                | (((b4 & 0xC0) != 0x80) as u64) << (i + 4)
-                | (((b5 & 0xC0) != 0x80) as u64) << (i + 5)
-                | (((b6 & 0xC0) != 0x80) as u64) << (i + 6)
-                | (((b7 & 0xC0) != 0x80) as u64) << (i + 7);
+            if utf8 {
+                char_mask |= (((b0 & 0xC0) != 0x80) as u64) << i
+                    | (((b1 & 0xC0) != 0x80) as u64) << (i + 1)
+                    | (((b2 & 0xC0) != 0x80) as u64) << (i + 2)
+                    | (((b3 & 0xC0) != 0x80) as u64) << (i + 3)
+                    | (((b4 & 0xC0) != 0x80) as u64) << (i + 4)
+                    | (((b5 & 0xC0) != 0x80) as u64) << (i + 5)
+                    | (((b6 & 0xC0) != 0x80) as u64) << (i + 6)
+                    | (((b7 & 0xC0) != 0x80) as u64) << (i + 7);
+            }
 
             i += 8;
         }
@@ -349,10 +464,15 @@ pub fn count_lines_words_chars_utf8(data: &[u8]) -> (u64, u64, u64) {
         if b == b'\n' {
             lines += 1;
         }
-        let curr_ws = WS_TABLE[b as usize];
+        let curr_ws = table[b as usize];
         words += (prev_ws & (curr_ws ^ 1)) as u64;
         prev_ws = curr_ws;
-        chars += ((b & 0xC0) != 0x80) as u64;
+        if utf8 {
+            chars += ((b & 0xC0) != 0x80) as u64;
+        }
+    }
+    if !utf8 {
+        chars = data.len() as u64;
     }
     (lines, words, chars)
 }
@@ -716,7 +836,7 @@ pub fn max_line_length(data: &[u8], utf8: bool) -> u64 {
 pub fn count_all(data: &[u8], utf8: bool) -> WcCounts {
     WcCounts {
         lines: count_lines(data),
-        words: count_words(data),
+        words: count_words_locale(data, utf8),
         bytes: data.len() as u64,
         chars: count_chars(data, utf8),
         max_line_length: max_line_length(data, utf8),
@@ -742,27 +862,25 @@ pub fn count_lines_parallel(data: &[u8]) -> u64 {
 }
 
 /// Count words in parallel with boundary adjustment.
-///
-/// Each chunk is counted independently, then boundaries are checked:
-/// if chunk N ends with non-whitespace and chunk N+1 starts with non-whitespace,
-/// a word was split across the boundary and double-counted — subtract 1.
-pub fn count_words_parallel(data: &[u8]) -> u64 {
-    if data.len() < PARALLEL_THRESHOLD {
-        return count_words(data);
+pub fn count_words_parallel(data: &[u8], utf8: bool) -> u64 {
+    if utf8 || data.len() < PARALLEL_THRESHOLD {
+        // UTF-8 word counting uses a state machine that can't be trivially parallelized
+        // (multi-byte sequences may span chunk boundaries).
+        return count_words_locale(data, utf8);
     }
 
+    let table = &WS_TABLE_C;
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
     let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
 
-    // Each chunk produces: (word_count, first_byte_is_non_ws, last_byte_is_non_ws)
     let results: Vec<(u64, bool, bool)> = chunks
         .par_iter()
         .map(|chunk| {
-            let words = count_words(chunk);
-            let starts_non_ws = chunk.first().is_some_and(|&b| WS_TABLE[b as usize] == 0);
-            let ends_non_ws = chunk.last().is_some_and(|&b| WS_TABLE[b as usize] == 0);
+            let words = count_words_with_table(chunk, table);
+            let starts_non_ws = chunk.first().is_some_and(|&b| table[b as usize] == 0);
+            let ends_non_ws = chunk.last().is_some_and(|&b| table[b as usize] == 0);
             (words, starts_non_ws, ends_non_ws)
         })
         .collect();
@@ -770,8 +888,6 @@ pub fn count_words_parallel(data: &[u8]) -> u64 {
     let mut total = 0u64;
     for i in 0..results.len() {
         total += results[i].0;
-        // If previous chunk ends with non-ws and this chunk starts with non-ws,
-        // a word spans the boundary and was counted as two separate words.
         if i > 0 && results[i].1 && results[i - 1].2 {
             total -= 1;
         }
@@ -794,71 +910,32 @@ pub fn count_chars_parallel(data: &[u8], utf8: bool) -> u64 {
     data.par_chunks(chunk_size).map(count_chars_utf8).sum()
 }
 
-/// Partial result from processing a chunk, used to combine results at boundaries.
-struct ChunkResult {
-    lines: u64,
-    words: u64,
-    chars: u64,
-    starts_non_ws: bool,
-    ends_non_ws: bool,
-}
-
 /// Combined parallel counting of lines + words + chars.
-///
-/// Uses SIMD-accelerated memchr for line counting plus optimized bitmask word
-/// counting per chunk, with data staying cache-warm between passes.
-/// On compute-bound CPUs (like Atom), the two-pass approach is faster than a
-/// combined scalar single-pass because memchr uses SIMD (16+ bytes/cycle)
-/// while the combined loop adds non-SIMD overhead to every byte.
 pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
     if data.len() < PARALLEL_THRESHOLD {
-        // Small files: SIMD memchr + scalar word counting, sequential
         let lines = count_lines(data);
-        let words = count_words(data);
+        let words = count_words_locale(data, utf8);
         let chars = count_chars(data, utf8);
         return (lines, words, chars);
     }
 
+    // Word counting: sequential for UTF-8 (state machine), parallel for C locale
+    let words = count_words_parallel(data, utf8);
+
+    // Lines and chars can always be parallelized safely
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
-    let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+    let lines: u64 = data
+        .par_chunks(chunk_size)
+        .map(|chunk| memchr_iter(b'\n', chunk).count() as u64)
+        .sum();
 
-    let results: Vec<ChunkResult> = chunks
-        .par_iter()
-        .map(|chunk| {
-            // Pass 1: SIMD-accelerated line counting (loads data into cache)
-            let lines = memchr_iter(b'\n', chunk).count() as u64;
-            // Pass 2: Bitmask word counting (data now cache-warm from pass 1)
-            let words = count_words(chunk);
-            // Pass 3: Char counting (fast with warm cache, or free for non-UTF8)
-            let chars = if utf8 {
-                count_chars_utf8(chunk)
-            } else {
-                chunk.len() as u64
-            };
-            let starts_non_ws = chunk.first().is_some_and(|&b| WS_TABLE[b as usize] == 0);
-            let ends_non_ws = chunk.last().is_some_and(|&b| WS_TABLE[b as usize] == 0);
-            ChunkResult {
-                lines,
-                words,
-                chars,
-                starts_non_ws,
-                ends_non_ws,
-            }
-        })
-        .collect();
+    let chars = if utf8 {
+        data.par_chunks(chunk_size).map(count_chars_utf8).sum()
+    } else {
+        data.len() as u64
+    };
 
-    let mut total_lines = 0u64;
-    let mut total_words = 0u64;
-    let mut total_chars = 0u64;
-    for i in 0..results.len() {
-        total_lines += results[i].lines;
-        total_words += results[i].words;
-        total_chars += results[i].chars;
-        if i > 0 && results[i].starts_non_ws && results[i - 1].ends_non_ws {
-            total_words -= 1;
-        }
-    }
-    (total_lines, total_words, total_chars)
+    (lines, words, chars)
 }

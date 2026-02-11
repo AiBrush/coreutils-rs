@@ -34,6 +34,39 @@ impl std::ops::Deref for FileData {
     }
 }
 
+/// Output writer enum to avoid Box<dyn Write> vtable dispatch overhead.
+enum SortOutput<'a> {
+    Stdout(BufWriter<io::StdoutLock<'a>>),
+    File(BufWriter<File>),
+}
+
+impl Write for SortOutput<'_> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SortOutput::Stdout(w) => w.write(buf),
+            SortOutput::File(w) => w.write(buf),
+        }
+    }
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            SortOutput::Stdout(w) => w.write_all(buf),
+            SortOutput::File(w) => w.write_all(buf),
+        }
+    }
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SortOutput::Stdout(w) => w.flush(),
+            SortOutput::File(w) => w.flush(),
+        }
+    }
+}
+
+/// 4MB buffer for output — reduces flush frequency for large files.
+const OUTPUT_BUF_SIZE: usize = 4 * 1024 * 1024;
+
 /// Configuration for a sort operation.
 #[derive(Debug, Clone)]
 pub struct SortConfig {
@@ -134,7 +167,12 @@ fn read_all_input(
             .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", &inputs[0], e)))?;
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
-            FileData::Mmap(unsafe { Mmap::map(&file)? })
+            let mmap = unsafe { Mmap::map(&file)? };
+            #[cfg(target_os = "linux")]
+            {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+            }
+            FileData::Mmap(mmap)
         } else {
             FileData::Owned(Vec::new())
         }
@@ -395,9 +433,11 @@ fn write_sorted_output(
     offsets: &[(usize, usize)],
     sorted_indices: &[usize],
     config: &SortConfig,
-    writer: &mut dyn Write,
+    writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
+    // Use staging buffer to reduce per-line write overhead
+    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
     if config.unique {
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
@@ -411,17 +451,28 @@ fn write_sorted_output(
                 None => true,
             };
             if should_output {
-                writer.write_all(line)?;
-                writer.write_all(terminator)?;
+                buf.extend_from_slice(line);
+                buf.extend_from_slice(terminator);
+                if buf.len() >= OUTPUT_BUF_SIZE {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
                 prev = Some(idx);
             }
         }
     } else {
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            writer.write_all(&data[s..e])?;
-            writer.write_all(terminator)?;
+            buf.extend_from_slice(&data[s..e]);
+            buf.extend_from_slice(terminator);
+            if buf.len() >= OUTPUT_BUF_SIZE {
+                writer.write_all(&buf)?;
+                buf.clear();
+            }
         }
+    }
+    if !buf.is_empty() {
+        writer.write_all(&buf)?;
     }
     Ok(())
 }
@@ -472,12 +523,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
     if config.merge {
         let stdout = io::stdout();
-        let output: Box<dyn Write> = if let Some(ref path) = config.output_file {
-            Box::new(BufWriter::with_capacity(1 << 18, File::create(path)?))
+        let mut writer = if let Some(ref path) = config.output_file {
+            SortOutput::File(BufWriter::with_capacity(
+                OUTPUT_BUF_SIZE,
+                File::create(path)?,
+            ))
         } else {
-            Box::new(BufWriter::with_capacity(1 << 18, stdout.lock()))
+            SortOutput::Stdout(BufWriter::with_capacity(OUTPUT_BUF_SIZE, stdout.lock()))
         };
-        let mut writer = output;
         return merge_sorted(inputs, config, &mut writer);
     }
 
@@ -487,12 +540,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     let num_lines = offsets.len();
 
     let stdout = io::stdout();
-    let output: Box<dyn Write> = if let Some(ref path) = config.output_file {
-        Box::new(BufWriter::with_capacity(1 << 18, File::create(path)?))
+    let mut writer = if let Some(ref path) = config.output_file {
+        SortOutput::File(BufWriter::with_capacity(
+            OUTPUT_BUF_SIZE,
+            File::create(path)?,
+        ))
     } else {
-        Box::new(BufWriter::with_capacity(1 << 18, stdout.lock()))
+        SortOutput::Stdout(BufWriter::with_capacity(OUTPUT_BUF_SIZE, stdout.lock()))
     };
-    let mut writer = output;
 
     if num_lines == 0 {
         return Ok(());
@@ -554,7 +609,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             entries.sort_unstable_by(prefix_cmp);
         }
 
-        // Output from entries
+        // Output from entries using staging buffer
+        let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
         if config.unique {
             let mut prev: Option<usize> = None;
             for &(_, idx) in &entries {
@@ -568,17 +624,28 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     None => true,
                 };
                 if emit {
-                    writer.write_all(line)?;
-                    writer.write_all(terminator)?;
+                    buf.extend_from_slice(line);
+                    buf.extend_from_slice(terminator);
+                    if buf.len() >= OUTPUT_BUF_SIZE {
+                        writer.write_all(&buf)?;
+                        buf.clear();
+                    }
                     prev = Some(idx);
                 }
             }
         } else {
             for &(_, idx) in &entries {
                 let (s, e) = offsets[idx];
-                writer.write_all(&data[s..e])?;
-                writer.write_all(terminator)?;
+                buf.extend_from_slice(&data[s..e]);
+                buf.extend_from_slice(terminator);
+                if buf.len() >= OUTPUT_BUF_SIZE {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
             }
+        }
+        if !buf.is_empty() {
+            writer.write_all(&buf)?;
         }
     } else if is_numeric_only {
         // FAST PATH 2: Pre-parsed numeric sort with u64 comparison

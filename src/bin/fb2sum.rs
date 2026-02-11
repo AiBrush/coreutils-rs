@@ -238,13 +238,14 @@ fn write_output(
             let _ = hash::print_hash_tag_b2sum(out, hash_hex, filename, bits);
         }
     } else if cli.zero {
-        let _ = hash::print_hash_zero(out, hash_hex, filename, cli.binary);
+        // GNU defaults to binary mode on Linux; only -t (text) uses space
+        let _ = hash::print_hash_zero(out, hash_hex, filename, !cli.text);
     } else if needs_escape(filename) {
         let escaped = escape_filename(filename);
-        let mode_char = if cli.binary { '*' } else { ' ' };
+        let mode_char = if !cli.text { '*' } else { ' ' };
         let _ = writeln!(out, "\\{} {}{}", hash_hex, mode_char, escaped);
     } else {
-        let _ = hash::print_hash(out, hash_hex, filename, cli.binary);
+        let _ = hash::print_hash(out, hash_hex, filename, !cli.text);
     }
 }
 

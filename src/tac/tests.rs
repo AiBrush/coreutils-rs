@@ -51,8 +51,8 @@ fn test_three_lines() {
 
 #[test]
 fn test_no_trailing_newline() {
-    // GNU tac: "aaa\nbbb" -> "bbb\naaa\n"
-    assert_eq!(run_tac(b"aaa\nbbb", b'\n', false), b"bbb\naaa\n");
+    // GNU tac: trailing "bbb" concatenated with next record "aaa\n" = "bbbaaa\n"
+    assert_eq!(run_tac(b"aaa\nbbb", b'\n', false), b"bbbaaa\n");
 }
 
 #[test]
@@ -94,7 +94,8 @@ fn test_custom_separator_comma() {
 
 #[test]
 fn test_custom_separator_no_trailing() {
-    assert_eq!(run_tac(b"a,b,c", b',', false), b"c,b,a,");
+    // GNU tac: trailing "c" concatenated with "b," = "cb,a,"
+    assert_eq!(run_tac(b"a,b,c", b',', false), b"cb,a,");
 }
 
 // ---- Multi-byte string separator tests ----
@@ -106,7 +107,8 @@ fn test_string_separator() {
 
 #[test]
 fn test_string_separator_no_trailing() {
-    assert_eq!(run_tac_str(b"aXYbXYc", b"XY", false), b"cXYbXYaXY");
+    // GNU tac: trailing "c" concatenated with "bXY" = "cbXYaXY"
+    assert_eq!(run_tac_str(b"aXYbXYc", b"XY", false), b"cbXYaXY");
 }
 
 #[test]
@@ -118,8 +120,8 @@ fn test_string_separator_before() {
 
 #[test]
 fn test_regex_separator_digit() {
-    // Separator is any digit
-    assert_eq!(run_tac_regex(b"a1b2c3", r"\d", false), b"c3b2a1");
+    // Separator is any digit — use [0-9] (POSIX ERE compatible, same as GNU tac)
+    assert_eq!(run_tac_regex(b"a1b2c3", r"[0-9]", false), b"c3b2a1");
 }
 
 #[test]
