@@ -22,11 +22,11 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         // Default mode: separator is AFTER the record (like newline at end of line)
         let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
 
-        // Trailing content without separator — GNU tac appends the separator
+        // Trailing content without separator — write without adding separator
+        // (it gets concatenated with the next reversed record, matching GNU behavior)
         if !has_trailing_sep {
             let last_sep = *positions.last().unwrap();
             buf.write_all(&data[last_sep + 1..])?;
-            buf.write_all(&[separator])?;
         }
 
         // Records in reverse order
@@ -94,10 +94,9 @@ pub fn tac_string_separator(
         let last_end = positions.last().unwrap() + sep_len;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing chunk without separator — GNU tac appends the separator
+        // Trailing chunk without separator — write without adding separator
         if !has_trailing_sep {
             buf.write_all(&data[last_end..])?;
-            buf.write_all(separator)?;
         }
 
         // Records in reverse
@@ -216,12 +215,9 @@ pub fn tac_regex_separator(
         let last_end = matches.last().unwrap().1;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing content after last separator — GNU tac appends the last separator match
+        // Trailing content after last separator — write without adding separator
         if !has_trailing_sep {
             buf.write_all(&data[last_end..])?;
-            // Append the last separator match to close this record
-            let last_match = matches.last().unwrap();
-            buf.write_all(&data[last_match.0..last_match.1])?;
         }
 
         // Records in reverse: each record = text + separator
