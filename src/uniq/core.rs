@@ -235,6 +235,9 @@ impl<'a> Iterator for LineIter<'a> {
     }
 }
 
+/// Batched output buffer size for uniq.
+const UNIQ_BUF_SIZE: usize = 4 * 1024 * 1024;
+
 /// Standard processing for Default, RepeatedOnly, UniqueOnly on byte slices.
 fn process_standard_bytes(
     data: &[u8],
@@ -249,11 +252,40 @@ fn process_standard_bytes(
         None => return Ok(()), // empty input
     };
 
+    let fast = !needs_key_extraction(config) && !config.ignore_case;
+
+    // Ultra-fast path: default mode, no count, no key extraction
+    // Uses batched Vec output to avoid per-line write_all overhead
+    if fast && !config.count && matches!(config.mode, OutputMode::Default) {
+        let mut prev_content = prev_content;
+        let mut out_buf = Vec::with_capacity(UNIQ_BUF_SIZE);
+        out_buf.extend_from_slice(prev_full);
+        if prev_full.len() == prev_content.len() {
+            out_buf.push(term);
+        }
+        for (cur_content, cur_full) in lines {
+            if !lines_equal_fast(prev_content, cur_content) {
+                out_buf.extend_from_slice(cur_full);
+                if cur_full.len() == cur_content.len() {
+                    out_buf.push(term);
+                }
+                if out_buf.len() >= UNIQ_BUF_SIZE {
+                    writer.write_all(&out_buf)?;
+                    out_buf.clear();
+                }
+                prev_content = cur_content;
+            }
+        }
+        if !out_buf.is_empty() {
+            writer.write_all(&out_buf)?;
+        }
+        return Ok(());
+    }
+
+    // General path with count tracking
     let mut prev_content = prev_content;
     let mut prev_full = prev_full;
     let mut count: u64 = 1;
-
-    let fast = !needs_key_extraction(config) && !config.ignore_case;
 
     for (cur_content, cur_full) in lines {
         let equal = if fast {
