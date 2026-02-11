@@ -394,6 +394,7 @@ pub fn compare_ignore_nonprinting(a: &[u8], b: &[u8], ignore_case: bool) -> Orde
 }
 
 /// Master comparison function that dispatches based on KeyOpts.
+#[inline]
 pub fn compare_with_opts(a: &[u8], b: &[u8], opts: &KeyOpts, random_seed: u64) -> Ordering {
     let a = if opts.ignore_leading_blanks {
         skip_leading_blanks(a)
