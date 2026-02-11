@@ -140,12 +140,21 @@ fn main() {
         };
 
         if let Err(e) = result {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
             eprintln!("fcut: write error: {}", e);
             had_error = true;
         }
     }
 
-    let _ = out.flush();
+    if let Err(e) = out.flush() {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
+        eprintln!("fcut: write error: {}", e);
+        had_error = true;
+    }
 
     if had_error {
         process::exit(1);

@@ -53,14 +53,14 @@ fn bench_count_chars(c: &mut Criterion) {
     // ASCII data
     let ascii_data = generate_text(100_000, 5);
     group.bench_function("ascii_1MB", |b| {
-        b.iter(|| wc::count_chars(black_box(&ascii_data)))
+        b.iter(|| wc::count_chars(black_box(&ascii_data), true))
     });
 
     // UTF-8 data with multibyte chars
     let utf8_text = "\u{4e16}\u{754c}\u{4f60}\u{597d} hello world\n".repeat(50_000);
     let utf8_data = utf8_text.as_bytes();
     group.bench_function("utf8_mixed", |b| {
-        b.iter(|| wc::count_chars(black_box(utf8_data)))
+        b.iter(|| wc::count_chars(black_box(utf8_data), true))
     });
     group.finish();
 }
@@ -68,14 +68,14 @@ fn bench_count_chars(c: &mut Criterion) {
 fn bench_count_all(c: &mut Criterion) {
     let data = generate_text(100_000, 5);
     c.bench_function("wc_count_all_1MB", |b| {
-        b.iter(|| wc::count_all(black_box(&data)))
+        b.iter(|| wc::count_all(black_box(&data), false))
     });
 }
 
 fn bench_max_line_length(c: &mut Criterion) {
     let data = generate_text(100_000, 10);
     c.bench_function("wc_max_line_length", |b| {
-        b.iter(|| wc::max_line_length(black_box(&data)))
+        b.iter(|| wc::max_line_length(black_box(&data), false))
     });
 }
 

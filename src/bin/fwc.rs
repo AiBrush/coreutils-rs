@@ -79,6 +79,9 @@ fn num_width(n: u64) -> usize {
 fn main() {
     let cli = Cli::parse();
 
+    // Detect locale once at startup
+    let utf8_locale = wc::is_utf8_locale();
+
     // If no flags specified, default to lines + words + bytes.
     // If any flag is specified, only show the explicitly requested ones.
     let no_explicit = !cli.bytes && !cli.chars && !cli.words && !cli.lines && !cli.max_line_length;
@@ -159,29 +162,45 @@ fn main() {
         };
 
         // Compute only the requested metrics — each uses its own optimized pass.
-        // Always compute bytes (it's free: data.len()) for GNU-compatible column width.
-        let counts = wc::WcCounts {
-            lines: if show.lines {
-                wc::count_lines(&data)
-            } else {
-                0
-            },
-            words: if show.words {
-                wc::count_words(&data)
-            } else {
-                0
-            },
-            bytes: data.len() as u64,
-            chars: if show.chars {
-                wc::count_chars(&data)
-            } else {
-                0
-            },
-            max_line_length: if show.max_line_length {
-                wc::max_line_length(&data)
-            } else {
-                0
-            },
+        // Uses parallel variants for large files (>4MB) to exploit multi-core CPUs.
+        // Default mode uses a combined parallel pass (lines+words+chars together)
+        // to keep data cache-warm between metric computations within each chunk.
+        let counts = if show.lines && show.words && !show.max_line_length {
+            // Combined parallel pass — most efficient for default mode
+            let (lines, words, chars) =
+                wc::count_lwc_parallel(&data, show.chars && utf8_locale);
+            wc::WcCounts {
+                lines,
+                words,
+                bytes: data.len() as u64,
+                chars: if show.chars { chars } else { 0 },
+                max_line_length: 0,
+            }
+        } else {
+            // Individual parallel passes for specific flags
+            wc::WcCounts {
+                lines: if show.lines {
+                    wc::count_lines_parallel(&data)
+                } else {
+                    0
+                },
+                words: if show.words {
+                    wc::count_words_parallel(&data)
+                } else {
+                    0
+                },
+                bytes: data.len() as u64,
+                chars: if show.chars {
+                    wc::count_chars_parallel(&data, utf8_locale)
+                } else {
+                    0
+                },
+                max_line_length: if show.max_line_length {
+                    wc::max_line_length(&data, utf8_locale)
+                } else {
+                    0
+                },
+            }
         };
 
         total.lines += counts.lines;
@@ -205,6 +224,7 @@ fn main() {
     // (including bytes, which is always computed) for column alignment.
     // Special case: single file + single column + no total = natural width.
     // For stdin with no files, GNU uses a default minimum width of 7.
+    // --total=only: GNU uses width 1 (natural width, no padding).
 
     // Determine whether to print total line (needed for width calculation)
     let show_total = match total_mode {
@@ -232,8 +252,12 @@ fn main() {
         1
     };
 
-    let width = if num_columns <= 1 && num_output_rows <= 1 {
+    let width = if total_mode == "only" {
+        // --total=only: GNU uses width 1 (natural width, no padding)
+        1
+    } else if num_columns <= 1 && num_output_rows <= 1 {
         // Single value output: no alignment needed, use natural width
+        // min_width (7 for stdin) only applies to multi-column output
         let single_val = if show.lines {
             total.lines
         } else if show.words {
@@ -247,7 +271,7 @@ fn main() {
         } else {
             0
         };
-        num_width(single_val).max(min_width)
+        num_width(single_val)
     } else {
         // Multiple columns or multiple rows: use max of ALL computed values
         // (including bytes which is always computed) for consistent alignment

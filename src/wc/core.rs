@@ -1,4 +1,8 @@
 use memchr::memchr_iter;
+use rayon::prelude::*;
+
+/// Minimum data size to use parallel processing (4MB).
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Results from counting a byte slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,6 +30,19 @@ const fn make_ws_table() -> [u8; 256] {
 /// Precomputed whitespace lookup: `WS_TABLE[byte] == 1` if whitespace, `0` otherwise.
 const WS_TABLE: [u8; 256] = make_ws_table();
 
+/// Printable ASCII lookup table: 0x20 (space) through 0x7E (~) are printable.
+const fn make_printable_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0x20u16;
+    while i <= 0x7E {
+        t[i as usize] = 1;
+        i += 1;
+    }
+    t
+}
+
+const PRINTABLE_TABLE: [u8; 256] = make_printable_table();
+
 /// Count newlines using SIMD-accelerated memchr.
 /// GNU wc counts newline bytes (`\n`), not logical lines.
 #[inline]
@@ -39,21 +56,59 @@ pub fn count_bytes(data: &[u8]) -> u64 {
     data.len() as u64
 }
 
-/// Count words using a branchless lookup table.
-/// A word is a maximal run of non-whitespace bytes (GNU wc definition).
+/// Count words using 64-byte block bitmask operations + popcount.
 ///
-/// Uses a branchless state machine: a word starts at each transition
-/// from whitespace to non-whitespace. The lookup table and XOR/AND
-/// avoid all branches in the hot loop, eliminating branch misprediction.
+/// A word is a maximal run of non-whitespace bytes (GNU wc definition).
+/// Word starts are transitions from whitespace to non-whitespace.
+///
+/// Instead of processing one byte at a time with serial dependencies,
+/// this builds a 64-bit whitespace bitmask for each block, then uses
+/// shift + AND + popcount to count transitions. The mask-building
+/// iterations are independent (no serial dependency), allowing the CPU's
+/// superscalar pipeline to execute multiple iterations per cycle.
 pub fn count_words(data: &[u8]) -> u64 {
     let mut words = 0u64;
-    let mut prev_ws = 1u8; // treat start-of-data as whitespace
+    let mut prev_ws_bit = 1u64; // treat start-of-data as whitespace
 
-    for &b in data {
+    // Process in 64-byte blocks
+    let chunks = data.chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        // Build 64-bit whitespace mask: bit i = 1 if chunk[i] is whitespace.
+        // These iterations are independent — no serial dependency — so the
+        // CPU can pipeline them efficiently.
+        let mut ws_mask = 0u64;
+        // Unroll 8 bytes at a time for better pipelining
+        let mut i = 0;
+        while i + 7 < 64 {
+            ws_mask |= (WS_TABLE[chunk[i] as usize] as u64) << i;
+            ws_mask |= (WS_TABLE[chunk[i + 1] as usize] as u64) << (i + 1);
+            ws_mask |= (WS_TABLE[chunk[i + 2] as usize] as u64) << (i + 2);
+            ws_mask |= (WS_TABLE[chunk[i + 3] as usize] as u64) << (i + 3);
+            ws_mask |= (WS_TABLE[chunk[i + 4] as usize] as u64) << (i + 4);
+            ws_mask |= (WS_TABLE[chunk[i + 5] as usize] as u64) << (i + 5);
+            ws_mask |= (WS_TABLE[chunk[i + 6] as usize] as u64) << (i + 6);
+            ws_mask |= (WS_TABLE[chunk[i + 7] as usize] as u64) << (i + 7);
+            i += 8;
+        }
+
+        // Build "previous was whitespace" mask: shift ws_mask left by 1,
+        // insert carry from previous block as bit 0
+        let prev_mask = (ws_mask << 1) | prev_ws_bit;
+
+        // Word starts: where previous byte was whitespace AND current is NOT whitespace
+        let word_starts = prev_mask & !ws_mask;
+        words += word_starts.count_ones() as u64;
+
+        // Carry last bit to next block
+        prev_ws_bit = (ws_mask >> 63) & 1;
+    }
+
+    // Handle remainder with scalar approach
+    let mut prev_ws = prev_ws_bit as u8;
+    for &b in remainder {
         let curr_ws = WS_TABLE[b as usize];
-        // Branchless: add 1 when prev was whitespace AND current is NOT whitespace.
-        // curr_ws ^ 1 flips 0↔1, so it's 1 when current is non-whitespace.
-        // prev_ws & (curr_ws ^ 1) is 1 only at word-start transitions.
         words += (prev_ws & (curr_ws ^ 1)) as u64;
         prev_ws = curr_ws;
     }
@@ -63,10 +118,7 @@ pub fn count_words(data: &[u8]) -> u64 {
 /// Count UTF-8 characters by counting non-continuation bytes.
 /// A continuation byte has the bit pattern `10xxxxxx` (0x80..0xBF).
 /// Every other byte starts a new character (ASCII, multi-byte leader, or invalid).
-///
-/// This is correct for valid UTF-8 and matches the common approach used by
-/// high-performance text tools (ripgrep, etc.).
-pub fn count_chars(data: &[u8]) -> u64 {
+pub fn count_chars_utf8(data: &[u8]) -> u64 {
     let mut count = 0u64;
     for &b in data {
         count += ((b & 0xC0) != 0x80) as u64;
@@ -74,40 +126,316 @@ pub fn count_chars(data: &[u8]) -> u64 {
     count
 }
 
+/// Count characters in C/POSIX locale (each byte is one character).
+#[inline]
+pub fn count_chars_c(data: &[u8]) -> u64 {
+    data.len() as u64
+}
+
+/// Count characters, choosing behavior based on locale.
+#[inline]
+pub fn count_chars(data: &[u8], utf8: bool) -> u64 {
+    if utf8 {
+        count_chars_utf8(data)
+    } else {
+        count_chars_c(data)
+    }
+}
+
+/// Detect if the current locale uses UTF-8 encoding.
+pub fn is_utf8_locale() -> bool {
+    for var in &["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                let lower = val.to_ascii_lowercase();
+                return lower.contains("utf-8") || lower.contains("utf8");
+            }
+        }
+    }
+    false
+}
+
+/// Decode one UTF-8 character from a byte slice.
+/// Returns (codepoint, byte_length). On invalid UTF-8, returns (byte as u32, 1).
+#[inline]
+fn decode_utf8(bytes: &[u8]) -> (u32, usize) {
+    let b0 = bytes[0];
+    if b0 < 0x80 {
+        return (b0 as u32, 1);
+    }
+    if b0 < 0xC2 {
+        // Continuation byte or overlong 2-byte — invalid as start
+        return (b0 as u32, 1);
+    }
+    if b0 < 0xE0 {
+        if bytes.len() < 2 || bytes[1] & 0xC0 != 0x80 {
+            return (b0 as u32, 1);
+        }
+        let cp = ((b0 as u32 & 0x1F) << 6) | (bytes[1] as u32 & 0x3F);
+        return (cp, 2);
+    }
+    if b0 < 0xF0 {
+        if bytes.len() < 3 || bytes[1] & 0xC0 != 0x80 || bytes[2] & 0xC0 != 0x80 {
+            return (b0 as u32, 1);
+        }
+        let cp = ((b0 as u32 & 0x0F) << 12)
+            | ((bytes[1] as u32 & 0x3F) << 6)
+            | (bytes[2] as u32 & 0x3F);
+        return (cp, 3);
+    }
+    if b0 < 0xF5 {
+        if bytes.len() < 4
+            || bytes[1] & 0xC0 != 0x80
+            || bytes[2] & 0xC0 != 0x80
+            || bytes[3] & 0xC0 != 0x80
+        {
+            return (b0 as u32, 1);
+        }
+        let cp = ((b0 as u32 & 0x07) << 18)
+            | ((bytes[1] as u32 & 0x3F) << 12)
+            | ((bytes[2] as u32 & 0x3F) << 6)
+            | (bytes[3] as u32 & 0x3F);
+        return (cp, 4);
+    }
+    (b0 as u32, 1)
+}
+
+/// Check if a Unicode codepoint is an East Asian Wide/Fullwidth character (display width 2).
+#[inline]
+fn is_wide_char(cp: u32) -> bool {
+    matches!(cp,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x231A..=0x231B // Watch, Hourglass
+        | 0x2329..=0x232A // Angle Brackets
+        | 0x23E9..=0x23F3 // Various symbols
+        | 0x23F8..=0x23FA
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267F
+        | 0x2693
+        | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE
+        | 0x26D4
+        | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5
+        | 0x26FA
+        | 0x26FD
+        | 0x2702
+        | 0x2705
+        | 0x2708..=0x270D
+        | 0x270F
+        | 0x2712
+        | 0x2714
+        | 0x2716
+        | 0x271D
+        | 0x2721
+        | 0x2728
+        | 0x2733..=0x2734
+        | 0x2744
+        | 0x2747
+        | 0x274C
+        | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2763..=0x2764
+        | 0x2795..=0x2797
+        | 0x27A1
+        | 0x27B0
+        | 0x27BF
+        | 0x2934..=0x2935
+        | 0x2B05..=0x2B07
+        | 0x2B1B..=0x2B1C
+        | 0x2B50
+        | 0x2B55
+        | 0x2E80..=0x303E  // CJK Radicals, Kangxi Radicals, Ideographic Description
+        | 0x3041..=0x33BF  // Hiragana, Katakana, Bopomofo, Hangul Compat Jamo, Kanbun, CJK
+        | 0x3400..=0x4DBF  // CJK Unified Ideographs Extension A
+        | 0x4E00..=0xA4CF  // CJK Unified Ideographs, Yi
+        | 0xA960..=0xA97C  // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7A3  // Hangul Syllables
+        | 0xF900..=0xFAFF  // CJK Compatibility Ideographs
+        | 0xFE10..=0xFE19  // Vertical Forms
+        | 0xFE30..=0xFE6F  // CJK Compatibility Forms
+        | 0xFF01..=0xFF60  // Fullwidth Latin, Halfwidth Katakana
+        | 0xFFE0..=0xFFE6  // Fullwidth Signs
+        | 0x1F004
+        | 0x1F0CF
+        | 0x1F170..=0x1F171
+        | 0x1F17E..=0x1F17F
+        | 0x1F18E
+        | 0x1F191..=0x1F19A
+        | 0x1F1E0..=0x1F1FF // Regional Indicators
+        | 0x1F200..=0x1F202
+        | 0x1F210..=0x1F23B
+        | 0x1F240..=0x1F248
+        | 0x1F250..=0x1F251
+        | 0x1F260..=0x1F265
+        | 0x1F300..=0x1F64F // Misc Symbols, Emoticons
+        | 0x1F680..=0x1F6FF // Transport Symbols
+        | 0x1F900..=0x1F9FF // Supplemental Symbols
+        | 0x1FA00..=0x1FA6F
+        | 0x1FA70..=0x1FAFF
+        | 0x20000..=0x2FFFD // CJK Unified Ideographs Extension B-F
+        | 0x30000..=0x3FFFD // CJK Unified Ideographs Extension G
+    )
+}
+
 /// Compute maximum display width of any line (C/POSIX locale).
 ///
-/// Lines are delimited by `\n`. Display width rules:
-/// - `\n`: terminates the line (not counted in width)
-/// - `\t`: advances to the next tab stop (multiple of 8)
-/// - `\r`: zero display width (not a line terminator)
-/// - `\v` (0x0B): zero display width
-/// - All other bytes: width 1
-pub fn max_line_length(data: &[u8]) -> u64 {
+/// GNU wc -L behavior in C locale:
+/// - `\n`: line terminator (records max, resets position)
+/// - `\t`: advances to next tab stop (multiple of 8)
+/// - `\r`: carriage return (resets position to 0, same line)
+/// - `\f`: form feed (acts as line terminator like \n)
+/// - Printable ASCII (0x20..0x7E): width 1
+/// - Everything else (controls, high bytes): width 0
+pub fn max_line_length_c(data: &[u8]) -> u64 {
     let mut max_len: u64 = 0;
-    let mut current_len: u64 = 0;
+    let mut line_len: u64 = 0; // max position seen on current line
+    let mut linepos: u64 = 0; // current cursor position
 
     for &b in data {
-        if b == b'\n' {
-            if current_len > max_len {
-                max_len = current_len;
+        match b {
+            b'\n' => {
+                if line_len > max_len {
+                    max_len = line_len;
+                }
+                linepos = 0;
+                line_len = 0;
             }
-            current_len = 0;
-        } else if b == b'\t' {
-            // Tab: advance to next multiple of 8
-            current_len = (current_len + 8) & !7;
-        } else if b == b'\r' || b == 0x0B {
-            // CR and VT: zero display width
-        } else {
-            current_len += 1;
+            b'\t' => {
+                linepos = (linepos + 8) & !7;
+                if linepos > line_len {
+                    line_len = linepos;
+                }
+            }
+            b'\r' => {
+                linepos = 0;
+            }
+            0x0C => {
+                // Form feed: acts as line terminator
+                if line_len > max_len {
+                    max_len = line_len;
+                }
+                linepos = 0;
+                line_len = 0;
+            }
+            _ => {
+                if PRINTABLE_TABLE[b as usize] != 0 {
+                    linepos += 1;
+                    if linepos > line_len {
+                        line_len = linepos;
+                    }
+                }
+                // Non-printable: width 0
+            }
         }
     }
 
     // Handle last line (may not end with \n)
-    if current_len > max_len {
-        max_len = current_len;
+    if line_len > max_len {
+        max_len = line_len;
     }
 
     max_len
+}
+
+/// Compute maximum display width of any line (UTF-8 locale).
+///
+/// GNU wc -L in UTF-8 locale uses mbrtowc() + wcwidth() for display width.
+/// East Asian Wide/Fullwidth characters get width 2, most others get width 1.
+pub fn max_line_length_utf8(data: &[u8]) -> u64 {
+    let mut max_len: u64 = 0;
+    let mut line_len: u64 = 0;
+    let mut linepos: u64 = 0;
+    let mut i = 0;
+
+    while i < data.len() {
+        let b = data[i];
+
+        // Fast path for common ASCII
+        if b < 0x80 {
+            match b {
+                b'\n' => {
+                    if line_len > max_len {
+                        max_len = line_len;
+                    }
+                    linepos = 0;
+                    line_len = 0;
+                }
+                b'\t' => {
+                    linepos = (linepos + 8) & !7;
+                    if linepos > line_len {
+                        line_len = linepos;
+                    }
+                }
+                b'\r' => {
+                    linepos = 0;
+                }
+                0x0C => {
+                    // Form feed: line terminator
+                    if line_len > max_len {
+                        max_len = line_len;
+                    }
+                    linepos = 0;
+                    line_len = 0;
+                }
+                0x20..=0x7E => {
+                    // Printable ASCII
+                    linepos += 1;
+                    if linepos > line_len {
+                        line_len = linepos;
+                    }
+                }
+                _ => {
+                    // Non-printable ASCII control chars: width 0
+                }
+            }
+            i += 1;
+        } else {
+            // Multibyte UTF-8
+            let (cp, len) = decode_utf8(&data[i..]);
+
+            // C1 control characters (0x80..0x9F): non-printable
+            if cp <= 0x9F {
+                // width 0
+            } else if is_wide_char(cp) {
+                linepos += 2;
+                if linepos > line_len {
+                    line_len = linepos;
+                }
+            } else {
+                // Regular printable Unicode character: width 1
+                linepos += 1;
+                if linepos > line_len {
+                    line_len = linepos;
+                }
+            }
+            i += len;
+        }
+    }
+
+    // Handle last line
+    if line_len > max_len {
+        max_len = line_len;
+    }
+
+    max_len
+}
+
+/// Compute maximum display width, choosing behavior based on locale.
+#[inline]
+pub fn max_line_length(data: &[u8], utf8: bool) -> u64 {
+    if utf8 {
+        max_line_length_utf8(data)
+    } else {
+        max_line_length_c(data)
+    }
 }
 
 /// Count all metrics using optimized individual passes.
@@ -115,18 +443,161 @@ pub fn max_line_length(data: &[u8]) -> u64 {
 /// Each metric uses its own optimized algorithm:
 /// - Lines: SIMD-accelerated memchr
 /// - Words: branchless lookup table
-/// - Chars: non-continuation byte counting
-/// - Max line length: single-pass with display width tracking
+/// - Chars: non-continuation byte counting (UTF-8) or byte counting (C locale)
+/// - Max line length: locale-aware display width tracking
 ///
 /// Multi-pass is faster than single-pass because each pass has a tight,
 /// specialized loop. After the first pass, data is hot in L2/L3 cache,
 /// making subsequent passes nearly free for memory bandwidth.
-pub fn count_all(data: &[u8]) -> WcCounts {
+pub fn count_all(data: &[u8], utf8: bool) -> WcCounts {
     WcCounts {
         lines: count_lines(data),
         words: count_words(data),
         bytes: data.len() as u64,
-        chars: count_chars(data),
-        max_line_length: max_line_length(data),
+        chars: count_chars(data, utf8),
+        max_line_length: max_line_length(data, utf8),
     }
+}
+
+// ──────────────────────────────────────────────────
+// Parallel counting for large files
+// ──────────────────────────────────────────────────
+
+/// Count newlines in parallel using SIMD memchr + rayon.
+pub fn count_lines_parallel(data: &[u8]) -> u64 {
+    if data.len() < PARALLEL_THRESHOLD {
+        return count_lines(data);
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (data.len() / num_threads).max(1024 * 1024);
+
+    data.par_chunks(chunk_size)
+        .map(|chunk| memchr_iter(b'\n', chunk).count() as u64)
+        .sum()
+}
+
+/// Count words in parallel with boundary adjustment.
+///
+/// Each chunk is counted independently, then boundaries are checked:
+/// if chunk N ends with non-whitespace and chunk N+1 starts with non-whitespace,
+/// a word was split across the boundary and double-counted — subtract 1.
+pub fn count_words_parallel(data: &[u8]) -> u64 {
+    if data.len() < PARALLEL_THRESHOLD {
+        return count_words(data);
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (data.len() / num_threads).max(1024 * 1024);
+
+    let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+
+    // Each chunk produces: (word_count, first_byte_is_non_ws, last_byte_is_non_ws)
+    let results: Vec<(u64, bool, bool)> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let words = count_words(chunk);
+            let starts_non_ws = chunk
+                .first()
+                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+            let ends_non_ws = chunk
+                .last()
+                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+            (words, starts_non_ws, ends_non_ws)
+        })
+        .collect();
+
+    let mut total = 0u64;
+    for i in 0..results.len() {
+        total += results[i].0;
+        // If previous chunk ends with non-ws and this chunk starts with non-ws,
+        // a word spans the boundary and was counted as two separate words.
+        if i > 0 && results[i].1 && results[i - 1].2 {
+            total -= 1;
+        }
+    }
+    total
+}
+
+/// Count UTF-8 characters in parallel.
+pub fn count_chars_parallel(data: &[u8], utf8: bool) -> u64 {
+    if !utf8 {
+        return data.len() as u64;
+    }
+    if data.len() < PARALLEL_THRESHOLD {
+        return count_chars_utf8(data);
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (data.len() / num_threads).max(1024 * 1024);
+
+    data.par_chunks(chunk_size)
+        .map(|chunk| count_chars_utf8(chunk))
+        .sum()
+}
+
+/// Partial result from processing a chunk, used to combine results at boundaries.
+struct ChunkResult {
+    lines: u64,
+    words: u64,
+    chars: u64,
+    starts_non_ws: bool,
+    ends_non_ws: bool,
+}
+
+/// Combined parallel counting of lines + words + chars in one pass per chunk.
+///
+/// This reads data from memory once per chunk (staying hot in cache),
+/// instead of doing separate parallel passes that each read from main memory.
+pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
+    if data.len() < PARALLEL_THRESHOLD {
+        return (count_lines(data), count_words(data), count_chars(data, utf8));
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (data.len() / num_threads).max(1024 * 1024);
+
+    let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+
+    let results: Vec<ChunkResult> = chunks
+        .par_iter()
+        .map(|chunk| {
+            // SIMD line counting first — this loads data into cache
+            let lines = memchr_iter(b'\n', chunk).count() as u64;
+            // Word counting benefits from data now being cache-warm
+            let words = count_words(chunk);
+            // Char counting: also fast with cache-warm data
+            let chars = if utf8 {
+                count_chars_utf8(chunk)
+            } else {
+                chunk.len() as u64
+            };
+            let starts_non_ws = chunk
+                .first()
+                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+            let ends_non_ws = chunk
+                .last()
+                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+            ChunkResult {
+                lines,
+                words,
+                chars,
+                starts_non_ws,
+                ends_non_ws,
+            }
+        })
+        .collect();
+
+    let mut total_lines = 0u64;
+    let mut total_words = 0u64;
+    let mut total_chars = 0u64;
+    for i in 0..results.len() {
+        total_lines += results[i].lines;
+        total_words += results[i].words;
+        total_chars += results[i].chars;
+        if i > 0 && results[i].starts_non_ws && results[i - 1].ends_non_ws {
+            total_words -= 1;
+        }
+    }
+    (total_lines, total_words, total_chars)
 }
