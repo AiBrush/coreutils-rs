@@ -68,9 +68,6 @@ pub fn ws_table(utf8: bool) -> &'static [u8; 256] {
     if utf8 { &WS_TABLE_UTF8 } else { &WS_TABLE_C }
 }
 
-/// Default WS_TABLE for backward compatibility (UTF-8 mode).
-const WS_TABLE: [u8; 256] = make_ws_table_utf8();
-
 /// Printable ASCII lookup table: 0x20 (space) through 0x7E (~) are printable.
 const fn make_printable_table() -> [u8; 256] {
     let mut t = [0u8; 256];
@@ -164,10 +161,7 @@ fn count_words_utf8(data: &[u8]) -> u64 {
             }
         } else if b < 0xF0 {
             // 3-byte sequence: need 2 continuation bytes
-            if i + 2 < data.len()
-                && (data[i + 1] & 0xC0) == 0x80
-                && (data[i + 2] & 0xC0) == 0x80
-            {
+            if i + 2 < data.len() && (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 {
                 if !in_word {
                     in_word = true;
                     words += 1;
@@ -331,14 +325,13 @@ unsafe fn count_words_sse2(data: &[u8]) -> u64 {
         // Scalar for final <16 bytes
         let mut prev_ws = prev_ws_u32 as u8;
         for &b in sub_remainder {
-            let curr_ws = WS_TABLE[b as usize];
+            let curr_ws = WS_TABLE_UTF8[b as usize];
             words += (prev_ws & (curr_ws ^ 1)) as u64;
             prev_ws = curr_ws;
         }
         words
     }
 }
-
 
 /// Count lines and words in a single pass using 64-byte bitmask blocks.
 pub fn count_lines_words(data: &[u8], utf8: bool) -> (u64, u64) {
