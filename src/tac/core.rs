@@ -10,31 +10,26 @@ const VECTORED_MAX_RECORDS: usize = 256 * 1024;
 /// Write all IoSlices to the writer, handling partial writes.
 /// Batches into IOV_BATCH-sized groups for writev() efficiency.
 fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
-    for batch in slices.chunks(IOV_BATCH) {
-        let mut bufs: Vec<IoSlice<'_>> = batch.to_vec();
-        let mut idx = 0;
-        while idx < bufs.len() {
-            let n = out.write_vectored(&bufs[idx..])?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write any data",
-                ));
-            }
-            // Advance past written bytes
-            let mut remaining = n;
-            while idx < bufs.len() && remaining > 0 {
-                let len = bufs[idx].len();
-                if remaining >= len {
-                    idx += 1;
-                    remaining -= len;
-                } else {
-                    // Partial write within a slice
-                    let slice_data = &bufs[idx][remaining..];
-                    bufs[idx] = IoSlice::new(slice_data);
-                    remaining = 0;
-                }
-            }
+    let mut offset = 0;
+    while offset < slices.len() {
+        let end = (offset + IOV_BATCH).min(slices.len());
+        let n = out.write_vectored(&slices[offset..end])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write any data",
+            ));
+        }
+        // Skip fully-written slices
+        let mut remaining = n;
+        while offset < end && remaining >= slices[offset].len() {
+            remaining -= slices[offset].len();
+            offset += 1;
+        }
+        // Handle partial write within a slice — use write_all for the remainder
+        if remaining > 0 && offset < end {
+            out.write_all(&slices[offset][remaining..])?;
+            offset += 1;
         }
     }
     Ok(())
