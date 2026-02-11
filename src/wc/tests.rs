@@ -407,15 +407,18 @@ fn test_gnu_trailing_newline() {
 
 #[test]
 fn test_gnu_word_definition() {
-    // GNU wc treats NUL bytes as word separators.
-    // In UTF-8 mode (default), control chars and high bytes are word content.
-    assert_eq!(count_words(b"\x00"), 0); // NUL is a word separator
-    assert_eq!(count_words(b"\x01"), 1); // SOH is a word (in UTF-8 mode)
-    assert_eq!(count_words(b"\x7f"), 1); // DEL is a word (in UTF-8 mode)
-    // In C locale, non-printable ASCII and high bytes are non-word
-    assert_eq!(count_words_locale(b"\x01", false), 0); // SOH is non-word in C locale
-    assert_eq!(count_words_locale(b"\x80", false), 0); // High byte is non-word in C locale
-    assert_eq!(count_words_locale(b"hello", false), 1); // Printable ASCII is word in C locale
+    // All C0 control chars (0x00-0x1F) and DEL (0x7F) are non-word in both locales
+    assert_eq!(count_words(b"\x00"), 0); // NUL
+    assert_eq!(count_words(b"\x01"), 0); // SOH (control char)
+    assert_eq!(count_words(b"\x7f"), 0); // DEL (control char)
+    // Printable ASCII is always word content
+    assert_eq!(count_words(b"!"), 1);
+    assert_eq!(count_words(b"hello"), 1);
+    // In UTF-8 mode, valid multi-byte sequences are word content
+    assert_eq!(count_words("café".as_bytes()), 1);
+    // In C locale, high bytes are non-word
+    assert_eq!(count_words_locale(b"\x80", false), 0);
+    assert_eq!(count_words_locale(b"hello", false), 1);
 }
 
 #[test]

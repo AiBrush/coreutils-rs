@@ -15,19 +15,28 @@ pub struct WcCounts {
     pub max_line_length: u64,
 }
 
-/// Whitespace/non-word lookup table for UTF-8 locale word boundary detection.
-/// GNU wc uses `iswspace()`: space, tab, newline, CR, form feed, vertical tab.
-/// Null bytes (0x00) are also treated as non-word characters to match GNU behavior.
-/// In UTF-8 locale, bytes >= 0x80 are part of valid multi-byte sequences (word content).
+/// Non-word lookup table for UTF-8 locale word boundary detection.
+/// In UTF-8 locale, GNU wc uses mbrtowc() + iswspace(). Non-word bytes:
+/// - C0 control chars (0x00-0x1F): non-printable, iswprint() = false
+/// - Space (0x20): iswspace() = true
+/// - DEL (0x7F): non-printable
+/// - Invalid standalone UTF-8: 0xC0, 0xC1, 0xFE, 0xFF (mbrtowc fails)
+/// Valid UTF-8 continuation (0x80-0xBF) and leader bytes (0xC2-0xFD) remain as word content.
 const fn make_ws_table_utf8() -> [u8; 256] {
     let mut t = [0u8; 256];
-    t[0x00] = 1; // \0  null byte — acts as word separator in GNU wc
-    t[0x09] = 1; // \t  horizontal tab
-    t[0x0A] = 1; // \n  newline
-    t[0x0B] = 1; // \v  vertical tab
-    t[0x0C] = 1; // \f  form feed
-    t[0x0D] = 1; // \r  carriage return
-    t[0x20] = 1; //     space
+    // All C0 control characters (0x00-0x1F) are non-word
+    let mut i = 0u16;
+    while i <= 0x1F {
+        t[i as usize] = 1;
+        i += 1;
+    }
+    t[0x20] = 1; // space
+    t[0x7F] = 1; // DEL
+    // Invalid UTF-8 standalone bytes
+    t[0xC0] = 1; // overlong encoding
+    t[0xC1] = 1; // overlong encoding
+    t[0xFE] = 1; // invalid UTF-8
+    t[0xFF] = 1; // invalid UTF-8
     t
 }
 
@@ -101,15 +110,8 @@ pub fn count_words(data: &[u8]) -> u64 {
 }
 
 /// Count words with explicit locale control.
+/// Uses the scalar table-based path for correctness with full non-word byte detection.
 pub fn count_words_locale(data: &[u8], utf8: bool) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if utf8 {
-            // SSE2 fast path only works for UTF-8 locale whitespace rules
-            return unsafe { count_words_sse2(data) };
-        }
-    }
-    // C locale or non-x86: use scalar with appropriate table
     count_words_with_table(data, ws_table(utf8))
 }
 
@@ -151,11 +153,12 @@ fn count_words_with_table(data: &[u8], table: &[u8; 256]) -> u64 {
     words
 }
 
-/// SSE2-accelerated word counting. Processes 64 bytes per iteration using
-/// 4 XMM registers for whitespace detection, then combines into a 64-bit
-/// bitmask for word boundary detection via popcount.
+/// SSE2-accelerated word counting (UTF-8 locale only).
+/// NOTE: Currently unused in favor of scalar table-based approach for correctness.
+/// Kept for potential future re-enablement after updating to handle all non-word bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 unsafe fn count_words_sse2(data: &[u8]) -> u64 {
     use std::arch::x86_64::*;
 
