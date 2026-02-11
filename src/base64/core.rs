@@ -88,7 +88,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     Ok(())
 }
 
-/// Decode base64 data and write to output.
+/// Decode base64 data and write to output (borrows data, allocates clean buffer).
 /// When `ignore_garbage` is true, strip all non-base64 characters.
 /// When false, only strip whitespace (standard behavior).
 pub fn decode_to_writer(
@@ -101,25 +101,86 @@ pub fn decode_to_writer(
     }
 
     if ignore_garbage {
-        let cleaned = strip_non_base64(data);
-        return decode_clean(out, &cleaned);
+        let mut cleaned = strip_non_base64(data);
+        return decode_owned_clean(&mut cleaned, out);
     }
 
     // Fast path: strip newlines with memchr (SIMD), then SIMD decode
     decode_stripping_whitespace(data, out)
 }
 
+/// Decode base64 from an owned Vec (in-place whitespace strip + decode).
+/// Avoids a full buffer copy by stripping whitespace in the existing allocation,
+/// then decoding in-place. Ideal when the caller already has an owned Vec.
+pub fn decode_owned(
+    data: &mut Vec<u8>,
+    ignore_garbage: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    if ignore_garbage {
+        data.retain(|&b| is_base64_char(b));
+    } else {
+        strip_whitespace_inplace(data);
+    }
+
+    decode_owned_clean(data, out)
+}
+
+/// Strip all whitespace from a Vec in-place using SIMD memchr for newlines
+/// and a fallback scan for rare non-newline whitespace.
+fn strip_whitespace_inplace(data: &mut Vec<u8>) {
+    // First, collect newline positions using SIMD memchr.
+    let positions: Vec<usize> = memchr::memchr_iter(b'\n', data.as_slice()).collect();
+
+    if positions.is_empty() {
+        // No newlines; check for other whitespace only.
+        if data.iter().any(|&b| is_whitespace(b)) {
+            data.retain(|&b| !is_whitespace(b));
+        }
+        return;
+    }
+
+    // Compact data in-place, removing newlines using copy_within.
+    let mut wp = 0;
+    let mut rp = 0;
+
+    for &pos in &positions {
+        if pos > rp {
+            let len = pos - rp;
+            data.copy_within(rp..pos, wp);
+            wp += len;
+        }
+        rp = pos + 1;
+    }
+
+    let data_len = data.len();
+    if rp < data_len {
+        let len = data_len - rp;
+        data.copy_within(rp..data_len, wp);
+        wp += len;
+    }
+
+    data.truncate(wp);
+
+    // Handle rare non-newline whitespace (CR, tab, etc.)
+    if data.iter().any(|&b| is_whitespace(b)) {
+        data.retain(|&b| !is_whitespace(b));
+    }
+}
+
 /// Decode by stripping all whitespace from the entire input at once,
-/// then performing a single SIMD decode pass. Avoids block-boundary
-/// overhead and gives the decoder the maximum possible contiguous input.
+/// then performing a single SIMD decode pass. Used when data is borrowed.
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?
     if memchr::memchr(b'\n', data).is_none() && !data.iter().any(|&b| is_whitespace(b)) {
-        return decode_clean(out, data);
+        return decode_borrowed_clean(out, data);
     }
 
     // Strip newlines from entire input in a single pass using SIMD memchr.
-    // Pre-allocate to input size (upper bound; actual will be slightly smaller).
     let mut clean = Vec::with_capacity(data.len());
     let mut last = 0;
     for pos in memchr::memchr_iter(b'\n', data) {
@@ -132,24 +193,27 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
         clean.extend_from_slice(&data[last..]);
     }
 
-    // Handle rare case of non-newline whitespace (CR, tab, etc.)
+    // Handle rare non-newline whitespace (CR, tab, etc.)
     if clean.iter().any(|&b| is_whitespace(b)) {
         clean.retain(|&b| !is_whitespace(b));
     }
 
-    if clean.is_empty() {
+    decode_owned_clean(&mut clean, out)
+}
+
+/// Decode a clean (no whitespace) owned buffer in-place with SIMD.
+fn decode_owned_clean(data: &mut Vec<u8>, out: &mut impl Write) -> io::Result<()> {
+    if data.is_empty() {
         return Ok(());
     }
-
-    // Single SIMD decode of entire cleaned input (no block boundaries).
-    match BASE64_ENGINE.decode_inplace(&mut clean) {
+    match BASE64_ENGINE.decode_inplace(data) {
         Ok(decoded) => out.write_all(decoded),
         Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input")),
     }
 }
 
-/// Decode clean base64 data (no whitespace) with a single SIMD pass.
-fn decode_clean(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
+/// Decode clean base64 data (no whitespace) from a borrowed slice.
+fn decode_borrowed_clean(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }

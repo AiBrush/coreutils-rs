@@ -79,11 +79,14 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
-    let data = read_file(Path::new(filename))?;
-
     if cli.decode {
-        b64::decode_to_writer(&data, cli.ignore_garbage, out)
+        // For decode: read to owned Vec for in-place whitespace strip + decode.
+        // Avoids double-buffering (mmap + clean buffer) by stripping in-place.
+        let mut data = std::fs::read(filename)?;
+        b64::decode_owned(&mut data, cli.ignore_garbage, out)
     } else {
+        // For encode: mmap for zero-copy read access.
+        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }
