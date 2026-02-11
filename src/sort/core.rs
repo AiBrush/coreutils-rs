@@ -361,14 +361,12 @@ pub fn merge_sorted(
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
 /// Big-endian byte order ensures u64 comparison matches lexicographic order.
-#[inline]
+#[inline(always)]
 fn line_prefix(data: &[u8], start: usize, end: usize) -> u64 {
     let len = end - start;
     if len >= 8 {
-        let slice = &data[start..start + 8];
-        u64::from_be_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ])
+        // Fast path: direct u64 load (most lines are >= 8 bytes)
+        u64::from_be_bytes(data[start..start + 8].try_into().unwrap())
     } else {
         let mut bytes = [0u8; 8];
         bytes[..len].copy_from_slice(&data[start..end]);
@@ -578,11 +576,20 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     if is_plain_lex && num_lines > 256 {
         // FAST PATH 1: Prefix-based lexicographic sort
         let reverse = gopts.reverse;
-        let mut entries: Vec<(u64, usize)> = offsets
-            .iter()
-            .enumerate()
-            .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
-            .collect();
+        let mut entries: Vec<(u64, usize)> = if num_lines > 100_000 {
+            // Parallel prefix extraction for large inputs
+            offsets
+                .par_iter()
+                .enumerate()
+                .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
+                .collect()
+        } else {
+            offsets
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
+                .collect()
+        };
 
         let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
             let ord = match a.0.cmp(&b.0) {
@@ -650,16 +657,29 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     } else if is_numeric_only {
         // FAST PATH 2: Pre-parsed numeric sort with u64 comparison
         // float_to_sortable_u64 enables branchless u64::cmp instead of f64::partial_cmp
-        let mut entries: Vec<(u64, usize)> = offsets
-            .iter()
-            .enumerate()
-            .map(|(i, &(s, e))| {
-                (
-                    float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
-                    i,
-                )
-            })
-            .collect();
+        let mut entries: Vec<(u64, usize)> = if num_lines > 100_000 {
+            offsets
+                .par_iter()
+                .enumerate()
+                .map(|(i, &(s, e))| {
+                    (
+                        float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
+                        i,
+                    )
+                })
+                .collect()
+        } else {
+            offsets
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, e))| {
+                    (
+                        float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
+                        i,
+                    )
+                })
+                .collect()
+        };
         let reverse = gopts.reverse;
         let stable = config.stable;
 

@@ -416,7 +416,7 @@ fn extract_single_field_line(
 }
 
 /// Extract fields from a single line into the output buffer.
-/// Uses inline byte scanning with early exit for maximum performance.
+/// Uses SIMD memchr_iter for delimiter scanning with early exit.
 #[inline(always)]
 fn extract_fields_to_buf(
     line: &[u8],
@@ -445,30 +445,25 @@ fn extract_fields_to_buf(
     let mut first_output = true;
     let mut has_delim = false;
 
-    // Tight byte scan loop with early exit
-    let mut i = 0;
-    while i < len {
-        // SAFETY: i is always in [0, len) due to the loop condition
-        if unsafe { *line.get_unchecked(i) } == delim {
-            has_delim = true;
+    // SIMD-accelerated delimiter scan
+    for delim_pos in memchr_iter(delim, line) {
+        has_delim = true;
 
-            if is_selected(field_num, field_mask, ranges, complement) {
-                if !first_output {
-                    buf.extend_from_slice(output_delim);
-                }
-                buf.extend_from_slice(&line[field_start..i]);
-                first_output = false;
+        if is_selected(field_num, field_mask, ranges, complement) {
+            if !first_output {
+                buf.extend_from_slice(output_delim);
             }
-
-            field_num += 1;
-            field_start = i + 1;
-
-            // Early exit: past the last needed field
-            if field_num > max_field {
-                break;
-            }
+            buf.extend_from_slice(&line[field_start..delim_pos]);
+            first_output = false;
         }
-        i += 1;
+
+        field_num += 1;
+        field_start = delim_pos + 1;
+
+        // Early exit: past the last needed field
+        if field_num > max_field {
+            break;
+        }
     }
 
     // Last field (only if we didn't early-exit past it)
