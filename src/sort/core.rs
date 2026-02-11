@@ -436,6 +436,7 @@ fn write_sorted_output(
     writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
     if config.unique {
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
@@ -449,17 +450,28 @@ fn write_sorted_output(
                 None => true,
             };
             if should_output {
-                writer.write_all(line)?;
-                writer.write_all(terminator)?;
+                buf.extend_from_slice(line);
+                buf.extend_from_slice(terminator);
+                if buf.len() >= OUTPUT_BUF_SIZE {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
                 prev = Some(idx);
             }
         }
     } else {
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            writer.write_all(&data[s..e])?;
-            writer.write_all(terminator)?;
+            buf.extend_from_slice(&data[s..e]);
+            buf.extend_from_slice(terminator);
+            if buf.len() >= OUTPUT_BUF_SIZE {
+                writer.write_all(&buf)?;
+                buf.clear();
+            }
         }
+    }
+    if !buf.is_empty() {
+        writer.write_all(&buf)?;
     }
     Ok(())
 }
@@ -590,7 +602,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             entries.sort_unstable_by(prefix_cmp);
         }
 
-        // Output from entries
+        // Output from entries using staging buffer
+        let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
         if config.unique {
             let mut prev: Option<usize> = None;
             for &(_, idx) in &entries {
@@ -604,17 +617,28 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     None => true,
                 };
                 if emit {
-                    writer.write_all(line)?;
-                    writer.write_all(terminator)?;
+                    buf.extend_from_slice(line);
+                    buf.extend_from_slice(terminator);
+                    if buf.len() >= OUTPUT_BUF_SIZE {
+                        writer.write_all(&buf)?;
+                        buf.clear();
+                    }
                     prev = Some(idx);
                 }
             }
         } else {
             for &(_, idx) in &entries {
                 let (s, e) = offsets[idx];
-                writer.write_all(&data[s..e])?;
-                writer.write_all(terminator)?;
+                buf.extend_from_slice(&data[s..e]);
+                buf.extend_from_slice(terminator);
+                if buf.len() >= OUTPUT_BUF_SIZE {
+                    writer.write_all(&buf)?;
+                    buf.clear();
+                }
             }
+        }
+        if !buf.is_empty() {
+            writer.write_all(&buf)?;
         }
     } else if is_numeric_only {
         // FAST PATH 2: Pre-parsed numeric sort with u64 comparison

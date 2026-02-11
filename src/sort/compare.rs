@@ -33,14 +33,45 @@ pub fn parse_numeric_value(s: &[u8]) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
-    let end = find_numeric_end(s);
-    if end == 0 {
+
+    let mut i = 0;
+    let negative = if s[i] == b'-' {
+        i += 1;
+        true
+    } else if s[i] == b'+' {
+        i += 1;
+        false
+    } else {
+        false
+    };
+
+    // Fast hand-rolled parser (avoids str::parse::<f64>() overhead)
+    let mut int_part: u64 = 0;
+    let mut has_digits = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        int_part = int_part.saturating_mul(10).saturating_add((s[i] - b'0') as u64);
+        i += 1;
+        has_digits = true;
+    }
+
+    let mut frac: f64 = 0.0;
+    if i < s.len() && s[i] == b'.' {
+        i += 1;
+        let mut divisor: f64 = 10.0;
+        while i < s.len() && s[i].is_ascii_digit() {
+            frac += (s[i] - b'0') as f64 / divisor;
+            divisor *= 10.0;
+            i += 1;
+            has_digits = true;
+        }
+    }
+
+    if !has_digits {
         return 0.0;
     }
-    match std::str::from_utf8(&s[..end]) {
-        Ok(num_str) => num_str.parse::<f64>().unwrap_or(0.0),
-        Err(_) => 0.0,
-    }
+
+    let result = int_part as f64 + frac;
+    if negative { -result } else { result }
 }
 
 fn find_numeric_end(s: &[u8]) -> usize {
