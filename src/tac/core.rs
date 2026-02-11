@@ -8,7 +8,7 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(64 * 1024, out);
+    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
 
     if !before {
         // Default mode: separator is AFTER the record (like newline at end of line)
@@ -16,16 +16,19 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         let mut end = data.len();
 
         // Handle trailing content that has no separator
+        // GNU tac appends the separator when input lacks a trailing one
         if data[end - 1] != separator {
             match memchr::memrchr(separator, &data[..end.saturating_sub(1)]) {
                 Some(last_sep) => {
-                    // Write trailing content as-is (GNU tac does NOT add separator)
+                    // Write trailing content + separator (GNU tac adds separator)
                     buf.write_all(&data[last_sep + 1..])?;
+                    buf.write_all(&[separator])?;
                     end = last_sep + 1;
                 }
                 None => {
-                    // No separator found at all — output data as-is
+                    // No separator found at all — output data + separator (GNU tac behavior)
                     buf.write_all(data)?;
+                    buf.write_all(&[separator])?;
                     buf.flush()?;
                     return Ok(());
                 }
@@ -107,7 +110,7 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-    let mut buf = io::BufWriter::with_capacity(64 * 1024, out);
+    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
 
     if !before {
         // Default: separator after record
@@ -183,7 +186,7 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(64 * 1024, out);
+    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
 
     if !before {
         let last_end = matches.last().unwrap().1;
