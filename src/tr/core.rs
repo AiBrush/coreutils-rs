@@ -1,6 +1,11 @@
 use std::io::{self, Read, Write};
 
+use rayon::prelude::*;
+
 const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — reduces syscall overhead
+
+/// Minimum size for parallel translation (4MB).
+const PARALLEL_TRANSLATE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
@@ -566,6 +571,7 @@ pub fn squeeze(
 
 /// Translate bytes from an mmap'd byte slice — zero syscall reads.
 /// Uses SIMD AVX2 for range-delta patterns (e.g., a-z → A-Z).
+/// For large inputs, translates in parallel using rayon for maximum throughput.
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -579,6 +585,31 @@ pub fn translate_mmap(
         return writer.write_all(data);
     }
 
+    // Parallel translation for large inputs — each chunk is independent
+    if data.len() >= PARALLEL_TRANSLATE_THRESHOLD {
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() + num_threads - 1) / num_threads;
+        // Align to BUF_SIZE boundaries for cache efficiency
+        let chunk_size = ((chunk_size + BUF_SIZE - 1) / BUF_SIZE) * BUF_SIZE;
+
+        // Translate all chunks in parallel
+        let translated: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = vec![0u8; chunk.len()];
+                translate_chunk_dispatch(chunk, &mut out, &table, &kind);
+                out
+            })
+            .collect();
+
+        // Write sequentially to preserve order
+        for chunk in &translated {
+            writer.write_all(chunk)?;
+        }
+        return Ok(());
+    }
+
+    // Sequential path for smaller data
     let mut out = vec![0u8; BUF_SIZE];
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind);
