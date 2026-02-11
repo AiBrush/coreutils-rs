@@ -49,7 +49,9 @@ pub fn parse_numeric_value(s: &[u8]) -> f64 {
     let mut int_part: u64 = 0;
     let mut has_digits = false;
     while i < s.len() && s[i].is_ascii_digit() {
-        int_part = int_part.saturating_mul(10).saturating_add((s[i] - b'0') as u64);
+        int_part = int_part
+            .saturating_mul(10)
+            .saturating_add((s[i] - b'0') as u64);
         i += 1;
         has_digits = true;
     }

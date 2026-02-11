@@ -331,7 +331,13 @@ fn process_standard_bytes(
     }
 
     // Fast batched path: repeated-only or unique-only mode, no count, no key extraction
-    if fast && !config.count && matches!(config.mode, OutputMode::RepeatedOnly | OutputMode::UniqueOnly) {
+    if fast
+        && !config.count
+        && matches!(
+            config.mode,
+            OutputMode::RepeatedOnly | OutputMode::UniqueOnly
+        )
+    {
         let is_unique = matches!(config.mode, OutputMode::UniqueOnly);
         let mut prev_content = prev_content;
         let mut prev_full = prev_full;
