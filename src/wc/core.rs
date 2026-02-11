@@ -110,9 +110,97 @@ pub fn count_words(data: &[u8]) -> u64 {
 }
 
 /// Count words with explicit locale control.
-/// Uses the scalar table-based path for correctness with full non-word byte detection.
+/// C locale uses scalar table-based path.
+/// UTF-8 locale uses a state machine for correct multi-byte sequence handling.
 pub fn count_words_locale(data: &[u8], utf8: bool) -> u64 {
-    count_words_with_table(data, ws_table(utf8))
+    if utf8 {
+        count_words_utf8(data)
+    } else {
+        count_words_with_table(data, &WS_TABLE_C)
+    }
+}
+
+/// Count words in UTF-8 locale using a state machine.
+/// Correctly handles:
+/// - Valid multi-byte UTF-8 sequences (word content)
+/// - Invalid standalone continuation bytes (non-word, mbrtowc fails)
+/// - Control characters (non-word)
+/// - Invalid UTF-8 leaders without proper continuations (non-word)
+fn count_words_utf8(data: &[u8]) -> u64 {
+    let mut words = 0u64;
+    let mut in_word = false;
+    let mut i = 0;
+
+    while i < data.len() {
+        let b = data[i];
+
+        if b <= 0x20 || b == 0x7F {
+            // Control chars (0x00-0x1F), space (0x20), DEL (0x7F): non-word
+            in_word = false;
+            i += 1;
+        } else if b < 0x80 {
+            // Printable ASCII (0x21-0x7E): word content
+            if !in_word {
+                in_word = true;
+                words += 1;
+            }
+            i += 1;
+        } else if b < 0xC2 {
+            // 0x80-0xBF: standalone continuation byte (invalid UTF-8)
+            // 0xC0-0xC1: overlong 2-byte (invalid UTF-8)
+            in_word = false;
+            i += 1;
+        } else if b < 0xE0 {
+            // 2-byte sequence: need 1 continuation byte
+            if i + 1 < data.len() && (data[i + 1] & 0xC0) == 0x80 {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 2;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else if b < 0xF0 {
+            // 3-byte sequence: need 2 continuation bytes
+            if i + 2 < data.len()
+                && (data[i + 1] & 0xC0) == 0x80
+                && (data[i + 2] & 0xC0) == 0x80
+            {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 3;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else if b < 0xF5 {
+            // 4-byte sequence: need 3 continuation bytes
+            if i + 3 < data.len()
+                && (data[i + 1] & 0xC0) == 0x80
+                && (data[i + 2] & 0xC0) == 0x80
+                && (data[i + 3] & 0xC0) == 0x80
+            {
+                if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+                i += 4;
+            } else {
+                in_word = false;
+                i += 1;
+            }
+        } else {
+            // 0xF5-0xFF: invalid UTF-8
+            in_word = false;
+            i += 1;
+        }
+    }
+
+    words
 }
 
 /// Scalar word counting with a given non-word lookup table.
@@ -790,11 +878,13 @@ pub fn count_lines_parallel(data: &[u8]) -> u64 {
 
 /// Count words in parallel with boundary adjustment.
 pub fn count_words_parallel(data: &[u8], utf8: bool) -> u64 {
-    if data.len() < PARALLEL_THRESHOLD {
+    if utf8 || data.len() < PARALLEL_THRESHOLD {
+        // UTF-8 word counting uses a state machine that can't be trivially parallelized
+        // (multi-byte sequences may span chunk boundaries).
         return count_words_locale(data, utf8);
     }
 
-    let table = ws_table(utf8);
+    let table = &WS_TABLE_C;
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
@@ -803,7 +893,7 @@ pub fn count_words_parallel(data: &[u8], utf8: bool) -> u64 {
     let results: Vec<(u64, bool, bool)> = chunks
         .par_iter()
         .map(|chunk| {
-            let words = count_words_locale(chunk, utf8);
+            let words = count_words_with_table(chunk, table);
             let starts_non_ws = chunk.first().is_some_and(|&b| table[b as usize] == 0);
             let ends_non_ws = chunk.last().is_some_and(|&b| table[b as usize] == 0);
             (words, starts_non_ws, ends_non_ws)
@@ -835,15 +925,6 @@ pub fn count_chars_parallel(data: &[u8], utf8: bool) -> u64 {
     data.par_chunks(chunk_size).map(count_chars_utf8).sum()
 }
 
-/// Partial result from processing a chunk, used to combine results at boundaries.
-struct ChunkResult {
-    lines: u64,
-    words: u64,
-    chars: u64,
-    starts_non_ws: bool,
-    ends_non_ws: bool,
-}
-
 /// Combined parallel counting of lines + words + chars.
 pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
     if data.len() < PARALLEL_THRESHOLD {
@@ -853,44 +934,23 @@ pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
         return (lines, words, chars);
     }
 
-    let table = ws_table(utf8);
+    // Word counting: sequential for UTF-8 (state machine), parallel for C locale
+    let words = count_words_parallel(data, utf8);
+
+    // Lines and chars can always be parallelized safely
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
-    let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+    let lines: u64 = data
+        .par_chunks(chunk_size)
+        .map(|chunk| memchr_iter(b'\n', chunk).count() as u64)
+        .sum();
 
-    let results: Vec<ChunkResult> = chunks
-        .par_iter()
-        .map(|chunk| {
-            let lines = memchr_iter(b'\n', chunk).count() as u64;
-            let words = count_words_locale(chunk, utf8);
-            let chars = if utf8 {
-                count_chars_utf8(chunk)
-            } else {
-                chunk.len() as u64
-            };
-            let starts_non_ws = chunk.first().is_some_and(|&b| table[b as usize] == 0);
-            let ends_non_ws = chunk.last().is_some_and(|&b| table[b as usize] == 0);
-            ChunkResult {
-                lines,
-                words,
-                chars,
-                starts_non_ws,
-                ends_non_ws,
-            }
-        })
-        .collect();
+    let chars = if utf8 {
+        data.par_chunks(chunk_size).map(count_chars_utf8).sum()
+    } else {
+        data.len() as u64
+    };
 
-    let mut total_lines = 0u64;
-    let mut total_words = 0u64;
-    let mut total_chars = 0u64;
-    for i in 0..results.len() {
-        total_lines += results[i].lines;
-        total_words += results[i].words;
-        total_chars += results[i].chars;
-        if i > 0 && results[i].starts_non_ws && results[i - 1].ends_non_ws {
-            total_words -= 1;
-        }
-    }
-    (total_lines, total_words, total_chars)
+    (lines, words, chars)
 }
