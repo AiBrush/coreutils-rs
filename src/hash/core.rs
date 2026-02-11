@@ -24,9 +24,6 @@ impl HashAlgorithm {
     }
 }
 
-/// Always mmap regular files — eliminates read() syscall overhead.
-const MMAP_THRESHOLD: u64 = 0;
-
 // ── Generic hash helpers ────────────────────────────────────────────
 
 fn hash_digest<D: Digest>(data: &[u8]) -> String {

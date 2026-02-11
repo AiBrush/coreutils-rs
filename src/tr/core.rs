@@ -99,63 +99,65 @@ mod simd_tr {
     /// SAFETY: Caller must ensure AVX2 is available and out.len() >= data.len().
     #[target_feature(enable = "avx2")]
     pub unsafe fn range_delta(data: &[u8], out: &mut [u8], lo: u8, hi: u8, delta: u8) {
-        use std::arch::x86_64::*;
+        unsafe {
+            use std::arch::x86_64::*;
 
-        let lo_vec = _mm256_set1_epi8(lo as i8);
-        let range_vec = _mm256_set1_epi8((hi - lo) as i8);
-        let delta_vec = _mm256_set1_epi8(delta as i8);
+            let lo_vec = _mm256_set1_epi8(lo as i8);
+            let range_vec = _mm256_set1_epi8((hi - lo) as i8);
+            let delta_vec = _mm256_set1_epi8(delta as i8);
 
-        let len = data.len();
-        let inp = data.as_ptr();
-        let outp = out.as_mut_ptr();
-        let mut i = 0usize;
+            let len = data.len();
+            let inp = data.as_ptr();
+            let outp = out.as_mut_ptr();
+            let mut i = 0usize;
 
-        // 4x unrolled: process 128 bytes per iteration for better ILP
-        while i + 128 <= len {
-            let v0 = _mm256_loadu_si256(inp.add(i) as *const __m256i);
-            let v1 = _mm256_loadu_si256(inp.add(i + 32) as *const __m256i);
-            let v2 = _mm256_loadu_si256(inp.add(i + 64) as *const __m256i);
-            let v3 = _mm256_loadu_si256(inp.add(i + 96) as *const __m256i);
+            // 4x unrolled: process 128 bytes per iteration for better ILP
+            while i + 128 <= len {
+                let v0 = _mm256_loadu_si256(inp.add(i) as *const __m256i);
+                let v1 = _mm256_loadu_si256(inp.add(i + 32) as *const __m256i);
+                let v2 = _mm256_loadu_si256(inp.add(i + 64) as *const __m256i);
+                let v3 = _mm256_loadu_si256(inp.add(i + 96) as *const __m256i);
 
-            let d0 = _mm256_sub_epi8(v0, lo_vec);
-            let d1 = _mm256_sub_epi8(v1, lo_vec);
-            let d2 = _mm256_sub_epi8(v2, lo_vec);
-            let d3 = _mm256_sub_epi8(v3, lo_vec);
+                let d0 = _mm256_sub_epi8(v0, lo_vec);
+                let d1 = _mm256_sub_epi8(v1, lo_vec);
+                let d2 = _mm256_sub_epi8(v2, lo_vec);
+                let d3 = _mm256_sub_epi8(v3, lo_vec);
 
-            let m0 = _mm256_cmpeq_epi8(_mm256_min_epu8(d0, range_vec), d0);
-            let m1 = _mm256_cmpeq_epi8(_mm256_min_epu8(d1, range_vec), d1);
-            let m2 = _mm256_cmpeq_epi8(_mm256_min_epu8(d2, range_vec), d2);
-            let m3 = _mm256_cmpeq_epi8(_mm256_min_epu8(d3, range_vec), d3);
+                let m0 = _mm256_cmpeq_epi8(_mm256_min_epu8(d0, range_vec), d0);
+                let m1 = _mm256_cmpeq_epi8(_mm256_min_epu8(d1, range_vec), d1);
+                let m2 = _mm256_cmpeq_epi8(_mm256_min_epu8(d2, range_vec), d2);
+                let m3 = _mm256_cmpeq_epi8(_mm256_min_epu8(d3, range_vec), d3);
 
-            let r0 = _mm256_add_epi8(v0, _mm256_and_si256(m0, delta_vec));
-            let r1 = _mm256_add_epi8(v1, _mm256_and_si256(m1, delta_vec));
-            let r2 = _mm256_add_epi8(v2, _mm256_and_si256(m2, delta_vec));
-            let r3 = _mm256_add_epi8(v3, _mm256_and_si256(m3, delta_vec));
+                let r0 = _mm256_add_epi8(v0, _mm256_and_si256(m0, delta_vec));
+                let r1 = _mm256_add_epi8(v1, _mm256_and_si256(m1, delta_vec));
+                let r2 = _mm256_add_epi8(v2, _mm256_and_si256(m2, delta_vec));
+                let r3 = _mm256_add_epi8(v3, _mm256_and_si256(m3, delta_vec));
 
-            _mm256_storeu_si256(outp.add(i) as *mut __m256i, r0);
-            _mm256_storeu_si256(outp.add(i + 32) as *mut __m256i, r1);
-            _mm256_storeu_si256(outp.add(i + 64) as *mut __m256i, r2);
-            _mm256_storeu_si256(outp.add(i + 96) as *mut __m256i, r3);
-            i += 128;
-        }
+                _mm256_storeu_si256(outp.add(i) as *mut __m256i, r0);
+                _mm256_storeu_si256(outp.add(i + 32) as *mut __m256i, r1);
+                _mm256_storeu_si256(outp.add(i + 64) as *mut __m256i, r2);
+                _mm256_storeu_si256(outp.add(i + 96) as *mut __m256i, r3);
+                i += 128;
+            }
 
-        while i + 32 <= len {
-            let v = _mm256_loadu_si256(inp.add(i) as *const __m256i);
-            let diff = _mm256_sub_epi8(v, lo_vec);
-            let mask = _mm256_cmpeq_epi8(_mm256_min_epu8(diff, range_vec), diff);
-            let result = _mm256_add_epi8(v, _mm256_and_si256(mask, delta_vec));
-            _mm256_storeu_si256(outp.add(i) as *mut __m256i, result);
-            i += 32;
-        }
+            while i + 32 <= len {
+                let v = _mm256_loadu_si256(inp.add(i) as *const __m256i);
+                let diff = _mm256_sub_epi8(v, lo_vec);
+                let mask = _mm256_cmpeq_epi8(_mm256_min_epu8(diff, range_vec), diff);
+                let result = _mm256_add_epi8(v, _mm256_and_si256(mask, delta_vec));
+                _mm256_storeu_si256(outp.add(i) as *mut __m256i, result);
+                i += 32;
+            }
 
-        while i < len {
-            let b = *inp.add(i);
-            *outp.add(i) = if b.wrapping_sub(lo) <= (hi - lo) {
-                b.wrapping_add(delta)
-            } else {
-                b
-            };
-            i += 1;
+            while i < len {
+                let b = *inp.add(i);
+                *outp.add(i) = if b.wrapping_sub(lo) <= (hi - lo) {
+                    b.wrapping_add(delta)
+                } else {
+                    b
+                };
+                i += 1;
+            }
         }
     }
 
@@ -164,61 +166,63 @@ mod simd_tr {
     /// SAFETY: Caller must ensure AVX2 is available.
     #[target_feature(enable = "avx2")]
     pub unsafe fn range_delta_inplace(data: &mut [u8], lo: u8, hi: u8, delta: u8) {
-        use std::arch::x86_64::*;
+        unsafe {
+            use std::arch::x86_64::*;
 
-        let lo_vec = _mm256_set1_epi8(lo as i8);
-        let range_vec = _mm256_set1_epi8((hi - lo) as i8);
-        let delta_vec = _mm256_set1_epi8(delta as i8);
+            let lo_vec = _mm256_set1_epi8(lo as i8);
+            let range_vec = _mm256_set1_epi8((hi - lo) as i8);
+            let delta_vec = _mm256_set1_epi8(delta as i8);
 
-        let len = data.len();
-        let ptr = data.as_mut_ptr();
-        let mut i = 0usize;
+            let len = data.len();
+            let ptr = data.as_mut_ptr();
+            let mut i = 0usize;
 
-        while i + 128 <= len {
-            let v0 = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-            let v1 = _mm256_loadu_si256(ptr.add(i + 32) as *const __m256i);
-            let v2 = _mm256_loadu_si256(ptr.add(i + 64) as *const __m256i);
-            let v3 = _mm256_loadu_si256(ptr.add(i + 96) as *const __m256i);
+            while i + 128 <= len {
+                let v0 = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+                let v1 = _mm256_loadu_si256(ptr.add(i + 32) as *const __m256i);
+                let v2 = _mm256_loadu_si256(ptr.add(i + 64) as *const __m256i);
+                let v3 = _mm256_loadu_si256(ptr.add(i + 96) as *const __m256i);
 
-            let d0 = _mm256_sub_epi8(v0, lo_vec);
-            let d1 = _mm256_sub_epi8(v1, lo_vec);
-            let d2 = _mm256_sub_epi8(v2, lo_vec);
-            let d3 = _mm256_sub_epi8(v3, lo_vec);
+                let d0 = _mm256_sub_epi8(v0, lo_vec);
+                let d1 = _mm256_sub_epi8(v1, lo_vec);
+                let d2 = _mm256_sub_epi8(v2, lo_vec);
+                let d3 = _mm256_sub_epi8(v3, lo_vec);
 
-            let m0 = _mm256_cmpeq_epi8(_mm256_min_epu8(d0, range_vec), d0);
-            let m1 = _mm256_cmpeq_epi8(_mm256_min_epu8(d1, range_vec), d1);
-            let m2 = _mm256_cmpeq_epi8(_mm256_min_epu8(d2, range_vec), d2);
-            let m3 = _mm256_cmpeq_epi8(_mm256_min_epu8(d3, range_vec), d3);
+                let m0 = _mm256_cmpeq_epi8(_mm256_min_epu8(d0, range_vec), d0);
+                let m1 = _mm256_cmpeq_epi8(_mm256_min_epu8(d1, range_vec), d1);
+                let m2 = _mm256_cmpeq_epi8(_mm256_min_epu8(d2, range_vec), d2);
+                let m3 = _mm256_cmpeq_epi8(_mm256_min_epu8(d3, range_vec), d3);
 
-            let r0 = _mm256_add_epi8(v0, _mm256_and_si256(m0, delta_vec));
-            let r1 = _mm256_add_epi8(v1, _mm256_and_si256(m1, delta_vec));
-            let r2 = _mm256_add_epi8(v2, _mm256_and_si256(m2, delta_vec));
-            let r3 = _mm256_add_epi8(v3, _mm256_and_si256(m3, delta_vec));
+                let r0 = _mm256_add_epi8(v0, _mm256_and_si256(m0, delta_vec));
+                let r1 = _mm256_add_epi8(v1, _mm256_and_si256(m1, delta_vec));
+                let r2 = _mm256_add_epi8(v2, _mm256_and_si256(m2, delta_vec));
+                let r3 = _mm256_add_epi8(v3, _mm256_and_si256(m3, delta_vec));
 
-            _mm256_storeu_si256(ptr.add(i) as *mut __m256i, r0);
-            _mm256_storeu_si256(ptr.add(i + 32) as *mut __m256i, r1);
-            _mm256_storeu_si256(ptr.add(i + 64) as *mut __m256i, r2);
-            _mm256_storeu_si256(ptr.add(i + 96) as *mut __m256i, r3);
-            i += 128;
-        }
+                _mm256_storeu_si256(ptr.add(i) as *mut __m256i, r0);
+                _mm256_storeu_si256(ptr.add(i + 32) as *mut __m256i, r1);
+                _mm256_storeu_si256(ptr.add(i + 64) as *mut __m256i, r2);
+                _mm256_storeu_si256(ptr.add(i + 96) as *mut __m256i, r3);
+                i += 128;
+            }
 
-        while i + 32 <= len {
-            let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-            let diff = _mm256_sub_epi8(v, lo_vec);
-            let mask = _mm256_cmpeq_epi8(_mm256_min_epu8(diff, range_vec), diff);
-            let result = _mm256_add_epi8(v, _mm256_and_si256(mask, delta_vec));
-            _mm256_storeu_si256(ptr.add(i) as *mut __m256i, result);
-            i += 32;
-        }
+            while i + 32 <= len {
+                let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+                let diff = _mm256_sub_epi8(v, lo_vec);
+                let mask = _mm256_cmpeq_epi8(_mm256_min_epu8(diff, range_vec), diff);
+                let result = _mm256_add_epi8(v, _mm256_and_si256(mask, delta_vec));
+                _mm256_storeu_si256(ptr.add(i) as *mut __m256i, result);
+                i += 32;
+            }
 
-        while i < len {
-            let b = *ptr.add(i);
-            *ptr.add(i) = if b.wrapping_sub(lo) <= (hi - lo) {
-                b.wrapping_add(delta)
-            } else {
-                b
-            };
-            i += 1;
+            while i < len {
+                let b = *ptr.add(i);
+                *ptr.add(i) = if b.wrapping_sub(lo) <= (hi - lo) {
+                    b.wrapping_add(delta)
+                } else {
+                    b
+                };
+                i += 1;
+            }
         }
     }
 }
@@ -320,12 +324,16 @@ fn translate_chunk_dispatch(
         TranslateKind::Identity => {
             out[..chunk.len()].copy_from_slice(chunk);
         }
+        #[cfg(target_arch = "x86_64")]
         TranslateKind::RangeDelta { lo, hi, delta } => {
-            #[cfg(target_arch = "x86_64")]
             if has_avx2() {
                 unsafe { simd_tr::range_delta(chunk, out, *lo, *hi, *delta) };
                 return;
             }
+            translate_chunk(chunk, out, table);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        TranslateKind::RangeDelta { .. } => {
             translate_chunk(chunk, out, table);
         }
         TranslateKind::General => {
@@ -339,12 +347,16 @@ fn translate_chunk_dispatch(
 fn translate_inplace_dispatch(data: &mut [u8], table: &[u8; 256], kind: &TranslateKind) {
     match kind {
         TranslateKind::Identity => {}
+        #[cfg(target_arch = "x86_64")]
         TranslateKind::RangeDelta { lo, hi, delta } => {
-            #[cfg(target_arch = "x86_64")]
             if has_avx2() {
                 unsafe { simd_tr::range_delta_inplace(data, *lo, *hi, *delta) };
                 return;
             }
+            translate_inplace(data, table);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        TranslateKind::RangeDelta { .. } => {
             translate_inplace(data, table);
         }
         TranslateKind::General => {
