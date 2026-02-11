@@ -353,7 +353,7 @@ fn process_single_field_chunk(
     }
 }
 
-/// Extract a single field from one line (fallback for degenerate delim==line_delim case).
+/// Extract a single field from one line using SIMD memchr for delimiter scanning.
 #[inline(always)]
 fn extract_single_field_line(
     line: &[u8],
@@ -363,45 +363,56 @@ fn extract_single_field_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    let len = line.len();
-    if len == 0 {
+    if line.is_empty() {
         if !suppress {
             buf.push(line_delim);
         }
         return;
     }
 
-    let mut delim_count: usize = 0;
-    let mut field_start: usize = 0;
+    // Quick check: does the line have any delimiter?
+    let first_delim = match memchr::memchr(delim, line) {
+        Some(pos) => pos,
+        None => {
+            // No delimiter — output whole line or suppress
+            if !suppress {
+                buf.extend_from_slice(line);
+                buf.push(line_delim);
+            }
+            return;
+        }
+    };
 
-    let mut i = 0;
-    while i < len {
-        if unsafe { *line.get_unchecked(i) } == delim {
-            if delim_count == target_idx {
-                buf.extend_from_slice(unsafe { line.get_unchecked(field_start..i) });
+    if target_idx == 0 {
+        // First field: everything before first delimiter
+        buf.extend_from_slice(&line[..first_delim]);
+        buf.push(line_delim);
+        return;
+    }
+
+    // Skip to target field using SIMD memchr
+    let mut pos = first_delim + 1;
+    for _ in 1..target_idx {
+        match memchr::memchr(delim, &line[pos..]) {
+            Some(idx) => pos += idx + 1,
+            None => {
+                // Field doesn't exist, output empty line
                 buf.push(line_delim);
                 return;
             }
-            delim_count += 1;
-            field_start = i + 1;
         }
-        i += 1;
     }
 
-    if delim_count == 0 {
-        // No delimiter on line
-        if !suppress {
-            buf.extend_from_slice(line);
-            buf.push(line_delim);
+    // pos is at the start of the target field
+    match memchr::memchr(delim, &line[pos..]) {
+        Some(idx) => {
+            buf.extend_from_slice(&line[pos..pos + idx]);
         }
-    } else if delim_count == target_idx {
-        // Target field is the last field
-        buf.extend_from_slice(unsafe { line.get_unchecked(field_start..len) });
-        buf.push(line_delim);
-    } else {
-        // Field doesn't exist
-        buf.push(line_delim);
+        None => {
+            buf.extend_from_slice(&line[pos..]);
+        }
     }
+    buf.push(line_delim);
 }
 
 /// Extract fields from a single line into the output buffer.
