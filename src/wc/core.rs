@@ -764,10 +764,10 @@ pub fn count_words_parallel(data: &[u8]) -> u64 {
             let words = count_words(chunk);
             let starts_non_ws = chunk
                 .first()
-                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+                .is_some_and(|&b| WS_TABLE[b as usize] == 0);
             let ends_non_ws = chunk
                 .last()
-                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+                .is_some_and(|&b| WS_TABLE[b as usize] == 0);
             (words, starts_non_ws, ends_non_ws)
         })
         .collect();
@@ -797,7 +797,7 @@ pub fn count_chars_parallel(data: &[u8], utf8: bool) -> u64 {
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
     data.par_chunks(chunk_size)
-        .map(|chunk| count_chars_utf8(chunk))
+        .map(count_chars_utf8)
         .sum()
 }
 
@@ -846,10 +846,10 @@ pub fn count_lwc_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
             };
             let starts_non_ws = chunk
                 .first()
-                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+                .is_some_and(|&b| WS_TABLE[b as usize] == 0);
             let ends_non_ws = chunk
                 .last()
-                .map_or(false, |&b| WS_TABLE[b as usize] == 0);
+                .is_some_and(|&b| WS_TABLE[b as usize] == 0);
             ChunkResult {
                 lines,
                 words,

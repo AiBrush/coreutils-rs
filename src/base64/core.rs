@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 
 use base64_simd::AsOut;
 
@@ -248,19 +248,19 @@ fn is_whitespace(b: u8) -> bool {
 
 /// Stream-encode from a reader to a writer. Used for stdin processing.
 /// Uses 4MB read chunks and batches wrapped output for minimum syscalls.
+/// The caller is expected to provide a suitably buffered or raw fd writer.
 pub fn encode_stream(
     reader: &mut impl Read,
     wrap_col: usize,
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; STREAM_ENCODE_CHUNK];
-    let mut out = BufWriter::with_capacity(2 * 1024 * 1024, writer);
 
     let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_ENCODE_CHUNK);
     let mut encode_buf = vec![0u8; encode_buf_size];
 
     if wrap_col == 0 {
-        // No wrapping: encode each chunk and write directly.
+        // No wrapping: encode each 4MB chunk and write directly.
         loop {
             let n = read_full(reader, &mut buf)?;
             if n == 0 {
@@ -268,7 +268,7 @@ pub fn encode_stream(
             }
             let enc_len = BASE64_ENGINE.encoded_length(n);
             let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
-            out.write_all(encoded)?;
+            writer.write_all(encoded)?;
         }
     } else {
         // Wrapping: batch wrapped output into a pre-allocated buffer.
@@ -287,15 +287,15 @@ pub fn encode_stream(
 
             // Build wrapped output in wrap_buf, then single write.
             let wp = build_wrapped_output(encoded, wrap_col, &mut col, &mut wrap_buf);
-            out.write_all(&wrap_buf[..wp])?;
+            writer.write_all(&wrap_buf[..wp])?;
         }
 
         if col > 0 {
-            out.write_all(b"\n")?;
+            writer.write_all(b"\n")?;
         }
     }
 
-    out.flush()
+    Ok(())
 }
 
 /// Build wrapped output into a pre-allocated buffer.
@@ -339,6 +339,8 @@ fn build_wrapped_output(
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
+/// Reads all input, strips whitespace, decodes in one SIMD pass, writes once.
+/// The caller is expected to provide a suitably buffered or raw fd writer.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
@@ -347,9 +349,13 @@ pub fn decode_stream(
     let mut data = Vec::new();
     reader.read_to_end(&mut data)?;
 
-    let mut out = BufWriter::with_capacity(2 * 1024 * 1024, writer);
-    decode_to_writer(&data, ignore_garbage, &mut out)?;
-    out.flush()
+    if ignore_garbage {
+        data.retain(|&b| is_base64_char(b));
+    } else {
+        strip_whitespace_inplace(&mut data);
+    }
+
+    decode_owned_clean(&mut data, writer)
 }
 
 /// Read as many bytes as possible into buf, retrying on partial reads.

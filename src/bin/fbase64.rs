@@ -1,4 +1,8 @@
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
@@ -36,22 +40,37 @@ struct Cli {
     file: Option<String>,
 }
 
+/// Raw fd stdout for zero-overhead writes on Unix.
+/// Bypasses BufWriter/StdoutLock overhead — our callers already batch
+/// output into large (4MB+) chunks, so no intermediate buffering needed.
+#[cfg(unix)]
+#[inline]
+fn raw_stdout() -> ManuallyDrop<std::fs::File> {
+    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let filename = cli.file.as_deref().unwrap_or("-");
 
-    let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(2 * 1024 * 1024, stdout.lock());
+    // Use raw fd stdout on Unix for maximum write throughput.
+    // Our encode/decode paths already batch output into large chunks,
+    // so BufWriter overhead is pure waste.
+    #[cfg(unix)]
+    let mut out = raw_stdout();
+    #[cfg(not(unix))]
+    let mut out = io::BufWriter::with_capacity(2 * 1024 * 1024, io::stdout().lock());
 
     let result = if filename == "-" {
-        process_stdin(&cli, &mut out)
+        process_stdin(&cli, &mut *out)
     } else {
-        process_file(filename, &cli, &mut out)
+        process_file(filename, &cli, &mut *out)
     };
 
+    // Flush on non-unix (raw fd doesn't need flushing)
+    #[cfg(not(unix))]
     if let Err(e) = out.flush() {
-        // Ignore broken pipe
         if e.kind() != io::ErrorKind::BrokenPipe {
             eprintln!("fbase64: {}", e);
             process::exit(1);
