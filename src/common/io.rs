@@ -35,6 +35,8 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
         let file = File::open(path)?;
         // SAFETY: Read-only mapping. File must not be truncated during use.
         let mmap = unsafe { Mmap::map(&file)? };
+        // Hint to kernel: we'll read sequentially, prefetch aggressively.
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         Ok(FileData::Mmap(mmap))
     } else {
         Ok(FileData::Owned(fs::read(path)?))

@@ -21,46 +21,59 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
     encode_wrapped(data, wrap_col, out)
 }
 
-/// Encode without wrapping: use cache-friendly chunks with reusable buffer.
+/// Encode without wrapping: single SIMD pass, single write.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    // Encode in ~1MB chunks to stay cache-friendly and avoid huge allocations.
-    const CHUNK_SIZE: usize = 1024 * 1024 - (1024 * 1024 % 3);
-    let max_encoded = BASE64_ENGINE.encoded_length(CHUNK_SIZE);
-    let mut encode_buf = vec![0u8; max_encoded];
-
-    for chunk in data.chunks(CHUNK_SIZE) {
-        let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-        let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
-        out.write_all(encoded)?;
-    }
-
-    Ok(())
+    // Encode entire input in one SIMD pass for maximum throughput.
+    let enc_len = BASE64_ENGINE.encoded_length(data.len());
+    let mut buf = vec![0u8; enc_len];
+    let encoded = BASE64_ENGINE.encode(data, buf.as_out());
+    out.write_all(encoded)
 }
 
-/// Encode with line wrapping using cache-friendly chunks.
-/// Each chunk is encoded with SIMD into a reusable buffer, then wrapped
-/// and written as a contiguous block. Chunk size fits in L2 cache.
+/// Encode with line wrapping using large cache-friendly chunks.
+/// Each chunk is SIMD-encoded, then wrapped with newlines in a pre-allocated
+/// buffer using direct slice copies, and written with a single write_all.
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     let bytes_per_line = wrap_col * 3 / 4;
 
-    // Chunk size: ~64KB of input → ~87KB encoded → fits in L2 cache.
+    // Process ~768KB of input per chunk. Encoded output (~1MB) fits in L2 cache.
     // Aligned to bytes_per_line for clean line boundaries.
-    let lines_per_chunk = 65536 / bytes_per_line;
+    let lines_per_chunk = (768 * 1024) / bytes_per_line;
     let chunk_input = lines_per_chunk * bytes_per_line;
     let chunk_encoded_max = BASE64_ENGINE.encoded_length(chunk_input);
 
-    // Reuse encode buffer across chunks (no per-chunk allocation).
+    // Pre-allocate reusable buffers (no per-chunk allocation).
     let mut encode_buf = vec![0u8; chunk_encoded_max];
+    // Wrapped output: each line is wrap_col + 1 bytes (content + newline).
+    let wrapped_max = (lines_per_chunk + 1) * (wrap_col + 1);
+    let mut wrap_buf = vec![0u8; wrapped_max];
 
     for chunk in data.chunks(chunk_input) {
         let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
         let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
 
-        // Write lines directly to output (BufWriter handles batching).
-        for line in encoded.chunks(wrap_col) {
-            out.write_all(line)?;
-            out.write_all(b"\n")?;
+        // Build wrapped output with direct slice copies (no Vec overhead).
+        let mut rp = 0;
+        let mut wp = 0;
+
+        while rp + wrap_col <= encoded.len() {
+            wrap_buf[wp..wp + wrap_col].copy_from_slice(&encoded[rp..rp + wrap_col]);
+            wp += wrap_col;
+            wrap_buf[wp] = b'\n';
+            wp += 1;
+            rp += wrap_col;
         }
+
+        if rp < encoded.len() {
+            let remaining = encoded.len() - rp;
+            wrap_buf[wp..wp + remaining].copy_from_slice(&encoded[rp..rp + remaining]);
+            wp += remaining;
+            wrap_buf[wp] = b'\n';
+            wp += 1;
+        }
+
+        // Single write per chunk (BufWriter bypasses buffer for large writes).
+        out.write_all(&wrap_buf[..wp])?;
     }
 
     Ok(())
@@ -87,74 +100,43 @@ pub fn decode_to_writer(
     decode_stripping_whitespace(data, out)
 }
 
-/// Decode by stripping whitespace with memchr (SIMD) then decoding in-place.
-/// Uses cache-friendly blocks to avoid huge intermediate allocations.
+/// Decode by stripping all whitespace from the entire input at once,
+/// then performing a single SIMD decode pass. Avoids block-boundary
+/// overhead and gives the decoder the maximum possible contiguous input.
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?
     if memchr::memchr(b'\n', data).is_none() && !data.iter().any(|&b| is_whitespace(b)) {
         return decode_clean(out, data);
     }
 
-    // Process in cache-friendly blocks (~256KB each).
-    // Each block: strip newlines, align to 4-byte groups, decode in-place.
-    // This avoids allocating a huge ~141MB intermediate buffer.
-    const BLOCK_SIZE: usize = 256 * 1024;
-    let mut clean_buf = Vec::with_capacity(BLOCK_SIZE + 4);
-    let mut leftover: Vec<u8> = Vec::new();
-
-    let num_blocks = (data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    for (block_idx, block) in data.chunks(BLOCK_SIZE).enumerate() {
-        clean_buf.clear();
-
-        // Prepend leftover from previous block
-        if !leftover.is_empty() {
-            clean_buf.extend_from_slice(&leftover);
-            leftover.clear();
+    // Strip newlines from entire input in a single pass using SIMD memchr.
+    // Pre-allocate to input size (upper bound; actual will be slightly smaller).
+    let mut clean = Vec::with_capacity(data.len());
+    let mut last = 0;
+    for pos in memchr::memchr_iter(b'\n', data) {
+        if pos > last {
+            clean.extend_from_slice(&data[last..pos]);
         }
-
-        // Strip newlines using memchr (SIMD-accelerated)
-        let mut last = 0;
-        for pos in memchr::memchr_iter(b'\n', block) {
-            if pos > last {
-                clean_buf.extend_from_slice(&block[last..pos]);
-            }
-            last = pos + 1;
-        }
-        if last < block.len() {
-            clean_buf.extend_from_slice(&block[last..]);
-        }
-
-        // Handle rare case of other whitespace (CR, tab, etc.)
-        if clean_buf.iter().any(|&b| is_whitespace(b)) {
-            clean_buf.retain(|&b| !is_whitespace(b));
-        }
-
-        let is_last = block_idx == num_blocks - 1;
-
-        if !is_last {
-            // Trim to multiple of 4, save excess for next block
-            let excess = clean_buf.len() % 4;
-            if excess > 0 {
-                leftover.extend_from_slice(&clean_buf[clean_buf.len() - excess..]);
-                clean_buf.truncate(clean_buf.len() - excess);
-            }
-        }
-
-        if clean_buf.is_empty() {
-            continue;
-        }
-
-        // Decode in-place (no extra allocation)
-        match BASE64_ENGINE.decode_inplace(&mut clean_buf) {
-            Ok(decoded) => out.write_all(decoded)?,
-            Err(_) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"))
-            }
-        }
+        last = pos + 1;
+    }
+    if last < data.len() {
+        clean.extend_from_slice(&data[last..]);
     }
 
-    Ok(())
+    // Handle rare case of non-newline whitespace (CR, tab, etc.)
+    if clean.iter().any(|&b| is_whitespace(b)) {
+        clean.retain(|&b| !is_whitespace(b));
+    }
+
+    if clean.is_empty() {
+        return Ok(());
+    }
+
+    // Single SIMD decode of entire cleaned input (no block boundaries).
+    match BASE64_ENGINE.decode_inplace(&mut clean) {
+        Ok(decoded) => out.write_all(decoded),
+        Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input")),
+    }
 }
 
 /// Decode clean base64 data (no whitespace) with a single SIMD pass.
@@ -199,7 +181,7 @@ pub fn encode_stream(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; STREAM_ENCODE_CHUNK];
     let mut col = 0usize;
-    let mut out = BufWriter::with_capacity(256 * 1024, writer);
+    let mut out = BufWriter::with_capacity(1024 * 1024, writer);
 
     let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_ENCODE_CHUNK);
     let mut encode_buf = vec![0u8; encode_buf_size];
@@ -266,7 +248,7 @@ pub fn decode_stream(
     let mut data = Vec::new();
     reader.read_to_end(&mut data)?;
 
-    let mut out = BufWriter::with_capacity(256 * 1024, writer);
+    let mut out = BufWriter::with_capacity(1024 * 1024, writer);
     decode_to_writer(&data, ignore_garbage, &mut out)?;
     out.flush()
 }

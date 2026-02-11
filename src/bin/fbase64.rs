@@ -42,7 +42,7 @@ fn main() {
     let filename = cli.file.as_deref().unwrap_or("-");
 
     let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
+    let mut out = BufWriter::with_capacity(1024 * 1024, stdout.lock());
 
     let result = if filename == "-" {
         process_stdin(&cli, &mut out)
