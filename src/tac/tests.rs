@@ -32,7 +32,8 @@ fn test_single_line_with_newline() {
 
 #[test]
 fn test_single_line_no_newline() {
-    assert_eq!(run_tac(b"hello", b'\n', false), b"hello\n");
+    // No separator found in input — output as-is (consistent with tac_string_separator)
+    assert_eq!(run_tac(b"hello", b'\n', false), b"hello");
 }
 
 #[test]

@@ -26,9 +26,8 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
                     end = last_sep + 1;
                 }
                 None => {
-                    // No separator found at all — output data + separator (GNU tac behavior)
+                    // No separator found at all — output data as-is
                     buf.write_all(data)?;
-                    buf.write_all(&[separator])?;
                     buf.flush()?;
                     return Ok(());
                 }
