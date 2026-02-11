@@ -23,16 +23,16 @@ High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleratio
 
 | Tool | Binary | Status | Description |
 |------|--------|--------|-------------|
-| wc | `fwc` | Complete | Word, line, byte, char count |
-| cut | `fcut` | Complete | Field/byte/char extraction |
-| sha256sum | `fsha256sum` | Complete | SHA-256 checksums (SHA-NI) |
-| md5sum | `fmd5sum` | Complete | MD5 checksums |
-| b2sum | `fb2sum` | Complete | BLAKE2b checksums |
-| base64 | `fbase64` | Planned | Base64 encode/decode |
-| sort | `fsort` | Planned | Line sorting |
-| tr | `ftr` | Planned | Character translation |
-| uniq | `funiq` | Planned | Filter duplicate lines |
-| tac | `ftac` | Planned | Reverse file lines |
+| wc | `fwc` | Optimized | Word, line, char, byte count (SIMD SSE2, single-pass, parallel) |
+| cut | `fcut` | Optimized | Field/byte/char extraction (mmap, SIMD) |
+| sha256sum | `fsha256sum` | Optimized | SHA-256 checksums (mmap, madvise, readahead, parallel) |
+| md5sum | `fmd5sum` | Optimized | MD5 checksums (mmap, madvise, readahead, parallel) |
+| b2sum | `fb2sum` | Optimized | BLAKE2b checksums (mmap, madvise, readahead) |
+| base64 | `fbase64` | Optimized | Base64 encode/decode (SIMD, 4MB chunks, raw fd stdout) |
+| sort | `fsort` | Optimized | Line sorting (parallel merge sort) |
+| tr | `ftr` | Optimized | Character translation (mmap, 4MB buffers, lookup tables) |
+| uniq | `funiq` | Optimized | Filter duplicate lines (mmap, 1MB buffers) |
+| tac | `ftac` | Optimized | Reverse file lines (forward SIMD scan, 1MB buffers) |
 
 ## Installation
 
@@ -75,14 +75,32 @@ fsha256sum file.txt       # SHA-256 checksum
 fmd5sum file.txt          # MD5 checksum
 fb2sum file.txt           # BLAKE2b checksum
 fsha256sum -c sums.txt    # Verify checksums
+
+# Base64 encode/decode
+fbase64 file.txt          # Encode to base64
+fbase64 -d encoded.txt    # Decode from base64
+fbase64 -w 0 file.txt     # No line wrapping
+
+# Sort, translate, deduplicate, reverse
+fsort file.txt            # Sort lines alphabetically
+fsort -n file.txt         # Numeric sort
+ftr 'a-z' 'A-Z' < file   # Translate lowercase to uppercase
+ftr -d '[:space:]' < file # Delete whitespace
+funiq file.txt            # Remove adjacent duplicates
+funiq -c file.txt         # Count occurrences
+ftac file.txt             # Print lines in reverse order
 ```
 
 ## Key Optimizations
 
 - **Zero-copy mmap**: Large files are memory-mapped directly, avoiding copies
-- **SIMD scanning**: `memchr` crate auto-detects AVX2/NEON for byte searches
+- **SIMD scanning**: `memchr` crate auto-detects AVX2/SSE2/NEON for byte searches
 - **stat-only byte counting**: `wc -c` uses `stat()` without reading file content
-- **Hardware-accelerated hashing**: sha2 crate detects SHA-NI, blake2 uses optimized implementations
+- **Hardware-accelerated hashing**: sha2 detects SHA-NI, blake2 uses optimized implementations
+- **SIMD base64**: Vectorized encode/decode with 4MB chunked streaming
+- **Parallel processing**: Multi-file hashing and wc use thread pools
+- **Lookup tables**: `tr` uses 256-byte translation tables for O(1) character mapping
+- **Forward SIMD scan**: `tac` scans forward with memchr for newlines, then reverses output
 - **Optimized release profile**: Fat LTO, single codegen unit, abort on panic, stripped binaries
 
 ## GNU Compatibility
