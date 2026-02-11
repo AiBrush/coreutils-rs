@@ -1,3 +1,4 @@
+use std::io;
 use std::process;
 
 use clap::Parser;
@@ -202,7 +203,7 @@ fn main() {
     };
 
     if let Err(e) = sort_and_output(&inputs, &config) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
+        if e.kind() == io::ErrorKind::BrokenPipe {
             eprintln!("fsort: write failed: 'standard output': Broken pipe");
             eprintln!("fsort: write error");
             process::exit(2);
