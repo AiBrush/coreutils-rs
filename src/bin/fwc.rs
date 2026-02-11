@@ -167,7 +167,7 @@ fn main() {
         // to keep data cache-warm between metric computations within each chunk.
         let counts = if show.lines && show.words && !show.max_line_length {
             // Combined parallel pass — most efficient for default mode
-            let (lines, words, chars) = wc::count_lwc_parallel(&data, show.chars && utf8_locale);
+            let (lines, words, chars) = wc::count_lwc_parallel(&data, utf8_locale);
             wc::WcCounts {
                 lines,
                 words,
@@ -184,7 +184,7 @@ fn main() {
                     0
                 },
                 words: if show.words {
-                    wc::count_words_parallel(&data)
+                    wc::count_words_parallel(&data, utf8_locale)
                 } else {
                     0
                 },
