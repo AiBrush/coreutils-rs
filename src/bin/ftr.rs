@@ -96,11 +96,11 @@ fn main() {
     #[cfg(unix)]
     let mut raw = raw_stdout();
     #[cfg(unix)]
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();
     #[cfg(not(unix))]
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
 
     // Try to mmap stdin for zero-copy reads
     let mmap = try_mmap_stdin();
