@@ -88,86 +88,88 @@ pub fn count_words(data: &[u8]) -> u64 {
 unsafe fn count_words_sse2(data: &[u8]) -> u64 {
     use std::arch::x86_64::*;
 
-    // Whitespace = (0x09 <= b <= 0x0D) || (b == 0x20)
-    // Using signed comparison: cmpgt(b, 0x08) && cmpgt(0x0E, b) || cmpeq(b, 0x20)
-    let min_ws = _mm_set1_epi8(0x08); // one below \t
-    let max_ws = _mm_set1_epi8(0x0E); // one above \r
-    let space = _mm_set1_epi8(0x20);
+    unsafe {
+        // Whitespace = (0x09 <= b <= 0x0D) || (b == 0x20)
+        // Using signed comparison: cmpgt(b, 0x08) && cmpgt(0x0E, b) || cmpeq(b, 0x20)
+        let min_ws = _mm_set1_epi8(0x08); // one below \t
+        let max_ws = _mm_set1_epi8(0x0E); // one above \r
+        let space = _mm_set1_epi8(0x20);
 
-    let mut words = 0u64;
-    let mut prev_ws_bit = 1u64; // treat start-of-data as whitespace
+        let mut words = 0u64;
+        let mut prev_ws_bit = 1u64; // treat start-of-data as whitespace
 
-    let chunks = data.chunks_exact(64);
-    let remainder = chunks.remainder();
+        let chunks = data.chunks_exact(64);
+        let remainder = chunks.remainder();
 
-    for chunk in chunks {
-        let ptr = chunk.as_ptr();
+        for chunk in chunks {
+            let ptr = chunk.as_ptr();
 
-        // Load 4 x 16-byte vectors
-        let v0 = _mm_loadu_si128(ptr as *const __m128i);
-        let v1 = _mm_loadu_si128(ptr.add(16) as *const __m128i);
-        let v2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
-        let v3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
+            // Load 4 x 16-byte vectors
+            let v0 = _mm_loadu_si128(ptr as *const __m128i);
+            let v1 = _mm_loadu_si128(ptr.add(16) as *const __m128i);
+            let v2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
+            let v3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
 
-        // Detect whitespace in each vector: 3 comparisons + 1 AND + 1 OR
-        macro_rules! detect_ws {
-            ($v:expr) => {{
-                let ge_9 = _mm_cmpgt_epi8($v, min_ws);
-                let le_d = _mm_cmpgt_epi8(max_ws, $v);
-                let in_range = _mm_and_si128(ge_9, le_d);
-                let is_sp = _mm_cmpeq_epi8($v, space);
-                _mm_or_si128(in_range, is_sp)
-            }};
+            // Detect whitespace in each vector: 3 comparisons + 1 AND + 1 OR
+            macro_rules! detect_ws {
+                ($v:expr) => {{
+                    let ge_9 = _mm_cmpgt_epi8($v, min_ws);
+                    let le_d = _mm_cmpgt_epi8(max_ws, $v);
+                    let in_range = _mm_and_si128(ge_9, le_d);
+                    let is_sp = _mm_cmpeq_epi8($v, space);
+                    _mm_or_si128(in_range, is_sp)
+                }};
+            }
+
+            let ws0 = detect_ws!(v0);
+            let ws1 = detect_ws!(v1);
+            let ws2 = detect_ws!(v2);
+            let ws3 = detect_ws!(v3);
+
+            // Combine 4 x 16-bit movemasks into one 64-bit whitespace mask
+            let m0 = (_mm_movemask_epi8(ws0) as u16) as u64;
+            let m1 = (_mm_movemask_epi8(ws1) as u16) as u64;
+            let m2 = (_mm_movemask_epi8(ws2) as u16) as u64;
+            let m3 = (_mm_movemask_epi8(ws3) as u16) as u64;
+            let ws_mask = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+
+            // Word starts: where previous byte was whitespace AND current is NOT
+            let prev_mask = (ws_mask << 1) | prev_ws_bit;
+            let word_starts = prev_mask & !ws_mask;
+            words += word_starts.count_ones() as u64;
+
+            prev_ws_bit = (ws_mask >> 63) & 1;
         }
 
-        let ws0 = detect_ws!(v0);
-        let ws1 = detect_ws!(v1);
-        let ws2 = detect_ws!(v2);
-        let ws3 = detect_ws!(v3);
+        // Handle 16-byte sub-chunks of remainder
+        let sub_chunks = remainder.chunks_exact(16);
+        let sub_remainder = sub_chunks.remainder();
+        let mut prev_ws_u32 = prev_ws_bit as u32;
 
-        // Combine 4 x 16-bit movemasks into one 64-bit whitespace mask
-        let m0 = (_mm_movemask_epi8(ws0) as u16) as u64;
-        let m1 = (_mm_movemask_epi8(ws1) as u16) as u64;
-        let m2 = (_mm_movemask_epi8(ws2) as u16) as u64;
-        let m3 = (_mm_movemask_epi8(ws3) as u16) as u64;
-        let ws_mask = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+        for chunk in sub_chunks {
+            let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+            let ge_9 = _mm_cmpgt_epi8(v, min_ws);
+            let le_d = _mm_cmpgt_epi8(max_ws, v);
+            let in_range = _mm_and_si128(ge_9, le_d);
+            let is_sp = _mm_cmpeq_epi8(v, space);
+            let ws_vec = _mm_or_si128(in_range, is_sp);
+            let ws_mask = _mm_movemask_epi8(ws_vec) as u32;
 
-        // Word starts: where previous byte was whitespace AND current is NOT
-        let prev_mask = (ws_mask << 1) | prev_ws_bit;
-        let word_starts = prev_mask & !ws_mask;
-        words += word_starts.count_ones() as u64;
+            let prev_mask = (ws_mask << 1) | prev_ws_u32;
+            let word_starts = prev_mask & (!ws_mask & 0xFFFF);
+            words += word_starts.count_ones() as u64;
+            prev_ws_u32 = (ws_mask >> 15) & 1;
+        }
 
-        prev_ws_bit = (ws_mask >> 63) & 1;
+        // Scalar for final <16 bytes
+        let mut prev_ws = prev_ws_u32 as u8;
+        for &b in sub_remainder {
+            let curr_ws = WS_TABLE[b as usize];
+            words += (prev_ws & (curr_ws ^ 1)) as u64;
+            prev_ws = curr_ws;
+        }
+        words
     }
-
-    // Handle 16-byte sub-chunks of remainder
-    let sub_chunks = remainder.chunks_exact(16);
-    let sub_remainder = sub_chunks.remainder();
-    let mut prev_ws_u32 = prev_ws_bit as u32;
-
-    for chunk in sub_chunks {
-        let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
-        let ge_9 = _mm_cmpgt_epi8(v, min_ws);
-        let le_d = _mm_cmpgt_epi8(max_ws, v);
-        let in_range = _mm_and_si128(ge_9, le_d);
-        let is_sp = _mm_cmpeq_epi8(v, space);
-        let ws_vec = _mm_or_si128(in_range, is_sp);
-        let ws_mask = _mm_movemask_epi8(ws_vec) as u32;
-
-        let prev_mask = (ws_mask << 1) | prev_ws_u32;
-        let word_starts = prev_mask & (!ws_mask & 0xFFFF);
-        words += word_starts.count_ones() as u64;
-        prev_ws_u32 = (ws_mask >> 15) & 1;
-    }
-
-    // Scalar for final <16 bytes
-    let mut prev_ws = prev_ws_u32 as u8;
-    for &b in sub_remainder {
-        let curr_ws = WS_TABLE[b as usize];
-        words += (prev_ws & (curr_ws ^ 1)) as u64;
-        prev_ws = curr_ws;
-    }
-    words
 }
 
 /// Scalar word counting fallback for non-x86 platforms.
