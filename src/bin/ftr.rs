@@ -1,3 +1,4 @@
+use std::io::{self, BufWriter, Write};
 use std::process;
 
 use clap::Parser;
@@ -33,16 +34,60 @@ struct Cli {
     sets: Vec<String>,
 }
 
+/// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
+/// Returns None if stdin is a pipe/terminal, or on non-unix platforms.
+#[cfg(unix)]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    use std::os::unix::io::AsRawFd;
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    // Check if stdin is a regular file via fstat
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    // mmap the stdin file descriptor
+    // SAFETY: fd is valid, file is regular, size > 0
+    let file = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
+    let mmap: Option<memmap2::Mmap> = unsafe { memmap2::Mmap::map(&file) }.ok();
+    std::mem::forget(file); // Don't close stdin
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+        }
+    }
+    mmap
+}
+
+#[cfg(not(unix))]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    None
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let set1_str = &cli.sets[0];
 
-    let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
+    // 4MB BufWriter for stdout — batches write syscalls
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
+
+    // Try to mmap stdin for zero-copy reads
+    let mmap = try_mmap_stdin();
 
     let result = if cli.delete && cli.squeeze {
-        // -d -s: delete SET1 chars, then squeeze SET2 chars — need two sets
+        // -d -s: delete SET1 chars, then squeeze SET2 chars
         if cli.sets.len() < 2 {
             eprintln!("ftr: missing operand after '{}'", set1_str);
             eprintln!("Two strings must be given when both deleting and squeezing repeats.");
@@ -56,7 +101,12 @@ fn main() {
         } else {
             set1
         };
-        tr::delete_squeeze(&delete_set, &set2, &mut stdin, &mut stdout)
+        if let Some(ref data) = mmap {
+            tr::delete_squeeze_mmap(&delete_set, &set2, data, &mut writer)
+        } else {
+            let mut stdin = io::stdin().lock();
+            tr::delete_squeeze(&delete_set, &set2, &mut stdin, &mut writer)
+        }
     } else if cli.delete {
         // -d only: delete SET1 chars
         if cli.sets.len() > 1 {
@@ -70,7 +120,12 @@ fn main() {
         } else {
             set1
         };
-        tr::delete(&delete_set, &mut stdin, &mut stdout)
+        if let Some(ref data) = mmap {
+            tr::delete_mmap(&delete_set, data, &mut writer)
+        } else {
+            let mut stdin = io::stdin().lock();
+            tr::delete(&delete_set, &mut stdin, &mut writer)
+        }
     } else if cli.squeeze && cli.sets.len() < 2 {
         // -s only with one set: squeeze SET1 chars
         let set1 = tr::parse_set(set1_str);
@@ -79,7 +134,12 @@ fn main() {
         } else {
             set1
         };
-        tr::squeeze(&squeeze_set, &mut stdin, &mut stdout)
+        if let Some(ref data) = mmap {
+            tr::squeeze_mmap(&squeeze_set, data, &mut writer)
+        } else {
+            let mut stdin = io::stdin().lock();
+            tr::squeeze(&squeeze_set, &mut stdin, &mut writer)
+        }
     } else if cli.squeeze {
         // -s with two sets: translate SET1->SET2, then squeeze SET2 chars
         let set2_str = &cli.sets[1];
@@ -94,7 +154,12 @@ fn main() {
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        tr::translate_squeeze(&set1, &set2, &mut stdin, &mut stdout)
+        if let Some(ref data) = mmap {
+            tr::translate_squeeze_mmap(&set1, &set2, data, &mut writer)
+        } else {
+            let mut stdin = io::stdin().lock();
+            tr::translate_squeeze(&set1, &set2, &mut stdin, &mut writer)
+        }
     } else {
         // Default: translate SET1 -> SET2
         if cli.sets.len() < 2 {
@@ -114,11 +179,19 @@ fn main() {
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        tr::translate(&set1, &set2, &mut stdin, &mut stdout)
+        if let Some(ref data) = mmap {
+            tr::translate_mmap(&set1, &set2, data, &mut writer)
+        } else {
+            let mut stdin = io::stdin().lock();
+            tr::translate(&set1, &set2, &mut stdin, &mut writer)
+        }
     };
 
+    // Flush buffered output
+    let _ = writer.flush();
+
     if let Err(e) = result {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
+        if e.kind() != io::ErrorKind::BrokenPipe {
             eprintln!("ftr: {}", e);
             process::exit(1);
         }

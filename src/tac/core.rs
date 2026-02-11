@@ -2,81 +2,59 @@ use std::io::{self, Write};
 
 /// Reverse the records in `data` separated by a single byte `separator` and write to `out`.
 /// If `before` is true, the separator is attached before the record instead of after.
-/// Uses memrchr for SIMD-accelerated reverse byte scanning with zero allocation.
+/// Uses forward memchr scan for SIMD-accelerated separator finding with optimal prefetch.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
+    // Forward SIMD scan to collect all separator positions — better prefetch than backward scanning
+    let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
+
+    if positions.is_empty() {
+        out.write_all(data)?;
+        return Ok(());
+    }
+
+    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
 
     if !before {
         // Default mode: separator is AFTER the record (like newline at end of line)
-        // Use memrchr to scan backwards — zero allocation, SIMD-accelerated
-        let mut end = data.len();
+        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
 
-        // Handle trailing content that has no separator
-        // GNU tac appends the separator when input lacks a trailing one
-        if data[end - 1] != separator {
-            match memchr::memrchr(separator, &data[..end.saturating_sub(1)]) {
-                Some(last_sep) => {
-                    // Write trailing content + separator (GNU tac adds separator)
-                    buf.write_all(&data[last_sep + 1..])?;
-                    buf.write_all(&[separator])?;
-                    end = last_sep + 1;
-                }
-                None => {
-                    // No separator found at all — output data as-is
-                    buf.write_all(data)?;
-                    buf.flush()?;
-                    return Ok(());
-                }
-            }
+        // Trailing content without separator — GNU tac appends the separator
+        if !has_trailing_sep {
+            let last_sep = *positions.last().unwrap();
+            buf.write_all(&data[last_sep + 1..])?;
+            buf.write_all(&[separator])?;
         }
 
-        // Now data[end-1] is guaranteed to be a separator byte.
-        // Scan backwards to emit each record (content + separator).
-        while end > 0 {
-            if end >= 2 {
-                match memchr::memrchr(separator, &data[..end - 1]) {
-                    Some(prev_sep) => {
-                        buf.write_all(&data[prev_sep + 1..end])?;
-                        end = prev_sep + 1;
-                    }
-                    None => {
-                        // First record — from start of data
-                        buf.write_all(&data[..end])?;
-                        end = 0;
-                    }
-                }
-            } else {
-                // end == 1: data[0] is the separator (empty record)
-                buf.write_all(&data[..1])?;
-                end = 0;
-            }
+        // Records in reverse order
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let end = positions[i] + 1; // include separator
+            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
+            buf.write_all(&data[start..end])?;
         }
     } else {
         // Before mode: separator is BEFORE the record
-        // Scan backwards with memrchr — zero allocation
-        let mut pos = data.len();
-
-        while pos > 0 {
-            match memchr::memrchr(separator, &data[..pos]) {
-                Some(sep_pos) => {
-                    // Write [separator .. pos) as one record
-                    buf.write_all(&data[sep_pos..pos])?;
-                    pos = sep_pos;
-                }
-                None => {
-                    // No more separators — remaining content is leading data
-                    break;
-                }
-            }
+        // Write records in reverse
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let start = positions[i];
+            let end = if i + 1 < positions.len() {
+                positions[i + 1]
+            } else {
+                data.len()
+            };
+            buf.write_all(&data[start..end])?;
         }
 
-        // Write any leading content (before the first separator)
-        if pos > 0 {
-            buf.write_all(&data[..pos])?;
+        // Leading content before first separator
+        if positions[0] > 0 {
+            buf.write_all(&data[..positions[0]])?;
         }
     }
 
@@ -109,7 +87,7 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
+    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
 
     if !before {
         // Default: separator after record
@@ -132,8 +110,6 @@ pub fn tac_string_separator(
         }
     } else {
         // Before mode: separator before record
-        let has_leading_sep = positions[0] == 0;
-
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
@@ -146,7 +122,7 @@ pub fn tac_string_separator(
             buf.write_all(&data[start..end])?;
         }
 
-        if !has_leading_sep {
+        if positions[0] > 0 {
             buf.write_all(&data[..positions[0]])?;
         }
     }
@@ -185,7 +161,7 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(256 * 1024, out);
+    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
 
     if !before {
         let last_end = matches.last().unwrap().1;
@@ -209,8 +185,6 @@ pub fn tac_regex_separator(
         }
     } else {
         // Before mode
-        let has_leading_sep = matches[0].0 == 0;
-
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
@@ -223,7 +197,7 @@ pub fn tac_regex_separator(
             buf.write_all(&data[start..end])?;
         }
 
-        if !has_leading_sep {
+        if matches[0].0 > 0 {
             buf.write_all(&data[..matches[0].0])?;
         }
     }
