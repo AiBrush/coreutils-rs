@@ -708,10 +708,6 @@ pub fn max_line_length_c(data: &[u8]) -> u64 {
             b'\r' => {
                 linepos = 0;
             }
-            0x08 => {
-                // Backspace: reduce position by 1 (min 0)
-                linepos = linepos.saturating_sub(1);
-            }
             0x0C => {
                 // Form feed: acts as line terminator
                 if line_len > max_len {
@@ -771,10 +767,6 @@ pub fn max_line_length_utf8(data: &[u8]) -> u64 {
                 }
                 b'\r' => {
                     linepos = 0;
-                }
-                0x08 => {
-                    // Backspace: reduce position by 1 (min 0)
-                    linepos = linepos.saturating_sub(1);
                 }
                 0x0C => {
                     // Form feed: line terminator
