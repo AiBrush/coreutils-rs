@@ -594,9 +594,11 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
             let ord = match a.0.cmp(&b.0) {
                 Ordering::Equal => {
+                    // Prefixes match — skip first 8 bytes since they're equal
                     let (sa, ea) = offsets[a.1];
                     let (sb, eb) = offsets[b.1];
-                    data[sa..ea].cmp(&data[sb..eb])
+                    let skip = 8.min(ea - sa).min(eb - sb);
+                    data[sa + skip..ea].cmp(&data[sb + skip..eb])
                 }
                 ord => ord,
             };
@@ -799,9 +801,11 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
                     let ord = match a.0.cmp(&b.0) {
                         Ordering::Equal => {
+                            // Skip first 8 bytes — they're equal (matched by prefix)
                             let (sa, ea) = key_offs[a.1];
                             let (sb, eb) = key_offs[b.1];
-                            data[sa..ea].cmp(&data[sb..eb])
+                            let skip = 8.min(ea.saturating_sub(sa)).min(eb.saturating_sub(sb));
+                            data[sa + skip..ea].cmp(&data[sb + skip..eb])
                         }
                         ord => ord,
                     };
