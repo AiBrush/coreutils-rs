@@ -238,6 +238,26 @@ impl<'a> Iterator for LineIter<'a> {
 /// Batched output buffer size for uniq.
 const UNIQ_BUF_SIZE: usize = 4 * 1024 * 1024;
 
+/// Write a count-prefixed line into a Vec buffer (avoids per-line write_all).
+#[inline(always)]
+fn write_count_to_buf(buf: &mut Vec<u8>, count: u64, line: &[u8], term: u8) {
+    let mut num_buf = [b' '; 20];
+    let count_len = {
+        let s = itoa_right_aligned(&mut num_buf, count);
+        s.len()
+    };
+    let start = 20 - count_len;
+    if count_len < 7 {
+        // Pad with spaces to width 7
+        let pad_bytes = &b"       "[..7 - count_len];
+        buf.extend_from_slice(pad_bytes);
+    }
+    buf.extend_from_slice(&num_buf[start..]);
+    buf.push(b' ');
+    buf.extend_from_slice(line);
+    buf.push(term);
+}
+
 /// Standard processing for Default, RepeatedOnly, UniqueOnly on byte slices.
 fn process_standard_bytes(
     data: &[u8],
@@ -274,6 +294,74 @@ fn process_standard_bytes(
                     out_buf.clear();
                 }
                 prev_content = cur_content;
+            }
+        }
+        if !out_buf.is_empty() {
+            writer.write_all(&out_buf)?;
+        }
+        return Ok(());
+    }
+
+    // Fast batched path: default mode with count, no key extraction
+    if fast && config.count && matches!(config.mode, OutputMode::Default) {
+        let mut prev_content = prev_content;
+        let mut prev_full = prev_full;
+        let mut count: u64 = 1;
+        let mut out_buf = Vec::with_capacity(UNIQ_BUF_SIZE);
+        for (cur_content, cur_full) in lines {
+            if lines_equal_fast(prev_content, cur_content) {
+                count += 1;
+            } else {
+                write_count_to_buf(&mut out_buf, count, prev_content, term);
+                if out_buf.len() >= UNIQ_BUF_SIZE {
+                    writer.write_all(&out_buf)?;
+                    out_buf.clear();
+                }
+                prev_content = cur_content;
+                prev_full = cur_full;
+                count = 1;
+            }
+        }
+        write_count_to_buf(&mut out_buf, count, prev_content, term);
+        if !out_buf.is_empty() {
+            writer.write_all(&out_buf)?;
+        }
+        let _ = prev_full; // suppress unused warning
+        return Ok(());
+    }
+
+    // Fast batched path: repeated-only or unique-only mode, no count, no key extraction
+    if fast && !config.count && matches!(config.mode, OutputMode::RepeatedOnly | OutputMode::UniqueOnly) {
+        let is_unique = matches!(config.mode, OutputMode::UniqueOnly);
+        let mut prev_content = prev_content;
+        let mut prev_full = prev_full;
+        let mut count: u64 = 1;
+        let mut out_buf = Vec::with_capacity(UNIQ_BUF_SIZE);
+        for (cur_content, cur_full) in lines {
+            if lines_equal_fast(prev_content, cur_content) {
+                count += 1;
+            } else {
+                let emit = if is_unique { count == 1 } else { count > 1 };
+                if emit {
+                    out_buf.extend_from_slice(prev_full);
+                    if prev_full.len() == prev_content.len() {
+                        out_buf.push(term);
+                    }
+                    if out_buf.len() >= UNIQ_BUF_SIZE {
+                        writer.write_all(&out_buf)?;
+                        out_buf.clear();
+                    }
+                }
+                prev_content = cur_content;
+                prev_full = cur_full;
+                count = 1;
+            }
+        }
+        let emit = if is_unique { count == 1 } else { count > 1 };
+        if emit {
+            out_buf.extend_from_slice(prev_full);
+            if prev_full.len() == prev_content.len() {
+                out_buf.push(term);
             }
         }
         if !out_buf.is_empty() {
