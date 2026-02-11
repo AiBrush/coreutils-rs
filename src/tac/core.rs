@@ -2,13 +2,15 @@ use std::io::{self, Write};
 
 /// Reverse the records in `data` separated by a single byte `separator` and write to `out`.
 /// If `before` is true, the separator is attached before the record instead of after.
-/// Builds output in a single pre-allocated Vec and writes once for minimal syscall overhead.
+/// Uses forward memchr scan for SIMD-accelerated separator finding.
+/// Writes records directly from mmap'd data through a 4MB BufWriter — avoids allocating
+/// a full copy of the file (better cache locality for large files).
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    // Forward SIMD scan to collect all separator positions
+    // Forward SIMD scan to collect all separator positions — better prefetch than backward scanning
     let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
 
     if positions.is_empty() {
@@ -16,8 +18,9 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    // Pre-allocate output buffer — output is same size as input (plus maybe one separator)
-    let mut buf = Vec::with_capacity(data.len() + 1);
+    // Use 4MB BufWriter for cache-friendly output batching.
+    // Writing directly from mmap avoids allocating a full copy of the file.
+    let mut buf = io::BufWriter::with_capacity(4 * 1024 * 1024, out);
 
     if !before {
         // Default mode: separator is AFTER the record (like newline at end of line)
@@ -26,20 +29,21 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         // Trailing content without separator — GNU tac appends the separator
         if !has_trailing_sep {
             let last_sep = *positions.last().unwrap();
-            buf.extend_from_slice(&data[last_sep + 1..]);
-            buf.push(separator);
+            buf.write_all(&data[last_sep + 1..])?;
+            buf.write_all(&[separator])?;
         }
 
-        // Records in reverse order
+        // Records in reverse order — write directly from mmap'd slices
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
             let end = positions[i] + 1; // include separator
             let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            buf.extend_from_slice(&data[start..end]);
+            buf.write_all(&data[start..end])?;
         }
     } else {
         // Before mode: separator is BEFORE the record
+        // Write records in reverse
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
@@ -49,17 +53,16 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
             } else {
                 data.len()
             };
-            buf.extend_from_slice(&data[start..end]);
+            buf.write_all(&data[start..end])?;
         }
 
         // Leading content before first separator
         if positions[0] > 0 {
-            buf.extend_from_slice(&data[..positions[0]]);
+            buf.write_all(&data[..positions[0]])?;
         }
     }
 
-    // Single write — minimal syscall overhead
-    out.write_all(&buf)?;
+    buf.flush()?;
     Ok(())
 }
 
@@ -88,7 +91,7 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-    let mut buf = Vec::with_capacity(data.len() + sep_len);
+    let mut buf = io::BufWriter::with_capacity(4 * 1024 * 1024, out);
 
     if !before {
         // Default: separator after record
@@ -97,8 +100,8 @@ pub fn tac_string_separator(
 
         // Trailing chunk without separator
         if !has_trailing_sep {
-            buf.extend_from_slice(&data[last_end..]);
-            buf.extend_from_slice(separator);
+            buf.write_all(&data[last_end..])?;
+            buf.write_all(separator)?;
         }
 
         // Records in reverse
@@ -111,7 +114,7 @@ pub fn tac_string_separator(
             } else {
                 positions[i - 1] + sep_len
             };
-            buf.extend_from_slice(&data[rec_start..sep_start + sep_len]);
+            buf.write_all(&data[rec_start..sep_start + sep_len])?;
         }
     } else {
         // Before mode: separator before record
@@ -124,15 +127,15 @@ pub fn tac_string_separator(
             } else {
                 data.len()
             };
-            buf.extend_from_slice(&data[start..end]);
+            buf.write_all(&data[start..end])?;
         }
 
         if positions[0] > 0 {
-            buf.extend_from_slice(&data[..positions[0]]);
+            buf.write_all(&data[..positions[0]])?;
         }
     }
 
-    out.write_all(&buf)?;
+    buf.flush()?;
     Ok(())
 }
 
@@ -166,7 +169,7 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    let mut buf = Vec::with_capacity(data.len() + 16);
+    let mut buf = io::BufWriter::with_capacity(4 * 1024 * 1024, out);
 
     if !before {
         let last_end = matches.last().unwrap().1;
@@ -174,10 +177,10 @@ pub fn tac_regex_separator(
 
         // Trailing content after last separator
         if !has_trailing_sep {
-            buf.extend_from_slice(&data[last_end..]);
+            buf.write_all(&data[last_end..])?;
             // Append the last separator match to close this record
             let last_match = matches.last().unwrap();
-            buf.extend_from_slice(&data[last_match.0..last_match.1]);
+            buf.write_all(&data[last_match.0..last_match.1])?;
         }
 
         // Records in reverse
@@ -186,7 +189,7 @@ pub fn tac_regex_separator(
             i -= 1;
             let rec_start = if i == 0 { 0 } else { matches[i - 1].1 };
             let rec_end = matches[i].1;
-            buf.extend_from_slice(&data[rec_start..rec_end]);
+            buf.write_all(&data[rec_start..rec_end])?;
         }
     } else {
         // Before mode
@@ -199,14 +202,14 @@ pub fn tac_regex_separator(
             } else {
                 data.len()
             };
-            buf.extend_from_slice(&data[start..end]);
+            buf.write_all(&data[start..end])?;
         }
 
         if matches[0].0 > 0 {
-            buf.extend_from_slice(&data[..matches[0].0]);
+            buf.write_all(&data[..matches[0].0])?;
         }
     }
 
-    out.write_all(&buf)?;
+    buf.flush()?;
     Ok(())
 }
