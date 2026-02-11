@@ -250,7 +250,7 @@ fn write_output(
 
 fn run_check_mode(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
     let mut had_error = false;
-    let mut total_ok: usize = 0;
+    let mut _total_ok: usize = 0;
     let mut total_fail: usize = 0;
     let mut total_fmt_errors: usize = 0;
     let mut total_read_errors: usize = 0;
@@ -278,7 +278,7 @@ fn run_check_mode(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
         let (file_ok, file_fail, file_fmt, file_read, file_ignored) =
             check_one(cli, reader, &display_name, out);
 
-        total_ok += file_ok;
+        _total_ok += file_ok;
         total_fail += file_fail;
         total_fmt_errors += file_fmt;
         total_read_errors += file_read;
