@@ -123,43 +123,49 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
 
 /// Write a count-prefixed line in GNU uniq format.
 /// GNU format: "%7lu " — right-aligned in 7-char field, followed by space.
+/// Uses a single write_all by building the prefix in a stack buffer.
 #[inline(always)]
 fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> io::Result<()> {
-    // Fast path for small counts (vast majority of cases)
-    // Manually format to avoid write!() macro overhead
-    let mut buf = [b' '; 20]; // Enough for u64 max
-    let count_len = {
-        let count_str = itoa_right_aligned(&mut buf, count);
-        count_str.len()
-    };
-    let start = 20 - count_len;
-    if count_len < 7 {
-        // Pad with spaces to width 7
-        let pad = 7 - count_len;
-        out.write_all(&buf[..pad])?; // spaces
-    }
-    out.write_all(&buf[start..])?;
-    out.write_all(b" ")?;
+    // Build prefix "     N " in a stack buffer (max 21 bytes for u64 + spaces)
+    let mut prefix = [b' '; 28]; // Enough for u64 max + padding + space
+    let digits = itoa_right_aligned_into(&mut prefix, count);
+    let width = digits.max(7); // minimum 7 chars
+    let prefix_len = width + 1; // +1 for trailing space
+    prefix[width] = b' ';
+    // Write prefix + line + term in as few calls as possible
+    out.write_all(&prefix[..prefix_len])?;
     out.write_all(line)?;
     out.write_all(&[term])?;
     Ok(())
 }
 
-/// Convert u64 to decimal string in a stack buffer, right-aligned.
-/// Returns the slice of the buffer containing the decimal digits.
+/// Write u64 decimal right-aligned into prefix buffer.
+/// Buffer is pre-filled with spaces. Returns number of digits written.
 #[inline(always)]
-fn itoa_right_aligned(buf: &mut [u8; 20], mut val: u64) -> &[u8] {
+fn itoa_right_aligned_into(buf: &mut [u8; 28], mut val: u64) -> usize {
     if val == 0 {
-        buf[19] = b'0';
-        return &buf[19..20];
+        buf[6] = b'0';
+        return 7; // 6 spaces + '0' = 7 chars
     }
-    let mut pos = 20;
+    // Write digits right-to-left from position 27 (leaving room for trailing space)
+    let mut pos = 27;
     while val > 0 {
         pos -= 1;
         buf[pos] = b'0' + (val % 10) as u8;
         val /= 10;
     }
-    &buf[pos..20]
+    let num_digits = 27 - pos;
+    if num_digits >= 7 {
+        // Number is wide enough, shift to front
+        buf.copy_within(pos..27, 0);
+        num_digits
+    } else {
+        // Right-align in 7-char field: spaces then digits
+        let pad = 7 - num_digits;
+        buf.copy_within(pos..27, pad);
+        // buf[0..pad] is already spaces from initialization
+        7
+    }
 }
 
 // ============================================================================

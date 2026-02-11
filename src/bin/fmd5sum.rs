@@ -1,4 +1,8 @@
 use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
@@ -105,7 +109,14 @@ fn main() {
         cli.files.clone()
     };
 
+    // Raw fd stdout on Unix for zero-overhead writes
+    #[cfg(unix)]
+    let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+    #[cfg(unix)]
+    let mut out = BufWriter::new(&mut *raw);
+    #[cfg(not(unix))]
     let stdout = io::stdout();
+    #[cfg(not(unix))]
     let mut out = BufWriter::new(stdout.lock());
     let mut had_error = false;
 
@@ -282,24 +293,35 @@ fn main() {
     }
 }
 
+/// Write hash output using pre-built byte buffer for minimum overhead.
 #[inline]
 fn write_output(out: &mut impl Write, cli: &Cli, algo: HashAlgorithm, hash: &str, filename: &str) {
     if cli.tag {
-        if cli.zero {
-            let _ = write!(out, "{} ({}) = {}\0", algo.name(), filename, hash);
-        } else {
-            let _ = writeln!(out, "{} ({}) = {}", algo.name(), filename, hash);
-        }
-    } else if cli.zero {
-        // GNU defaults to binary mode on Linux; only -t (text) uses space
-        let mode_char = if !cli.text { '*' } else { ' ' };
-        let _ = write!(out, "{} {}{}\0", hash, mode_char, filename);
-    } else if needs_escape(filename) {
-        let escaped = escape_filename(filename);
-        let mode_char = if !cli.text { '*' } else { ' ' };
-        let _ = writeln!(out, "\\{} {}{}", hash, mode_char, escaped);
+        let name = algo.name();
+        let term = if cli.zero { b'\0' } else { b'\n' };
+        let _ = out.write_all(name.as_bytes());
+        let _ = out.write_all(b" (");
+        let _ = out.write_all(filename.as_bytes());
+        let _ = out.write_all(b") = ");
+        let _ = out.write_all(hash.as_bytes());
+        let _ = out.write_all(&[term]);
     } else {
-        let mode_char = if !cli.text { '*' } else { ' ' };
-        let _ = writeln!(out, "{} {}{}", hash, mode_char, filename);
+        // GNU defaults to binary mode on Linux; only -t (text) uses space
+        let mode = if !cli.text { b'*' } else { b' ' };
+        let term = if cli.zero { b'\0' } else { b'\n' };
+
+        if !cli.zero && needs_escape(filename) {
+            let escaped = escape_filename(filename);
+            let _ = out.write_all(b"\\");
+            let _ = out.write_all(hash.as_bytes());
+            let _ = out.write_all(&[b' ', mode]);
+            let _ = out.write_all(escaped.as_bytes());
+            let _ = out.write_all(&[term]);
+        } else {
+            let _ = out.write_all(hash.as_bytes());
+            let _ = out.write_all(&[b' ', mode]);
+            let _ = out.write_all(filename.as_bytes());
+            let _ = out.write_all(&[term]);
+        }
     }
 }

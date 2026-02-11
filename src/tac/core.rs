@@ -1,14 +1,49 @@
-use std::io::{self, Write};
+use std::io::{self, IoSlice, Write};
+
+/// Maximum number of iovecs per writev() call (Linux IOV_MAX is 1024).
+const IOV_BATCH: usize = 1024;
+
+/// Maximum records for vectored I/O. Beyond this, use BufWriter to avoid
+/// excessive memory for IoSlice entries (16 bytes each).
+const VECTORED_MAX_RECORDS: usize = 256 * 1024;
+
+/// Write all IoSlices to the writer, handling partial writes.
+/// Batches into IOV_BATCH-sized groups for writev() efficiency.
+fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < slices.len() {
+        let end = (offset + IOV_BATCH).min(slices.len());
+        let n = out.write_vectored(&slices[offset..end])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write any data",
+            ));
+        }
+        // Skip fully-written slices
+        let mut remaining = n;
+        while offset < end && remaining >= slices[offset].len() {
+            remaining -= slices[offset].len();
+            offset += 1;
+        }
+        // Handle partial write within a slice — use write_all for the remainder
+        if remaining > 0 && offset < end {
+            out.write_all(&slices[offset][remaining..])?;
+            offset += 1;
+        }
+    }
+    Ok(())
+}
 
 /// Reverse the records in `data` separated by a single byte `separator` and write to `out`.
 /// If `before` is true, the separator is attached before the record instead of after.
-/// Uses forward memchr scan for SIMD-accelerated separator finding with optimal prefetch.
+/// Uses vectored I/O (writev) to write directly from mmap'd data — zero intermediate copies.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    // Forward SIMD scan to collect all separator positions — better prefetch than backward scanning
+    // Forward SIMD scan to collect all separator positions
     let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
 
     if positions.is_empty() {
@@ -16,30 +51,85 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
+    // For files with many records, use BufWriter to avoid excessive IoSlice memory.
+    // For smaller record counts, use vectored I/O for zero-copy writes.
+    if positions.len() > VECTORED_MAX_RECORDS {
+        return tac_bytes_bufwriter(data, separator, before, &positions, out);
+    }
+
+    // Build IoSlice list pointing directly into mmap'd data — zero copies
+    let sep_byte = [separator];
 
     if !before {
-        // Default mode: separator is AFTER the record (like newline at end of line)
         let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
 
-        // Trailing content without separator — write without adding separator
-        // (it gets concatenated with the next reversed record, matching GNU behavior)
+        // GNU tac appends separator to trailing content without one
         if !has_trailing_sep {
             let last_sep = *positions.last().unwrap();
-            buf.write_all(&data[last_sep + 1..])?;
+            slices.push(IoSlice::new(&data[last_sep + 1..]));
+            slices.push(IoSlice::new(&sep_byte));
         }
 
-        // Records in reverse order
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
-            let end = positions[i] + 1; // include separator
+            let end = positions[i] + 1;
+            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
+            slices.push(IoSlice::new(&data[start..end]));
+        }
+
+        write_all_slices(out, &slices)?;
+    } else {
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
+
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let start = positions[i];
+            let end = if i + 1 < positions.len() {
+                positions[i + 1]
+            } else {
+                data.len()
+            };
+            slices.push(IoSlice::new(&data[start..end]));
+        }
+
+        if positions[0] > 0 {
+            slices.push(IoSlice::new(&data[..positions[0]]));
+        }
+
+        write_all_slices(out, &slices)?;
+    }
+
+    Ok(())
+}
+
+/// BufWriter fallback for tac_bytes when there are too many records for vectored I/O.
+fn tac_bytes_bufwriter(
+    data: &[u8],
+    separator: u8,
+    before: bool,
+    positions: &[usize],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut buf = io::BufWriter::with_capacity(4 * 1024 * 1024, out);
+
+    if !before {
+        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
+        if !has_trailing_sep {
+            let last_sep = *positions.last().unwrap();
+            buf.write_all(&data[last_sep + 1..])?;
+            buf.write_all(&[separator])?;
+        }
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let end = positions[i] + 1;
             let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
             buf.write_all(&data[start..end])?;
         }
     } else {
-        // Before mode: separator is BEFORE the record
-        // Write records in reverse
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
@@ -51,13 +141,10 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
             };
             buf.write_all(&data[start..end])?;
         }
-
-        // Leading content before first separator
         if positions[0] > 0 {
             buf.write_all(&data[..positions[0]])?;
         }
     }
-
     buf.flush()?;
     Ok(())
 }
@@ -87,19 +174,18 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
 
     if !before {
-        // Default: separator after record
         let last_end = positions.last().unwrap() + sep_len;
         let has_trailing_sep = last_end == data.len();
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
 
-        // Trailing chunk without separator — write without adding separator
+        // GNU tac appends separator to trailing content without one
         if !has_trailing_sep {
-            buf.write_all(&data[last_end..])?;
+            slices.push(IoSlice::new(&data[last_end..]));
+            slices.push(IoSlice::new(separator));
         }
 
-        // Records in reverse
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
@@ -109,10 +195,13 @@ pub fn tac_string_separator(
             } else {
                 positions[i - 1] + sep_len
             };
-            buf.write_all(&data[rec_start..sep_start + sep_len])?;
+            slices.push(IoSlice::new(&data[rec_start..sep_start + sep_len]));
         }
+
+        write_all_slices(out, &slices)?;
     } else {
-        // Before mode: separator before record
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
+
         let mut i = positions.len();
         while i > 0 {
             i -= 1;
@@ -122,15 +211,16 @@ pub fn tac_string_separator(
             } else {
                 data.len()
             };
-            buf.write_all(&data[start..end])?;
+            slices.push(IoSlice::new(&data[start..end]));
         }
 
         if positions[0] > 0 {
-            buf.write_all(&data[..positions[0]])?;
+            slices.push(IoSlice::new(&data[..positions[0]]));
         }
+
+        write_all_slices(out, &slices)?;
     }
 
-    buf.flush()?;
     Ok(())
 }
 
@@ -209,27 +299,30 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    let mut buf = io::BufWriter::with_capacity(1024 * 1024, out);
-
     if !before {
         let last_end = matches.last().unwrap().1;
         let has_trailing_sep = last_end == data.len();
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(matches.len() + 4);
 
-        // Trailing content after last separator — write without adding separator
+        // GNU tac appends the last separator match to close trailing content
         if !has_trailing_sep {
-            buf.write_all(&data[last_end..])?;
+            slices.push(IoSlice::new(&data[last_end..]));
+            let last_match = matches.last().unwrap();
+            slices.push(IoSlice::new(&data[last_match.0..last_match.1]));
         }
 
-        // Records in reverse: each record = text + separator
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
             let rec_start = if i == 0 { 0 } else { matches[i - 1].1 };
             let rec_end = matches[i].1;
-            buf.write_all(&data[rec_start..rec_end])?;
+            slices.push(IoSlice::new(&data[rec_start..rec_end]));
         }
+
+        write_all_slices(out, &slices)?;
     } else {
-        // Before mode: separator before record
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(matches.len() + 2);
+
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
@@ -239,14 +332,15 @@ pub fn tac_regex_separator(
             } else {
                 data.len()
             };
-            buf.write_all(&data[start..end])?;
+            slices.push(IoSlice::new(&data[start..end]));
         }
 
         if matches[0].0 > 0 {
-            buf.write_all(&data[..matches[0].0])?;
+            slices.push(IoSlice::new(&data[..matches[0].0]));
         }
+
+        write_all_slices(out, &slices)?;
     }
 
-    buf.flush()?;
     Ok(())
 }

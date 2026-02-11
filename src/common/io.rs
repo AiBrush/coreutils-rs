@@ -3,11 +3,7 @@ use std::io::{self, Read};
 use std::ops::Deref;
 use std::path::Path;
 
-use memmap2::Mmap;
-
-/// Threshold above which we use mmap instead of buffered read.
-/// mmap has overhead from page table setup; for small files buffered read wins.
-const MMAP_THRESHOLD: u64 = 64 * 1024; // 64KB
+use memmap2::{Mmap, MmapOptions};
 
 /// Holds file data — either zero-copy mmap or an owned Vec.
 /// Dereferences to `&[u8]` for transparent use.
@@ -27,21 +23,39 @@ impl Deref for FileData {
     }
 }
 
-/// Read a file with zero-copy mmap for large files, buffered read for small ones.
+/// Read a file with zero-copy mmap. Uses populate() for eager page table setup
+/// and MADV_HUGEPAGE for TLB efficiency on large files.
 pub fn read_file(path: &Path) -> io::Result<FileData> {
     let metadata = fs::metadata(path)?;
+    let len = metadata.len();
 
-    if metadata.len() >= MMAP_THRESHOLD {
+    if len > 0 && metadata.file_type().is_file() {
         let file = File::open(path)?;
         // SAFETY: Read-only mapping. File must not be truncated during use.
-        let mmap = unsafe { Mmap::map(&file)? };
-        #[cfg(target_os = "linux")]
-        {
-            let _ = mmap.advise(memmap2::Advice::Sequential);
+        match unsafe { MmapOptions::new().populate().map(&file) } {
+            Ok(mmap) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise(memmap2::Advice::Sequential);
+                    if len >= 2 * 1024 * 1024 {
+                        unsafe {
+                            libc::madvise(
+                                mmap.as_ptr() as *mut libc::c_void,
+                                mmap.len(),
+                                libc::MADV_HUGEPAGE,
+                            );
+                        }
+                    }
+                }
+                Ok(FileData::Mmap(mmap))
+            }
+            Err(_) => Ok(FileData::Owned(fs::read(path)?)),
         }
-        Ok(FileData::Mmap(mmap))
-    } else {
+    } else if len > 0 {
+        // Non-regular file (special files)
         Ok(FileData::Owned(fs::read(path)?))
+    } else {
+        Ok(FileData::Owned(Vec::new()))
     }
 }
 

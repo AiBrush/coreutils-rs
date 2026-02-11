@@ -2,9 +2,9 @@ use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::io::{self, BufRead, Write};
 
-/// Minimum file size for parallel processing (1MB).
-/// Below this, thread overhead outweighs the benefit.
-const PARALLEL_THRESHOLD: usize = 1024 * 1024;
+/// Minimum file size for parallel processing (512KB).
+/// Tuned for optimal throughput on multi-core systems.
+const PARALLEL_THRESHOLD: usize = 512 * 1024;
 
 /// Configuration for cut operations.
 pub struct CutConfig<'a> {

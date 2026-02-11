@@ -1,4 +1,8 @@
 use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
@@ -112,8 +116,15 @@ fn main() {
         cli.files.clone()
     };
 
+    // Raw fd stdout on Unix for zero-overhead writes
+    #[cfg(unix)]
+    let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+    #[cfg(unix)]
+    let mut out = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
+    #[cfg(not(unix))]
     let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    #[cfg(not(unix))]
+    let mut out = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
     let mut had_error = false;
 
     let cfg = cut::CutConfig {

@@ -1,4 +1,8 @@
 use std::io::{self, BufWriter, Write};
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 use std::process;
 
 use clap::Parser;
@@ -34,6 +38,13 @@ struct Cli {
     sets: Vec<String>,
 }
 
+/// Raw fd stdout for zero-overhead writes on Unix.
+#[cfg(unix)]
+#[inline]
+fn raw_stdout() -> ManuallyDrop<std::fs::File> {
+    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
+}
+
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
 /// Returns None if stdin is a pipe/terminal, or on non-unix platforms.
 #[cfg(unix)]
@@ -55,7 +66,8 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     // SAFETY: fd is valid, file is regular, size > 0
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap: Option<memmap2::Mmap> = unsafe { memmap2::Mmap::map(&file) }.ok();
+    let mmap: Option<memmap2::Mmap> =
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -65,6 +77,13 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
                 m.len(),
                 libc::MADV_SEQUENTIAL,
             );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
     }
     mmap
@@ -80,8 +99,15 @@ fn main() {
 
     let set1_str = &cli.sets[0];
 
-    // 4MB BufWriter for stdout — batches write syscalls
+    // Raw fd stdout on Unix with 4MB BufWriter for batching.
+    // Raw fd bypasses StdoutLock overhead; BufWriter handles small writes efficiently.
+    #[cfg(unix)]
+    let mut raw = raw_stdout();
+    #[cfg(unix)]
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
+    #[cfg(not(unix))]
     let stdout = io::stdout();
+    #[cfg(not(unix))]
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
 
     // Try to mmap stdin for zero-copy reads

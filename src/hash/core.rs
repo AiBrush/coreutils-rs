@@ -24,9 +24,6 @@ impl HashAlgorithm {
     }
 }
 
-/// Threshold above which we use mmap instead of buffered read.
-const MMAP_THRESHOLD: u64 = 64 * 1024;
-
 // ── Generic hash helpers ────────────────────────────────────────────
 
 fn hash_digest<D: Digest>(data: &[u8]) -> String {
@@ -35,7 +32,7 @@ fn hash_digest<D: Digest>(data: &[u8]) -> String {
 
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
     let mut hasher = D::new();
-    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer for better throughput
+    let mut buf = vec![0u8; 16 * 1024 * 1024]; // 16MB buffer — fewer syscalls
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -69,45 +66,89 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
     }
 }
 
-/// Hash a file by path using mmap for large files. Returns the hex digest.
+/// Hash a file by path using mmap for regular files. Returns the hex digest.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
     let is_regular = metadata.file_type().is_file();
 
-    // mmap fast path for regular files >= 64KB
-    if is_regular && len >= MMAP_THRESHOLD {
+    // mmap fast path for all regular files with data
+    if is_regular && len > 0 {
         let file = File::open(path)?;
-        match unsafe { MmapOptions::new().map(&file) } {
+        match unsafe {
+            MmapOptions::new()
+                .populate()  // Eagerly populate page tables — avoids page faults
+                .map(&file)
+        } {
             Ok(mmap) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise(memmap2::Advice::Sequential);
+                    // Request transparent huge pages for TLB efficiency on large files
+                    if len >= 2 * 1024 * 1024 {
+                        unsafe {
+                            libc::madvise(
+                                mmap.as_ptr() as *mut libc::c_void,
+                                mmap.len(),
+                                libc::MADV_HUGEPAGE,
+                            );
+                        }
+                    }
+                }
+                return Ok(hash_bytes(algo, &mmap));
+            }
+            Err(_) => {
+                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+                return hash_reader(algo, reader);
+            }
+        }
+    }
+
+    // Empty regular files
+    if is_regular {
+        return Ok(hash_bytes(algo, &[]));
+    }
+
+    // Fallback: buffered read (special files, pipes, etc.)
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+    hash_reader(algo, reader)
+}
+
+/// Hash stdin. Reads all data first, then hashes in one pass for optimal throughput.
+pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
+    // Try to mmap stdin if it's a regular file (shell redirect)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } == 0
+            && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+            && stat.st_size > 0
+        {
+            use std::os::unix::io::FromRawFd;
+            let file = unsafe { File::from_raw_fd(fd) };
+            let result = unsafe {
+                MmapOptions::new()
+                    .populate()
+                    .map(&file)
+            };
+            std::mem::forget(file); // Don't close stdin
+            if let Ok(mmap) = result {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
                 }
                 return Ok(hash_bytes(algo, &mmap));
             }
-            Err(_) => {
-                let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-                return hash_reader(algo, reader);
-            }
         }
     }
-
-    // Small regular files: read into memory directly
-    if is_regular && len > 0 {
-        let data = fs::read(path)?;
-        return Ok(hash_bytes(algo, &data));
-    }
-
-    // Fallback: buffered read (special files, empty files, etc.)
-    let file = File::open(path)?;
-    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    hash_reader(algo, reader)
-}
-
-/// Hash stdin. Returns the hex digest.
-pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
-    hash_reader(algo, io::stdin().lock())
+    // Fallback: read all then hash in one pass (avoids per-read update overhead)
+    let mut data = Vec::new();
+    io::stdin().lock().read_to_end(&mut data)?;
+    Ok(hash_bytes(algo, &data))
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.
@@ -150,7 +191,7 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
     let mut state = blake2b_simd::Params::new()
         .hash_length(output_bytes)
         .to_state();
-    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
+    let mut buf = vec![0u8; 16 * 1024 * 1024]; // 16MB buffer
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -167,30 +208,44 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
     let len = metadata.len();
     let is_regular = metadata.file_type().is_file();
 
-    if is_regular && len >= MMAP_THRESHOLD {
+    // mmap fast path for all regular files with data
+    if is_regular && len > 0 {
         let file = File::open(path)?;
-        match unsafe { MmapOptions::new().map(&file) } {
+        match unsafe {
+            MmapOptions::new()
+                .populate()
+                .map(&file)
+        } {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
+                    if len >= 2 * 1024 * 1024 {
+                        unsafe {
+                            libc::madvise(
+                                mmap.as_ptr() as *mut libc::c_void,
+                                mmap.len(),
+                                libc::MADV_HUGEPAGE,
+                            );
+                        }
+                    }
                 }
                 return Ok(blake2b_hash_data(&mmap, output_bytes));
             }
             Err(_) => {
-                let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
                 return blake2b_hash_reader(reader, output_bytes);
             }
         }
     }
 
-    if is_regular && len > 0 {
-        let data = fs::read(path)?;
-        return Ok(blake2b_hash_data(&data, output_bytes));
+    // Empty regular files
+    if is_regular {
+        return Ok(blake2b_hash_data(&[], output_bytes));
     }
 
     let file = File::open(path)?;
-    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
     blake2b_hash_reader(reader, output_bytes)
 }
 
@@ -457,14 +512,32 @@ pub fn parse_check_line_tag(line: &str) -> Option<(&str, &str, Option<usize>)> {
     Some((hash, filename, bits))
 }
 
-/// Fast hex encoding using lookup table.
-const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+/// Compile-time generated 2-byte hex pair lookup table.
+/// Each byte maps directly to its 2-char hex representation — single lookup per byte.
+const fn generate_hex_table() -> [[u8; 2]; 256] {
+    let hex = b"0123456789abcdef";
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = [hex[i >> 4], hex[i & 0xf]];
+        i += 1;
+    }
+    table
+}
 
+const HEX_TABLE: [[u8; 2]; 256] = generate_hex_table();
+
+/// Fast hex encoding using 2-byte pair lookup table — one lookup per input byte.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut hex = vec![0u8; bytes.len() * 2];
-    for (i, &b) in bytes.iter().enumerate() {
-        hex[i * 2] = HEX_CHARS[(b >> 4) as usize];
-        hex[i * 2 + 1] = HEX_CHARS[(b & 0x0f) as usize];
+    let mut i = 0;
+    for &b in bytes {
+        let pair = unsafe { *HEX_TABLE.get_unchecked(b as usize) };
+        unsafe {
+            *hex.get_unchecked_mut(i) = pair[0];
+            *hex.get_unchecked_mut(i + 1) = pair[1];
+        }
+        i += 2;
     }
     // SAFETY: All bytes are ASCII hex digits [0-9a-f]
     unsafe { String::from_utf8_unchecked(hex) }

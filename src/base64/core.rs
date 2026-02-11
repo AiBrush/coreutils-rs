@@ -4,11 +4,11 @@ use base64_simd::AsOut;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Streaming encode chunk: 4MB aligned to 3 bytes for maximum throughput.
-const STREAM_ENCODE_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
+/// Streaming encode chunk: 8MB aligned to 3 bytes for maximum throughput.
+const STREAM_ENCODE_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
-/// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
-const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
+/// Chunk size for no-wrap encoding: 8MB aligned to 3 bytes.
+const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -45,9 +45,9 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     let bytes_per_line = wrap_col * 3 / 4;
 
-    // Process ~4MB of input per chunk for maximum throughput.
+    // Process ~8MB of input per chunk for maximum throughput.
     // Aligned to bytes_per_line for clean line boundaries.
-    let lines_per_chunk = (4 * 1024 * 1024) / bytes_per_line;
+    let lines_per_chunk = (8 * 1024 * 1024) / bytes_per_line;
     let chunk_input = lines_per_chunk * bytes_per_line;
     let chunk_encoded_max = BASE64_ENGINE.encoded_length(chunk_input);
 
@@ -57,14 +57,47 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     let wrapped_max = (lines_per_chunk + 1) * (wrap_col + 1);
     let mut wrap_buf = vec![0u8; wrapped_max];
 
+    let line_out = wrap_col + 1; // bytes per output line (content + newline)
+
     for chunk in data.chunks(chunk_input) {
         let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
         let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
 
-        // Build wrapped output with direct slice copies (no Vec overhead).
+        // Build wrapped output with unrolled copies for common case.
         let mut rp = 0;
         let mut wp = 0;
 
+        // Unrolled: process 4 lines per iteration for better throughput
+        while rp + 4 * wrap_col <= encoded.len() {
+            unsafe {
+                let src = encoded.as_ptr().add(rp);
+                let dst = wrap_buf.as_mut_ptr().add(wp);
+
+                std::ptr::copy_nonoverlapping(src, dst, wrap_col);
+                *dst.add(wrap_col) = b'\n';
+
+                std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
+                *dst.add(line_out + wrap_col) = b'\n';
+
+                std::ptr::copy_nonoverlapping(
+                    src.add(2 * wrap_col),
+                    dst.add(2 * line_out),
+                    wrap_col,
+                );
+                *dst.add(2 * line_out + wrap_col) = b'\n';
+
+                std::ptr::copy_nonoverlapping(
+                    src.add(3 * wrap_col),
+                    dst.add(3 * line_out),
+                    wrap_col,
+                );
+                *dst.add(3 * line_out + wrap_col) = b'\n';
+            }
+            rp += 4 * wrap_col;
+            wp += 4 * line_out;
+        }
+
+        // Remaining full lines
         while rp + wrap_col <= encoded.len() {
             wrap_buf[wp..wp + wrap_col].copy_from_slice(&encoded[rp..rp + wrap_col]);
             wp += wrap_col;
@@ -73,6 +106,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             rp += wrap_col;
         }
 
+        // Partial last line
         if rp < encoded.len() {
             let remaining = encoded.len() - rp;
             wrap_buf[wp..wp + remaining].copy_from_slice(&encoded[rp..rp + remaining]);
@@ -81,7 +115,6 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             wp += 1;
         }
 
-        // Single write per chunk (BufWriter bypasses buffer for large writes).
         out.write_all(&wrap_buf[..wp])?;
     }
 
