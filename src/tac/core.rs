@@ -64,9 +64,11 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
         let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
 
+        // GNU tac appends separator to trailing content without one
         if !has_trailing_sep {
             let last_sep = *positions.last().unwrap();
             slices.push(IoSlice::new(&data[last_sep + 1..]));
+            slices.push(IoSlice::new(&sep_byte));
         }
 
         let mut i = positions.len();
@@ -118,6 +120,7 @@ fn tac_bytes_bufwriter(
         if !has_trailing_sep {
             let last_sep = *positions.last().unwrap();
             buf.write_all(&data[last_sep + 1..])?;
+            buf.write_all(&[separator])?;
         }
         let mut i = positions.len();
         while i > 0 {
@@ -177,8 +180,10 @@ pub fn tac_string_separator(
         let has_trailing_sep = last_end == data.len();
         let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
 
+        // GNU tac appends separator to trailing content without one
         if !has_trailing_sep {
             slices.push(IoSlice::new(&data[last_end..]));
+            slices.push(IoSlice::new(separator));
         }
 
         let mut i = positions.len();
@@ -254,8 +259,11 @@ pub fn tac_regex_separator(
         let has_trailing_sep = last_end == data.len();
         let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(matches.len() + 4);
 
+        // GNU tac appends the last separator match to close trailing content
         if !has_trailing_sep {
             slices.push(IoSlice::new(&data[last_end..]));
+            let last_match = matches.last().unwrap();
+            slices.push(IoSlice::new(&data[last_match.0..last_match.1]));
         }
 
         let mut i = matches.len();
