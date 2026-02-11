@@ -129,11 +129,11 @@ fn main() {
     };
 
     // -c is incompatible with -D/--all-repeated and --group
-    if cli.count {
-        if matches!(mode, OutputMode::AllRepeated(_) | OutputMode::Group(_)) {
-            eprintln!("funiq: printing all duplicated lines and repeat counts is meaningless");
-            process::exit(1);
-        }
+    if cli.count
+        && matches!(mode, OutputMode::AllRepeated(_) | OutputMode::Group(_))
+    {
+        eprintln!("funiq: printing all duplicated lines and repeat counts is meaningless");
+        process::exit(1);
     }
 
     let config = UniqConfig {

@@ -133,18 +133,20 @@ fn main() {
     });
 
     // Build global options
-    let mut global_opts = KeyOpts::default();
-    global_opts.ignore_leading_blanks = cli.ignore_leading_blanks;
-    global_opts.dictionary_order = cli.dictionary_order;
-    global_opts.ignore_case = cli.ignore_case;
-    global_opts.general_numeric = cli.general_numeric;
-    global_opts.human_numeric = cli.human_numeric;
-    global_opts.ignore_nonprinting = cli.ignore_nonprinting;
-    global_opts.month = cli.month_sort;
-    global_opts.numeric = cli.numeric_sort;
-    global_opts.random = cli.random_sort;
-    global_opts.version = cli.version_sort;
-    global_opts.reverse = cli.reverse;
+    let global_opts = KeyOpts {
+        ignore_leading_blanks: cli.ignore_leading_blanks,
+        dictionary_order: cli.dictionary_order,
+        ignore_case: cli.ignore_case,
+        general_numeric: cli.general_numeric,
+        human_numeric: cli.human_numeric,
+        ignore_nonprinting: cli.ignore_nonprinting,
+        month: cli.month_sort,
+        numeric: cli.numeric_sort,
+        random: cli.random_sort,
+        version: cli.version_sort,
+        reverse: cli.reverse,
+        ..KeyOpts::default()
+    };
 
     // Determine check mode
     let check = if cli.check_quiet {
