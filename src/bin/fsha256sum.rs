@@ -449,5 +449,11 @@ fn check_one(
         }
     }
 
-    (ok_count, mismatch_count, format_errors, read_errors, ignored_missing)
+    (
+        ok_count,
+        mismatch_count,
+        format_errors,
+        read_errors,
+        ignored_missing,
+    )
 }

@@ -158,16 +158,10 @@ fn main() {
 
                     // GNU compat: when --ignore-missing is used and no file was verified
                     // for this checkfile, print warning and set error
-                    if cli.ignore_missing
-                        && r.ok == 0
-                        && r.mismatches == 0
-                        && r.ignored_missing > 0
+                    if cli.ignore_missing && r.ok == 0 && r.mismatches == 0 && r.ignored_missing > 0
                     {
                         let _ = out.flush();
-                        eprintln!(
-                            "{}: {}: no file was verified",
-                            TOOL_NAME, display_name
-                        );
+                        eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
                         had_error = true;
                     }
                 }
