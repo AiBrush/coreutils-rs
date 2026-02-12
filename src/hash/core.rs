@@ -1,13 +1,12 @@
 use std::cell::RefCell;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use md5::Md5;
-use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
 
 /// Supported hash algorithms.
@@ -34,27 +33,41 @@ fn hash_digest<D: Digest>(data: &[u8]) -> String {
     hex_encode(&D::digest(data))
 }
 
+/// Streaming hash using thread-local 4MB buffer for optimal L3 cache behavior.
+/// Avoids per-call 16MB allocation and keeps working set cache-resident.
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
-    let mut hasher = D::new();
-    let mut buf = vec![0u8; 16 * 1024 * 1024]; // 16MB buffer — fewer syscalls
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut hasher = D::new();
+        loop {
+            let n = reader.read(&mut *buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_encode(&hasher.finalize()))
+        Ok(hex_encode(&hasher.finalize()))
+    })
 }
 
 // ── Public hashing API ──────────────────────────────────────────────
 
-/// Chunk size for cache-friendly hashing of large mmap'd data.
-/// 4MB fits in L3 cache, reducing TLB misses and improving memory bus
-/// utilization on large files (100MB+). Without chunking, single-shot
-/// hashing touches all pages before any computation, causing poor
-/// cache behavior.
-const HASH_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Buffer size for streaming hash I/O.
+/// 4MB fits in L3 cache for optimal throughput while minimizing syscall count.
+/// With fadvise(SEQUENTIAL), the kernel prefetches ahead of our reads.
+const HASH_READ_BUF: usize = 4 * 1024 * 1024;
+
+/// Threshold below which read() into thread-local buffer + single-shot hash
+/// is faster than streaming. Avoids per-chunk hasher.update() overhead.
+const MMAP_THRESHOLD: u64 = 1024 * 1024; // 1MB
+
+// Thread-local reusable buffers avoid per-call allocation overhead.
+// READ_BUF: for small files (<1MB) — read entire file, single-shot hash.
+// STREAM_BUF: for large files & pipes — streaming read + incremental hash.
+thread_local! {
+    static READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(MMAP_THRESHOLD as usize));
+    static STREAM_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; HASH_READ_BUF]);
+}
 
 /// Compute hash of a byte slice directly (zero-copy fast path).
 pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
@@ -68,52 +81,6 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     }
 }
 
-/// Chunked hash for cache-friendly processing of large mmap'd data.
-/// Feeds HASH_CHUNK_SIZE chunks to keep working set in L3 cache.
-/// For small data (<= HASH_CHUNK_SIZE), delegates to single-shot hash_bytes.
-fn hash_bytes_chunked(algo: HashAlgorithm, data: &[u8]) -> String {
-    if data.len() <= HASH_CHUNK_SIZE {
-        return hash_bytes(algo, data);
-    }
-    match algo {
-        HashAlgorithm::Sha256 => {
-            let mut hasher = Sha256::new();
-            for chunk in data.chunks(HASH_CHUNK_SIZE) {
-                hasher.update(chunk);
-            }
-            hex_encode(&hasher.finalize())
-        }
-        HashAlgorithm::Md5 => {
-            let mut hasher = Md5::new();
-            for chunk in data.chunks(HASH_CHUNK_SIZE) {
-                hasher.update(chunk);
-            }
-            hex_encode(&hasher.finalize())
-        }
-        HashAlgorithm::Blake2b => {
-            let mut state = blake2b_simd::State::new();
-            for chunk in data.chunks(HASH_CHUNK_SIZE) {
-                state.update(chunk);
-            }
-            hex_encode(state.finalize().as_bytes())
-        }
-    }
-}
-
-/// Chunked BLAKE2b hash with variable output length for large mmap'd data.
-fn blake2b_hash_data_chunked(data: &[u8], output_bytes: usize) -> String {
-    if data.len() <= HASH_CHUNK_SIZE {
-        return blake2b_hash_data(data, output_bytes);
-    }
-    let mut state = blake2b_simd::Params::new()
-        .hash_length(output_bytes)
-        .to_state();
-    for chunk in data.chunks(HASH_CHUNK_SIZE) {
-        state.update(chunk);
-    }
-    hex_encode(state.finalize().as_bytes())
-}
-
 /// Compute hash of data from a reader, returning hex string.
 pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String> {
     match algo {
@@ -121,19 +88,6 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
         HashAlgorithm::Md5 => hash_reader_impl::<Md5>(reader),
         HashAlgorithm::Blake2b => blake2b_hash_reader(reader, 64),
     }
-}
-
-/// Threshold below which read() is faster than mmap() due to mmap setup overhead.
-/// mmap creates page table entries (one per 4KB page), issues madvise syscalls,
-/// and requires munmap cleanup. For files under 1MB, the total mmap overhead
-/// (~50-200μs) is significant relative to hash time (~500μs for 1MB at 2GB/s).
-const MMAP_THRESHOLD: u64 = 1024 * 1024; // 1MB
-
-// Thread-local reusable buffer for small file reads.
-// Avoids per-file heap allocation when processing many small files sequentially or in parallel.
-// Each rayon worker thread gets its own buffer automatically.
-thread_local! {
-    static READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(MMAP_THRESHOLD as usize));
 }
 
 /// Track whether O_NOATIME is supported to avoid repeated failed open() attempts.
@@ -168,10 +122,27 @@ fn open_noatime(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// Hint the kernel for sequential read access. Non-blocking.
+#[cfg(target_os = "linux")]
+#[inline]
+fn fadvise_sequential(file: &File, len: u64) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, len as i64, libc::POSIX_FADV_SEQUENTIAL);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn fadvise_sequential(_file: &File, _len: u64) {}
+
 /// Hash a file by path. Single open + fstat to minimize syscalls.
-/// Uses read() for small files, mmap for large files.
+/// Uses read() for small files, streaming read+hash for large files.
+/// Replaced mmap with read()+fadvise for better cache behavior:
+/// read() keeps data hot in L2/L3 cache, while mmap suffers page table
+/// and TLB overhead for sequential single-pass workloads.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
-    // Single open — reuse fd for fstat + read/mmap (saves separate stat + open)
+    // Single open — reuse fd for fstat + read (saves separate stat + open)
     let file = open_noatime(path)?;
     let metadata = file.metadata()?; // fstat on existing fd, cheaper than stat(path)
     let len = metadata.len();
@@ -194,82 +165,36 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
             });
         }
 
-        // Large files: mmap the already-open fd for zero-copy
-        return mmap_and_hash(algo, &file);
+        // Large files: streaming read with kernel readahead hint.
+        // fadvise(SEQUENTIAL) enables aggressive readahead (2x default).
+        fadvise_sequential(&file, len);
+        return hash_reader(algo, file);
     }
 
-    // Fallback: buffered read (special files, pipes, etc.) — fd already open
-    let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-    hash_reader(algo, reader)
+    // Fallback: streaming read (special files, pipes, etc.) — fd already open
+    hash_reader(algo, file)
 }
 
-/// Mmap a file and hash it. Shared by hash_file and blake2b_hash_file.
-/// With chunked hashing, MADV_SEQUENTIAL is sufficient — the kernel
-/// prefetches ahead of our sequential 4MB chunk access pattern.
-fn mmap_and_hash(algo: HashAlgorithm, file: &File) -> io::Result<String> {
-    match unsafe { MmapOptions::new().map(file) } {
-        Ok(mmap) => {
-            #[cfg(target_os = "linux")]
-            {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-            }
-            Ok(hash_bytes_chunked(algo, &mmap))
-        }
-        Err(_) => {
-            // mmap failed — fall back to buffered read from the same fd
-            let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-            hash_reader(algo, reader)
-        }
-    }
-}
-
-/// Mmap a file and hash with BLAKE2b. Shared helper for blake2b_hash_file.
-fn mmap_and_hash_blake2b(file: &File, output_bytes: usize) -> io::Result<String> {
-    match unsafe { MmapOptions::new().map(file) } {
-        Ok(mmap) => {
-            #[cfg(target_os = "linux")]
-            {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-            }
-            Ok(blake2b_hash_data_chunked(&mmap, output_bytes))
-        }
-        Err(_) => {
-            let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-            blake2b_hash_reader(reader, output_bytes)
-        }
-    }
-}
-
-/// Hash stdin. Reads all data first, then hashes in one pass for optimal throughput.
+/// Hash stdin. Uses fadvise for file redirects, streaming for pipes.
 pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
-    // Try to mmap stdin if it's a regular file (shell redirect)
+    let stdin = io::stdin();
+    // Hint kernel for sequential access if stdin is a regular file (redirect)
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let stdin = io::stdin();
         let fd = stdin.as_raw_fd();
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut stat) } == 0
             && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
             && stat.st_size > 0
         {
-            use std::os::unix::io::FromRawFd;
-            let file = unsafe { File::from_raw_fd(fd) };
-            let result = unsafe { MmapOptions::new().map(&file) };
-            std::mem::forget(file); // Don't close stdin
-            if let Ok(mmap) = result {
-                #[cfg(target_os = "linux")]
-                {
-                    let _ = mmap.advise(memmap2::Advice::Sequential);
-                }
-                return Ok(hash_bytes_chunked(algo, &mmap));
+            unsafe {
+                libc::posix_fadvise(fd, 0, stat.st_size, libc::POSIX_FADV_SEQUENTIAL);
             }
         }
     }
-    // Fallback: read all then hash in one pass (avoids per-read update overhead)
-    let mut data = Vec::new();
-    io::stdin().lock().read_to_end(&mut data)?;
-    Ok(hash_bytes(algo, &data))
+    // Streaming hash — works for both pipe and file-redirect stdin
+    hash_reader(algo, stdin.lock())
 }
 
 /// Estimate total file size for parallel/sequential decision.
@@ -343,25 +268,28 @@ pub fn blake2b_hash_data(data: &[u8], output_bytes: usize) -> String {
 }
 
 /// Hash a reader with BLAKE2b variable output length.
+/// Uses thread-local 4MB buffer for cache-friendly streaming.
 pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::Result<String> {
-    let mut state = blake2b_simd::Params::new()
-        .hash_length(output_bytes)
-        .to_state();
-    let mut buf = vec![0u8; 16 * 1024 * 1024]; // 16MB buffer
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut state = blake2b_simd::Params::new()
+            .hash_length(output_bytes)
+            .to_state();
+        loop {
+            let n = reader.read(&mut *buf)?;
+            if n == 0 {
+                break;
+            }
+            state.update(&buf[..n]);
         }
-        state.update(&buf[..n]);
-    }
-    Ok(hex_encode(state.finalize().as_bytes()))
+        Ok(hex_encode(state.finalize().as_bytes()))
+    })
 }
 
 /// Hash a file with BLAKE2b variable output length. Single open + fstat.
-/// Uses read() for small files, mmap for large.
+/// Uses read() for small files, streaming read+hash for large.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
-    // Single open — reuse fd for fstat + read/mmap
+    // Single open — reuse fd for fstat + read
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
     let len = metadata.len();
@@ -383,46 +311,34 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
             });
         }
 
-        // Large files: mmap the already-open fd for zero-copy
-        return mmap_and_hash_blake2b(&file, output_bytes);
+        // Large files: streaming read with kernel readahead hint
+        fadvise_sequential(&file, len);
+        return blake2b_hash_reader(file, output_bytes);
     }
 
-    // Fallback: buffered read — fd already open
-    let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-    blake2b_hash_reader(reader, output_bytes)
+    // Fallback: streaming read — fd already open
+    blake2b_hash_reader(file, output_bytes)
 }
 
 /// Hash stdin with BLAKE2b variable output length.
-/// Tries mmap if stdin is a regular file (shell redirect), falls back to read.
+/// Tries fadvise if stdin is a regular file (shell redirect), then streams.
 pub fn blake2b_hash_stdin(output_bytes: usize) -> io::Result<String> {
-    // Try to mmap stdin if it's a regular file (shell redirect)
+    let stdin = io::stdin();
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let stdin = io::stdin();
         let fd = stdin.as_raw_fd();
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut stat) } == 0
             && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
             && stat.st_size > 0
         {
-            use std::os::unix::io::FromRawFd;
-            let file = unsafe { File::from_raw_fd(fd) };
-            let result = unsafe { MmapOptions::new().map(&file) };
-            std::mem::forget(file); // Don't close stdin
-            if let Ok(mmap) = result {
-                #[cfg(target_os = "linux")]
-                {
-                    let _ = mmap.advise(memmap2::Advice::Sequential);
-                }
-                return Ok(blake2b_hash_data_chunked(&mmap, output_bytes));
+            unsafe {
+                libc::posix_fadvise(fd, 0, stat.st_size, libc::POSIX_FADV_SEQUENTIAL);
             }
         }
     }
-    // Fallback: read all then hash in one pass
-    let mut data = Vec::new();
-    io::stdin().lock().read_to_end(&mut data)?;
-    Ok(blake2b_hash_data(&data, output_bytes))
+    blake2b_hash_reader(stdin.lock(), output_bytes)
 }
 
 /// Print hash result in GNU format: "hash  filename\n"

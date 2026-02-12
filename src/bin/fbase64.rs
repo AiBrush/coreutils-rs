@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -119,25 +119,22 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
-    // Try mmap for zero-copy stdin when redirected from a file
-    #[cfg(unix)]
-    if let Some(mmap) = try_mmap_stdin() {
-        if cli.decode {
-            // For decode from mmap: need owned copy for in-place strip
-            let mut data = mmap.to_vec();
-            return b64::decode_owned(&mut data, cli.ignore_garbage, out);
-        } else {
-            return b64::encode_to_writer(&mmap, cli.wrap, out);
-        }
+    if cli.decode {
+        // For decode: read directly to Vec — avoids mmap setup + copy overhead.
+        // mmap would require .to_vec() anyway since in-place decode needs owned data.
+        let mut data = Vec::new();
+        io::stdin().lock().read_to_end(&mut data)?;
+        return b64::decode_owned(&mut data, cli.ignore_garbage, out);
     }
 
-    if cli.decode {
-        let mut stdin = io::stdin().lock();
-        b64::decode_stream(&mut stdin, cli.ignore_garbage, out)
-    } else {
-        let mut stdin = io::stdin().lock();
-        b64::encode_stream(&mut stdin, cli.wrap, out)
+    // For encode: try mmap for zero-copy stdin when redirected from a file
+    #[cfg(unix)]
+    if let Some(mmap) = try_mmap_stdin() {
+        return b64::encode_to_writer(&mmap, cli.wrap, out);
     }
+
+    let mut stdin = io::stdin().lock();
+    b64::encode_stream(&mut stdin, cli.wrap, out)
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
