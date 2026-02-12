@@ -325,8 +325,10 @@ fn run_check_mode(
 
         // GNU compat: when --ignore-missing is used and no file was verified
         if cli.ignore_missing && file_ok == 0 && file_fail == 0 && file_ignored > 0 {
-            let _ = out.flush();
-            eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
+            if !cli.status {
+                let _ = out.flush();
+                eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
+            }
             *had_error = true;
         }
     }

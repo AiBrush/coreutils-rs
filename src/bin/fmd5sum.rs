@@ -171,8 +171,10 @@ fn main() {
                     // for this checkfile, print warning and set error
                     if cli.ignore_missing && r.ok == 0 && r.mismatches == 0 && r.ignored_missing > 0
                     {
-                        let _ = out.flush();
-                        eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
+                        if !cli.status {
+                            let _ = out.flush();
+                            eprintln!("{}: {}: no file was verified", TOOL_NAME, display_name);
+                        }
                         had_error = true;
                     }
                 }
