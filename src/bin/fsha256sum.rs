@@ -236,15 +236,15 @@ fn write_output(out: &mut impl Write, cli: &Cli, algo: HashAlgorithm, hash: &str
     } else if cli.zero {
         // -z mode: no escaping, NUL terminator
         // GNU defaults to binary mode on Linux; only -t (text) uses space
-        let mode_char = if !cli.text { '*' } else { ' ' };
+        let mode_char = if cli.binary || (!cli.text && cfg!(windows)) { '*' } else { ' ' };
         let _ = write!(out, "{} {}{}\0", hash, mode_char, filename);
     } else if needs_escape(filename) {
         // Escape filename and prefix line with backslash
         let escaped = escape_filename(filename);
-        let mode_char = if !cli.text { '*' } else { ' ' };
+        let mode_char = if cli.binary || (!cli.text && cfg!(windows)) { '*' } else { ' ' };
         let _ = writeln!(out, "\\{} {}{}", hash, mode_char, escaped);
     } else {
-        let mode_char = if !cli.text { '*' } else { ' ' };
+        let mode_char = if cli.binary || (!cli.text && cfg!(windows)) { '*' } else { ' ' };
         let _ = writeln!(out, "{} {}{}", hash, mode_char, filename);
     }
 }

@@ -250,13 +250,13 @@ fn write_output(
         }
     } else if cli.zero {
         // GNU defaults to binary mode on Linux; only -t (text) uses space
-        let _ = hash::print_hash_zero(out, hash_hex, filename, !cli.text);
+        let _ = hash::print_hash_zero(out, hash_hex, filename, cli.binary || (!cli.text && cfg!(windows)));
     } else if needs_escape(filename) {
         let escaped = escape_filename(filename);
-        let mode_char = if !cli.text { '*' } else { ' ' };
+        let mode_char = if cli.binary || (!cli.text && cfg!(windows)) { '*' } else { ' ' };
         let _ = writeln!(out, "\\{} {}{}", hash_hex, mode_char, escaped);
     } else {
-        let _ = hash::print_hash(out, hash_hex, filename, !cli.text);
+        let _ = hash::print_hash(out, hash_hex, filename, cli.binary || (!cli.text && cfg!(windows)));
     }
 }
 
