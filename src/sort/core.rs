@@ -271,8 +271,12 @@ fn read_all_input(
 
     // Single file (non-stdin): use mmap directly for zero-copy
     let buffer = if inputs.len() == 1 && inputs[0] != "-" {
-        let file = File::open(&inputs[0])
-            .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", &inputs[0], io_error_msg(&e))))?;
+        let file = File::open(&inputs[0]).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("open failed: {}: {}", &inputs[0], io_error_msg(&e)),
+            )
+        })?;
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
             let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
@@ -295,7 +299,10 @@ fn read_all_input(
                 io::stdin().lock().read_to_end(&mut data)?;
             } else {
                 let mut file = File::open(input).map_err(|e| {
-                    io::Error::new(e.kind(), format!("open failed: {}: {}", input, io_error_msg(&e)))
+                    io::Error::new(
+                        e.kind(),
+                        format!("open failed: {}: {}", input, io_error_msg(&e)),
+                    )
                 })?;
                 file.read_to_end(&mut data)?;
             }
@@ -347,8 +354,12 @@ pub fn read_lines(inputs: &[String], zero_terminated: bool) -> io::Result<Vec<Ve
             let reader = BufReader::new(stdin.lock());
             read_delimited_lines(reader, delimiter, &mut lines)?;
         } else {
-            let file = File::open(input)
-                .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", input, io_error_msg(&e))))?;
+            let file = File::open(input).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("open failed: {}: {}", input, io_error_msg(&e)),
+                )
+            })?;
             let reader = BufReader::with_capacity(256 * 1024, file);
             read_delimited_lines(reader, delimiter, &mut lines)?;
         }

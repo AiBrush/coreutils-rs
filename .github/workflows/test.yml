@@ -33,7 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.os }}
+          key: test-v2-${{ matrix.os }}
       - name: Build binaries
         run: cargo build --release
       - name: Run tests
@@ -54,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bench
+          key: bench-v2
       - name: Run benchmarks
         run: cargo bench --bench wc_benchmark 2>&1 | tee bench_output.txt
       - name: Upload results

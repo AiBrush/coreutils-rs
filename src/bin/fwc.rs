@@ -599,7 +599,11 @@ fn read_files0_from(path: &str) -> Vec<String> {
         read_stdin().unwrap_or_default()
     } else {
         std::fs::read(path).unwrap_or_else(|e| {
-            eprintln!("wc: cannot open '{}' for reading: {}", path, io_error_msg(&e));
+            eprintln!(
+                "wc: cannot open '{}' for reading: {}",
+                path,
+                io_error_msg(&e)
+            );
             process::exit(1);
         })
     };
