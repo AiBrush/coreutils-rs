@@ -63,7 +63,8 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // tac reads backward — use MADV_RANDOM instead of SEQUENTIAL
+        // tac now uses forward SIMD scan (memchr_iter) then reverse IoSlice output,
+        // so MADV_SEQUENTIAL is optimal for the forward scan phase.
         #[cfg(unix)]
         {
             if let FileData::Mmap(ref mmap) = data {
@@ -71,7 +72,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                     libc::madvise(
                         mmap.as_ptr() as *mut libc::c_void,
                         mmap.len(),
-                        libc::MADV_RANDOM,
+                        libc::MADV_SEQUENTIAL,
                     );
                 }
             }

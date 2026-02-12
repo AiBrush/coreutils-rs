@@ -23,13 +23,23 @@ impl Deref for FileData {
     }
 }
 
-/// Read a file with zero-copy mmap. Uses populate() for eager page table setup
-/// and MADV_HUGEPAGE for TLB efficiency on large files.
+/// Threshold below which we use read() instead of mmap.
+/// For small files, read() is faster since mmap has setup/teardown overhead
+/// (page table creation, TLB flush on munmap) that exceeds the zero-copy benefit.
+const MMAP_THRESHOLD: u64 = 256 * 1024;
+
+/// Read a file with zero-copy mmap for large files or read() for small files.
+/// Uses populate() for eager page table setup and MADV_HUGEPAGE for TLB efficiency.
 pub fn read_file(path: &Path) -> io::Result<FileData> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
 
     if len > 0 && metadata.file_type().is_file() {
+        // Small files: read() is faster than mmap (avoids page table overhead)
+        if len < MMAP_THRESHOLD {
+            return Ok(FileData::Owned(fs::read(path)?));
+        }
+
         let file = File::open(path)?;
         // SAFETY: Read-only mapping. File must not be truncated during use.
         match unsafe { MmapOptions::new().populate().map(&file) } {
