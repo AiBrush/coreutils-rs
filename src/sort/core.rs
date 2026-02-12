@@ -1078,12 +1078,77 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         });
 
         write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
+    } else if !config.keys.is_empty() {
+        // GENERAL PATH: Key-based sort with pre-selected comparators (fallback for unusual configs)
+        let stable = config.stable;
+        let random_seed = config.random_seed;
+        let keys = &config.keys;
+        let global_opts = &config.global_opts;
+
+        let comparators: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let opts = if key.opts.has_any_option() {
+                    &key.opts
+                } else {
+                    global_opts
+                };
+                select_comparator(opts, random_seed)
+            })
+            .collect();
+
+        do_sort(&mut indices, stable, |&a, &b| {
+            let la = &data[offsets[a].0..offsets[a].1];
+            let lb = &data[offsets[b].0..offsets[b].1];
+
+            for (ki, &(cmp_fn, needs_blank, needs_reverse)) in comparators.iter().enumerate() {
+                let ka = extract_key(la, &keys[ki], config.separator);
+                let kb = extract_key(lb, &keys[ki], config.separator);
+                let ka = if needs_blank {
+                    skip_leading_blanks(ka)
+                } else {
+                    ka
+                };
+                let kb = if needs_blank {
+                    skip_leading_blanks(kb)
+                } else {
+                    kb
+                };
+                let result = cmp_fn(ka, kb);
+                let result = if needs_reverse {
+                    result.reverse()
+                } else {
+                    result
+                };
+                if result != Ordering::Equal {
+                    return result;
+                }
+            }
+            if !stable { la.cmp(lb) } else { Ordering::Equal }
+        });
+
+        write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
     } else {
-        // GENERAL PATH: Index-based sort with full comparison (fallback)
-        do_sort(&mut indices, config.stable, |&a, &b| {
-            let (sa, ea) = offsets[a];
-            let (sb, eb) = offsets[b];
-            compare_lines(&data[sa..ea], &data[sb..eb], config)
+        // GENERAL PATH: No keys, non-lex sort with pre-selected comparator
+        let (cmp_fn, needs_blank, needs_reverse) =
+            select_comparator(&config.global_opts, config.random_seed);
+        let stable = config.stable;
+
+        do_sort(&mut indices, stable, |&a, &b| {
+            let la = &data[offsets[a].0..offsets[a].1];
+            let lb = &data[offsets[b].0..offsets[b].1];
+            let la = if needs_blank {
+                skip_leading_blanks(la)
+            } else {
+                la
+            };
+            let lb = if needs_blank {
+                skip_leading_blanks(lb)
+            } else {
+                lb
+            };
+            let ord = cmp_fn(la, lb);
+            if needs_reverse { ord.reverse() } else { ord }
         });
 
         write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
