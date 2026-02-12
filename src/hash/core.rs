@@ -33,8 +33,8 @@ fn hash_digest<D: Digest>(data: &[u8]) -> String {
     hex_encode(&D::digest(data))
 }
 
-/// Streaming hash using thread-local 4MB buffer for optimal L3 cache behavior.
-/// Avoids per-call 16MB allocation and keeps working set cache-resident.
+/// Streaming hash using thread-local 1MB buffer for optimal L2 cache behavior.
+/// 1MB fits in L2 cache on most CPUs, keeping data hot during hash update.
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -53,19 +53,20 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 // ── Public hashing API ──────────────────────────────────────────────
 
 /// Buffer size for streaming hash I/O.
-/// 4MB fits in L3 cache for optimal throughput while minimizing syscall count.
-/// With fadvise(SEQUENTIAL), the kernel prefetches ahead of our reads.
-const HASH_READ_BUF: usize = 4 * 1024 * 1024;
+/// 1MB balances syscall count vs L2 cache locality. Smaller buffers keep
+/// data hot in L2 (256KB-1MB) during hash update, while fadvise(SEQUENTIAL)
+/// ensures the kernel pre-fetches the next chunk asynchronously.
+const HASH_READ_BUF: usize = 1024 * 1024;
 
-/// Threshold below which read() into thread-local buffer + single-shot hash
-/// is faster than streaming. Avoids per-chunk hasher.update() overhead.
-const MMAP_THRESHOLD: u64 = 1024 * 1024; // 1MB
+/// Threshold below which we read the entire file + single-shot hash.
+/// Files up to 8MB fit comfortably in memory and benefit from contiguous
+/// data access — the CPU hardware prefetcher works best on large contiguous
+/// buffers. Also avoids per-chunk hasher.update() call overhead.
+const SINGLE_SHOT_THRESHOLD: u64 = 8 * 1024 * 1024;
 
-// Thread-local reusable buffers avoid per-call allocation overhead.
-// READ_BUF: for small files (<1MB) — read entire file, single-shot hash.
-// STREAM_BUF: for large files & pipes — streaming read + incremental hash.
+// Thread-local reusable buffer for streaming hash I/O.
+// Allocated once per thread, reused across all hash_reader calls.
 thread_local! {
-    static READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(MMAP_THRESHOLD as usize));
     static STREAM_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; HASH_READ_BUF]);
 }
 
@@ -153,19 +154,19 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     }
 
     if is_regular && len > 0 {
-        // Small files: read into thread-local buffer (zero allocation after first call)
-        if len < MMAP_THRESHOLD {
-            return READ_BUF.with(|cell| {
-                let mut buf = cell.borrow_mut();
-                buf.clear();
-                // Reserve is a no-op if capacity >= len (which it is after first call)
-                buf.reserve(len as usize);
-                Read::read_to_end(&mut &file, &mut buf)?;
-                Ok(hash_bytes(algo, &buf))
-            });
+        // Files up to 8MB: read entirely + single-shot hash.
+        // Contiguous data enables optimal CPU prefetching and avoids
+        // per-chunk hasher.update() overhead. Vec::with_capacity uses
+        // mmap(MAP_ANONYMOUS) for large allocs — kernel zero-page COW
+        // means pages are only physically allocated on first write (by read).
+        if len <= SINGLE_SHOT_THRESHOLD {
+            fadvise_sequential(&file, len);
+            let mut buf = Vec::with_capacity(len as usize);
+            Read::read_to_end(&mut &file, &mut buf)?;
+            return Ok(hash_bytes(algo, &buf));
         }
 
-        // Large files: streaming read with kernel readahead hint.
+        // Large files (>8MB): streaming read with kernel readahead hint.
         // fadvise(SEQUENTIAL) enables aggressive readahead (2x default).
         fadvise_sequential(&file, len);
         return hash_reader(algo, file);
@@ -268,7 +269,7 @@ pub fn blake2b_hash_data(data: &[u8], output_bytes: usize) -> String {
 }
 
 /// Hash a reader with BLAKE2b variable output length.
-/// Uses thread-local 4MB buffer for cache-friendly streaming.
+/// Uses thread-local 1MB buffer for cache-friendly streaming.
 pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -300,18 +301,15 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
     }
 
     if is_regular && len > 0 {
-        // Small files: read into thread-local buffer (zero allocation after first call)
-        if len < MMAP_THRESHOLD {
-            return READ_BUF.with(|cell| {
-                let mut buf = cell.borrow_mut();
-                buf.clear();
-                buf.reserve(len as usize);
-                Read::read_to_end(&mut &file, &mut buf)?;
-                Ok(blake2b_hash_data(&buf, output_bytes))
-            });
+        // Files up to 8MB: read entirely + single-shot hash.
+        if len <= SINGLE_SHOT_THRESHOLD {
+            fadvise_sequential(&file, len);
+            let mut buf = Vec::with_capacity(len as usize);
+            Read::read_to_end(&mut &file, &mut buf)?;
+            return Ok(blake2b_hash_data(&buf, output_bytes));
         }
 
-        // Large files: streaming read with kernel readahead hint
+        // Large files (>8MB): streaming read with kernel readahead hint
         fadvise_sequential(&file, len);
         return blake2b_hash_reader(file, output_bytes);
     }
