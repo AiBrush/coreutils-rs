@@ -204,13 +204,62 @@ pub fn tac_string_separator(
 
     let sep_len = separator.len();
 
+    // Small data: contiguous buffer + single write (avoids IoSlice/writev overhead)
+    if data.len() < 2 * 1024 * 1024 {
+        let mut outbuf = vec![0u8; data.len()];
+        let mut wp = 0;
+
+        if !before {
+            let last_end = positions.last().unwrap() + sep_len;
+
+            if last_end < data.len() {
+                let trail = &data[last_end..];
+                outbuf[wp..wp + trail.len()].copy_from_slice(trail);
+                wp += trail.len();
+            }
+
+            let mut i = positions.len();
+            while i > 0 {
+                i -= 1;
+                let sep_start = positions[i];
+                let rec_start = if i == 0 {
+                    0
+                } else {
+                    positions[i - 1] + sep_len
+                };
+                let record = &data[rec_start..sep_start + sep_len];
+                outbuf[wp..wp + record.len()].copy_from_slice(record);
+                wp += record.len();
+            }
+        } else {
+            let mut i = positions.len();
+            while i > 0 {
+                i -= 1;
+                let start = positions[i];
+                let end = if i + 1 < positions.len() {
+                    positions[i + 1]
+                } else {
+                    data.len()
+                };
+                let record = &data[start..end];
+                outbuf[wp..wp + record.len()].copy_from_slice(record);
+                wp += record.len();
+            }
+            if positions[0] > 0 {
+                outbuf[wp..wp + positions[0]].copy_from_slice(&data[..positions[0]]);
+                wp += positions[0];
+            }
+        }
+        return out.write_all(&outbuf[..wp]);
+    }
+
+    // Large data: batched IoSlice/writev for zero-copy output
     let mut batch: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_BATCH);
 
     if !before {
         let last_end = positions.last().unwrap() + sep_len;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing content without separator — output as-is
         if !has_trailing_sep {
             batch.push(IoSlice::new(&data[last_end..]));
         }
