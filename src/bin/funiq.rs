@@ -180,15 +180,18 @@ fn main() {
         return;
     }
 
-    // Raw fd stdout on Unix for zero-overhead writes
+    // Raw fd stdout — process_uniq/process_uniq_bytes already wrap in BufWriter(16MB),
+    // so we pass the raw fd directly to avoid double-buffering overhead.
     #[cfg(unix)]
-    let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-    #[cfg(unix)]
-    let output = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
+    {
+        let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        run_uniq(&cli, &config, &mut *raw);
+    }
     #[cfg(not(unix))]
-    let output = BufWriter::with_capacity(4 * 1024 * 1024, io::stdout().lock());
-
-    run_uniq(&cli, &config, output);
+    {
+        let stdout = io::stdout();
+        run_uniq(&cli, &config, stdout.lock());
+    }
 }
 
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
@@ -264,7 +267,7 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
                 return;
             }
 
-            // Use mmap for files — MADV_SEQUENTIAL for async readahead
+            // Use mmap for files — MADV_SEQUENTIAL + WILLNEED + HUGEPAGE
             let mmap = match unsafe { MmapOptions::new().map(&file) } {
                 Ok(m) => {
                     #[cfg(target_os = "linux")]
@@ -276,6 +279,13 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
                                 m.len(),
                                 libc::MADV_WILLNEED,
                             );
+                            if m.len() >= 2 * 1024 * 1024 {
+                                libc::madvise(
+                                    m.as_ptr() as *mut libc::c_void,
+                                    m.len(),
+                                    libc::MADV_HUGEPAGE,
+                                );
+                            }
                         }
                     }
                     m

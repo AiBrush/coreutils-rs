@@ -145,7 +145,7 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
 
 /// Write a count-prefixed line in GNU uniq format.
 /// GNU format: "%7lu " — right-aligned in 7-char field, followed by space.
-/// Uses a single write_all by building the prefix in a stack buffer.
+/// Combines prefix + line + term into a single write for short lines (< 240 bytes).
 #[inline(always)]
 fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> io::Result<()> {
     // Build prefix "     N " in a stack buffer (max 21 bytes for u64 + spaces)
@@ -154,11 +154,20 @@ fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> 
     let width = digits.max(7); // minimum 7 chars
     let prefix_len = width + 1; // +1 for trailing space
     prefix[width] = b' ';
-    // Write prefix + line + term in as few calls as possible
-    out.write_all(&prefix[..prefix_len])?;
-    out.write_all(line)?;
-    out.write_all(&[term])?;
-    Ok(())
+
+    // Single write for short lines (common case) — avoids 3 separate BufWriter calls
+    let total = prefix_len + line.len() + 1;
+    if total <= 256 {
+        let mut buf = [0u8; 256];
+        buf[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+        buf[prefix_len..prefix_len + line.len()].copy_from_slice(line);
+        buf[prefix_len + line.len()] = term;
+        out.write_all(&buf[..total])
+    } else {
+        out.write_all(&prefix[..prefix_len])?;
+        out.write_all(line)?;
+        out.write_all(&[term])
+    }
 }
 
 /// Write u64 decimal right-aligned into prefix buffer.
