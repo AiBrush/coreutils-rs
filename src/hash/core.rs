@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use digest::Digest;
 use md5::Md5;
+use memmap2::MmapOptions;
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy)]
@@ -54,21 +55,13 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 
 // ── Public hashing API ──────────────────────────────────────────────
 
-/// Buffer size for streaming hash I/O.
-/// 2MB gives fewer syscalls while still fitting in L3 cache.
+/// Buffer size for streaming hash I/O (stdin/pipes only — regular files use mmap).
+/// 4MB gives fewer syscalls while still fitting in L3 cache.
 /// With fadvise(SEQUENTIAL) the kernel prefetches ahead, so the next
-/// 2MB is already in page cache by the time we finish hashing the current chunk.
-/// ring's SHA-NI processes at ~3-4 GB/s, so 2MB takes ~0.5ms — fast enough
-/// that I/O latency dominates and larger buffers just waste memory.
-const HASH_READ_BUF: usize = 2 * 1024 * 1024;
+/// chunk is already in page cache by the time we finish hashing the current one.
+const HASH_READ_BUF: usize = 4 * 1024 * 1024;
 
-/// Threshold below which we read the entire file + single-shot hash.
-/// Files up to 8MB fit comfortably in memory and benefit from contiguous
-/// data access — the CPU hardware prefetcher works best on large contiguous
-/// buffers. Also avoids per-chunk hasher.update() call overhead.
-const SINGLE_SHOT_THRESHOLD: u64 = 8 * 1024 * 1024;
-
-// Thread-local reusable buffer for streaming hash I/O.
+// Thread-local reusable buffer for streaming hash I/O (stdin/pipes only).
 // Allocated once per thread, reused across all hash_reader calls.
 thread_local! {
     static STREAM_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; HASH_READ_BUF]);
@@ -143,7 +136,7 @@ static NOATIME_SUPPORTED: AtomicBool = AtomicBool::new(true);
 fn open_noatime(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     if NOATIME_SUPPORTED.load(Ordering::Relaxed) {
-        match fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOATIME)
             .open(path)
@@ -164,27 +157,32 @@ fn open_noatime(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-/// Hint the kernel for sequential read access. Non-blocking.
+/// Advise kernel for optimal mmap access: sequential readahead + transparent huge pages.
+/// MADV_SEQUENTIAL enables aggressive readahead (2x default window).
+/// MADV_HUGEPAGE requests 2MB pages, reducing TLB misses by ~500x for large files
+/// (e.g., 100MB file: 50 TLB entries with 2MB pages vs 25,600 with 4KB pages).
 #[cfg(target_os = "linux")]
 #[inline]
-fn fadvise_sequential(file: &File, len: u64) {
-    use std::os::unix::io::AsRawFd;
+fn mmap_advise(mmap: &memmap2::Mmap) {
     unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, len as i64, libc::POSIX_FADV_SEQUENTIAL);
+        let ptr = mmap.as_ptr() as *mut libc::c_void;
+        let len = mmap.len();
+        libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 #[inline]
-fn fadvise_sequential(_file: &File, _len: u64) {}
+fn mmap_advise(_mmap: &memmap2::Mmap) {}
 
 /// Hash a file by path. Single open + fstat to minimize syscalls.
-/// Uses read() for small files, streaming read+hash for large files.
-/// Replaced mmap with read()+fadvise for better cache behavior:
-/// read() keeps data hot in L2/L3 cache, while mmap suffers page table
-/// and TLB overhead for sequential single-pass workloads.
+/// Uses zero-copy mmap for regular files: the hash function reads directly
+/// from the page cache without any kernel→user memcpy or read() syscalls.
+/// MAP_POPULATE prefaults all pages before hashing starts.
+/// MADV_HUGEPAGE uses 2MB pages to reduce TLB misses by ~500x.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
-    // Single open — reuse fd for fstat + read (saves separate stat + open)
+    // Single open — reuse fd for fstat + mmap (saves separate stat + open)
     let file = open_noatime(path)?;
     let metadata = file.metadata()?; // fstat on existing fd, cheaper than stat(path)
     let len = metadata.len();
@@ -195,22 +193,12 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     }
 
     if is_regular && len > 0 {
-        // Files up to 8MB: read entirely + single-shot hash.
-        // Contiguous data enables optimal CPU prefetching and avoids
-        // per-chunk hasher.update() overhead.
-        // Use read_full into exact-size buffer instead of read_to_end
-        // to avoid the grow-and-probe loop (saves 1-2 extra read() syscalls).
-        if len <= SINGLE_SHOT_THRESHOLD {
-            fadvise_sequential(&file, len);
-            let mut buf = vec![0u8; len as usize];
-            let n = read_full(&mut &file, &mut buf)?;
-            return Ok(hash_bytes(algo, &buf[..n]));
-        }
-
-        // Large files (>8MB): streaming read with kernel readahead hint.
-        // fadvise(SEQUENTIAL) enables aggressive readahead (2x default).
-        fadvise_sequential(&file, len);
-        return hash_reader(algo, file);
+        // Zero-copy mmap: hash function reads directly from page cache.
+        // No read() syscalls, no kernel→user memcpy.
+        // MAP_POPULATE prefaults all pages before hashing starts.
+        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        mmap_advise(&mmap);
+        return Ok(hash_bytes(algo, &mmap));
     }
 
     // Fallback: streaming read (special files, pipes, etc.) — fd already open
@@ -239,34 +227,13 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
     hash_reader(algo, stdin.lock())
 }
 
-/// Estimate total file size for parallel/sequential decision.
-/// Uses a quick heuristic: samples first file and extrapolates.
-/// Returns 0 if estimation fails.
-pub fn estimate_total_size(paths: &[&Path]) -> u64 {
-    if paths.is_empty() {
-        return 0;
-    }
-    // Sample first file to estimate
-    if let Ok(meta) = fs::metadata(paths[0]) {
-        meta.len().saturating_mul(paths.len() as u64)
-    } else {
-        0
-    }
-}
-
 /// Check if parallel hashing is worthwhile for the given file paths.
-/// Only uses rayon when files are individually large enough for the hash
-/// computation to dominate over rayon overhead (thread pool init + work stealing).
-/// For many small files (e.g., 100 × 100KB), sequential is much faster.
+/// Always parallelizes with 2+ files — rayon's thread pool is already initialized
+/// and work-stealing overhead is minimal (~1µs per file dispatch).
+/// With mmap, each thread independently maps and hashes its own file with no
+/// shared state, giving near-linear speedup with available cores.
 pub fn should_use_parallel(paths: &[&Path]) -> bool {
-    if paths.len() < 2 {
-        return false;
-    }
-    let total = estimate_total_size(paths);
-    let avg = total / paths.len() as u64;
-    // Only parallelize when average file size >= 1MB.
-    // Below this, rayon overhead exceeds the benefit of parallel hashing.
-    avg >= 1024 * 1024
+    paths.len() >= 2
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.
@@ -329,9 +296,9 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
 }
 
 /// Hash a file with BLAKE2b variable output length. Single open + fstat.
-/// Uses read() for small files, streaming read+hash for large.
+/// Uses zero-copy mmap for regular files, streaming for pipes/special files.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
-    // Single open — reuse fd for fstat + read
+    // Single open — reuse fd for fstat + mmap
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
     let len = metadata.len();
@@ -342,17 +309,10 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
     }
 
     if is_regular && len > 0 {
-        // Files up to 8MB: read entirely + single-shot hash.
-        if len <= SINGLE_SHOT_THRESHOLD {
-            fadvise_sequential(&file, len);
-            let mut buf = vec![0u8; len as usize];
-            let n = read_full(&mut &file, &mut buf)?;
-            return Ok(blake2b_hash_data(&buf[..n], output_bytes));
-        }
-
-        // Large files (>8MB): streaming read with kernel readahead hint
-        fadvise_sequential(&file, len);
-        return blake2b_hash_reader(file, output_bytes);
+        // Zero-copy mmap: hash function reads directly from page cache.
+        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        mmap_advise(&mmap);
+        return Ok(blake2b_hash_data(&mmap, output_bytes));
     }
 
     // Fallback: streaming read — fd already open
