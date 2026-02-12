@@ -40,7 +40,7 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
         let mut buf = cell.borrow_mut();
         let mut hasher = D::new();
         loop {
-            let n = reader.read(&mut *buf)?;
+            let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
@@ -179,7 +179,7 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
 pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
     let stdin = io::stdin();
     // Hint kernel for sequential access if stdin is a regular file (redirect)
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = stdin.as_raw_fd();
@@ -276,7 +276,7 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
             .hash_length(output_bytes)
             .to_state();
         loop {
-            let n = reader.read(&mut *buf)?;
+            let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
@@ -324,7 +324,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
 /// Tries fadvise if stdin is a regular file (shell redirect), then streams.
 pub fn blake2b_hash_stdin(output_bytes: usize) -> io::Result<String> {
     let stdin = io::stdin();
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = stdin.as_raw_fd();
