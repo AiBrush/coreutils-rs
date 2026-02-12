@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
@@ -136,7 +136,7 @@ static NOATIME_SUPPORTED: AtomicBool = AtomicBool::new(true);
 fn open_noatime(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     if NOATIME_SUPPORTED.load(Ordering::Relaxed) {
-        match fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOATIME)
             .open(path)
