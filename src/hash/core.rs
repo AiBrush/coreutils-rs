@@ -157,10 +157,8 @@ fn open_noatime(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-/// Advise kernel for optimal mmap access: sequential readahead + transparent huge pages.
+/// Advise kernel for optimal mmap access: sequential readahead.
 /// MADV_SEQUENTIAL enables aggressive readahead (2x default window).
-/// MADV_HUGEPAGE requests 2MB pages, reducing TLB misses by ~500x for large files
-/// (e.g., 100MB file: 50 TLB entries with 2MB pages vs 25,600 with 4KB pages).
 #[cfg(target_os = "linux")]
 #[inline]
 fn mmap_advise(mmap: &memmap2::Mmap) {
@@ -168,7 +166,6 @@ fn mmap_advise(mmap: &memmap2::Mmap) {
         let ptr = mmap.as_ptr() as *mut libc::c_void;
         let len = mmap.len();
         libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
-        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
 }
 
@@ -195,8 +192,7 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     if is_regular && len > 0 {
         // Zero-copy mmap: hash function reads directly from page cache.
         // No read() syscalls, no kernel→user memcpy.
-        // MAP_POPULATE prefaults all pages before hashing starts.
-        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
         mmap_advise(&mmap);
         return Ok(hash_bytes(algo, &mmap));
     }
@@ -310,7 +306,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
 
     if is_regular && len > 0 {
         // Zero-copy mmap: hash function reads directly from page cache.
-        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
         mmap_advise(&mmap);
         return Ok(blake2b_hash_data(&mmap, output_bytes));
     }
