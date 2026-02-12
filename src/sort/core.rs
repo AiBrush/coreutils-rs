@@ -252,6 +252,9 @@ fn read_all_input(
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
+                if metadata.len() >= 2 * 1024 * 1024 {
+                    let _ = mmap.advise(memmap2::Advice::HugePage);
+                }
             }
             FileData::Mmap(mmap)
         } else {
