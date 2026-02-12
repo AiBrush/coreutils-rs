@@ -1,8 +1,5 @@
 use std::io::{self, IoSlice, Write};
 
-/// Output buffer size (retained for string/regex separator backward-fill strategy).
-const OUT_BUF: usize = 16 * 1024 * 1024;
-
 /// Maximum number of iovecs per writev() call (Linux IOV_MAX is 1024).
 const IOV_BATCH: usize = 1024;
 

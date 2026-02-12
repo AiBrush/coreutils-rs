@@ -78,19 +78,6 @@ const fn make_byte_class_utf8() -> [u8; 256] {
 
 const BYTE_CLASS_UTF8: [u8; 256] = make_byte_class_utf8();
 
-/// Printable ASCII lookup table: 0x20 (space) through 0x7E (~) are printable.
-const fn make_printable_table() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut i = 0x20u16;
-    while i <= 0x7E {
-        t[i as usize] = 1;
-        i += 1;
-    }
-    t
-}
-
-const PRINTABLE_TABLE: [u8; 256] = make_printable_table();
-
 // ──────────────────────────────────────────────────
 // Unicode character classification helpers
 // ──────────────────────────────────────────────────
