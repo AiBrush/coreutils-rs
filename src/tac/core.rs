@@ -383,13 +383,57 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
+    // Small data: contiguous buffer + single write (avoids IoSlice/writev overhead)
+    if data.len() < 2 * 1024 * 1024 {
+        let mut outbuf = vec![0u8; data.len()];
+        let mut wp = 0;
+
+        if !before {
+            let last_end = matches.last().unwrap().1;
+
+            if last_end < data.len() {
+                let trail = &data[last_end..];
+                outbuf[wp..wp + trail.len()].copy_from_slice(trail);
+                wp += trail.len();
+            }
+
+            let mut i = matches.len();
+            while i > 0 {
+                i -= 1;
+                let rec_start = if i == 0 { 0 } else { matches[i - 1].1 };
+                let record = &data[rec_start..matches[i].1];
+                outbuf[wp..wp + record.len()].copy_from_slice(record);
+                wp += record.len();
+            }
+        } else {
+            let mut i = matches.len();
+            while i > 0 {
+                i -= 1;
+                let start = matches[i].0;
+                let end = if i + 1 < matches.len() {
+                    matches[i + 1].0
+                } else {
+                    data.len()
+                };
+                let record = &data[start..end];
+                outbuf[wp..wp + record.len()].copy_from_slice(record);
+                wp += record.len();
+            }
+            if matches[0].0 > 0 {
+                outbuf[wp..wp + matches[0].0].copy_from_slice(&data[..matches[0].0]);
+                wp += matches[0].0;
+            }
+        }
+        return out.write_all(&outbuf[..wp]);
+    }
+
+    // Large data: batched IoSlice/writev for zero-copy output
     let mut batch: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_BATCH);
 
     if !before {
         let last_end = matches.last().unwrap().1;
         let has_trailing_sep = last_end == data.len();
 
-        // Trailing content without separator — output as-is
         if !has_trailing_sep {
             batch.push(IoSlice::new(&data[last_end..]));
         }
