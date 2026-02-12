@@ -66,14 +66,28 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
     }
 }
 
-/// Hash a file by path using mmap for regular files. Returns the hex digest.
+/// Threshold below which read() is faster than mmap() due to mmap setup overhead.
+/// For small files, the page table setup + madvise syscalls cost more than a simple read.
+const MMAP_THRESHOLD: u64 = 256 * 1024; // 256KB
+
+/// Hash a file by path. Uses read() for small files, mmap for large files.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
     let is_regular = metadata.file_type().is_file();
 
-    // mmap fast path for all regular files with data
+    if is_regular && len == 0 {
+        return Ok(hash_bytes(algo, &[]));
+    }
+
     if is_regular && len > 0 {
+        // Small files: read() is faster than mmap due to lower syscall overhead
+        if len < MMAP_THRESHOLD {
+            let data = fs::read(path)?;
+            return Ok(hash_bytes(algo, &data));
+        }
+
+        // Large files: mmap for zero-copy
         let file = File::open(path)?;
         match unsafe {
             MmapOptions::new()
@@ -102,11 +116,6 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
                 return hash_reader(algo, reader);
             }
         }
-    }
-
-    // Empty regular files
-    if is_regular {
-        return Ok(hash_bytes(algo, &[]));
     }
 
     // Fallback: buffered read (special files, pipes, etc.)
@@ -198,14 +207,24 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
     Ok(hex_encode(state.finalize().as_bytes()))
 }
 
-/// Hash a file with BLAKE2b variable output length using mmap.
+/// Hash a file with BLAKE2b variable output length. Uses read() for small files, mmap for large.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
     let metadata = fs::metadata(path)?;
     let len = metadata.len();
     let is_regular = metadata.file_type().is_file();
 
-    // mmap fast path for all regular files with data
+    if is_regular && len == 0 {
+        return Ok(blake2b_hash_data(&[], output_bytes));
+    }
+
     if is_regular && len > 0 {
+        // Small files: read() is faster than mmap
+        if len < MMAP_THRESHOLD {
+            let data = fs::read(path)?;
+            return Ok(blake2b_hash_data(&data, output_bytes));
+        }
+
+        // Large files: mmap for zero-copy
         let file = File::open(path)?;
         match unsafe { MmapOptions::new().populate().map(&file) } {
             Ok(mmap) => {
@@ -229,11 +248,6 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
                 return blake2b_hash_reader(reader, output_bytes);
             }
         }
-    }
-
-    // Empty regular files
-    if is_regular {
-        return Ok(blake2b_hash_data(&[], output_bytes));
     }
 
     let file = File::open(path)?;
