@@ -11,6 +11,7 @@ use clap::Parser;
 use memmap2::MmapOptions;
 
 use coreutils_rs::common::io::read_file;
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::cut::{self, CutMode};
 
 #[derive(Parser)]
@@ -89,6 +90,7 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Determine mode
@@ -201,7 +203,7 @@ fn main() {
             match read_file(Path::new(filename)) {
                 Ok(data) => cut::process_cut_data(&data, &cfg, &mut out),
                 Err(e) => {
-                    eprintln!("cut: {}: {}", filename, e);
+                    eprintln!("cut: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -212,7 +214,7 @@ fn main() {
             if e.kind() == io::ErrorKind::BrokenPipe {
                 process::exit(0);
             }
-            eprintln!("cut: write error: {}", e);
+            eprintln!("cut: write error: {}", io_error_msg(&e));
             had_error = true;
         }
     }
@@ -221,7 +223,7 @@ fn main() {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("cut: write error: {}", e);
+        eprintln!("cut: write error: {}", io_error_msg(&e));
         had_error = true;
     }
 

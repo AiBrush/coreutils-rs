@@ -2,6 +2,7 @@ use std::process;
 
 use clap::Parser;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::sort::{
     CheckMode, KeyDef, KeyOpts, SortConfig, parse_buffer_size, sort_and_output,
 };
@@ -106,6 +107,7 @@ struct Cli {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Parse key definitions
@@ -202,12 +204,12 @@ fn main() {
     };
 
     if let Err(e) = sort_and_output(&inputs, &config) {
+        // SIGPIPE is reset to SIG_DFL, so broken pipe kills the process
+        // before we get here. This is a fallback for edge cases.
         if e.kind() == std::io::ErrorKind::BrokenPipe {
-            eprintln!("sort: write failed: 'standard output': Broken pipe");
-            eprintln!("sort: write error");
             process::exit(2);
         }
-        eprintln!("sort: {}", e);
+        eprintln!("sort: {}", io_error_msg(&e));
         process::exit(2);
     }
 }

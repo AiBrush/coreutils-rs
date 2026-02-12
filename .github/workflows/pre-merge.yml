@@ -17,6 +17,8 @@ jobs:
     name: Build (${{ matrix.target }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ""
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +41,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: build-${{ matrix.target }}
+          key: build-v2-${{ matrix.target }}
 
       - name: Install cross
         if: matrix.cross

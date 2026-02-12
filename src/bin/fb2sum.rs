@@ -9,6 +9,7 @@ use std::process;
 use clap::Parser;
 use rayon::prelude::*;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::hash;
 
 const TOOL_NAME: &str = "b2sum";
@@ -109,17 +110,8 @@ fn unescape_filename(s: &str) -> String {
     out
 }
 
-/// Format an IO error message without the "(os error N)" suffix.
-fn io_error_msg(e: &io::Error) -> String {
-    if let Some(raw) = e.raw_os_error() {
-        let os_err = io::Error::from_raw_os_error(raw);
-        format!("{}", os_err).replace(&format!(" (os error {})", raw), "")
-    } else {
-        format!("{}", e)
-    }
-}
-
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // -l 0 means use default (512), matching GNU behavior
@@ -379,7 +371,7 @@ fn run_check_mode(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_read_errors, word);
         }
 
-        if total_fmt_errors > 0 && (cli.warn || cli.strict) {
+        if total_fmt_errors > 0 {
             let word = if total_fmt_errors == 1 {
                 "line is"
             } else {
@@ -459,7 +451,7 @@ fn check_one(
             || !expected_hash.bytes().all(|b| b.is_ascii_hexdigit())
         {
             format_errors += 1;
-            if cli.warn || cli.strict {
+            if cli.warn {
                 let _ = out.flush();
                 eprintln!(
                     "{}: {}: {}: improperly formatted BLAKE2b checksum line",

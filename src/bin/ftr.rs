@@ -7,6 +7,7 @@ use std::process;
 
 use clap::Parser;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
 #[derive(Parser)]
@@ -95,6 +96,7 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     let set1_str = &cli.sets[0];
@@ -144,7 +146,7 @@ fn main() {
         if let Err(e) = result
             && e.kind() != io::ErrorKind::BrokenPipe
         {
-            eprintln!("tr: {}", e);
+            eprintln!("tr: {}", io_error_msg(&e));
             process::exit(1);
         }
         return;
@@ -165,7 +167,7 @@ fn main() {
         if let Err(e) = result
             && e.kind() != io::ErrorKind::BrokenPipe
         {
-            eprintln!("tr: {}", e);
+            eprintln!("tr: {}", io_error_msg(&e));
             process::exit(1);
         }
         return;
@@ -187,7 +189,7 @@ fn main() {
     if let Err(e) = result
         && e.kind() != io::ErrorKind::BrokenPipe
     {
-        eprintln!("tr: {}", e);
+        eprintln!("tr: {}", io_error_msg(&e));
         process::exit(1);
     }
 }
@@ -203,6 +205,7 @@ fn run_mmap_mode(
         if cli.sets.len() < 2 {
             eprintln!("tr: missing operand after '{}'", set1_str);
             eprintln!("Two strings must be given when both deleting and squeezing repeats.");
+            eprintln!("Try 'tr --help' for more information.");
             process::exit(1);
         }
         let set2_str = &cli.sets[1];
@@ -218,6 +221,7 @@ fn run_mmap_mode(
         if cli.sets.len() > 1 {
             eprintln!("tr: extra operand '{}'", cli.sets[1]);
             eprintln!("Only one string may be given when deleting without squeezing.");
+            eprintln!("Try 'tr --help' for more information.");
             process::exit(1);
         }
         let set1 = tr::parse_set(set1_str);
@@ -252,6 +256,7 @@ fn run_mmap_mode(
     } else {
         eprintln!("tr: missing operand after '{}'", set1_str);
         eprintln!("Two strings must be given when translating.");
+        eprintln!("Try 'tr --help' for more information.");
         process::exit(1);
     }
 }
@@ -264,6 +269,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         if cli.sets.len() < 2 {
             eprintln!("tr: missing operand after '{}'", set1_str);
             eprintln!("Two strings must be given when both deleting and squeezing repeats.");
+            eprintln!("Try 'tr --help' for more information.");
             process::exit(1);
         }
         let set2_str = &cli.sets[1];
@@ -279,6 +285,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         if cli.sets.len() > 1 {
             eprintln!("tr: extra operand '{}'", cli.sets[1]);
             eprintln!("Only one string may be given when deleting without squeezing.");
+            eprintln!("Try 'tr --help' for more information.");
             process::exit(1);
         }
         let set1 = tr::parse_set(set1_str);
@@ -313,6 +320,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
     } else {
         eprintln!("tr: missing operand after '{}'", set1_str);
         eprintln!("Two strings must be given when translating.");
+        eprintln!("Try 'tr --help' for more information.");
         process::exit(1);
     }
 }

@@ -9,6 +9,7 @@ use std::process;
 use clap::Parser;
 use memmap2::MmapOptions;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::uniq::{
     AllRepeatedMethod, GroupMethod, OutputMode, UniqConfig, process_uniq, process_uniq_bytes,
 };
@@ -97,6 +98,7 @@ struct Cli {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Determine output mode
@@ -111,6 +113,7 @@ fn main() {
                 eprintln!(
                     "Valid arguments are:\n  - 'separate'\n  - 'prepend'\n  - 'append'\n  - 'both'"
                 );
+                eprintln!("Try 'uniq --help' for more information.");
                 process::exit(1);
             }
         };
@@ -122,6 +125,7 @@ fn main() {
             || cli.unique
         {
             eprintln!("uniq: --group is mutually exclusive with -c/-d/-D/-u");
+            eprintln!("Try 'uniq --help' for more information.");
             process::exit(1);
         }
         OutputMode::Group(method)
@@ -134,6 +138,7 @@ fn main() {
                 other => {
                     eprintln!("uniq: invalid argument '{}' for '--all-repeated'", other);
                     eprintln!("Valid arguments are:\n  - 'none'\n  - 'prepend'\n  - 'separate'");
+                    eprintln!("Try 'uniq --help' for more information.");
                     process::exit(1);
                 }
             }
@@ -152,6 +157,7 @@ fn main() {
     // -c is incompatible with -D/--all-repeated and --group
     if cli.count && matches!(mode, OutputMode::AllRepeated(_) | OutputMode::Group(_)) {
         eprintln!("uniq: printing all duplicated lines and repeat counts is meaningless");
+        eprintln!("Try 'uniq --help' for more information.");
         process::exit(1);
     }
 
@@ -172,7 +178,7 @@ fn main() {
         let output = match File::create(path) {
             Ok(f) => BufWriter::new(f),
             Err(e) => {
-                eprintln!("uniq: {}: {}", path, e);
+                eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                 process::exit(1);
             }
         };
@@ -250,14 +256,14 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
             let file = match File::open(path) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
             let metadata = match file.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
@@ -291,7 +297,7 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
                     m
                 }
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
@@ -303,7 +309,7 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
     if let Err(e) = result {
         // Ignore broken pipe
         if e.kind() != io::ErrorKind::BrokenPipe {
-            eprintln!("uniq: {}", e);
+            eprintln!("uniq: {}", io_error_msg(&e));
             process::exit(1);
         }
     }

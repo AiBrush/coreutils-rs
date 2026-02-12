@@ -515,6 +515,12 @@ pub fn select_comparator(opts: &KeyOpts, random_seed: u64) -> (CompareFn, bool, 
             (true, false, true) => |a: &[u8], b: &[u8]| compare_dictionary(a, b, true),
             (false, true, false) => |a: &[u8], b: &[u8]| compare_ignore_nonprinting(a, b, false),
             (false, true, true) => |a: &[u8], b: &[u8]| compare_ignore_nonprinting(a, b, true),
+            (true, true, false) => {
+                |a: &[u8], b: &[u8]| compare_text_filtered(a, b, true, true, false)
+            }
+            (true, true, true) => {
+                |a: &[u8], b: &[u8]| compare_text_filtered(a, b, true, true, true)
+            }
             _ => |a: &[u8], b: &[u8]| a.cmp(b),
         }
     } else {

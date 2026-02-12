@@ -15,6 +15,8 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
+use crate::common::io_error_msg;
+
 use super::compare::{
     compare_with_opts, parse_general_numeric, parse_human_numeric, parse_numeric_value,
     select_comparator, skip_leading_blanks,
@@ -124,9 +126,29 @@ impl Default for SortConfig {
     }
 }
 
-/// Compare two lines using the full key chain and global options.
+/// Compare two lines using the full key chain, global options, and last-resort.
+/// Used for sorting (determines order of all lines).
 #[inline]
 pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
+    compare_lines_inner(a, b, config, false)
+}
+
+/// Compare two lines for dedup (-u): skip last-resort comparison.
+/// GNU sort -u considers lines equal when the sort keys match, even if the
+/// raw bytes differ (e.g., "Apple" == "apple" with -f, "01" == "1" with -n).
+#[inline]
+pub fn compare_lines_for_dedup(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
+    compare_lines_inner(a, b, config, true)
+}
+
+#[inline]
+fn compare_lines_inner(
+    a: &[u8],
+    b: &[u8],
+    config: &SortConfig,
+    skip_last_resort: bool,
+) -> Ordering {
+    let stable = config.stable || skip_last_resort;
     if !config.keys.is_empty() {
         for key in &config.keys {
             let ka = extract_key(a, key, config.separator);
@@ -151,15 +173,21 @@ pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
             }
         }
 
-        // All keys equal: last-resort comparison (whole line) unless -s
-        if !config.stable {
+        // All keys equal: last-resort comparison (whole line) unless -s or dedup
+        if !stable {
             return a.cmp(b);
         }
 
         Ordering::Equal
     } else {
         // No keys: compare whole line with global opts
-        compare_with_opts(a, b, &config.global_opts, config.random_seed)
+        let result = compare_with_opts(a, b, &config.global_opts, config.random_seed);
+        // Last-resort whole-line comparison for deterministic order (unless -s or dedup)
+        if result == Ordering::Equal && !stable {
+            a.cmp(b)
+        } else {
+            result
+        }
     }
 }
 
@@ -243,8 +271,12 @@ fn read_all_input(
 
     // Single file (non-stdin): use mmap directly for zero-copy
     let buffer = if inputs.len() == 1 && inputs[0] != "-" {
-        let file = File::open(&inputs[0])
-            .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", &inputs[0], e)))?;
+        let file = File::open(&inputs[0]).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("open failed: {}: {}", &inputs[0], io_error_msg(&e)),
+            )
+        })?;
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
             let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
@@ -267,7 +299,10 @@ fn read_all_input(
                 io::stdin().lock().read_to_end(&mut data)?;
             } else {
                 let mut file = File::open(input).map_err(|e| {
-                    io::Error::new(e.kind(), format!("open failed: {}: {}", input, e))
+                    io::Error::new(
+                        e.kind(),
+                        format!("open failed: {}: {}", input, io_error_msg(&e)),
+                    )
                 })?;
                 file.read_to_end(&mut data)?;
             }
@@ -319,8 +354,12 @@ pub fn read_lines(inputs: &[String], zero_terminated: bool) -> io::Result<Vec<Ve
             let reader = BufReader::new(stdin.lock());
             read_delimited_lines(reader, delimiter, &mut lines)?;
         } else {
-            let file = File::open(input)
-                .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", input, e)))?;
+            let file = File::open(input).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("open failed: {}: {}", input, io_error_msg(&e)),
+                )
+            })?;
             let reader = BufReader::with_capacity(256 * 1024, file);
             read_delimited_lines(reader, delimiter, &mut lines)?;
         }
@@ -360,7 +399,14 @@ pub fn check_sorted(inputs: &[String], config: &SortConfig) -> io::Result<bool> 
     for i in 1..offsets.len() {
         let (s1, e1) = offsets[i - 1];
         let (s2, e2) = offsets[i];
-        let cmp = compare_lines(&data[s1..e1], &data[s2..e2], config);
+        // For -c -u: use dedup comparison (no last-resort) so that
+        // key-equal lines are detected as duplicates.
+        // For -c without -u: use full comparison (with last-resort).
+        let cmp = if config.unique {
+            compare_lines_for_dedup(&data[s1..e1], &data[s2..e2], config)
+        } else {
+            compare_lines(&data[s1..e1], &data[s2..e2], config)
+        };
         let bad = if config.unique {
             cmp != Ordering::Less
         } else {
@@ -458,7 +504,9 @@ pub fn merge_sorted(
     while let Some(std::cmp::Reverse(min)) = heap.pop() {
         let should_output = if config.unique {
             match &prev_line {
-                Some(prev) => compare_lines(prev, &min.entry.line, config) != Ordering::Equal,
+                Some(prev) => {
+                    compare_lines_for_dedup(prev, &min.entry.line, config) != Ordering::Equal
+                }
                 None => true,
             }
         } else {
@@ -720,7 +768,7 @@ fn write_sorted_output(
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines(&data[ps..pe], line, config) != Ordering::Equal
+                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -759,7 +807,7 @@ fn write_sorted_entries(
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines(&data[ps..pe], line, config) != Ordering::Equal
+                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -894,7 +942,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     let emit = match prev {
                         Some(p) => {
                             let (ps, pe) = offsets[p];
-                            compare_lines(&data[ps..pe], &data[s..e], config) != Ordering::Equal
+                            compare_lines_for_dedup(&data[ps..pe], &data[s..e], config)
+                                != Ordering::Equal
                         }
                         None => true,
                     };
@@ -1573,7 +1622,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 lb
             };
             let ord = cmp_fn(la, lb);
-            if needs_reverse { ord.reverse() } else { ord }
+            let ord = if needs_reverse { ord.reverse() } else { ord };
+            // Last-resort whole-line comparison for deterministic order (unless -s)
+            if ord == Ordering::Equal && !stable {
+                data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
+            } else {
+                ord
+            }
         });
 
         write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
