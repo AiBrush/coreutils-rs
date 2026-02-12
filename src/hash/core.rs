@@ -74,9 +74,9 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
 /// For small files, the page table setup + madvise syscalls cost more than a simple read.
 const MMAP_THRESHOLD: u64 = 256 * 1024; // 256KB
 
-/// Thread-local reusable buffer for small file reads.
-/// Avoids per-file heap allocation when processing many small files sequentially or in parallel.
-/// Each rayon worker thread gets its own buffer automatically.
+// Thread-local reusable buffer for small file reads.
+// Avoids per-file heap allocation when processing many small files sequentially or in parallel.
+// Each rayon worker thread gets its own buffer automatically.
 thread_local! {
     static READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(MMAP_THRESHOLD as usize));
 }
@@ -134,7 +134,7 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
                 buf.clear();
                 // Reserve is a no-op if capacity >= len (which it is after first call)
                 buf.reserve(len as usize);
-                Read::read_to_end(&mut &file, &mut *buf)?;
+                Read::read_to_end(&mut &file, &mut buf)?;
                 Ok(hash_bytes(algo, &buf))
             });
         }
@@ -344,7 +344,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
                 let mut buf = cell.borrow_mut();
                 buf.clear();
                 buf.reserve(len as usize);
-                Read::read_to_end(&mut &file, &mut *buf)?;
+                Read::read_to_end(&mut &file, &mut buf)?;
                 Ok(blake2b_hash_data(&buf, output_bytes))
             });
         }
