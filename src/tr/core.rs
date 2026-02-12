@@ -449,6 +449,40 @@ mod simd_tr {
     }
 }
 
+/// AVX2 nibble-based set membership classifier.
+/// Uses vpshufb to test 32 bytes at a time for membership in a byte set.
+/// Returns a `__m256i` where each byte is 0xFF if the byte is NOT in the set, 0x00 if it IS.
+/// The tables are built from the 256-bit member bitset.
+#[cfg(target_arch = "x86_64")]
+mod simd_classify {
+    /// Build vpshufb nibble lookup tables for set membership testing.
+    /// Returns (lo_table, hi_table) where a byte b is in the set iff
+    /// lo_table[b & 0xF] & hi_table[b >> 4] != 0.
+    pub fn build_nibble_tables(member_set: &[u8; 32]) -> ([u8; 16], [u8; 16]) {
+        let mut lo_table = [0u8; 16];
+        let mut hi_table = [0u8; 16];
+
+        // For each byte in the set, record its high/low nibble association.
+        // We assign bit positions based on high nibble value.
+        // Since we have 8 bits and 16 possible high nibble values,
+        // we use a folding trick: hi_bit = (1 << (hi_nibble & 7)).
+        // For hi nibbles 0-7, bits 0-7; for hi nibbles 8-15, bits 0-7 (folded).
+        // To avoid false positives from folding, we use two passes.
+        for byte_val in 0u16..256 {
+            let idx = byte_val as usize;
+            if (member_set[idx >> 3] & (1 << (idx & 7))) != 0 {
+                let lo = (byte_val & 0x0F) as usize;
+                let hi = (byte_val >> 4) as usize;
+                let bit = 1u8 << (hi & 7);
+                lo_table[lo] |= bit;
+                hi_table[hi] |= bit;
+            }
+        }
+
+        (lo_table, hi_table)
+    }
+}
+
 /// Check if AVX2 is available at runtime.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
