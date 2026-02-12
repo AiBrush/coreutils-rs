@@ -300,8 +300,7 @@ fn main() {
                     max_line_length: 0,
                 }
             } else {
-                let (lines, words, chars) =
-                    wc::count_lines_words_chars(&data, utf8_locale);
+                let (lines, words, chars) = wc::count_lines_words_chars(&data, utf8_locale);
                 wc::WcCounts {
                     lines,
                     words,
