@@ -38,10 +38,10 @@ fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<
 }
 
 /// Reverse records separated by a single byte.
-/// Uses a single forward SIMD scan to collect all separator positions,
-/// then iterates in reverse with batched writev output.
-/// Eliminates per-record memrchr calls AND the copy to an output buffer.
-/// Uses O(IOV_BATCH) memory for IoSlice batches instead of O(N) for all lines.
+/// Uses backward SIMD scan (memrchr_iter) to process records from back to front,
+/// building batched IoSlice references for zero-copy writev output.
+/// O(IOV_BATCH) memory — no positions Vec allocation needed at all.
+/// For 100MB/2.5M lines: saves ~20MB positions Vec + ~40MB IoSlice Vec.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -52,51 +52,45 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return tac_bytes_small(data, separator, before, out);
     }
 
-    // Pre-estimate line count to avoid Vec reallocation.
-    // Conservative estimate: ~40 bytes per line for typical text.
-    let estimated_lines = (data.len() / 40).max(64);
-
-    // Single forward SIMD scan — O(n) with memchr auto-vectorization
-    let mut positions: Vec<usize> = Vec::with_capacity(estimated_lines);
-    for pos in memchr::memchr_iter(separator, data) {
-        positions.push(pos);
-    }
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
-    // Batched IoSlice output — only IOV_BATCH slices in memory at once.
-    // For 100MB/2.5M lines: saves ~40MB of IoSlice allocation vs building full Vec.
     let mut batch: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_BATCH);
 
     if !before {
         // separator-after mode: records end with separator
-        let last_pos = *positions.last().unwrap();
+        let mut iter = memchr::memrchr_iter(separator, data);
+
+        let first_sep = match iter.next() {
+            Some(pos) => pos,
+            None => return out.write_all(data), // no separator found
+        };
 
         // Trailing content without separator — output first
-        if last_pos < data.len() - 1 {
-            batch.push(IoSlice::new(&data[last_pos + 1..]));
+        if first_sep + 1 < data.len() {
+            batch.push(IoSlice::new(&data[first_sep + 1..]));
         }
 
-        // Records in reverse order (each includes its trailing separator)
-        for i in (0..positions.len()).rev() {
-            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            batch.push(IoSlice::new(&data[start..positions[i] + 1]));
+        let mut end = first_sep + 1; // exclusive end of current record
+
+        // Process remaining separators from back to front
+        for pos in iter {
+            batch.push(IoSlice::new(&data[pos + 1..end]));
+            end = pos + 1;
             if batch.len() == IOV_BATCH {
                 write_all_slices(out, &batch)?;
                 batch.clear();
             }
         }
+
+        // First record (no separator before it)
+        if end > 0 {
+            batch.push(IoSlice::new(&data[0..end]));
+        }
     } else {
         // separator-before mode: records start with separator
-        for i in (0..positions.len()).rev() {
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            batch.push(IoSlice::new(&data[positions[i]..end]));
+        let mut end = data.len();
+
+        for pos in memchr::memrchr_iter(separator, data) {
+            batch.push(IoSlice::new(&data[pos..end]));
+            end = pos;
             if batch.len() == IOV_BATCH {
                 write_all_slices(out, &batch)?;
                 batch.clear();
@@ -104,8 +98,8 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         }
 
         // Leading content before first separator
-        if positions[0] > 0 {
-            batch.push(IoSlice::new(&data[..positions[0]]));
+        if end > 0 {
+            batch.push(IoSlice::new(&data[0..end]));
         }
     }
 

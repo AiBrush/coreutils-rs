@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -112,18 +112,14 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // tac now uses forward SIMD scan (memchr_iter) then reverse IoSlice output,
-        // so MADV_SEQUENTIAL is optimal for the forward scan phase.
+        // tac uses backward SIMD scan (memrchr_iter) for single-byte separator,
+        // so MADV_RANDOM is optimal (no sequential readahead benefit).
+        // WILLNEED still helps pre-fault all pages, HUGEPAGE reduces TLB misses.
         #[cfg(unix)]
         {
             if let FileData::Mmap(ref mmap) = data {
                 unsafe {
-                    libc::madvise(
-                        mmap.as_ptr() as *mut libc::c_void,
-                        mmap.len(),
-                        libc::MADV_SEQUENTIAL,
-                    );
-                    // WILLNEED triggers async readahead to pre-fault pages
+                    // Pre-fault all pages for backward scan
                     libc::madvise(
                         mmap.as_ptr() as *mut libc::c_void,
                         mmap.len(),
@@ -174,22 +170,18 @@ fn main() {
         cli.files.clone()
     };
 
-    // Raw fd stdout with BufWriter for batching small writes
+    // Raw fd stdout — tac's batched writev sends IoSlice directly to kernel.
+    // BufWriter would copy mmap data into its buffer, defeating zero-copy.
     #[cfg(unix)]
     let had_error = {
         let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        run(&cli, &files, &mut *raw)
     };
     #[cfg(not(unix))]
     let had_error = {
         let stdout = io::stdout();
-        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        let mut lock = stdout.lock();
+        run(&cli, &files, &mut lock)
     };
 
     if had_error {

@@ -1484,55 +1484,104 @@ fn squeeze_multi_mmap<const N: usize>(
     Ok(())
 }
 
+/// Maximum IoSlices per writev call (Linux IOV_MAX = 1024).
+const IOV_BATCH: usize = 1024;
+
+/// Write all IoSlices to the writer, handling partial writes.
+fn write_all_slices(writer: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    if slices.len() <= 4 {
+        for s in slices {
+            writer.write_all(s)?;
+        }
+        return Ok(());
+    }
+    let mut offset = 0;
+    while offset < slices.len() {
+        let end = (offset + IOV_BATCH).min(slices.len());
+        let n = writer.write_vectored(&slices[offset..end])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write any data",
+            ));
+        }
+        let mut remaining = n;
+        while offset < end && remaining >= slices[offset].len() {
+            remaining -= slices[offset].len();
+            offset += 1;
+        }
+        if remaining > 0 && offset < end {
+            writer.write_all(&slices[offset][remaining..])?;
+            offset += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Squeeze a single repeated character from mmap'd data.
-/// Batched: copies non-duplicate runs into output buffer, single write_all per buffer fill.
-/// Uses SIMD memchr for bulk-skip between occurrences of the squeeze char.
+/// Uses SIMD memmem to find runs of consecutive duplicates, then outputs
+/// the data between runs as zero-copy IoSlice references into the mmap.
+/// For data with no duplicates (common case), outputs the entire mmap directly.
 fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut wp = 0;
-    let mut cursor = 0;
+    if data.is_empty() {
+        return Ok(());
+    }
 
-    while cursor < data.len() {
-        match memchr::memchr(ch, &data[cursor..]) {
+    let needle = [ch, ch];
+    let finder = memchr::memmem::Finder::new(&needle);
+
+    // Fast path: no consecutive duplicates — output entire data as-is (zero copy)
+    if finder.find(data).is_none() {
+        return writer.write_all(data);
+    }
+
+    // Build IoSlice segments for zero-copy output directly from mmap.
+    // Each segment spans from the end of the previous squeeze run to the
+    // first byte of the next run (inclusive), skipping duplicate chars.
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(1024);
+    let mut seg_start = 0;
+    let mut search_start = 0;
+
+    while search_start < data.len() {
+        match finder.find(&data[search_start..]) {
             Some(offset) => {
-                let pos = cursor + offset;
-                let run = offset + 1; // include first squeeze char
-
-                // Flush if output buffer can't hold the run
-                if wp + run > BUF_SIZE {
-                    writer.write_all(&outbuf[..wp])?;
-                    wp = 0;
+                let abs_pos = search_start + offset;
+                // Include everything up to and including the first squeeze char
+                let include_end = abs_pos + 1;
+                if include_end > seg_start {
+                    slices.push(IoSlice::new(&data[seg_start..include_end]));
                 }
 
-                outbuf[wp..wp + run].copy_from_slice(&data[cursor..pos + 1]);
-                wp += run;
-
-                // Skip consecutive duplicates
-                let mut skip = pos + 1;
-                while skip < data.len() && data[skip] == ch {
-                    skip += 1;
+                // Skip all consecutive duplicates
+                let mut skip = abs_pos + 2;
+                unsafe {
+                    let ptr = data.as_ptr();
+                    let len = data.len();
+                    while skip < len && *ptr.add(skip) == ch {
+                        skip += 1;
+                    }
                 }
-                cursor = skip;
+                seg_start = skip;
+                search_start = skip;
+
+                // Flush batch when we have enough slices
+                if slices.len() >= 512 {
+                    write_all_slices(writer, &slices)?;
+                    slices.clear();
+                }
             }
             None => {
-                let remaining = data.len() - cursor;
-                if wp + remaining > BUF_SIZE {
-                    writer.write_all(&outbuf[..wp])?;
-                    wp = 0;
-                }
-                if remaining > BUF_SIZE {
-                    // Remaining data is larger than buffer — write directly
-                    writer.write_all(&data[cursor..])?;
-                } else {
-                    outbuf[wp..wp + remaining].copy_from_slice(&data[cursor..]);
-                    wp += remaining;
+                // No more duplicate runs — output remaining data
+                if seg_start < data.len() {
+                    slices.push(IoSlice::new(&data[seg_start..]));
                 }
                 break;
             }
         }
     }
-    if wp > 0 {
-        writer.write_all(&outbuf[..wp])?;
+
+    if !slices.is_empty() {
+        write_all_slices(writer, &slices)?;
     }
     Ok(())
 }
