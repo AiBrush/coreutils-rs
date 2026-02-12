@@ -2,6 +2,7 @@ use std::process;
 
 use clap::Parser;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::sort::{
     CheckMode, KeyDef, KeyOpts, SortConfig, parse_buffer_size, sort_and_output,
 };
@@ -208,7 +209,7 @@ fn main() {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
             process::exit(2);
         }
-        eprintln!("sort: {}", e);
+        eprintln!("sort: {}", io_error_msg(&e));
         process::exit(2);
     }
 }

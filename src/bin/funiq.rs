@@ -9,6 +9,7 @@ use std::process;
 use clap::Parser;
 use memmap2::MmapOptions;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::uniq::{
     AllRepeatedMethod, GroupMethod, OutputMode, UniqConfig, process_uniq, process_uniq_bytes,
 };
@@ -177,7 +178,7 @@ fn main() {
         let output = match File::create(path) {
             Ok(f) => BufWriter::new(f),
             Err(e) => {
-                eprintln!("uniq: {}: {}", path, e);
+                eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                 process::exit(1);
             }
         };
@@ -255,14 +256,14 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
             let file = match File::open(path) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
             let metadata = match file.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
@@ -296,7 +297,7 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
                     m
                 }
                 Err(e) => {
-                    eprintln!("uniq: {}: {}", path, e);
+                    eprintln!("uniq: {}: {}", path, io_error_msg(&e));
                     process::exit(1);
                 }
             };
@@ -308,7 +309,7 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
     if let Err(e) = result {
         // Ignore broken pipe
         if e.kind() != io::ErrorKind::BrokenPipe {
-            eprintln!("uniq: {}", e);
+            eprintln!("uniq: {}", io_error_msg(&e));
             process::exit(1);
         }
     }

@@ -7,6 +7,7 @@ use std::process;
 
 use clap::Parser;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
 #[derive(Parser)]
@@ -145,7 +146,7 @@ fn main() {
         if let Err(e) = result
             && e.kind() != io::ErrorKind::BrokenPipe
         {
-            eprintln!("tr: {}", e);
+            eprintln!("tr: {}", io_error_msg(&e));
             process::exit(1);
         }
         return;
@@ -166,7 +167,7 @@ fn main() {
         if let Err(e) = result
             && e.kind() != io::ErrorKind::BrokenPipe
         {
-            eprintln!("tr: {}", e);
+            eprintln!("tr: {}", io_error_msg(&e));
             process::exit(1);
         }
         return;
@@ -188,7 +189,7 @@ fn main() {
     if let Err(e) = result
         && e.kind() != io::ErrorKind::BrokenPipe
     {
-        eprintln!("tr: {}", e);
+        eprintln!("tr: {}", io_error_msg(&e));
         process::exit(1);
     }
 }

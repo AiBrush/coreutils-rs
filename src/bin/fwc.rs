@@ -10,6 +10,7 @@ use clap::Parser;
 use memchr::memchr_iter;
 
 use coreutils_rs::common::io::{FileData, file_size, read_file, read_stdin};
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::wc;
 use memmap2::MmapOptions;
 
@@ -236,7 +237,7 @@ fn main() {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("wc: {}: {}", filename, e);
+                    eprintln!("wc: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -259,7 +260,7 @@ fn main() {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("wc: {}: {}", filename, e);
+                    eprintln!("wc: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -276,7 +277,7 @@ fn main() {
                     None => match read_stdin() {
                         Ok(d) => FileData::Owned(d),
                         Err(e) => {
-                            eprintln!("wc: standard input: {}", e);
+                            eprintln!("wc: standard input: {}", io_error_msg(&e));
                             had_error = true;
                             continue;
                         }
@@ -287,7 +288,7 @@ fn main() {
             match read_stdin() {
                 Ok(d) => FileData::Owned(d),
                 Err(e) => {
-                    eprintln!("wc: standard input: {}", e);
+                    eprintln!("wc: standard input: {}", io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -296,7 +297,7 @@ fn main() {
             match read_file(Path::new(filename)) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("wc: {}: {}", filename, e);
+                    eprintln!("wc: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -598,7 +599,7 @@ fn read_files0_from(path: &str) -> Vec<String> {
         read_stdin().unwrap_or_default()
     } else {
         std::fs::read(path).unwrap_or_else(|e| {
-            eprintln!("wc: cannot open '{}' for reading: {}", path, e);
+            eprintln!("wc: cannot open '{}' for reading: {}", path, io_error_msg(&e));
             process::exit(1);
         })
     };

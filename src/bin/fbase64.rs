@@ -12,6 +12,7 @@ use memmap2::MmapOptions;
 
 use coreutils_rs::base64::core as b64;
 use coreutils_rs::common::io::read_file;
+use coreutils_rs::common::io_error_msg;
 
 #[derive(Parser)]
 #[command(
@@ -74,7 +75,7 @@ fn main() {
     if let Err(e) = out.flush()
         && e.kind() != io::ErrorKind::BrokenPipe
     {
-        eprintln!("base64: {}", e);
+        eprintln!("base64: {}", io_error_msg(&e));
         process::exit(1);
     }
 
@@ -86,9 +87,9 @@ fn main() {
         }
         // Include filename in error message (GNU compat)
         if filename != "-" {
-            eprintln!("base64: {}: {}", filename, e);
+            eprintln!("base64: {}: {}", filename, io_error_msg(&e));
         } else {
-            eprintln!("base64: {}", e);
+            eprintln!("base64: {}", io_error_msg(&e));
         }
         process::exit(1);
     }

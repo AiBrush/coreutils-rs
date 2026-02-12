@@ -9,6 +9,7 @@ use std::process;
 use clap::Parser;
 use rayon::prelude::*;
 
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::hash::{self, HashAlgorithm};
 
 const TOOL_NAME: &str = "md5sum";
@@ -77,16 +78,6 @@ fn escape_filename(name: &str) -> String {
         }
     }
     out
-}
-
-/// Format an IO error message without the "(os error N)" suffix.
-fn io_error_msg(e: &io::Error) -> String {
-    if let Some(raw) = e.raw_os_error() {
-        let os_err = io::Error::from_raw_os_error(raw);
-        format!("{}", os_err).replace(&format!(" (os error {})", raw), "")
-    } else {
-        format!("{}", e)
-    }
 }
 
 fn main() {

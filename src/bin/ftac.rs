@@ -11,6 +11,7 @@ use clap::Parser;
 use memmap2::MmapOptions;
 
 use coreutils_rs::common::io::{FileData, read_file, read_stdin};
+use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
 
 #[derive(Parser)]
@@ -85,7 +86,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                     None => match read_stdin() {
                         Ok(d) => FileData::Owned(d),
                         Err(e) => {
-                            eprintln!("tac: standard input: {}", e);
+                            eprintln!("tac: standard input: {}", io_error_msg(&e));
                             had_error = true;
                             continue;
                         }
@@ -96,7 +97,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             match read_stdin() {
                 Ok(d) => FileData::Owned(d),
                 Err(e) => {
-                    eprintln!("tac: standard input: {}", e);
+                    eprintln!("tac: standard input: {}", io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -105,7 +106,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             match read_file(Path::new(filename)) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("tac: {}: {}", filename, e);
+                    eprintln!("tac: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
                     continue;
                 }
@@ -153,7 +154,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             if e.kind() == io::ErrorKind::BrokenPipe {
                 process::exit(0);
             }
-            eprintln!("tac: write error: {}", e);
+            eprintln!("tac: write error: {}", io_error_msg(&e));
             had_error = true;
         }
     }

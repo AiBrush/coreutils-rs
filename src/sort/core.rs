@@ -15,6 +15,8 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
+use crate::common::io_error_msg;
+
 use super::compare::{
     compare_with_opts, parse_general_numeric, parse_human_numeric, parse_numeric_value,
     select_comparator, skip_leading_blanks,
@@ -200,7 +202,7 @@ fn read_all_input(
     // Single file (non-stdin): use mmap directly for zero-copy
     let buffer = if inputs.len() == 1 && inputs[0] != "-" {
         let file = File::open(&inputs[0])
-            .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", &inputs[0], e)))?;
+            .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", &inputs[0], io_error_msg(&e))))?;
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
             let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
@@ -220,7 +222,7 @@ fn read_all_input(
                 io::stdin().lock().read_to_end(&mut data)?;
             } else {
                 let mut file = File::open(input).map_err(|e| {
-                    io::Error::new(e.kind(), format!("open failed: {}: {}", input, e))
+                    io::Error::new(e.kind(), format!("open failed: {}: {}", input, io_error_msg(&e)))
                 })?;
                 file.read_to_end(&mut data)?;
             }
@@ -267,7 +269,7 @@ pub fn read_lines(inputs: &[String], zero_terminated: bool) -> io::Result<Vec<Ve
             read_delimited_lines(reader, delimiter, &mut lines)?;
         } else {
             let file = File::open(input)
-                .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", input, e)))?;
+                .map_err(|e| io::Error::new(e.kind(), format!("open failed: {}: {}", input, io_error_msg(&e))))?;
             let reader = BufReader::with_capacity(256 * 1024, file);
             read_delimited_lines(reader, delimiter, &mut lines)?;
         }
