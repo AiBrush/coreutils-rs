@@ -1101,7 +1101,9 @@ pub fn translate_mmap(
 
     // Parallel translation for very large inputs — single shared output buffer
     if data.len() >= PARALLEL_TRANSLATE_THRESHOLD {
-        let mut out = vec![0u8; data.len()];
+        // Avoid zero-initialization: translate writes every byte of output
+        let mut out = Vec::with_capacity(data.len());
+        unsafe { out.set_len(data.len()) };
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() + num_threads - 1) / num_threads;
         // Align to BUF_SIZE boundaries for cache efficiency
@@ -1121,14 +1123,16 @@ pub fn translate_mmap(
 
     // Single-allocation path: translate entire data into one buffer, single write
     if data.len() <= BUF_SIZE {
-        let mut out = vec![0u8; data.len()];
+        let mut out = Vec::with_capacity(data.len());
+        unsafe { out.set_len(data.len()) };
         translate_chunk_dispatch(data, &mut out, &table, &kind, use_simd);
         writer.write_all(&out)?;
         return Ok(());
     }
 
     // Chunked path for larger data — reuses buffer across chunks
-    let mut out = vec![0u8; BUF_SIZE];
+    let mut out = Vec::with_capacity(BUF_SIZE);
+    unsafe { out.set_len(BUF_SIZE) };
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;
@@ -1137,8 +1141,8 @@ pub fn translate_mmap(
 }
 
 /// Translate + squeeze from mmap'd byte slice.
-/// Uses a two-pass approach for the common case where few bytes are squeezed:
-/// translate first (using SIMD when possible), then squeeze.
+/// Single buffer: translate into buffer, then squeeze in-place (wp <= i always holds).
+/// Eliminates second buffer allocation and reduces memory traffic.
 pub fn translate_squeeze_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -1153,39 +1157,33 @@ pub fn translate_squeeze_mmap(
     #[cfg(not(target_arch = "x86_64"))]
     let use_simd = false;
 
-    // Pre-allocate output buffer for translation
-    let mut trans_buf = vec![0u8; BUF_SIZE];
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    // Single buffer: translate chunk→buf, then squeeze in-place within buf
+    let mut buf = vec![0u8; BUF_SIZE];
     let mut last_squeezed: u16 = 256;
 
     for chunk in data.chunks(BUF_SIZE) {
-        // Phase 1: Translate (may use SIMD)
-        translate_chunk_dispatch(
-            chunk,
-            &mut trans_buf[..chunk.len()],
-            &table,
-            &kind,
-            use_simd,
-        );
+        // Phase 1: Translate into buf (may use SIMD)
+        translate_chunk_dispatch(chunk, &mut buf[..chunk.len()], &table, &kind, use_simd);
 
-        // Phase 2: Squeeze
-        let mut out_pos = 0;
-        for i in 0..chunk.len() {
-            let translated = unsafe { *trans_buf.get_unchecked(i) };
-            if is_member(&squeeze_set, translated) {
-                if last_squeezed == translated as u16 {
-                    continue;
+        // Phase 2: Squeeze in-place (wp <= i always, safe for overlapping writes)
+        let mut wp = 0;
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            for i in 0..chunk.len() {
+                let b = *ptr.add(i);
+                if is_member(&squeeze_set, b) {
+                    if last_squeezed == b as u16 {
+                        continue;
+                    }
+                    last_squeezed = b as u16;
+                } else {
+                    last_squeezed = 256;
                 }
-                last_squeezed = translated as u16;
-            } else {
-                last_squeezed = 256;
+                *ptr.add(wp) = b;
+                wp += 1;
             }
-            unsafe {
-                *outbuf.get_unchecked_mut(out_pos) = translated;
-            }
-            out_pos += 1;
         }
-        writer.write_all(&outbuf[..out_pos])?;
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }
