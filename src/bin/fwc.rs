@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process;
 
 use clap::Parser;
+use memchr::memchr_iter;
 
 use coreutils_rs::common::io::{FileData, file_size, read_file, read_stdin};
 use coreutils_rs::wc;
@@ -65,6 +66,50 @@ impl ShowFlags {
     fn bytes_only(&self) -> bool {
         self.bytes && !self.lines && !self.words && !self.chars && !self.max_line_length
     }
+
+    /// True if only -l (lines) is requested.
+    fn lines_only(&self) -> bool {
+        self.lines && !self.words && !self.bytes && !self.chars && !self.max_line_length
+    }
+}
+
+/// Threshold below which non-parallel counting is used.
+/// Avoids rayon thread pool initialization cost (~0.5-1ms) for single/small files.
+const WC_PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024; // 16MB
+
+/// Lines-only fast path: stream through file without loading into memory.
+/// Avoids both mmap overhead (page tables) and rayon thread pool init.
+/// Returns (line_count, byte_count).
+fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let file_bytes = meta.len();
+    if !meta.file_type().is_file() || file_bytes == 0 {
+        return Ok((0, file_bytes));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                file_bytes as i64,
+                libc::POSIX_FADV_SEQUENTIAL,
+            );
+        }
+    }
+    let mut lines = 0u64;
+    let mut buf = [0u8; 64 * 1024]; // 64KB fits in L1 cache
+    let mut reader = file;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        lines += memchr_iter(b'\n', &buf[..n]).count() as u64;
+    }
+    Ok((lines, file_bytes))
 }
 
 /// Compute number of decimal digits needed to display a value.
@@ -178,6 +223,29 @@ fn main() {
             }
         }
 
+        // Fast path: -l only on regular files — stream through with memchr
+        // Avoids mmap overhead (page tables) and rayon thread pool init
+        if show.lines_only() && filename != "-" {
+            match count_lines_streaming(Path::new(filename)) {
+                Ok((lines, bytes)) => {
+                    let counts = wc::WcCounts {
+                        lines,
+                        bytes,
+                        ..Default::default()
+                    };
+                    total.lines += lines;
+                    total.bytes += bytes;
+                    results.push((counts, filename.clone()));
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("wc: {}: {}", filename, e);
+                    had_error = true;
+                    continue;
+                }
+            }
+        }
+
         // Read file data (zero-copy mmap for large files)
         // For stdin: try mmap if it's a regular file redirect (< file)
         let data: FileData = if filename == "-" {
@@ -215,46 +283,80 @@ fn main() {
             }
         };
 
-        // Compute only the requested metrics — each uses its own optimized pass.
-        // Uses parallel variants for large files (>4MB) to exploit multi-core CPUs.
-        // Default mode uses a combined parallel pass (lines+words+chars together)
-        // to keep data cache-warm between metric computations within each chunk.
+        // Compute requested metrics. Use parallel variants only for large files
+        // (>16MB) where rayon overhead is negligible vs computation time.
+        // For smaller files, non-parallel functions avoid rayon thread pool init
+        // cost (~0.5-1ms per process) which dominates for single-file benchmarks.
+        let use_parallel = data.len() >= WC_PARALLEL_THRESHOLD;
+
         let counts = if show.lines && show.words && show.chars && !show.max_line_length {
-            // Full parallel pass: lines + words + chars
-            let (lines, words, chars) = wc::count_lwc_parallel(&data, utf8_locale);
-            wc::WcCounts {
-                lines,
-                words,
-                bytes: data.len() as u64,
-                chars,
-                max_line_length: 0,
+            if use_parallel {
+                let (lines, words, chars) = wc::count_lwc_parallel(&data, utf8_locale);
+                wc::WcCounts {
+                    lines,
+                    words,
+                    bytes: data.len() as u64,
+                    chars,
+                    max_line_length: 0,
+                }
+            } else {
+                let (lines, words, chars) =
+                    wc::count_lines_words_chars(&data, utf8_locale);
+                wc::WcCounts {
+                    lines,
+                    words,
+                    bytes: data.len() as u64,
+                    chars,
+                    max_line_length: 0,
+                }
             }
         } else if show.lines && show.words && !show.chars && !show.max_line_length {
-            // Default mode: lines + words + bytes only (skip char counting)
-            let (lines, words, bytes) = wc::count_lwb_parallel(&data, utf8_locale);
-            wc::WcCounts {
-                lines,
-                words,
-                bytes,
-                chars: 0,
-                max_line_length: 0,
+            if use_parallel {
+                let (lines, words, bytes) = wc::count_lwb_parallel(&data, utf8_locale);
+                wc::WcCounts {
+                    lines,
+                    words,
+                    bytes,
+                    chars: 0,
+                    max_line_length: 0,
+                }
+            } else {
+                let (lines, words, bytes) = wc::count_lwb(&data, utf8_locale);
+                wc::WcCounts {
+                    lines,
+                    words,
+                    bytes,
+                    chars: 0,
+                    max_line_length: 0,
+                }
             }
         } else {
-            // Individual parallel passes for specific flags
             wc::WcCounts {
                 lines: if show.lines {
-                    wc::count_lines_parallel(&data)
+                    if use_parallel {
+                        wc::count_lines_parallel(&data)
+                    } else {
+                        wc::count_lines(&data)
+                    }
                 } else {
                     0
                 },
                 words: if show.words {
-                    wc::count_words_parallel(&data, utf8_locale)
+                    if use_parallel {
+                        wc::count_words_parallel(&data, utf8_locale)
+                    } else {
+                        wc::count_words_locale(&data, utf8_locale)
+                    }
                 } else {
                     0
                 },
                 bytes: data.len() as u64,
                 chars: if show.chars {
-                    wc::count_chars_parallel(&data, utf8_locale)
+                    if use_parallel {
+                        wc::count_chars_parallel(&data, utf8_locale)
+                    } else {
+                        wc::count_chars(&data, utf8_locale)
+                    }
                 } else {
                     0
                 },
