@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 
 use rayon::prelude::*;
 
-const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — mmap chunk processing
+const BUF_SIZE: usize = 1024 * 1024; // 1MB — fits L2/L3 cache for locality
 
 /// Stream buffer: 256KB — process data immediately after each read().
 /// Stays in L2 cache, matches typical kernel pipe buffer size.
@@ -11,8 +11,9 @@ const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — mmap chunk processing
 const STREAM_BUF: usize = 256 * 1024;
 
 /// Minimum size for parallel translation.
-/// Even with fast SIMD, parallelism helps for 100MB benchmark files when split across cores.
-const PARALLEL_TRANSLATE_THRESHOLD: usize = 1024 * 1024;
+/// Set high to avoid rayon overhead (thread wake + per-chunk Vec allocation)
+/// for medium-sized files. Parallel only helps for very large inputs (>32MB).
+const PARALLEL_TRANSLATE_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
@@ -550,6 +551,11 @@ pub fn squeeze(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
+    // Fast path: single squeeze char — bulk copy non-match runs
+    if squeeze_chars.len() == 1 {
+        return squeeze_single_stream(squeeze_chars[0], reader, writer);
+    }
+
     let member = build_member_set(squeeze_chars);
     let mut outbuf = vec![0u8; STREAM_BUF];
     let mut inbuf = vec![0u8; STREAM_BUF];
@@ -582,6 +588,56 @@ pub fn squeeze(
     Ok(())
 }
 
+/// Squeeze a single character from a stream — optimized with bulk copy.
+fn squeeze_single_stream(
+    ch: u8,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut inbuf = vec![0u8; STREAM_BUF];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    let mut was_squeeze_char = false;
+
+    loop {
+        let n = match reader.read(&mut inbuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let chunk = &inbuf[..n];
+        let mut out_pos = 0;
+        let mut i = 0;
+
+        while i < n {
+            if chunk[i] == ch {
+                if !was_squeeze_char {
+                    // First in run — keep it
+                    unsafe {
+                        *outbuf.get_unchecked_mut(out_pos) = ch;
+                    }
+                    out_pos += 1;
+                    was_squeeze_char = true;
+                }
+                // Skip rest of run
+                i += 1;
+            } else {
+                was_squeeze_char = false;
+                // Find next squeeze char using SIMD memchr
+                let remaining = &chunk[i..];
+                let run_end = memchr::memchr(ch, remaining).unwrap_or(remaining.len());
+                // Bulk copy the non-match run
+                outbuf[out_pos..out_pos + run_end].copy_from_slice(&chunk[i..i + run_end]);
+                out_pos += run_end;
+                i += run_end;
+            }
+        }
+
+        writer.write_all(&outbuf[..out_pos])?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Mmap-based functions (zero-copy input from byte slice)
 // ============================================================================
@@ -606,32 +662,28 @@ pub fn translate_mmap(
         return writer.write_all(data);
     }
 
-    // Parallel translation for large inputs — each chunk is independent
+    // Parallel translation for very large inputs — single shared output buffer
     if data.len() >= PARALLEL_TRANSLATE_THRESHOLD {
+        let mut out = vec![0u8; data.len()];
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() + num_threads - 1) / num_threads;
         // Align to BUF_SIZE boundaries for cache efficiency
         let chunk_size = ((chunk_size + BUF_SIZE - 1) / BUF_SIZE) * BUF_SIZE;
 
-        // Translate all chunks in parallel
-        let translated: Vec<Vec<u8>> = data
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut out = vec![0u8; chunk.len()];
-                translate_chunk_dispatch(chunk, &mut out, &table, &kind, use_simd);
-                out
-            })
-            .collect();
+        // Translate in parallel into shared buffer — no per-chunk allocation
+        data.par_chunks(chunk_size)
+            .zip(out.par_chunks_mut(chunk_size))
+            .for_each(|(inp, outp)| {
+                translate_chunk_dispatch(inp, &mut outp[..inp.len()], &table, &kind, use_simd);
+            });
 
-        // Write sequentially to preserve order
-        for chunk in &translated {
-            writer.write_all(chunk)?;
-        }
+        // Single write of entire result
+        writer.write_all(&out)?;
         return Ok(());
     }
 
-    // Sequential path for smaller data
-    let mut out = vec![0u8; BUF_SIZE];
+    // Sequential path — reuses buffer across chunks
+    let mut out = vec![0u8; data.len().min(BUF_SIZE)];
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;
@@ -675,6 +727,7 @@ pub fn translate_squeeze_mmap(
 
 /// Delete from mmap'd byte slice.
 /// Uses SIMD memchr for single-character delete (common case).
+/// For multi-char delete, uses 8-byte unrolled scan with bitset lookup.
 pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     // Fast path: single character delete uses SIMD memchr
     if delete_chars.len() == 1 {
@@ -686,14 +739,68 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 
     for chunk in data.chunks(BUF_SIZE) {
         let mut out_pos = 0;
-        for &b in chunk {
-            if !is_member(&member, b) {
-                unsafe {
-                    *outbuf.get_unchecked_mut(out_pos) = b;
+        let len = chunk.len();
+        let mut i = 0;
+
+        // 8-byte unrolled scan for better ILP
+        while i + 8 <= len {
+            unsafe {
+                let b0 = *chunk.get_unchecked(i);
+                let b1 = *chunk.get_unchecked(i + 1);
+                let b2 = *chunk.get_unchecked(i + 2);
+                let b3 = *chunk.get_unchecked(i + 3);
+                let b4 = *chunk.get_unchecked(i + 4);
+                let b5 = *chunk.get_unchecked(i + 5);
+                let b6 = *chunk.get_unchecked(i + 6);
+                let b7 = *chunk.get_unchecked(i + 7);
+
+                if !is_member(&member, b0) {
+                    *outbuf.get_unchecked_mut(out_pos) = b0;
+                    out_pos += 1;
                 }
-                out_pos += 1;
+                if !is_member(&member, b1) {
+                    *outbuf.get_unchecked_mut(out_pos) = b1;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b2) {
+                    *outbuf.get_unchecked_mut(out_pos) = b2;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b3) {
+                    *outbuf.get_unchecked_mut(out_pos) = b3;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b4) {
+                    *outbuf.get_unchecked_mut(out_pos) = b4;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b5) {
+                    *outbuf.get_unchecked_mut(out_pos) = b5;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b6) {
+                    *outbuf.get_unchecked_mut(out_pos) = b6;
+                    out_pos += 1;
+                }
+                if !is_member(&member, b7) {
+                    *outbuf.get_unchecked_mut(out_pos) = b7;
+                    out_pos += 1;
+                }
             }
+            i += 8;
         }
+
+        while i < len {
+            unsafe {
+                let b = *chunk.get_unchecked(i);
+                if !is_member(&member, b) {
+                    *outbuf.get_unchecked_mut(out_pos) = b;
+                    out_pos += 1;
+                }
+            }
+            i += 1;
+        }
+
         writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())
@@ -752,7 +859,14 @@ pub fn delete_squeeze_mmap(
 }
 
 /// Squeeze from mmap'd byte slice.
+/// Uses a two-pass approach: find runs of squeezable bytes with memchr,
+/// then copy non-squeezed content in bulk.
 pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    // Fast path: single squeeze character — use SIMD memchr to find runs
+    if squeeze_chars.len() == 1 {
+        return squeeze_single_mmap(squeeze_chars[0], data, writer);
+    }
+
     let member = build_member_set(squeeze_chars);
     let mut outbuf = vec![0u8; BUF_SIZE];
     let mut last_squeezed: u16 = 256;
@@ -773,6 +887,69 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
             }
             out_pos += 1;
         }
+        writer.write_all(&outbuf[..out_pos])?;
+    }
+    Ok(())
+}
+
+/// Squeeze a single repeated character from mmap'd data.
+/// Uses SIMD memchr to find all occurrences, then copies runs between them.
+fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    let mut last = 0;
+    let mut in_run = false;
+
+    for pos in memchr::memchr_iter(ch, data) {
+        if in_run {
+            // Skip consecutive occurrences
+            continue;
+        }
+        // First occurrence — include it, mark start of run
+        // Write everything from last to pos+1 (including this occurrence)
+        // Actually we need to handle runs properly
+        in_run = true;
+    }
+
+    // Simpler approach: scan for runs and copy non-run content
+    let mut outbuf = vec![0u8; BUF_SIZE];
+    let mut out_pos = 0;
+    let mut i = 0;
+    let len = data.len();
+
+    while i < len {
+        let b = data[i];
+        if b == ch {
+            // Output first occurrence
+            unsafe {
+                *outbuf.get_unchecked_mut(out_pos) = b;
+            }
+            out_pos += 1;
+            // Skip consecutive duplicates using memchr to find next non-match
+            i += 1;
+            while i < len && data[i] == ch {
+                i += 1;
+            }
+        } else {
+            // Find next occurrence of squeeze char using SIMD memchr
+            let remaining = &data[i..];
+            let run_end = memchr::memchr(ch, remaining).unwrap_or(remaining.len());
+            // Copy entire non-match run at once (bulk memcpy)
+            let copy_end = i + run_end;
+            if out_pos + run_end > BUF_SIZE {
+                writer.write_all(&outbuf[..out_pos])?;
+                out_pos = 0;
+            }
+            if run_end > BUF_SIZE {
+                // Huge run — write directly
+                writer.write_all(&data[i..copy_end])?;
+            } else {
+                outbuf[out_pos..out_pos + run_end].copy_from_slice(&data[i..copy_end]);
+                out_pos += run_end;
+            }
+            i = copy_end;
+        }
+    }
+
+    if out_pos > 0 {
         writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())

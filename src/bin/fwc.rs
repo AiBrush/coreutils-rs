@@ -318,7 +318,42 @@ fn main() {
     }
 }
 
-/// Print count values in GNU-compatible format.
+/// Format a u64 right-aligned into a stack buffer. Returns number of bytes written.
+/// Avoids the overhead of write! format machinery.
+#[inline]
+fn fmt_u64(val: u64, width: usize, buf: &mut [u8]) -> usize {
+    // Convert to decimal digits right-to-left
+    let mut digits = [0u8; 20];
+    let mut n = val;
+    let mut dlen = 0;
+    if n == 0 {
+        digits[19] = b'0';
+        dlen = 1;
+    } else {
+        let mut pos = 20;
+        while n > 0 {
+            pos -= 1;
+            digits[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            dlen += 1;
+        }
+        // Shift digits to end of array
+        if pos > 0 {
+            digits.copy_within(pos..20, 20 - dlen);
+        }
+    }
+    let pad = if width > dlen { width - dlen } else { 0 };
+    let total = pad + dlen;
+    // Write padding spaces
+    for b in &mut buf[..pad] {
+        *b = b' ';
+    }
+    // Write digits
+    buf[pad..total].copy_from_slice(&digits[20 - dlen..20]);
+    total
+}
+
+/// Print count values in GNU-compatible format using fast manual formatting.
 /// GNU wc order: newline, word, character, byte, maximum line length.
 fn print_counts_fmt(
     out: &mut impl Write,
@@ -327,15 +362,18 @@ fn print_counts_fmt(
     width: usize,
     show: &ShowFlags,
 ) {
+    // Stack buffer for the entire output line (max ~120 bytes)
+    let mut line = [0u8; 256];
+    let mut pos = 0;
     let mut first = true;
 
     macro_rules! field {
         ($val:expr) => {
-            if first {
-                let _ = write!(out, "{:>w$}", $val, w = width);
-            } else {
-                let _ = write!(out, " {:>w$}", $val, w = width);
+            if !first {
+                line[pos] = b' ';
+                pos += 1;
             }
+            pos += fmt_u64($val, width, &mut line[pos..]);
             #[allow(unused_assignments)]
             {
                 first = false;
@@ -361,9 +399,16 @@ fn print_counts_fmt(
     }
 
     if !filename.is_empty() {
-        let _ = write!(out, " {}", filename);
+        line[pos] = b' ';
+        pos += 1;
+        let name_bytes = filename.as_bytes();
+        line[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
+        pos += name_bytes.len();
     }
-    let _ = writeln!(out);
+    line[pos] = b'\n';
+    pos += 1;
+
+    let _ = out.write_all(&line[..pos]);
 }
 
 /// Read NUL-terminated filenames from a file (or stdin if "-").

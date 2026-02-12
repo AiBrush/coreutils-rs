@@ -1,7 +1,7 @@
 use std::io::{self, IoSlice, Write};
 
-/// Output buffer size for backward-fill strategy.
-const OUT_BUF: usize = 8 * 1024 * 1024;
+/// Output buffer size (retained for string/regex separator backward-fill strategy).
+const OUT_BUF: usize = 16 * 1024 * 1024;
 
 /// Maximum number of iovecs per writev() call (Linux IOV_MAX is 1024).
 const IOV_BATCH: usize = 1024;
@@ -31,10 +31,10 @@ fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<
     Ok(())
 }
 
-/// Reverse records separated by a single byte using backward memrchr scanning.
-/// Scans backward from end, writes each record as found. No Vec<usize> allocation.
-/// Uses a backward-fill buffer: records are copied backward into an 8MB buffer,
-/// then flushed as a single write_all when full.
+/// Reverse records separated by a single byte.
+/// Uses a single forward SIMD scan to collect all separator positions,
+/// then builds IoSlice references in reverse order for zero-copy output.
+/// Eliminates per-record memrchr calls AND the copy to an output buffer.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -45,111 +45,47 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return tac_bytes_small(data, separator, before, out);
     }
 
-    // Large data: backward scan with forward-fill output buffer
-    let mut buf = vec![0u8; OUT_BUF];
-    let mut bp = 0; // write position (fills forward)
+    // Single forward SIMD scan — O(n) with memchr auto-vectorization
+    let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
+
+    if positions.is_empty() {
+        return out.write_all(data);
+    }
+
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
 
     if !before {
         // separator-after mode: records end with separator
-        let mut end = data.len();
+        let last_pos = *positions.last().unwrap();
 
-        // Check for trailing content after last separator
-        if let Some(last_sep) = memchr::memrchr(separator, data) {
-            if last_sep < data.len() - 1 {
-                // Trailing content without separator — output first
-                let record = &data[last_sep + 1..];
-                if bp + record.len() > OUT_BUF {
-                    out.write_all(&buf[..bp])?;
-                    bp = 0;
-                }
-                if record.len() > OUT_BUF {
-                    out.write_all(record)?;
-                } else {
-                    buf[bp..bp + record.len()].copy_from_slice(record);
-                    bp += record.len();
-                }
-                end = last_sep + 1;
-            }
-        } else {
-            // No separator found — output entire data
-            out.write_all(data)?;
-            return Ok(());
+        // Trailing content without separator — output first
+        if last_pos < data.len() - 1 {
+            slices.push(IoSlice::new(&data[last_pos + 1..]));
         }
 
-        // Scan backward through records
-        let mut cursor = end;
-        while cursor > 0 {
-            // Find previous separator
-            let search_end = cursor - 1; // skip separator at cursor-1
-            let prev_sep = if search_end > 0 {
-                memchr::memrchr(separator, &data[..search_end])
-            } else {
-                None
-            };
-
-            let start = match prev_sep {
-                Some(pos) => pos + 1,
-                None => 0,
-            };
-
-            let record = &data[start..cursor];
-            if bp + record.len() > OUT_BUF {
-                out.write_all(&buf[..bp])?;
-                bp = 0;
-            }
-            if record.len() > OUT_BUF {
-                out.write_all(record)?;
-            } else {
-                buf[bp..bp + record.len()].copy_from_slice(record);
-                bp += record.len();
-            }
-
-            cursor = start;
+        // Records in reverse order (each includes its trailing separator)
+        for i in (0..positions.len()).rev() {
+            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
+            slices.push(IoSlice::new(&data[start..positions[i] + 1]));
         }
     } else {
         // separator-before mode: records start with separator
-        let mut cursor = data.len();
-        while cursor > 0 {
-            let sep_pos = memchr::memrchr(separator, &data[..cursor]);
-            match sep_pos {
-                Some(pos) => {
-                    let record = &data[pos..cursor];
-                    if bp + record.len() > OUT_BUF {
-                        out.write_all(&buf[..bp])?;
-                        bp = 0;
-                    }
-                    if record.len() > OUT_BUF {
-                        out.write_all(record)?;
-                    } else {
-                        buf[bp..bp + record.len()].copy_from_slice(record);
-                        bp += record.len();
-                    }
-                    cursor = pos;
-                }
-                None => {
-                    // Leading content before first separator
-                    let record = &data[..cursor];
-                    if bp + record.len() > OUT_BUF {
-                        out.write_all(&buf[..bp])?;
-                        bp = 0;
-                    }
-                    if record.len() > OUT_BUF {
-                        out.write_all(record)?;
-                    } else {
-                        buf[bp..bp + record.len()].copy_from_slice(record);
-                        bp += record.len();
-                    }
-                    break;
-                }
-            }
+        for i in (0..positions.len()).rev() {
+            let end = if i + 1 < positions.len() {
+                positions[i + 1]
+            } else {
+                data.len()
+            };
+            slices.push(IoSlice::new(&data[positions[i]..end]));
+        }
+
+        // Leading content before first separator
+        if positions[0] > 0 {
+            slices.push(IoSlice::new(&data[..positions[0]]));
         }
     }
 
-    // Flush remaining buffer
-    if bp > 0 {
-        out.write_all(&buf[..bp])?;
-    }
-
+    write_all_slices(out, &slices)?;
     Ok(())
 }
 

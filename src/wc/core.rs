@@ -1,9 +1,10 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
 
-/// Minimum data size to use parallel processing (2MB).
-/// Lower threshold lets us exploit 4 cores on smaller files.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size to use parallel processing (4MB).
+/// Higher threshold avoids rayon overhead on medium files where
+/// sequential memchr SIMD is already fast enough.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Results from counting a byte slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

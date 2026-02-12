@@ -5,8 +5,8 @@ use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Streaming encode chunk: 8MB aligned to 3 bytes for maximum throughput.
-const STREAM_ENCODE_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
+/// Streaming encode chunk: 12MB aligned to 3 bytes for maximum throughput.
+const STREAM_ENCODE_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
 
 /// Chunk size for no-wrap encoding: 8MB aligned to 3 bytes.
 const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);

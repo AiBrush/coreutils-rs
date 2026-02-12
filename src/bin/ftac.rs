@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -109,17 +109,22 @@ fn main() {
         cli.files.clone()
     };
 
-    // Raw fd stdout on Unix — tac core handles buffering internally
+    // Raw fd stdout with BufWriter for batching small writes
     #[cfg(unix)]
     let had_error = {
         let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        run(&cli, &files, &mut *raw)
+        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, &mut *raw);
+        let err = run(&cli, &files, &mut writer);
+        let _ = writer.flush();
+        err
     };
     #[cfg(not(unix))]
     let had_error = {
         let stdout = io::stdout();
-        let mut locked = stdout.lock();
-        run(&cli, &files, &mut locked)
+        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, stdout.lock());
+        let err = run(&cli, &files, &mut writer);
+        let _ = writer.flush();
+        err
     };
 
     if had_error {

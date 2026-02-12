@@ -62,11 +62,12 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         return None;
     }
 
-    // mmap the stdin file descriptor
+    // mmap the stdin file descriptor with populate() for eager page table setup
     // SAFETY: fd is valid, file is regular, size > 0
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap: Option<memmap2::Mmap> = unsafe { memmap2::Mmap::map(&file) }.ok();
+    let mmap: Option<memmap2::Mmap> =
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -76,6 +77,13 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
                 m.len(),
                 libc::MADV_SEQUENTIAL,
             );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
     }
     mmap
@@ -97,11 +105,11 @@ fn main() {
     #[cfg(unix)]
     let mut raw = raw_stdout();
     #[cfg(unix)]
-    let mut writer = BufWriter::with_capacity(64 * 1024, &mut *raw);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();
     #[cfg(not(unix))]
-    let mut writer = BufWriter::with_capacity(64 * 1024, stdout.lock());
+    let mut writer = BufWriter::with_capacity(1024 * 1024, stdout.lock());
 
     // Try to mmap stdin for zero-copy reads
     let mmap = try_mmap_stdin();
