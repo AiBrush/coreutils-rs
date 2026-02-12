@@ -47,9 +47,9 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    // For small data (< 256KB), use simple backward scan with direct writes.
-    // Avoids overhead of forward SIMD scan + position Vec + IoSlice Vec allocation.
-    if data.len() < 256 * 1024 {
+    // For small/medium data (< 2MB), use simple backward scan with direct writes.
+    // A single write_all is faster than writev with many small segments.
+    if data.len() < 2 * 1024 * 1024 {
         return tac_bytes_small(data, separator, before, out);
     }
 
