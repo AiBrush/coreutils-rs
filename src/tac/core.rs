@@ -67,8 +67,6 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 
     // Build IoSlice list pointing directly into mmap'd data — zero copies
-    let sep_byte = [separator];
-
     if !before {
         let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
         let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
@@ -117,7 +115,7 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
 /// Uses direct write_all calls with a small staging buffer.
 fn tac_bytes_simple(
     data: &[u8],
-    separator: u8,
+    _separator: u8,
     before: bool,
     positions: &[usize],
     out: &mut impl Write,
@@ -159,7 +157,7 @@ fn tac_bytes_simple(
 /// BufWriter fallback for tac_bytes when there are too many records for vectored I/O.
 fn tac_bytes_bufwriter(
     data: &[u8],
-    separator: u8,
+    _separator: u8,
     before: bool,
     positions: &[usize],
     out: &mut impl Write,
