@@ -85,7 +85,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                     None => match read_stdin() {
                         Ok(d) => FileData::Owned(d),
                         Err(e) => {
-                            eprintln!("ftac: standard input: {}", e);
+                            eprintln!("tac: standard input: {}", e);
                             had_error = true;
                             continue;
                         }
@@ -162,6 +162,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     let files: Vec<String> = if cli.files.is_empty() {

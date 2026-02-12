@@ -106,6 +106,7 @@ struct Cli {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Parse key definitions
@@ -202,8 +203,9 @@ fn main() {
     };
 
     if let Err(e) = sort_and_output(&inputs, &config) {
+        // SIGPIPE is reset to SIG_DFL, so broken pipe kills the process
+        // before we get here. This is a fallback for edge cases.
         if e.kind() == std::io::ErrorKind::BrokenPipe {
-            eprintln!("sort: write error: Broken pipe");
             process::exit(2);
         }
         eprintln!("sort: {}", e);
