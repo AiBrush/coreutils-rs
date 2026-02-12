@@ -28,19 +28,43 @@ impl Deref for FileData {
 /// (page table creation, TLB flush on munmap) that exceeds the zero-copy benefit.
 const MMAP_THRESHOLD: u64 = 256 * 1024;
 
+/// Open a file with O_NOATIME on Linux to avoid atime inode writes.
+/// Falls back to normal open if O_NOATIME fails (e.g., not file owner).
+#[cfg(target_os = "linux")]
+fn open_noatime(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOATIME = 0o1000000 on Linux
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+    {
+        Ok(f) => Ok(f),
+        Err(_) => File::open(path),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_noatime(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 /// Read a file with zero-copy mmap for large files or read() for small files.
-/// Uses populate() for eager page table setup and MADV_HUGEPAGE for TLB efficiency.
+/// Opens once with O_NOATIME, uses fstat for metadata to save a syscall.
 pub fn read_file(path: &Path) -> io::Result<FileData> {
-    let metadata = fs::metadata(path)?;
+    let file = open_noatime(path)?;
+    let metadata = file.metadata()?;
     let len = metadata.len();
 
     if len > 0 && metadata.file_type().is_file() {
-        // Small files: read() is faster than mmap (avoids page table overhead)
+        // Small files: read from already-open fd (avoids double open + page table overhead)
         if len < MMAP_THRESHOLD {
-            return Ok(FileData::Owned(fs::read(path)?));
+            let mut buf = Vec::with_capacity(len as usize);
+            let mut reader = file;
+            reader.read_to_end(&mut buf)?;
+            return Ok(FileData::Owned(buf));
         }
 
-        let file = File::open(path)?;
         // SAFETY: Read-only mapping. File must not be truncated during use.
         // Don't use populate() — it blocks until all pages are loaded.
         // Instead, MADV_SEQUENTIAL triggers async readahead which overlaps with processing.
@@ -69,11 +93,20 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
                 }
                 Ok(FileData::Mmap(mmap))
             }
-            Err(_) => Ok(FileData::Owned(fs::read(path)?)),
+            Err(_) => {
+                // mmap failed — fall back to read
+                let mut buf = Vec::with_capacity(len as usize);
+                let mut reader = file;
+                reader.read_to_end(&mut buf)?;
+                Ok(FileData::Owned(buf))
+            }
         }
     } else if len > 0 {
-        // Non-regular file (special files)
-        Ok(FileData::Owned(fs::read(path)?))
+        // Non-regular file (special files) — read from open fd
+        let mut buf = Vec::new();
+        let mut reader = file;
+        reader.read_to_end(&mut buf)?;
+        Ok(FileData::Owned(buf))
     } else {
         Ok(FileData::Owned(Vec::new()))
     }

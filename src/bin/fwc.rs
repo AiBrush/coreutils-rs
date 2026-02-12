@@ -188,7 +188,7 @@ fn main() {
                     None => match read_stdin() {
                         Ok(d) => FileData::Owned(d),
                         Err(e) => {
-                            eprintln!("fwc: standard input: {}", e);
+                            eprintln!("wc: standard input: {}", e);
                             had_error = true;
                             continue;
                         }
