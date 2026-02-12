@@ -248,7 +248,6 @@ fn read_all_input(
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
             let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
-            // Sequential for line scanning; caller switches to Random for sort phase
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -276,9 +275,10 @@ fn read_all_input(
     };
 
     // Find line boundaries using SIMD-accelerated memchr
-    // Use parallel scanning for large files (>4MB) to leverage multiple cores
+    // Use parallel scanning for large files (>32MB) to leverage multiple cores.
+    // For smaller files (<32MB), sequential memchr is faster due to rayon overhead.
     let data = &*buffer;
-    let offsets = if data.len() > 4 * 1024 * 1024 {
+    let offsets = if data.len() > 32 * 1024 * 1024 {
         find_lines_parallel(data, delimiter)
     } else {
         let mut offsets = Vec::with_capacity(data.len() / 40 + 1);
@@ -701,9 +701,7 @@ fn break_ties_line_cmp(entries: &mut [(u64, usize)], data: &[u8], offsets: &[(us
     }
 }
 
-/// Write sorted indices to output, with optional unique dedup.
-/// Writes directly to BufWriter — it already handles batching.
-/// Eliminates intermediate Vec buffer copy (saves ~100MB memcpy for 100MB input).
+/// Write sorted indices to output.
 fn write_sorted_output(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -740,9 +738,7 @@ fn write_sorted_output(
     Ok(())
 }
 
-/// Write sorted (key, index) entries to output. Like write_sorted_output but
-/// iterates (u64, usize) entries directly, avoiding the O(n) copy-back to indices.
-/// Writes directly to BufWriter to eliminate intermediate buffer overhead.
+/// Write sorted (key, index) entries to output.
 fn write_sorted_entries(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -872,21 +868,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
         }
         if is_sorted {
-            // Zero-copy fast path: write mmap data directly when possible.
-            // Conditions: non-unique, newline-terminated, no \r in data.
-            if !config.unique && !config.zero_terminated && memchr::memchr(b'\r', data).is_none() {
-                if data.last() == Some(&b'\n') {
-                    writer.write_all(data)?;
-                } else if !data.is_empty() {
-                    writer.write_all(data)?;
-                    writer.write_all(b"\n")?;
-                }
-                writer.flush()?;
-                return Ok(());
-            }
-
-            // Line-by-line output for unique/\r\n/zero-terminated cases
-            // Write directly to BufWriter — it already handles batching.
+            // Already sorted: output lines in order
             if config.unique {
                 let mut prev: Option<usize> = None;
                 for i in 0..num_lines {
@@ -903,6 +885,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         writer.write_all(terminator)?;
                         prev = Some(i);
                     }
+                }
+            } else if !config.zero_terminated {
+                // Fast path: write raw data directly (no \r scan needed for sorted data)
+                if data.last() == Some(&b'\n') {
+                    writer.write_all(data)?;
+                } else if !data.is_empty() {
+                    writer.write_all(data)?;
+                    writer.write_all(b"\n")?;
                 }
             } else {
                 for i in 0..num_lines {
@@ -951,25 +941,30 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     if is_plain_lex && num_lines > 256 {
         // FAST PATH 1: Prefix-based lexicographic sort
         let reverse = gopts.reverse;
-        let mut entries: Vec<(u64, usize)> = if num_lines > 10_000 {
-            offsets
-                .par_iter()
-                .enumerate()
-                .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
-                .collect()
-        } else {
-            offsets
-                .iter()
-                .enumerate()
-                .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
-                .collect()
-        };
+        let mut entries: Vec<(u64, usize)> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
+            .collect();
 
         let n = entries.len();
-        if n > 1000 {
-            // Radix sort on 8-byte prefixes: O(n) vs O(n log n)
+        // Prefix-first comparison: resolves on u64 prefix (1ns) for most comparisons,
+        // falls back to full line memcmp only for ties (rare with random data).
+        let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
+            let ord = match a.0.cmp(&b.0) {
+                Ordering::Equal => {
+                    let (sa, ea) = offsets[a.1];
+                    let (sb, eb) = offsets[b.1];
+                    data[sa..ea].cmp(&data[sb..eb])
+                }
+                ord => ord,
+            };
+            if reverse { ord.reverse() } else { ord }
+        };
+
+        if n > 5_000_000 {
+            // Very large inputs: radix sort O(n) + tie breaking.
             radix_sort_entries(&mut entries, reverse);
-            // Break ties: entries with same prefix need full line comparison
             let mut i = 0;
             while i < n {
                 let key = entries[i].0;
@@ -978,7 +973,6 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     j += 1;
                 }
                 if j - i > 256 {
-                    // Two-level radix: sort tied group by secondary prefix (bytes 8-15)
                     let group = &mut entries[i..j];
                     let mut secondary: Vec<(u64, usize)> = group
                         .iter()
@@ -989,7 +983,6 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         })
                         .collect();
                     radix_sort_entries(&mut secondary, reverse);
-                    // Break remaining ties with full comparison
                     let mut si = 0;
                     while si < secondary.len() {
                         let skey = secondary[si].0;
@@ -1026,18 +1019,9 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
                 i = j;
             }
+        } else if n > 10_000 {
+            entries.par_sort_unstable_by(prefix_cmp);
         } else {
-            let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-                let ord = match a.0.cmp(&b.0) {
-                    Ordering::Equal => {
-                        let (sa, ea) = offsets[a.1];
-                        let (sb, eb) = offsets[b.1];
-                        data[sa..ea].cmp(&data[sb..eb])
-                    }
-                    ord => ord,
-                };
-                if reverse { ord.reverse() } else { ord }
-            };
             entries.sort_unstable_by(prefix_cmp);
         }
 
@@ -1047,7 +1031,6 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }
 
-        // Write directly to BufWriter — it already handles batching.
         if config.unique {
             let mut prev: Option<usize> = None;
             for &(_, idx) in &entries {

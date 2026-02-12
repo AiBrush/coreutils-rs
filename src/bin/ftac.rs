@@ -1,16 +1,11 @@
 use std::io::{self, Write};
 #[cfg(unix)]
-use std::mem::ManuallyDrop;
-#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
 use clap::Parser;
-#[cfg(unix)]
-use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::{FileData, read_file, read_stdin};
 use coreutils_rs::tac;
 
 #[derive(Parser)]
@@ -41,11 +36,82 @@ struct Cli {
     files: Vec<String>,
 }
 
+/// Memory-mapped file data (either mmap or owned Vec).
+enum TacData {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for TacData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            TacData::Mmap(m) => m,
+            TacData::Owned(v) => v,
+        }
+    }
+}
+
+/// Read file for tac: mmap WITH MAP_POPULATE for backward scan.
+/// MAP_POPULATE pre-creates all page table entries, avoiding ~35K minor page faults
+/// during backward memrchr scan. MADV_SEQUENTIAL + HUGEPAGE for large files.
+fn read_file_for_tac(path: &Path) -> io::Result<TacData> {
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+
+    if len == 0 || !metadata.file_type().is_file() {
+        if len > 0 {
+            let mut buf = Vec::new();
+            let mut reader = file;
+            io::Read::read_to_end(&mut reader, &mut buf)?;
+            return Ok(TacData::Owned(buf));
+        }
+        return Ok(TacData::Owned(Vec::new()));
+    }
+
+    // Small files (< 1MB): direct read is faster than mmap
+    if len < 1024 * 1024 {
+        let mut buf = vec![0u8; len as usize];
+        let mut total = 0;
+        let mut reader = &file;
+        while total < buf.len() {
+            match io::Read::read(&mut reader, &mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(total);
+        return Ok(TacData::Owned(buf));
+    }
+
+    // Large files: mmap WITH populate for backward scan.
+    match unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+        Ok(mmap) => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                if len >= 2 * 1024 * 1024 {
+                    let _ = mmap.advise(memmap2::Advice::HugePage);
+                }
+            }
+            Ok(TacData::Mmap(mmap))
+        }
+        Err(_) => {
+            let mut buf = Vec::with_capacity(len as usize);
+            let mut reader = file;
+            io::Read::read_to_end(&mut reader, &mut buf)?;
+            Ok(TacData::Owned(buf))
+        }
+    }
+}
+
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
-/// Returns None if stdin is a pipe/terminal.
 #[cfg(unix)]
 fn try_mmap_stdin() -> Option<memmap2::Mmap> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::io::AsRawFd;
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();
 
@@ -58,34 +124,35 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     }
 
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
-    std::mem::forget(file); // Don't close stdin
+    let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
+    std::mem::forget(file);
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
-        unsafe {
-            libc::madvise(
-                m.as_ptr() as *mut libc::c_void,
-                m.len(),
-                libc::MADV_SEQUENTIAL,
-            );
-        }
+        let _ = m.advise(memmap2::Advice::Sequential);
     }
     mmap
+}
+
+fn read_stdin_data() -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    io::stdin().lock().read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
     let mut had_error = false;
 
     for filename in files {
-        let data: FileData = if filename == "-" {
+        let data: TacData = if filename == "-" {
             #[cfg(unix)]
             {
                 match try_mmap_stdin() {
-                    Some(mmap) => FileData::Mmap(mmap),
-                    None => match read_stdin() {
-                        Ok(d) => FileData::Owned(d),
+                    Some(mmap) => TacData::Mmap(mmap),
+                    None => match read_stdin_data() {
+                        Ok(d) => TacData::Owned(d),
                         Err(e) => {
-                            eprintln!("ftac: standard input: {}", e);
+                            eprintln!("tac: standard input: {}", e);
                             had_error = true;
                             continue;
                         }
@@ -93,8 +160,8 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
             #[cfg(not(unix))]
-            match read_stdin() {
-                Ok(d) => FileData::Owned(d),
+            match read_stdin_data() {
+                Ok(d) => TacData::Owned(d),
                 Err(e) => {
                     eprintln!("tac: standard input: {}", e);
                     had_error = true;
@@ -102,7 +169,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         } else {
-            match read_file(Path::new(filename)) {
+            match read_file_for_tac(Path::new(filename)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("tac: {}: {}", filename, e);
@@ -111,32 +178,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         };
-
-        // tac uses backward SIMD scan (memrchr_iter) for single-byte separator,
-        // so MADV_RANDOM is optimal (no sequential readahead benefit).
-        // WILLNEED still helps pre-fault all pages, HUGEPAGE reduces TLB misses.
-        #[cfg(unix)]
-        {
-            if let FileData::Mmap(ref mmap) = data {
-                unsafe {
-                    // Pre-fault all pages for backward scan
-                    libc::madvise(
-                        mmap.as_ptr() as *mut libc::c_void,
-                        mmap.len(),
-                        libc::MADV_WILLNEED,
-                    );
-                    // HUGEPAGE reduces TLB misses for large files (Linux only)
-                    #[cfg(target_os = "linux")]
-                    if mmap.len() >= 2 * 1024 * 1024 {
-                        libc::madvise(
-                            mmap.as_ptr() as *mut libc::c_void,
-                            mmap.len(),
-                            libc::MADV_HUGEPAGE,
-                        );
-                    }
-                }
-            }
-        }
 
         let bytes: &[u8] = &data;
 
@@ -170,12 +211,17 @@ fn main() {
         cli.files.clone()
     };
 
-    // Raw fd stdout — tac's batched writev sends IoSlice directly to kernel.
-    // BufWriter would copy mmap data into its buffer, defeating zero-copy.
+    // Write directly to raw fd WITHOUT BufWriter.
+    // BufWriter copies all data through its internal buffer, destroying
+    // the zero-copy writev approach of tac core (~70ms wasted for 141MB).
     #[cfg(unix)]
     let had_error = {
-        let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        run(&cli, &files, &mut *raw)
+        use std::mem::ManuallyDrop;
+        let raw_file = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let mut writer: &std::fs::File = &raw_file;
+        let err = run(&cli, &files, &mut writer);
+        let _ = writer.flush();
+        err
     };
     #[cfg(not(unix))]
     let had_error = {
