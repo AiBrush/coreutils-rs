@@ -181,6 +181,16 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
     let output_delim = cfg.output_delim;
     let suppress = cfg.suppress_no_delim;
 
+    // Ultra-fast path: no delimiter in data → all lines pass through unchanged.
+    // Single memchr scan (~10GB/s with AVX2) to detect, then one write for the whole buffer.
+    if !suppress && delim != line_delim && memchr::memchr(delim, data).is_none() {
+        out.write_all(data)?;
+        if !data.is_empty() && data[data.len() - 1] != line_delim {
+            out.write_all(&[line_delim])?;
+        }
+        return Ok(());
+    }
+
     // Ultra-fast path: single field extraction (e.g., cut -f5)
     if !complement && ranges.len() == 1 && ranges[0].start == ranges[0].end {
         return process_single_field(data, delim, line_delim, ranges[0].start, suppress, out);
