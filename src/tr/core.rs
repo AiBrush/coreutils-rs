@@ -1094,11 +1094,11 @@ pub fn translate_mmap(
         return writer.write_all(data);
     }
 
-    // 1MB chunked path — reuses single buffer across chunks.
-    // Better than allocating vec![0u8; data.len()] which zero-inits 100MB+.
-    // 1MB fits in L2 cache for optimal SIMD throughput.
-    let mut out = vec![0u8; BUF_SIZE];
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked path — reuses single buffer across chunks.
+    // Size buffer to min(data.len(), 1MB) to avoid over-allocating for small files.
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut out = vec![0u8; buf_size];
+    for chunk in data.chunks(buf_size) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;
     }
@@ -1123,10 +1123,11 @@ pub fn translate_squeeze_mmap(
     let use_simd = false;
 
     // Single buffer: translate chunk→buf, then squeeze in-place within buf
-    let mut buf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut buf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         // Phase 1: Translate into buf (may use SIMD)
         translate_chunk_dispatch(chunk, &mut buf[..chunk.len()], &table, &kind, use_simd);
 
@@ -1173,9 +1174,10 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
     }
 
     let member = build_member_set(delete_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         let mut out_pos = 0;
         let len = chunk.len();
         let mut i = 0;
@@ -1235,9 +1237,10 @@ fn delete_multi_memchr_mmap<const N: usize>(
     data: &[u8],
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         let mut wp = 0;
         let mut last = 0;
 
@@ -1274,9 +1277,10 @@ fn delete_multi_memchr_mmap<const N: usize>(
 /// Chunked: processes 1MB at a time into contiguous output buffer, single write_all per chunk.
 /// Uses memchr_iter (precomputed SIMD state for entire chunk) + bulk copy_from_slice.
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         let mut wp = 0;
         let mut last = 0;
         for pos in memchr::memchr_iter(ch, chunk) {
@@ -1306,10 +1310,11 @@ pub fn delete_squeeze_mmap(
 ) -> io::Result<()> {
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         let mut out_pos = 0;
         for &b in chunk {
             if is_member(&delete_set, b) {
@@ -1352,10 +1357,11 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
 
     // General path: chunked output buffer with member check
     let member = build_member_set(squeeze_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;
 
-    for chunk in data.chunks(BUF_SIZE) {
+    for chunk in data.chunks(buf_size) {
         let len = chunk.len();
         let mut wp = 0;
         let mut i = 0;
@@ -1397,7 +1403,8 @@ fn squeeze_multi_mmap<const N: usize>(
     data: &[u8],
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
     let mut wp = 0;
     let mut last_squeezed: u16 = 256;
     let mut cursor = 0;
@@ -1414,11 +1421,11 @@ fn squeeze_multi_mmap<const N: usize>(
 
     macro_rules! flush_and_copy {
         ($src:expr, $len:expr) => {
-            if wp + $len > BUF_SIZE {
+            if wp + $len > buf_size {
                 writer.write_all(&outbuf[..wp])?;
                 wp = 0;
             }
-            if $len > BUF_SIZE {
+            if $len > buf_size {
                 writer.write_all($src)?;
             } else {
                 outbuf[wp..wp + $len].copy_from_slice($src);
@@ -1439,7 +1446,7 @@ fn squeeze_multi_mmap<const N: usize>(
                     last_squeezed = 256;
                 }
                 if last_squeezed != b as u16 {
-                    if wp >= BUF_SIZE {
+                    if wp >= buf_size {
                         writer.write_all(&outbuf[..wp])?;
                         wp = 0;
                     }
@@ -1480,7 +1487,8 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
         return writer.write_all(data);
     }
 
-    let mut outbuf = vec![0u8; BUF_SIZE];
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = vec![0u8; buf_size];
     let len = data.len();
     let mut wp = 0;
     let mut cursor = 0;
@@ -1494,11 +1502,11 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
                 // Bulk copy non-squeeze region [cursor..pos]
                 let gap = pos - cursor;
                 if gap > 0 {
-                    if wp + gap > BUF_SIZE {
+                    if wp + gap > buf_size {
                         writer.write_all(&outbuf[..wp])?;
                         wp = 0;
                     }
-                    if gap > BUF_SIZE {
+                    if gap > buf_size {
                         // Huge gap: write directly
                         writer.write_all(&data[cursor..pos])?;
                     } else {
@@ -1508,7 +1516,7 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
                 }
 
                 // Emit one squeeze char
-                if wp >= BUF_SIZE {
+                if wp >= buf_size {
                     writer.write_all(&outbuf[..wp])?;
                     wp = 0;
                 }
@@ -1525,11 +1533,11 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
                 // No more squeeze chars — bulk copy remainder
                 let remaining = len - cursor;
                 if remaining > 0 {
-                    if wp + remaining > BUF_SIZE {
+                    if wp + remaining > buf_size {
                         writer.write_all(&outbuf[..wp])?;
                         wp = 0;
                     }
-                    if remaining > BUF_SIZE {
+                    if remaining > buf_size {
                         writer.write_all(&data[cursor..])?;
                     } else {
                         outbuf[wp..wp + remaining].copy_from_slice(&data[cursor..]);

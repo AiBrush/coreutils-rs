@@ -517,6 +517,100 @@ fn float_to_sortable_u64(f: f64) -> u64 {
     }
 }
 
+/// LSD Radix sort for (u64, usize) entries.
+/// 4 passes on 16-bit digits: O(4n) time, O(n) space, stable.
+/// Avoids O(n log n) comparison overhead entirely.
+/// For reverse: inverts keys before sorting (bitwise NOT flips u64 order).
+fn radix_sort_entries(entries: &mut Vec<(u64, usize)>, reverse: bool) {
+    let n = entries.len();
+
+    // Invert keys for descending sort (ascending on inverted = descending on original)
+    if reverse {
+        for e in entries.iter_mut() {
+            e.0 = !e.0;
+        }
+    }
+
+    let mut aux: Vec<(u64, usize)> = Vec::with_capacity(n);
+    unsafe {
+        aux.set_len(n);
+    }
+
+    for pass in 0..4u32 {
+        let shift = pass * 16;
+
+        // Build histogram
+        let mut histogram = [0u32; 65536];
+        for &(key, _) in entries.iter() {
+            unsafe {
+                let digit = ((key >> shift) & 0xFFFF) as usize;
+                *histogram.get_unchecked_mut(digit) += 1;
+            }
+        }
+
+        // Check if all entries have the same digit — skip this pass
+        let mut non_zero = 0u32;
+        for &c in histogram.iter() {
+            non_zero += (c != 0) as u32;
+        }
+        if non_zero <= 1 {
+            continue; // All same digit, no reordering needed
+        }
+
+        // Prefix sum
+        let mut offset = 0u32;
+        for count in histogram.iter_mut() {
+            let c = *count;
+            *count = offset;
+            offset += c;
+        }
+
+        // Scatter
+        for &entry in entries.iter() {
+            unsafe {
+                let digit = ((entry.0 >> shift) & 0xFFFF) as usize;
+                let pos = *histogram.get_unchecked(digit) as usize;
+                *aux.get_unchecked_mut(pos) = entry;
+                *histogram.get_unchecked_mut(digit) += 1;
+            }
+        }
+
+        std::mem::swap(entries, &mut aux);
+    }
+
+    // Restore original keys
+    if reverse {
+        for e in entries.iter_mut() {
+            e.0 = !e.0;
+        }
+    }
+}
+
+/// Break ties in radix-sorted entries by running comparison sort on equal-key groups.
+/// After radix sort, entries with equal u64 keys are adjacent (and in input order, stable).
+/// For non-stable sort, GNU requires last-resort whole-line comparison for deterministic output.
+fn break_ties_line_cmp(entries: &mut [(u64, usize)], data: &[u8], offsets: &[(usize, usize)]) {
+    if entries.len() <= 1 {
+        return;
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        let key = entries[i].0;
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == key {
+            j += 1;
+        }
+        if j - i > 1 {
+            entries[i..j].sort_unstable_by(|a, b| {
+                let (sa, ea) = offsets[a.1];
+                let (sb, eb) = offsets[b.1];
+                data[sa..ea].cmp(&data[sb..eb])
+            });
+        }
+        i = j;
+    }
+}
+
 /// Write sorted indices to output, with optional unique dedup.
 /// Uses contiguous output buffer with batched write_all for efficient I/O.
 fn write_sorted_output(
@@ -801,28 +895,39 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             .map(|(i, &(s, e))| (line_prefix(data, s, e), i))
             .collect();
 
-        let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-            let ord = match a.0.cmp(&b.0) {
-                Ordering::Equal => {
-                    let (sa, ea) = offsets[a.1];
-                    let (sb, eb) = offsets[b.1];
-                    data[sa..ea].cmp(&data[sb..eb])
-                }
-                ord => ord,
-            };
-            if reverse { ord.reverse() } else { ord }
-        };
-
         let n = entries.len();
-        if config.stable {
-            if n > 10_000 {
-                entries.par_sort_by(prefix_cmp);
-            } else {
-                entries.sort_by(prefix_cmp);
+        if n > 1000 {
+            // Radix sort on 8-byte prefixes: O(n) vs O(n log n)
+            radix_sort_entries(&mut entries, reverse);
+            // Break ties: entries with same prefix need full line comparison
+            let mut i = 0;
+            while i < n {
+                let key = entries[i].0;
+                let mut j = i + 1;
+                while j < n && entries[j].0 == key {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    entries[i..j].sort_unstable_by(|a, b| {
+                        let ord = data[offsets[a.1].0..offsets[a.1].1]
+                            .cmp(&data[offsets[b.1].0..offsets[b.1].1]);
+                        if reverse { ord.reverse() } else { ord }
+                    });
+                }
+                i = j;
             }
-        } else if n > 10_000 {
-            entries.par_sort_unstable_by(prefix_cmp);
         } else {
+            let prefix_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
+                let ord = match a.0.cmp(&b.0) {
+                    Ordering::Equal => {
+                        let (sa, ea) = offsets[a.1];
+                        let (sb, eb) = offsets[b.1];
+                        data[sa..ea].cmp(&data[sb..eb])
+                    }
+                    ord => ord,
+                };
+                if reverse { ord.reverse() } else { ord }
+            };
             entries.sort_unstable_by(prefix_cmp);
         }
 
@@ -885,28 +990,25 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         let reverse = gopts.reverse;
         let stable = config.stable;
 
-        let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-            let ord = a.0.cmp(&b.0);
-            if ord != Ordering::Equal {
-                return if reverse { ord.reverse() } else { ord };
-            }
-            if !stable {
-                data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
-            } else {
-                Ordering::Equal
-            }
-        };
-
         let n = entries.len();
-        if stable {
-            if n > 10_000 {
-                entries.par_sort_by(cmp);
-            } else {
-                entries.sort_by(cmp);
+        if n > 1000 {
+            // Radix sort: O(n) vs O(n log n) comparison sort
+            radix_sort_entries(&mut entries, reverse);
+            if !stable {
+                break_ties_line_cmp(&mut entries, data, &offsets);
             }
-        } else if n > 10_000 {
-            entries.par_sort_unstable_by(cmp);
         } else {
+            let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
+                let ord = a.0.cmp(&b.0);
+                if ord != Ordering::Equal {
+                    return if reverse { ord.reverse() } else { ord };
+                }
+                if !stable {
+                    data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                } else {
+                    Ordering::Equal
+                }
+            };
             entries.sort_unstable_by(cmp);
         }
 
@@ -946,28 +1048,25 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let reverse = opts.reverse;
             let stable = config.stable;
 
-            let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-                let ord = a.0.cmp(&b.0);
-                if ord != Ordering::Equal {
-                    return if reverse { ord.reverse() } else { ord };
-                }
-                if !stable {
-                    data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
-                } else {
-                    Ordering::Equal
-                }
-            };
-
             let n = entries.len();
-            if stable {
-                if n > 10_000 {
-                    entries.par_sort_by(cmp);
-                } else {
-                    entries.sort_by(cmp);
+            if n > 1000 {
+                radix_sort_entries(&mut entries, reverse);
+                if !stable {
+                    break_ties_line_cmp(&mut entries, data, &offsets);
                 }
-            } else if n > 10_000 {
-                entries.par_sort_unstable_by(cmp);
             } else {
+                let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
+                    let ord = a.0.cmp(&b.0);
+                    if ord != Ordering::Equal {
+                        return if reverse { ord.reverse() } else { ord };
+                    }
+                    if !stable {
+                        data[offsets[a.1].0..offsets[a.1].1]
+                            .cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                    } else {
+                        Ordering::Equal
+                    }
+                };
                 entries.sort_unstable_by(cmp);
             }
 
@@ -992,36 +1091,57 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     .map(|(i, &(s, e))| (if s < e { line_prefix(data, s, e) } else { 0u64 }, i))
                     .collect();
 
-                let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-                    let ord = match a.0.cmp(&b.0) {
-                        Ordering::Equal => {
-                            let (sa, ea) = key_offs[a.1];
-                            let (sb, eb) = key_offs[b.1];
-                            data[sa..ea].cmp(&data[sb..eb])
-                        }
-                        ord => ord,
-                    };
-                    if ord != Ordering::Equal {
-                        return if reverse { ord.reverse() } else { ord };
-                    }
-                    if !stable {
-                        data[offsets[a.1].0..offsets[a.1].1]
-                            .cmp(&data[offsets[b.1].0..offsets[b.1].1])
-                    } else {
-                        Ordering::Equal
-                    }
-                };
-
                 let n = entries.len();
-                if stable {
-                    if n > 10_000 {
-                        entries.par_sort_by(cmp);
-                    } else {
-                        entries.sort_by(cmp);
+                if n > 1000 {
+                    // Radix sort on key prefixes
+                    radix_sort_entries(&mut entries, reverse);
+                    // Break ties: full key + last-resort whole-line comparison
+                    let mut ti = 0;
+                    while ti < n {
+                        let key = entries[ti].0;
+                        let mut tj = ti + 1;
+                        while tj < n && entries[tj].0 == key {
+                            tj += 1;
+                        }
+                        if tj - ti > 1 {
+                            entries[ti..tj].sort_unstable_by(|a, b| {
+                                let (ska, eka) = key_offs[a.1];
+                                let (skb, ekb) = key_offs[b.1];
+                                let ord = data[ska..eka].cmp(&data[skb..ekb]);
+                                let ord = if reverse { ord.reverse() } else { ord };
+                                if ord != Ordering::Equal {
+                                    return ord;
+                                }
+                                if !stable {
+                                    data[offsets[a.1].0..offsets[a.1].1]
+                                        .cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                                } else {
+                                    Ordering::Equal
+                                }
+                            });
+                        }
+                        ti = tj;
                     }
-                } else if n > 10_000 {
-                    entries.par_sort_unstable_by(cmp);
                 } else {
+                    let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
+                        let ord = match a.0.cmp(&b.0) {
+                            Ordering::Equal => {
+                                let (sa, ea) = key_offs[a.1];
+                                let (sb, eb) = key_offs[b.1];
+                                data[sa..ea].cmp(&data[sb..eb])
+                            }
+                            ord => ord,
+                        };
+                        if ord != Ordering::Equal {
+                            return if reverse { ord.reverse() } else { ord };
+                        }
+                        if !stable {
+                            data[offsets[a.1].0..offsets[a.1].1]
+                                .cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                        } else {
+                            Ordering::Equal
+                        }
+                    };
                     entries.sort_unstable_by(cmp);
                 }
 
