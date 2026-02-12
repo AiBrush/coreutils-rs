@@ -150,12 +150,12 @@ fn test_unique_dedup() {
         b"cherry".to_vec(),
     ];
     lines.sort_by(|a, b| compare_lines(a, b, &config));
-    // Dedup happens at output time, not sort time
+    // Dedup uses compare_lines_for_dedup (no last-resort)
     let mut output: Vec<&[u8]> = Vec::new();
     let mut prev: Option<&[u8]> = None;
     for line in &lines {
         let should = match prev {
-            Some(p) => compare_lines(p, line, &config) != Ordering::Equal,
+            Some(p) => compare_lines_for_dedup(p, line, &config) != Ordering::Equal,
             None => true,
         };
         if should {
@@ -164,6 +164,40 @@ fn test_unique_dedup() {
         }
     }
     assert_eq!(output.len(), 3);
+}
+
+#[test]
+fn test_unique_dedup_case_insensitive() {
+    // GNU sort -fu: "Apple" and "apple" are equal, only first should be emitted
+    let config = SortConfig {
+        unique: true,
+        global_opts: KeyOpts {
+            ignore_case: true,
+            ..KeyOpts::default()
+        },
+        ..SortConfig::default()
+    };
+    let mut lines = vec![
+        b"apple".to_vec(),
+        b"Apple".to_vec(),
+        b"BANANA".to_vec(),
+        b"banana".to_vec(),
+    ];
+    lines.sort_by(|a, b| compare_lines(a, b, &config));
+    let mut output: Vec<&[u8]> = Vec::new();
+    let mut prev: Option<&[u8]> = None;
+    for line in &lines {
+        let should = match prev {
+            Some(p) => compare_lines_for_dedup(p, line, &config) != Ordering::Equal,
+            None => true,
+        };
+        if should {
+            output.push(line);
+            prev = Some(line);
+        }
+    }
+    // Only 2 unique entries: one apple variant, one banana variant
+    assert_eq!(output.len(), 2);
 }
 
 #[test]
