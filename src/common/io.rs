@@ -27,9 +27,10 @@ impl Deref for FileData {
 }
 
 /// Threshold below which we use read() instead of mmap.
-/// For small files, read() is faster since mmap has setup/teardown overhead
-/// (page table creation, TLB flush on munmap) that exceeds the zero-copy benefit.
-const MMAP_THRESHOLD: u64 = 256 * 1024;
+/// For files under 1MB, read() is faster since mmap has setup/teardown overhead
+/// (page table creation for up to 256 pages, TLB flush on munmap) that exceeds
+/// the zero-copy benefit.
+const MMAP_THRESHOLD: u64 = 1024 * 1024;
 
 /// Track whether O_NOATIME is supported to avoid repeated failed open() attempts.
 /// After the first EPERM, we never try O_NOATIME again (saves one syscall per file).
