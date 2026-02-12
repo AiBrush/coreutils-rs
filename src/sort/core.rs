@@ -307,7 +307,14 @@ pub fn check_sorted(inputs: &[String], config: &SortConfig) -> io::Result<bool> 
     for i in 1..offsets.len() {
         let (s1, e1) = offsets[i - 1];
         let (s2, e2) = offsets[i];
-        let cmp = compare_lines(&data[s1..e1], &data[s2..e2], config);
+        // For -c -u: use dedup comparison (no last-resort) so that
+        // key-equal lines are detected as duplicates.
+        // For -c without -u: use full comparison (with last-resort).
+        let cmp = if config.unique {
+            compare_lines_for_dedup(&data[s1..e1], &data[s2..e2], config)
+        } else {
+            compare_lines(&data[s1..e1], &data[s2..e2], config)
+        };
         let bad = if config.unique {
             cmp != Ordering::Less
         } else {
