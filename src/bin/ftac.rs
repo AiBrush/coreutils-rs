@@ -126,15 +126,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                         mmap.len(),
                         libc::MADV_WILLNEED,
                     );
-                    // HUGEPAGE reduces TLB misses for large files (Linux only)
-                    #[cfg(target_os = "linux")]
-                    if mmap.len() >= 2 * 1024 * 1024 {
-                        libc::madvise(
-                            mmap.as_ptr() as *mut libc::c_void,
-                            mmap.len(),
-                            libc::MADV_HUGEPAGE,
-                        );
-                    }
                 }
             }
         }

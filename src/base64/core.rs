@@ -1,24 +1,14 @@
 use std::io::{self, Read, Write};
 
 use base64_simd::AsOut;
-use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
 /// Streaming encode chunk: 4MB aligned to 3 bytes.
-/// Smaller than 12MB for less memory pressure while keeping syscall count low
-/// (25 reads for 100MB). SIMD encode is fast enough that I/O dominates.
 const STREAM_ENCODE_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 
 /// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
-/// 4MB balances L3 cache residency with low syscall count
-/// (25 iterations for 100MB input).
 const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
-
-/// Minimum input size for parallel encoding/decoding.
-/// 4MB threshold: rayon thread pool init is one-time (~0.5ms), and encoding
-/// 4MB takes ~2ms, so multi-core benefits outweigh overhead for 4MB+ inputs.
-const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -34,38 +24,9 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
     encode_wrapped(data, wrap_col, out)
 }
 
-/// Encode without wrapping using parallel SIMD encoding for large inputs.
+/// Encode without wrapping — sequential SIMD encoding in chunks.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    if data.len() >= PARALLEL_ENCODE_THRESHOLD {
-        // Split into per-thread chunks aligned to 3-byte boundaries
-        let num_threads = rayon::current_num_threads().max(1);
-        let raw_chunk = (data.len() + num_threads - 1) / num_threads;
-        // Align to 3 bytes for clean base64 boundaries (no padding mid-stream)
-        let chunk_size = ((raw_chunk + 2) / 3) * 3;
-
-        let encoded_chunks: Vec<Vec<u8>> = data
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-                let mut buf = vec![0u8; enc_len];
-                let encoded = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
-                let len = encoded.len();
-                buf.truncate(len);
-                buf
-            })
-            .collect();
-
-        // Write each chunk directly — avoids allocating a merged 133MB buffer
-        // which would cause ~33K page faults (~33ms overhead).
-        // BufWriter auto-bypasses its buffer for writes > capacity.
-        for chunk in &encoded_chunks {
-            out.write_all(chunk)?;
-        }
-        return Ok(());
-    }
-
     // Size buffer for actual data, not max chunk size.
-    // For 100KB input, allocates ~134KB instead of ~5.4MB.
     let actual_chunk = NOWRAP_CHUNK.min(data.len());
     let enc_max = BASE64_ENGINE.encoded_length(actual_chunk);
     let mut buf = vec![0u8; enc_max];
@@ -78,44 +39,11 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Encode with line wrapping. For large inputs, uses parallel encoding.
+/// Encode with line wrapping — sequential SIMD encoding in chunks.
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     let bytes_per_line = wrap_col * 3 / 4;
 
-    if data.len() >= PARALLEL_ENCODE_THRESHOLD && bytes_per_line > 0 {
-        // Parallel: split input into chunks aligned to bytes_per_line (= 3-byte aligned)
-        // so each chunk produces complete lines (no cross-chunk line splitting).
-        let num_threads = rayon::current_num_threads().max(1);
-        let lines_per_thread = ((data.len() / bytes_per_line) + num_threads - 1) / num_threads;
-        let chunk_input = (lines_per_thread * bytes_per_line).max(bytes_per_line);
-
-        let wrapped_chunks: Vec<Vec<u8>> = data
-            .par_chunks(chunk_input)
-            .map(|chunk| {
-                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-                let mut encode_buf = vec![0u8; enc_len];
-                let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
-
-                // Wrap the encoded output
-                let line_out = wrap_col + 1;
-                let max_lines = (encoded.len() + wrap_col - 1) / wrap_col + 1;
-                let mut wrap_buf = vec![0u8; max_lines * line_out];
-                let wp = wrap_encoded(encoded, wrap_col, &mut wrap_buf);
-                wrap_buf.truncate(wp);
-                wrap_buf
-            })
-            .collect();
-
-        // Write each chunk directly — avoids large merge allocation + page faults.
-        for chunk in &wrapped_chunks {
-            out.write_all(chunk)?;
-        }
-        return Ok(());
-    }
-
-    // Sequential path: 2MB chunks fit in L2 cache and reduce initial allocation.
-    // Cap buffer sizes to actual data size to avoid over-allocation for small inputs.
-    // For 100KB input: allocates ~270KB instead of ~5.5MB.
+    // Sequential path: 2MB chunks fit in L2 cache.
     let lines_per_chunk = (2 * 1024 * 1024) / bytes_per_line.max(1);
     let chunk_input = lines_per_chunk * bytes_per_line.max(1);
     let effective_chunk = chunk_input.max(1).min(data.len());
@@ -204,8 +132,6 @@ pub fn decode_to_writer(data: &[u8], ignore_garbage: bool, out: &mut impl Write)
 }
 
 /// Decode base64 from an owned Vec (in-place whitespace strip + decode).
-/// Avoids a full buffer copy by stripping whitespace in the existing allocation,
-/// then decoding in-place. Ideal when the caller already has an owned Vec.
 pub fn decode_owned(
     data: &mut Vec<u8>,
     ignore_garbage: bool,
@@ -224,12 +150,10 @@ pub fn decode_owned(
     decode_owned_clean(data, out)
 }
 
-/// Strip all whitespace from a Vec in-place using SIMD memchr for newlines
-/// and a fallback scan for rare non-newline whitespace.
+/// Strip all whitespace from a Vec in-place using SIMD memchr for newlines.
 fn strip_whitespace_inplace(data: &mut Vec<u8>) {
     // Quick check for newlines using SIMD
     if memchr::memchr(b'\n', data).is_none() {
-        // No newlines; check for other whitespace only.
         if data.iter().any(|&b| is_whitespace(b)) {
             data.retain(|&b| !is_whitespace(b));
         }
@@ -237,12 +161,9 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
     }
 
     // In-place compaction using raw pointers to avoid borrow conflict.
-    // This eliminates the 13.6MB Vec<usize> positions allocation (for 133MB input).
-    // Safety: wp <= rp always (we only skip bytes), so copy regions don't overlap.
     let ptr = data.as_ptr();
     let mut_ptr = data.as_mut_ptr();
     let len = data.len();
-    // Create an immutable slice for memchr_iter that doesn't conflict with mut_ptr
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
     let mut wp = 0usize;
@@ -276,18 +197,13 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
 }
 
 /// Decode by stripping all whitespace from the entire input at once,
-/// then performing a single SIMD decode pass. Used when data is borrowed.
-/// For large inputs, decodes in parallel chunks for maximum throughput.
+/// then performing a single SIMD decode pass.
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?
-    // Use SIMD memchr2 to check for both \n and \r simultaneously
     if memchr::memchr2(b'\n', b'\r', data).is_none()
         && !data.iter().any(|&b| b == b' ' || b == b'\t')
     {
         // No whitespace — decode directly from borrowed data
-        if data.len() >= PARALLEL_ENCODE_THRESHOLD {
-            return decode_parallel(data, out);
-        }
         return decode_borrowed_clean(out, data);
     }
 
@@ -309,37 +225,7 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
         clean.retain(|&b| !is_whitespace(b));
     }
 
-    // Parallel decode for large inputs
-    if clean.len() >= PARALLEL_ENCODE_THRESHOLD {
-        return decode_parallel(&clean, out);
-    }
-
     decode_owned_clean(&mut clean, out)
-}
-
-/// Decode clean base64 data in parallel chunks.
-fn decode_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    let num_threads = rayon::current_num_threads().max(1);
-    // Each chunk must be aligned to 4 bytes (base64 quadruplet boundary)
-    let raw_chunk = (data.len() + num_threads - 1) / num_threads;
-    let chunk_size = ((raw_chunk + 3) / 4) * 4;
-
-    // Check if last chunk has padding — only the very last chunk can have '='
-    // Split so that all but the last chunk are padless and 4-aligned
-    let decoded_chunks: Vec<Result<Vec<u8>, _>> = data
-        .par_chunks(chunk_size)
-        .map(|chunk| match BASE64_ENGINE.decode_to_vec(chunk) {
-            Ok(decoded) => Ok(decoded),
-            Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input")),
-        })
-        .collect();
-
-    for chunk_result in decoded_chunks {
-        let chunk = chunk_result?;
-        out.write_all(&chunk)?;
-    }
-
-    Ok(())
 }
 
 /// Decode a clean (no whitespace) owned buffer in-place with SIMD.
@@ -388,8 +274,6 @@ fn is_whitespace(b: u8) -> bool {
 }
 
 /// Stream-encode from a reader to a writer. Used for stdin processing.
-/// Uses 4MB read chunks and batches wrapped output for minimum syscalls.
-/// The caller is expected to provide a suitably buffered or raw fd writer.
 pub fn encode_stream(
     reader: &mut impl Read,
     wrap_col: usize,
@@ -413,7 +297,6 @@ pub fn encode_stream(
         }
     } else {
         // Wrapping: batch wrapped output into a pre-allocated buffer.
-        // For 4MB input at 76-col wrap, wrapped output is ~5.6MB.
         let max_wrapped = encode_buf_size + (encode_buf_size / wrap_col + 2);
         let mut wrap_buf = vec![0u8; max_wrapped];
         let mut col = 0usize;
@@ -441,7 +324,6 @@ pub fn encode_stream(
 
 /// Build wrapped output into a pre-allocated buffer.
 /// Returns the number of bytes written to wrap_buf.
-/// Updates `col` to track the current column position across calls.
 #[inline]
 fn build_wrapped_output(
     data: &[u8],
@@ -480,8 +362,6 @@ fn build_wrapped_output(
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
-/// Reads 4MB chunks, strips whitespace, decodes, and writes incrementally.
-/// Handles base64 quadruplet boundaries across chunk reads.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
