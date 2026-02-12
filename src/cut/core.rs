@@ -354,8 +354,8 @@ fn process_single_field_chunk(
     }
 }
 
-/// Extract a single field from one line using a single SIMD memchr_iter pass.
-/// Collects all delimiter positions in one scan, then indexes directly.
+/// Extract a single field from one line using SIMD memchr_iter with early exit.
+/// Tracks field boundaries directly — no stack array needed.
 #[inline(always)]
 fn extract_single_field_line(
     line: &[u8],
@@ -372,24 +372,24 @@ fn extract_single_field_line(
         return;
     }
 
-    // Single SIMD pass to find ALL delimiter positions
-    // This reduces N SIMD scans to 1 for field N
-    let mut delim_positions: [usize; 64] = [0; 64];
-    let mut num_delims: usize = 0;
+    let mut field_start = 0;
+    let mut field_idx = 0;
+    let mut has_delim = false;
 
     for pos in memchr_iter(delim, line) {
-        if num_delims < 64 {
-            delim_positions[num_delims] = pos;
+        has_delim = true;
+        if field_idx == target_idx {
+            // Found end of target field — output and return
+            buf.extend_from_slice(&line[field_start..pos]);
+            buf.push(line_delim);
+            return;
         }
-        num_delims += 1;
-        // Early exit: we have enough delimiters to extract our target field
-        if num_delims > target_idx {
-            break;
-        }
+        field_idx += 1;
+        field_start = pos + 1;
     }
 
-    // No delimiters found — output whole line or suppress
-    if num_delims == 0 {
+    if !has_delim {
+        // No delimiters found — output whole line or suppress
         if !suppress {
             buf.extend_from_slice(line);
             buf.push(line_delim);
@@ -397,29 +397,14 @@ fn extract_single_field_line(
         return;
     }
 
-    // Fast path: target is field 1 (cut -f1)
-    if target_idx == 0 {
-        buf.extend_from_slice(&line[..delim_positions[0]]);
-        buf.push(line_delim);
-        return;
-    }
-
-    // Not enough fields for target
-    if num_delims < target_idx {
-        buf.push(line_delim);
-        return;
-    }
-
-    // Field start is right after the (target_idx-1)th delimiter
-    let field_start = delim_positions[target_idx - 1] + 1;
-
-    // Field end is the target_idx-th delimiter (or end of line)
-    if num_delims > target_idx && target_idx < 64 {
-        buf.extend_from_slice(&line[field_start..delim_positions[target_idx]]);
-    } else {
+    if field_idx == target_idx {
+        // Target is the last field (no trailing delimiter)
         buf.extend_from_slice(&line[field_start..]);
+        buf.push(line_delim);
+    } else {
+        // Not enough fields — output empty line
+        buf.push(line_delim);
     }
-    buf.push(line_delim);
 }
 
 /// Extract fields from a single line into the output buffer.
