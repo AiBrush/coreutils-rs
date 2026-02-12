@@ -1,7 +1,5 @@
 use std::io::{self, Read, Write};
 
-use rayon::prelude::*;
-
 const BUF_SIZE: usize = 1024 * 1024; // 1MB — fits L2/L3 cache for locality
 
 /// Stream buffer: 256KB — process data immediately after each read().
@@ -9,11 +7,6 @@ const BUF_SIZE: usize = 1024 * 1024; // 1MB — fits L2/L3 cache for locality
 /// Unlike fill_buf (which loops to accumulate 8MB = ~128 syscalls for pipes),
 /// we read once and process immediately, matching GNU tr's approach.
 const STREAM_BUF: usize = 256 * 1024;
-
-/// Minimum size for parallel translation.
-/// Lowered to 4MB since rayon overhead is small (~10μs) compared to
-/// translation time per chunk (~400μs at 10GB/s).
-const PARALLEL_TRANSLATE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
@@ -1081,7 +1074,9 @@ fn squeeze_single_stream(
 
 /// Translate bytes from an mmap'd byte slice — zero syscall reads.
 /// Uses SIMD AVX2 for range-delta patterns (e.g., a-z → A-Z).
-/// For large inputs, translates in parallel using rayon for maximum throughput.
+/// Chunked approach: 1MB buffer fits in L2 cache, avoids large allocations.
+/// Translation is memory-bandwidth-bound (not compute-bound), so parallel
+/// offers minimal gain but costs 100MB+ allocation + zero-init overhead.
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -1099,35 +1094,9 @@ pub fn translate_mmap(
         return writer.write_all(data);
     }
 
-    // Parallel translation for very large inputs — single shared output buffer
-    if data.len() >= PARALLEL_TRANSLATE_THRESHOLD {
-        let mut out = vec![0u8; data.len()];
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (data.len() + num_threads - 1) / num_threads;
-        // Align to BUF_SIZE boundaries for cache efficiency
-        let chunk_size = ((chunk_size + BUF_SIZE - 1) / BUF_SIZE) * BUF_SIZE;
-
-        // Translate in parallel into shared buffer — no per-chunk allocation
-        data.par_chunks(chunk_size)
-            .zip(out.par_chunks_mut(chunk_size))
-            .for_each(|(inp, outp)| {
-                translate_chunk_dispatch(inp, &mut outp[..inp.len()], &table, &kind, use_simd);
-            });
-
-        // Single write of entire result
-        writer.write_all(&out)?;
-        return Ok(());
-    }
-
-    // Single-allocation path: translate entire data into one buffer, single write
-    if data.len() <= BUF_SIZE {
-        let mut out = vec![0u8; data.len()];
-        translate_chunk_dispatch(data, &mut out, &table, &kind, use_simd);
-        writer.write_all(&out)?;
-        return Ok(());
-    }
-
-    // Chunked path for larger data — reuses buffer across chunks
+    // 1MB chunked path — reuses single buffer across chunks.
+    // Better than allocating vec![0u8; data.len()] which zero-inits 100MB+.
+    // 1MB fits in L2 cache for optimal SIMD throughput.
     let mut out = vec![0u8; BUF_SIZE];
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
