@@ -239,12 +239,19 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
         {
             use std::os::unix::io::FromRawFd;
             let file = unsafe { File::from_raw_fd(fd) };
-            let result = unsafe { MmapOptions::new().populate().map(&file) };
+            let result = unsafe { MmapOptions::new().map(&file) };
             std::mem::forget(file); // Don't close stdin
             if let Ok(mmap) = result {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
+                    unsafe {
+                        libc::madvise(
+                            mmap.as_ptr() as *mut libc::c_void,
+                            mmap.len(),
+                            libc::MADV_WILLNEED,
+                        );
+                    }
                 }
                 return Ok(hash_bytes(algo, &mmap));
             }
@@ -392,12 +399,19 @@ pub fn blake2b_hash_stdin(output_bytes: usize) -> io::Result<String> {
         {
             use std::os::unix::io::FromRawFd;
             let file = unsafe { File::from_raw_fd(fd) };
-            let result = unsafe { MmapOptions::new().populate().map(&file) };
+            let result = unsafe { MmapOptions::new().map(&file) };
             std::mem::forget(file); // Don't close stdin
             if let Ok(mmap) = result {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
+                    unsafe {
+                        libc::madvise(
+                            mmap.as_ptr() as *mut libc::c_void,
+                            mmap.len(),
+                            libc::MADV_WILLNEED,
+                        );
+                    }
                 }
                 return Ok(blake2b_hash_data(&mmap, output_bytes));
             }
