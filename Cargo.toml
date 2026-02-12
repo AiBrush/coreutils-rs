@@ -83,9 +83,14 @@ rayon = "1"
 # Hashing
 blake2b_simd = "1"
 
-# Base sha2/md-5 (always needed)
-sha2 = "0.10"
+# ring for SHA-256: uses BoringSSL assembly with runtime SHA-NI/AVX2 detection
+ring = "0.17"
+
+# MD5 hashing (ring doesn't support MD5)
 md-5 = "0.10"
+
+# Digest trait (for generic hash interface used by md-5)
+digest = "0.10"
 
 # Base64 (SIMD-accelerated)
 base64-simd = "0.8"
@@ -128,8 +133,7 @@ inherits = "release"
 debug = true
 strip = false
 
-# Enable ASM acceleration for hash crates on non-MSVC targets
-# (sha2-asm/md5-asm use .S assembly files that MSVC cl.exe can't compile)
+# Enable ASM acceleration for MD5 on non-MSVC targets
+# (md5-asm uses .S assembly files that MSVC cl.exe can't compile)
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-sha2 = { version = "0.10", features = ["asm"] }
 md-5 = { version = "0.10", features = ["asm"] }

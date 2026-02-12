@@ -6,8 +6,8 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use digest::Digest;
 use md5::Md5;
-use sha2::{Digest, Sha256};
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +75,10 @@ thread_local! {
 /// Compute hash of a byte slice directly (zero-copy fast path).
 pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     match algo {
-        HashAlgorithm::Sha256 => hash_digest::<Sha256>(data),
+        HashAlgorithm::Sha256 => {
+            // ring uses BoringSSL assembly with runtime SHA-NI/AVX2 detection
+            hex_encode(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
+        }
         HashAlgorithm::Md5 => hash_digest::<Md5>(data),
         HashAlgorithm::Blake2b => {
             let hash = blake2b_simd::blake2b(data);
@@ -84,10 +87,27 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     }
 }
 
+/// Streaming SHA-256 hash using ring's BoringSSL assembly.
+/// Uses ring::digest::Context for incremental updates with SHA-NI/AVX2 acceleration.
+fn hash_reader_ring_sha256(mut reader: impl Read) -> io::Result<String> {
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        loop {
+            let n = read_full(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            ctx.update(&buf[..n]);
+        }
+        Ok(hex_encode(ctx.finish().as_ref()))
+    })
+}
+
 /// Compute hash of data from a reader, returning hex string.
 pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String> {
     match algo {
-        HashAlgorithm::Sha256 => hash_reader_impl::<Sha256>(reader),
+        HashAlgorithm::Sha256 => hash_reader_ring_sha256(reader),
         HashAlgorithm::Md5 => hash_reader_impl::<Md5>(reader),
         HashAlgorithm::Blake2b => blake2b_hash_reader(reader, 64),
     }
