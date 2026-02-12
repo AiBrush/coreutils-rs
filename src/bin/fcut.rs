@@ -7,6 +7,8 @@ use std::path::Path;
 use std::process;
 
 use clap::Parser;
+#[cfg(unix)]
+use memmap2::MmapOptions;
 
 use coreutils_rs::common::io::read_file;
 use coreutils_rs::cut::{self, CutMode};
@@ -52,6 +54,38 @@ struct Cli {
 
     /// Files to process
     files: Vec<String>,
+}
+
+/// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
+/// Returns None if stdin is a pipe/terminal.
+#[cfg(unix)]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
+    std::mem::forget(file); // Don't close stdin
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+        }
+    }
+    mmap
 }
 
 fn main() {
@@ -137,10 +171,32 @@ fn main() {
         line_delim,
     };
 
+    // Try to mmap stdin for zero-copy (only used if stdin is a regular file)
+    #[cfg(unix)]
+    let stdin_mmap = {
+        if files.iter().any(|f| f == "-") {
+            try_mmap_stdin()
+        } else {
+            None
+        }
+    };
+
     for filename in &files {
         let result: io::Result<()> = if filename == "-" {
-            let reader = BufReader::new(io::stdin().lock());
-            cut::process_cut_reader(reader, &cfg, &mut out)
+            #[cfg(unix)]
+            {
+                if let Some(ref data) = stdin_mmap {
+                    cut::process_cut_data(data, &cfg, &mut out)
+                } else {
+                    let reader = BufReader::new(io::stdin().lock());
+                    cut::process_cut_reader(reader, &cfg, &mut out)
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let reader = BufReader::new(io::stdin().lock());
+                cut::process_cut_reader(reader, &cfg, &mut out)
+            }
         } else {
             match read_file(Path::new(filename)) {
                 Ok(data) => cut::process_cut_data(&data, &cfg, &mut out),

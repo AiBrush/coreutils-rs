@@ -191,10 +191,55 @@ fn main() {
     run_uniq(&cli, &config, output);
 }
 
+/// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
+/// Returns None if stdin is a pipe/terminal.
+#[cfg(unix)]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
+    std::mem::forget(file); // Don't close stdin
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_WILLNEED,
+            );
+        }
+    }
+    mmap
+}
+
 fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
     let result = match cli.input.as_deref() {
         Some("-") | None => {
-            // Stdin: use streaming mode
+            // Stdin: try mmap first (zero-copy for file redirects), fall back to streaming
+            #[cfg(unix)]
+            {
+                match try_mmap_stdin() {
+                    Some(mmap) => process_uniq_bytes(&mmap, output, config),
+                    None => process_uniq(io::stdin().lock(), output, config),
+                }
+            }
+            #[cfg(not(unix))]
             process_uniq(io::stdin().lock(), output, config)
         }
         Some(path) => {
