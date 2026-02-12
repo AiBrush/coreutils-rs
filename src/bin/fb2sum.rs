@@ -379,7 +379,7 @@ fn run_check_mode(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_read_errors, word);
         }
 
-        if total_fmt_errors > 0 && (cli.warn || cli.strict) {
+        if total_fmt_errors > 0 {
             let word = if total_fmt_errors == 1 {
                 "line is"
             } else {

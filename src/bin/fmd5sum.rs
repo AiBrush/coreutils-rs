@@ -188,10 +188,11 @@ fn main() {
         // Flush stdout before printing stderr warnings (ordering matters)
         let _ = out.flush();
 
-        // Print GNU-compatible warning summaries to stderr
-        if !cli.status {
-            let checked = total_ok + total_mismatches + total_read_errors;
-            if checked == 0 && total_format_errors > 0 {
+        // "no properly formatted checksum lines found" — always set error,
+        // even with --status (GNU compat: exit 1 when no valid lines)
+        let checked = total_ok + total_mismatches + total_read_errors;
+        if checked == 0 && total_format_errors > 0 {
+            if !cli.status {
                 let name = if files.len() == 1 && files[0] == "-" {
                     "standard input"
                 } else {
@@ -201,35 +202,38 @@ fn main() {
                     "{}: {}: no properly formatted MD5 checksum lines found",
                     TOOL_NAME, name
                 );
-                had_error = true;
-            } else {
-                if total_mismatches > 0 {
-                    let word = if total_mismatches == 1 {
-                        "computed checksum did NOT match"
-                    } else {
-                        "computed checksums did NOT match"
-                    };
-                    eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_mismatches, word);
-                }
-                if total_read_errors > 0 {
-                    let word = if total_read_errors == 1 {
-                        "listed file could not be read"
-                    } else {
-                        "listed files could not be read"
-                    };
-                    eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_read_errors, word);
-                }
-                if total_format_errors > 0 {
-                    let line_word = if total_format_errors == 1 {
-                        "line is"
-                    } else {
-                        "lines are"
-                    };
-                    eprintln!(
-                        "{}: WARNING: {} {} improperly formatted",
-                        TOOL_NAME, total_format_errors, line_word
-                    );
-                }
+            }
+            had_error = true;
+        }
+
+        // Print GNU-compatible warning summaries to stderr
+        if !cli.status {
+            if total_mismatches > 0 {
+                let word = if total_mismatches == 1 {
+                    "computed checksum did NOT match"
+                } else {
+                    "computed checksums did NOT match"
+                };
+                eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_mismatches, word);
+            }
+            if total_read_errors > 0 {
+                let word = if total_read_errors == 1 {
+                    "listed file could not be read"
+                } else {
+                    "listed files could not be read"
+                };
+                eprintln!("{}: WARNING: {} {}", TOOL_NAME, total_read_errors, word);
+            }
+            if total_format_errors > 0 {
+                let line_word = if total_format_errors == 1 {
+                    "line is"
+                } else {
+                    "lines are"
+                };
+                eprintln!(
+                    "{}: WARNING: {} {} improperly formatted",
+                    TOOL_NAME, total_format_errors, line_word
+                );
             }
         }
     } else {

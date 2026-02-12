@@ -276,7 +276,12 @@ impl<'a> Iterator for LineIter<'a> {
 /// Get line content (without terminator) from pre-computed positions.
 /// `content_end` is the end of actual content (excludes trailing terminator if present).
 #[inline(always)]
-fn line_content_at<'a>(data: &'a [u8], line_starts: &[usize], idx: usize, content_end: usize) -> &'a [u8] {
+fn line_content_at<'a>(
+    data: &'a [u8],
+    line_starts: &[usize],
+    idx: usize,
+    content_end: usize,
+) -> &'a [u8] {
     let start = line_starts[idx];
     let end = if idx + 1 < line_starts.len() {
         line_starts[idx + 1] - 1 // exclude terminator
@@ -352,7 +357,11 @@ fn process_standard_bytes(
     }
 
     // Pre-compute content end: if data ends with terminator, exclude it for last line
-    let content_end = if data.last() == Some(&term) { data.len() - 1 } else { data.len() };
+    let content_end = if data.last() == Some(&term) {
+        data.len() - 1
+    } else {
+        data.len()
+    };
 
     // Ultra-fast path: default mode, no count, no key extraction
     if fast && !config.count && matches!(config.mode, OutputMode::Default) {
@@ -371,7 +380,8 @@ fn process_standard_bytes(
 
             if lines_equal_fast(prev, cur) {
                 // Duplicate detected — binary search for end of group
-                let group_end = linear_scan_group_end(data, &line_starts, i - 1, num_lines, content_end);
+                let group_end =
+                    linear_scan_group_end(data, &line_starts, i - 1, num_lines, content_end);
                 i = group_end;
                 continue;
             }
@@ -396,20 +406,30 @@ fn process_standard_bytes(
         // Find group size: check next line, if equal use binary search
         let group_end = if fast
             && i + 1 < num_lines
-            && lines_equal_fast(content, line_content_at(data, &line_starts, i + 1, content_end))
-        {
+            && lines_equal_fast(
+                content,
+                line_content_at(data, &line_starts, i + 1, content_end),
+            ) {
             // Duplicate detected — binary search for end
             linear_scan_group_end(data, &line_starts, i, num_lines, content_end)
         } else if !fast
             && i + 1 < num_lines
-            && lines_equal(content, line_content_at(data, &line_starts, i + 1, content_end), config)
+            && lines_equal(
+                content,
+                line_content_at(data, &line_starts, i + 1, content_end),
+                config,
+            )
         {
             // Slow path binary search with key extraction
             let mut lo = i + 2;
             let mut hi = num_lines;
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if lines_equal(content, line_content_at(data, &line_starts, mid, content_end), config) {
+                if lines_equal(
+                    content,
+                    line_content_at(data, &line_starts, mid, content_end),
+                    config,
+                ) {
                     lo = mid + 1;
                 } else {
                     hi = mid;
