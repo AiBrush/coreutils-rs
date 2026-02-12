@@ -124,9 +124,29 @@ impl Default for SortConfig {
     }
 }
 
-/// Compare two lines using the full key chain and global options.
+/// Compare two lines using the full key chain, global options, and last-resort.
+/// Used for sorting (determines order of all lines).
 #[inline]
 pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
+    compare_lines_inner(a, b, config, false)
+}
+
+/// Compare two lines for dedup (-u): skip last-resort comparison.
+/// GNU sort -u considers lines equal when the sort keys match, even if the
+/// raw bytes differ (e.g., "Apple" == "apple" with -f, "01" == "1" with -n).
+#[inline]
+pub fn compare_lines_for_dedup(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
+    compare_lines_inner(a, b, config, true)
+}
+
+#[inline]
+fn compare_lines_inner(
+    a: &[u8],
+    b: &[u8],
+    config: &SortConfig,
+    skip_last_resort: bool,
+) -> Ordering {
+    let stable = config.stable || skip_last_resort;
     if !config.keys.is_empty() {
         for key in &config.keys {
             let ka = extract_key(a, key, config.separator);
@@ -151,8 +171,8 @@ pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
             }
         }
 
-        // All keys equal: last-resort comparison (whole line) unless -s
-        if !config.stable {
+        // All keys equal: last-resort comparison (whole line) unless -s or dedup
+        if !stable {
             return a.cmp(b);
         }
 
@@ -160,8 +180,8 @@ pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
     } else {
         // No keys: compare whole line with global opts
         let result = compare_with_opts(a, b, &config.global_opts, config.random_seed);
-        // Last-resort whole-line comparison for deterministic order (unless -s)
-        if result == Ordering::Equal && !config.stable {
+        // Last-resort whole-line comparison for deterministic order (unless -s or dedup)
+        if result == Ordering::Equal && !stable {
             a.cmp(b)
         } else {
             result
@@ -386,7 +406,9 @@ pub fn merge_sorted(
     while let Some(std::cmp::Reverse(min)) = heap.pop() {
         let should_output = if config.unique {
             match &prev_line {
-                Some(prev) => compare_lines(prev, &min.entry.line, config) != Ordering::Equal,
+                Some(prev) => {
+                    compare_lines_for_dedup(prev, &min.entry.line, config) != Ordering::Equal
+                }
                 None => true,
             }
         } else {
@@ -657,7 +679,7 @@ fn write_sorted_output(
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines(&data[ps..pe], line, config) != Ordering::Equal
+                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -708,7 +730,7 @@ fn write_sorted_entries(
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines(&data[ps..pe], line, config) != Ordering::Equal
+                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -854,7 +876,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     let emit = match prev {
                         Some(p) => {
                             let (ps, pe) = offsets[p];
-                            compare_lines(&data[ps..pe], &data[s..e], config) != Ordering::Equal
+                            compare_lines_for_dedup(&data[ps..pe], &data[s..e], config)
+                                != Ordering::Equal
                         }
                         None => true,
                     };
