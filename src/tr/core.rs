@@ -1,4 +1,4 @@
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, Read, Write};
 
 const BUF_SIZE: usize = 1024 * 1024; // 1MB — fits L2/L3 cache for locality
 
@@ -1480,40 +1480,6 @@ fn squeeze_multi_mmap<const N: usize>(
     }
     if wp > 0 {
         writer.write_all(&outbuf[..wp])?;
-    }
-    Ok(())
-}
-
-/// Maximum IoSlices per writev call (Linux IOV_MAX = 1024).
-const IOV_BATCH: usize = 1024;
-
-/// Write all IoSlices to the writer, handling partial writes.
-fn write_all_slices(writer: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
-    if slices.len() <= 4 {
-        for s in slices {
-            writer.write_all(s)?;
-        }
-        return Ok(());
-    }
-    let mut offset = 0;
-    while offset < slices.len() {
-        let end = (offset + IOV_BATCH).min(slices.len());
-        let n = writer.write_vectored(&slices[offset..end])?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write any data",
-            ));
-        }
-        let mut remaining = n;
-        while offset < end && remaining >= slices[offset].len() {
-            remaining -= slices[offset].len();
-            offset += 1;
-        }
-        if remaining > 0 && offset < end {
-            writer.write_all(&slices[offset][remaining..])?;
-            offset += 1;
-        }
     }
     Ok(())
 }

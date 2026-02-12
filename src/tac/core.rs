@@ -110,59 +110,68 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     Ok(())
 }
 
-/// Small-file path: backward scan collecting IoSlice refs, single writev.
-/// Uses forward SIMD scan to find all separator positions (like the large path),
-/// then builds IoSlice references in reverse. Faster than per-record memrchr calls.
+/// Small-file path: backward SIMD scan, copy records into contiguous buffer, single write.
+/// Uses memrchr_iter for backward scanning (matches large-path approach).
+/// Avoids positions Vec + IoSlice Vec allocations and writev syscalls.
+/// Single write_all is faster than writev with many small segments for small data.
 fn tac_bytes_small(
     data: &[u8],
     separator: u8,
     before: bool,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    // Forward SIMD scan to find all separator positions
-    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 16);
-    for pos in memchr::memchr_iter(separator, data) {
-        positions.push(pos);
-    }
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
+    let mut outbuf = vec![0u8; data.len()];
+    let mut wp = 0;
 
     if !before {
-        let last_pos = *positions.last().unwrap();
+        // separator-after mode: records end with separator
+        let mut iter = memchr::memrchr_iter(separator, data);
+
+        let first_sep = match iter.next() {
+            Some(pos) => pos,
+            None => return out.write_all(data),
+        };
 
         // Trailing content without separator — output first
-        if last_pos < data.len() - 1 {
-            slices.push(IoSlice::new(&data[last_pos + 1..]));
+        if first_sep + 1 < data.len() {
+            let trail = &data[first_sep + 1..];
+            outbuf[wp..wp + trail.len()].copy_from_slice(trail);
+            wp += trail.len();
         }
 
-        // Records in reverse order (each includes its trailing separator)
-        for i in (0..positions.len()).rev() {
-            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            slices.push(IoSlice::new(&data[start..positions[i] + 1]));
+        let mut end = first_sep + 1;
+
+        for pos in iter {
+            let record = &data[pos + 1..end];
+            outbuf[wp..wp + record.len()].copy_from_slice(record);
+            wp += record.len();
+            end = pos + 1;
+        }
+
+        // First record
+        if end > 0 {
+            outbuf[wp..wp + end].copy_from_slice(&data[0..end]);
+            wp += end;
         }
     } else {
-        // separator-before mode
-        for i in (0..positions.len()).rev() {
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            slices.push(IoSlice::new(&data[positions[i]..end]));
+        // separator-before mode: records start with separator
+        let mut end = data.len();
+
+        for pos in memchr::memrchr_iter(separator, data) {
+            let record = &data[pos..end];
+            outbuf[wp..wp + record.len()].copy_from_slice(record);
+            wp += record.len();
+            end = pos;
         }
 
         // Leading content before first separator
-        if positions[0] > 0 {
-            slices.push(IoSlice::new(&data[..positions[0]]));
+        if end > 0 {
+            outbuf[wp..wp + end].copy_from_slice(&data[0..end]);
+            wp += end;
         }
     }
 
-    write_all_slices(out, &slices)?;
-    Ok(())
+    out.write_all(&outbuf[..wp])
 }
 
 /// Reverse records using a multi-byte string separator.
