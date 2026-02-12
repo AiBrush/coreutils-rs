@@ -227,9 +227,8 @@ unsafe fn count_lw_c_chunk_avx2(data: &[u8]) -> (u64, u64, bool, bool) {
 
             // Check for transparent bytes (neither space nor word)
             let is_known = _mm256_or_si256(is_space, is_word_vec);
-            let transparent_mask = _mm256_movemask_epi8(
-                _mm256_andnot_si256(is_known, all_ones),
-            ) as u32;
+            let transparent_mask =
+                _mm256_movemask_epi8(_mm256_andnot_si256(is_known, all_ones)) as u32;
 
             if transparent_mask == 0 {
                 // Fast path: no transparent bytes — bitmask transition counting
