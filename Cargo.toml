@@ -89,6 +89,9 @@ sha2 = "0.10"
 # MD5 hashing (ring doesn't support MD5)
 md-5 = "0.10"
 
+# OpenSSL for optimized MD5 (uses system OpenSSL assembly)
+openssl = "0.10"
+
 # Digest trait (for generic hash interface used by md-5/sha2)
 digest = "0.10"
 

@@ -163,18 +163,23 @@ fn main() {
         cli.files.clone()
     };
 
-    // Raw fd stdout — tac's batched writev sends IoSlice directly to kernel.
-    // BufWriter would copy mmap data into its buffer, defeating zero-copy.
+    // Raw fd stdout with BufWriter: tac's buffered output is now built
+    // in-memory, so BufWriter batches the final writes to reduce syscalls.
     #[cfg(unix)]
     let had_error = {
         let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        run(&cli, &files, &mut *raw)
+        let mut writer = io::BufWriter::with_capacity(8 * 1024 * 1024, &mut *raw);
+        let err = run(&cli, &files, &mut writer);
+        let _ = writer.flush();
+        err
     };
     #[cfg(not(unix))]
     let had_error = {
         let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        run(&cli, &files, &mut lock)
+        let mut writer = io::BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+        let err = run(&cli, &files, &mut writer);
+        let _ = writer.flush();
+        err
     };
 
     if had_error {

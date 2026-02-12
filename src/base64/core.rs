@@ -4,11 +4,12 @@ use base64_simd::AsOut;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Streaming encode chunk: 4MB aligned to 3 bytes.
-const STREAM_ENCODE_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
+/// Streaming encode chunk: 12MB aligned to 3 bytes.
+/// Larger chunks = fewer loop iterations = fewer encode setup calls.
+const STREAM_ENCODE_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
 
-/// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
-const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
+/// Chunk size for no-wrap encoding: 12MB aligned to 3 bytes.
+const NOWRAP_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -43,8 +44,9 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     let bytes_per_line = wrap_col * 3 / 4;
 
-    // Sequential path: 2MB chunks fit in L2 cache.
-    let lines_per_chunk = (2 * 1024 * 1024) / bytes_per_line.max(1);
+    // Use 8MB input chunks for better throughput — the SIMD encoder is fast
+    // enough that we want to minimize the number of encode + wrap cycles.
+    let lines_per_chunk = (8 * 1024 * 1024) / bytes_per_line.max(1);
     let chunk_input = lines_per_chunk * bytes_per_line.max(1);
     let effective_chunk = chunk_input.max(1).min(data.len());
     let chunk_encoded_max = BASE64_ENGINE.encoded_length(effective_chunk);
