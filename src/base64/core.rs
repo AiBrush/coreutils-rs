@@ -10,10 +10,10 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 /// (25 reads for 100MB). SIMD encode is fast enough that I/O dominates.
 const STREAM_ENCODE_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 
-/// Chunk size for no-wrap encoding: 2MB aligned to 3 bytes.
-/// Smaller than before (was 8MB) for better L2 cache behavior and
-/// faster initial buffer allocation (fewer page faults).
-const NOWRAP_CHUNK: usize = 2 * 1024 * 1024 - (2 * 1024 * 1024 % 3);
+/// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
+/// 4MB balances L3 cache residency with low syscall count
+/// (25 iterations for 100MB input).
+const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 
 /// Minimum input size for parallel encoding/decoding.
 /// 4MB threshold: rayon thread pool init is one-time (~0.5ms), and encoding
@@ -55,17 +55,17 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
             })
             .collect();
 
-        // Merge into single buffer for ONE write syscall
-        let total_len: usize = encoded_chunks.iter().map(|c| c.len()).sum();
-        let mut output = Vec::with_capacity(total_len);
+        // Write each chunk directly — avoids allocating a merged 133MB buffer
+        // which would cause ~33K page faults (~33ms overhead).
+        // BufWriter auto-bypasses its buffer for writes > capacity.
         for chunk in &encoded_chunks {
-            output.extend_from_slice(chunk);
+            out.write_all(chunk)?;
         }
-        return out.write_all(&output);
+        return Ok(());
     }
 
     // Size buffer for actual data, not max chunk size.
-    // For 100KB input, allocates ~134KB instead of ~2.7MB.
+    // For 100KB input, allocates ~134KB instead of ~5.4MB.
     let actual_chunk = NOWRAP_CHUNK.min(data.len());
     let enc_max = BASE64_ENGINE.encoded_length(actual_chunk);
     let mut buf = vec![0u8; enc_max];
@@ -106,13 +106,11 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             })
             .collect();
 
-        // Compute total output size and write in a single call
-        let total_len: usize = wrapped_chunks.iter().map(|c| c.len()).sum();
-        let mut output = Vec::with_capacity(total_len);
+        // Write each chunk directly — avoids large merge allocation + page faults.
         for chunk in &wrapped_chunks {
-            output.extend_from_slice(chunk);
+            out.write_all(chunk)?;
         }
-        return out.write_all(&output);
+        return Ok(());
     }
 
     // Sequential path: 2MB chunks fit in L2 cache and reduce initial allocation.
