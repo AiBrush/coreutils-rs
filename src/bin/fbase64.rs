@@ -52,6 +52,7 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     let filename = cli.file.as_deref().unwrap_or("-");
@@ -78,11 +79,17 @@ fn main() {
     }
 
     if let Err(e) = result {
-        // Ignore broken pipe
+        // SIGPIPE is reset to SIG_DFL, so broken pipe kills the process
+        // before we get here. This is a fallback for edge cases.
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("base64: {}", e);
+        // Include filename in error message (GNU compat)
+        if filename != "-" {
+            eprintln!("base64: {}: {}", filename, e);
+        } else {
+            eprintln!("base64: {}", e);
+        }
         process::exit(1);
     }
 }

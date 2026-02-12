@@ -90,6 +90,7 @@ fn io_error_msg(e: &io::Error) -> String {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
     let algo = HashAlgorithm::Md5;
 

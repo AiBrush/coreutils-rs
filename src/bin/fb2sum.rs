@@ -120,6 +120,7 @@ fn io_error_msg(e: &io::Error) -> String {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // -l 0 means use default (512), matching GNU behavior

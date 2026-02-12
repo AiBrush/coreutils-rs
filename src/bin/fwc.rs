@@ -178,6 +178,7 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Detect locale once at startup

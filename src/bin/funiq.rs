@@ -97,6 +97,7 @@ struct Cli {
 }
 
 fn main() {
+    coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
     // Determine output mode
