@@ -67,7 +67,7 @@ fn test_count_bytes_utf8() {
 }
 
 // ──────────────────────────────────────────────────
-// Word counting tests (branchless)
+// Word counting tests (3-state logic)
 // ──────────────────────────────────────────────────
 
 #[test]
@@ -127,9 +127,16 @@ fn test_count_words_crlf_separated() {
 }
 
 #[test]
-fn test_count_words_binary_data() {
-    // NUL bytes act as word separators (GNU compat)
-    assert_eq!(count_words(b"\x00hello\x00world"), 2);
+fn test_count_words_binary_data_transparent() {
+    // NUL bytes are non-printable, non-space → transparent (3-state logic)
+    // They do NOT break words — "hello" and "world" merge into 1 word
+    assert_eq!(count_words(b"\x00hello\x00world"), 1);
+}
+
+#[test]
+fn test_count_words_nul_between_spaces() {
+    // NUL between spaces: both spaces break words, NUL is transparent
+    assert_eq!(count_words(b"hello \x00 world"), 2);
 }
 
 #[test]
@@ -141,6 +148,101 @@ fn test_count_words_consecutive_non_ws() {
 fn test_count_words_all_whitespace_types() {
     // Each whitespace type separates words
     assert_eq!(count_words(b"a b\tc\nd\re\x0Bf\x0Cg"), 7);
+}
+
+// ──────────────────────────────────────────────────
+// 3-state word counting: transparent byte tests
+// ──────────────────────────────────────────────────
+
+#[test]
+fn test_3state_nul_only() {
+    // NUL alone: transparent, starts at in_word=false, stays false → 0 words
+    assert_eq!(count_words(b"\x00"), 0);
+}
+
+#[test]
+fn test_3state_control_chars_transparent() {
+    // Control chars (0x01-0x08, 0x0E-0x1F, 0x7F) are transparent
+    assert_eq!(count_words(b"\x01"), 0);
+    assert_eq!(count_words(b"\x08"), 0);
+    assert_eq!(count_words(b"\x0E"), 0);
+    assert_eq!(count_words(b"\x1F"), 0);
+    assert_eq!(count_words(b"\x7f"), 0);
+}
+
+#[test]
+fn test_3state_transparent_doesnt_break_words() {
+    // Control chars between printable chars don't break words
+    assert_eq!(count_words(b"hello\x01world"), 1);
+    assert_eq!(count_words(b"hello\x7fworld"), 1);
+    assert_eq!(count_words(b"hello\x00world"), 1);
+}
+
+#[test]
+fn test_3state_transparent_doesnt_start_words() {
+    // Transparent bytes at start don't start a word
+    assert_eq!(count_words(b"\x00\x01\x02"), 0);
+    // Transparent at start, then printable: 1 word
+    assert_eq!(count_words(b"\x00hello"), 1);
+}
+
+#[test]
+fn test_3state_space_still_breaks() {
+    // Space after transparent still breaks (transparent preserves state, space resets)
+    assert_eq!(count_words(b"hello\x00 world"), 2);
+    assert_eq!(count_words(b"hello \x00world"), 2);
+}
+
+#[test]
+fn test_3state_c_locale_high_bytes_transparent() {
+    // In C locale, bytes >= 0x80 are transparent (mbrtowc fails)
+    assert_eq!(count_words_locale(b"\x80", false), 0);
+    assert_eq!(count_words_locale(b"\xFF", false), 0);
+    // High bytes between words: transparent, don't break
+    assert_eq!(count_words_locale(b"hello\x80world", false), 1);
+    // High bytes with space: space still breaks
+    assert_eq!(count_words_locale(b"hello \x80 world", false), 2);
+}
+
+#[test]
+fn test_3state_c_locale_only_ascii_words() {
+    // In C locale, only ASCII printable (0x21-0x7E) forms words
+    assert_eq!(count_words_locale(b"hello", false), 1);
+    assert_eq!(count_words_locale(b"hello world", false), 2);
+}
+
+#[test]
+fn test_3state_utf8_c1_controls_transparent() {
+    // C1 control characters (U+0080-U+009F) in UTF-8 are non-printable → transparent
+    // U+0080 = 0xC2 0x80 (PAD control)
+    assert_eq!(count_words(b"\xC2\x80"), 0);
+    // C1 control between words: transparent, doesn't break
+    assert_eq!(count_words(b"hello\xC2\x80world"), 1);
+}
+
+#[test]
+fn test_3state_utf8_valid_multibyte_is_word() {
+    // Valid UTF-8 printable multi-byte chars (>= U+00A0) are word content
+    // U+00E9 (é) = 0xC3 0xA9
+    assert_eq!(count_words("café".as_bytes()), 1);
+    // U+4E16 (世) = 3 bytes
+    assert_eq!(count_words("世界".as_bytes()), 1);
+}
+
+#[test]
+fn test_3state_utf8_invalid_standalone_transparent() {
+    // Standalone continuation bytes (0x80-0xBF) in UTF-8: invalid → transparent
+    assert_eq!(count_words(b"\x80\x81\x82"), 0);
+    // Between words: transparent, doesn't break
+    assert_eq!(count_words(b"hello\x80world"), 1);
+}
+
+#[test]
+fn test_3state_utf8_unicode_space_breaks() {
+    // Unicode NBSP (U+00A0 = 0xC2 0xA0) is a space character
+    assert_eq!(count_words("hello\u{00A0}world".as_bytes()), 2);
+    // Ideographic space (U+3000 = 0xE3 0x80 0x80)
+    assert_eq!(count_words("hello\u{3000}world".as_bytes()), 2);
 }
 
 // ──────────────────────────────────────────────────
@@ -386,7 +488,8 @@ fn test_count_all_binary_data() {
     let counts = count_all(data, false);
     assert_eq!(counts.lines, 2);
     assert_eq!(counts.bytes, 7);
-    // C locale: all bytes here are non-printable, so 0 words
+    // C locale: all bytes here are non-printable or space — 0 words
+    // (NUL, SOH, STX are transparent; \n is space; \xFF, \xFE are transparent)
     assert_eq!(counts.words, 0);
     // C locale: each byte is a char
     assert_eq!(counts.chars, 7);
@@ -406,18 +509,19 @@ fn test_gnu_trailing_newline() {
 }
 
 #[test]
-fn test_gnu_word_definition() {
-    // All C0 control chars (0x00-0x1F) and DEL (0x7F) are non-word in both locales
-    assert_eq!(count_words(b"\x00"), 0); // NUL
-    assert_eq!(count_words(b"\x01"), 0); // SOH (control char)
-    assert_eq!(count_words(b"\x7f"), 0); // DEL (control char)
+fn test_gnu_word_definition_3state() {
+    // Non-printable non-space bytes are transparent (don't change in_word)
+    assert_eq!(count_words(b"\x00"), 0); // NUL: transparent, starts false → stays false
+    assert_eq!(count_words(b"\x01"), 0); // SOH: transparent
+    assert_eq!(count_words(b"\x7f"), 0); // DEL: transparent
     // Printable ASCII is always word content
     assert_eq!(count_words(b"!"), 1);
     assert_eq!(count_words(b"hello"), 1);
-    // In UTF-8 mode, valid multi-byte sequences are word content
+    // In UTF-8 mode, valid multi-byte sequences (>= U+00A0) are word content
     assert_eq!(count_words("café".as_bytes()), 1);
-    // In C locale, high bytes are non-word
+    // In C locale, high bytes are transparent (not word-breaking!)
     assert_eq!(count_words_locale(b"\x80", false), 0);
+    assert_eq!(count_words_locale(b"hello\x80world", false), 1); // transparent: 1 word
     assert_eq!(count_words_locale(b"hello", false), 1);
 }
 
