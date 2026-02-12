@@ -196,7 +196,8 @@ fn itoa_right_aligned_into(buf: &mut [u8; 28], mut val: u64) -> usize {
 
 /// Process uniq from a byte slice (mmap'd file). Zero-copy, no per-line allocation.
 pub fn process_uniq_bytes(data: &[u8], output: impl Write, config: &UniqConfig) -> io::Result<()> {
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, output);
+    // 16MB output buffer for fewer flush syscalls on large inputs
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, output);
     let term = if config.zero_terminated { b'\0' } else { b'\n' };
 
     match config.mode {
@@ -546,7 +547,7 @@ fn process_group_bytes(
 /// Reads from `input`, writes to `output`.
 pub fn process_uniq<R: Read, W: Write>(input: R, output: W, config: &UniqConfig) -> io::Result<()> {
     let reader = BufReader::with_capacity(8 * 1024 * 1024, input);
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, output);
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, output);
     let term = if config.zero_terminated { b'\0' } else { b'\n' };
 
     match config.mode {

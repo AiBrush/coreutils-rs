@@ -950,39 +950,47 @@ fn squeeze_single_stream(
             Err(e) => return Err(e),
         };
 
-        // In-place squeeze compaction using memchr for SIMD scanning
+        // In-place squeeze compaction using memchr for SIMD scanning.
+        // wp tracks write position (always <= read position i), so in-place is safe.
         let mut wp = 0;
         let mut i = 0;
 
         while i < n {
+            // Cross-chunk continuation: skip squeeze chars from previous chunk
             if was_squeeze_char && buf[i] == ch {
-                // Skip consecutive squeeze chars
                 i += 1;
                 while i < n && buf[i] == ch {
                     i += 1;
                 }
-                was_squeeze_char = i < n || true; // still in squeeze state
+                // was_squeeze_char stays true until we see a non-squeeze char
                 if i >= n {
                     break;
                 }
             }
 
             // Find next occurrence of squeeze char using SIMD memchr
-            let remaining = &buf[i..n];
-            match memchr::memchr(ch, remaining) {
+            match memchr::memchr(ch, &buf[i..n]) {
                 Some(offset) => {
                     let run_len = offset;
-                    // Shift non-squeeze run left in-place (only if needed)
-                    if wp != i && run_len > 0 {
-                        unsafe {
-                            std::ptr::copy(buf.as_ptr().add(i), buf.as_mut_ptr().add(wp), run_len);
+                    // Shift non-squeeze run left in-place (skip if already in position)
+                    if run_len > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
                         }
+                        wp += run_len;
                     }
-                    wp += run_len;
                     i += run_len;
 
-                    // Write one squeeze char, skip consecutive duplicates
-                    buf[wp] = ch;
+                    // Emit one squeeze char, skip consecutive duplicates
+                    unsafe {
+                        *buf.as_mut_ptr().add(wp) = ch;
+                    }
                     wp += 1;
                     was_squeeze_char = true;
                     i += 1;
@@ -993,12 +1001,18 @@ fn squeeze_single_stream(
                 None => {
                     // No more squeeze chars — shift remaining data
                     let run_len = n - i;
-                    if wp != i && run_len > 0 {
-                        unsafe {
-                            std::ptr::copy(buf.as_ptr().add(i), buf.as_mut_ptr().add(wp), run_len);
+                    if run_len > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
                         }
+                        wp += run_len;
                     }
-                    wp += run_len;
                     was_squeeze_char = false;
                     break;
                 }
