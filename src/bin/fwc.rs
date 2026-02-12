@@ -8,6 +8,7 @@ use std::process;
 
 use clap::Parser;
 use memchr::memchr_iter;
+use rayon::prelude::*;
 
 use coreutils_rs::common::io::{FileData, file_size, read_file, read_stdin};
 use coreutils_rs::common::io_error_msg;
@@ -74,12 +75,17 @@ impl ShowFlags {
 }
 
 /// Threshold below which non-parallel counting is used.
-/// Avoids rayon thread pool initialization cost (~0.5-1ms) for single/small files.
-const WC_PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024; // 16MB
+/// Rayon thread pool is initialized once (amortized), so parallel counting
+/// benefits inputs as small as 1MB on multi-core machines.
+const WC_PARALLEL_THRESHOLD: usize = 1024 * 1024; // 1MB
 
-/// Lines-only fast path: mmap + single memchr pass for maximum throughput.
-/// Avoids read() syscalls entirely — single mmap setup then SIMD memchr scan.
-/// Falls back to streaming read if mmap fails (e.g., special files).
+/// Parallel threshold for line counting (2MB).
+/// Below this, serial memchr is faster than paying rayon overhead.
+const LINE_PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Lines-only fast path: mmap + parallel SIMD memchr for maximum throughput.
+/// For files > 2MB, splits data across all CPU cores for parallel newline counting.
+/// Uses populate() to pre-fault pages and MADV_HUGEPAGE to reduce TLB misses.
 /// Returns (line_count, byte_count).
 fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
     let file = std::fs::File::open(path)?;
@@ -89,8 +95,8 @@ fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
         return Ok((0, file_bytes));
     }
 
-    // Fast path: mmap + single SIMD memchr pass — no read() syscalls
-    if let Ok(mmap) = unsafe { MmapOptions::new().map(&file) } {
+    // Fast path: mmap with populate (pre-fault pages) + parallel SIMD memchr
+    if let Ok(mmap) = unsafe { MmapOptions::new().populate().map(&file) } {
         #[cfg(target_os = "linux")]
         {
             unsafe {
@@ -99,9 +105,27 @@ fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
                     mmap.len(),
                     libc::MADV_SEQUENTIAL,
                 );
+                // HUGEPAGE reduces TLB misses: 100MB = 50 huge pages vs 25,600 regular pages
+                if mmap.len() >= LINE_PARALLEL_THRESHOLD {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_HUGEPAGE,
+                    );
+                }
             }
         }
-        let lines = memchr_iter(b'\n', &mmap).count() as u64;
+
+        // Parallel counting for large files: split across CPU cores
+        let lines = if mmap.len() >= LINE_PARALLEL_THRESHOLD {
+            let num_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (mmap.len() / num_threads).max(512 * 1024);
+            mmap.par_chunks(chunk_size)
+                .map(|chunk| memchr_iter(b'\n', chunk).count() as u64)
+                .sum()
+        } else {
+            memchr_iter(b'\n', &mmap).count() as u64
+        };
         return Ok((lines, file_bytes));
     }
 

@@ -1,10 +1,10 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
 
-/// Minimum data size to use parallel processing (2MB).
-/// Rayon overhead is ~5-10μs per task; at 2MB with memchr SIMD (~10 GB/s),
-/// each chunk takes ~200μs, so overhead is < 5%.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size to use parallel processing (1MB).
+/// Rayon overhead is ~5-10μs per task; at 1MB with memchr SIMD (~10 GB/s),
+/// each chunk takes ~100μs, so overhead is < 10%.
+const PARALLEL_THRESHOLD: usize = 1024 * 1024;
 
 /// Results from counting a byte slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

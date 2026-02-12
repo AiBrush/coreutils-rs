@@ -16,9 +16,9 @@ const STREAM_ENCODE_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 const NOWRAP_CHUNK: usize = 2 * 1024 * 1024 - (2 * 1024 * 1024 % 3);
 
 /// Minimum input size for parallel encoding/decoding.
-/// Set high enough to avoid rayon thread pool init cost (~0.5-1ms per process)
-/// which dominates for inputs under 32MB where SIMD encode is already very fast.
-const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
+/// 4MB threshold: rayon thread pool init is one-time (~0.5ms), and encoding
+/// 4MB takes ~2ms, so multi-core benefits outweigh overhead for 4MB+ inputs.
+const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -55,10 +55,13 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
             })
             .collect();
 
+        // Merge into single buffer for ONE write syscall
+        let total_len: usize = encoded_chunks.iter().map(|c| c.len()).sum();
+        let mut output = Vec::with_capacity(total_len);
         for chunk in &encoded_chunks {
-            out.write_all(chunk)?;
+            output.extend_from_slice(chunk);
         }
-        return Ok(());
+        return out.write_all(&output);
     }
 
     // Size buffer for actual data, not max chunk size.
@@ -103,10 +106,13 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             })
             .collect();
 
+        // Compute total output size and write in a single call
+        let total_len: usize = wrapped_chunks.iter().map(|c| c.len()).sum();
+        let mut output = Vec::with_capacity(total_len);
         for chunk in &wrapped_chunks {
-            out.write_all(chunk)?;
+            output.extend_from_slice(chunk);
         }
-        return Ok(());
+        return out.write_all(&output);
     }
 
     // Sequential path: 2MB chunks fit in L2 cache and reduce initial allocation.
