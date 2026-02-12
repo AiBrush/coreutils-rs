@@ -8,9 +8,7 @@ use std::process;
 
 use clap::Parser;
 
-#[cfg(unix)]
-use coreutils_rs::common::io::FileData;
-use coreutils_rs::common::io::{read_file, read_stdin};
+use coreutils_rs::common::io::{FileData, read_file, read_stdin};
 use coreutils_rs::tac;
 
 #[derive(Parser)]
