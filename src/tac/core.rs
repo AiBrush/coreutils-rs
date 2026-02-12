@@ -38,6 +38,10 @@ fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<
 /// Reverse the records in `data` separated by a single byte `separator` and write to `out`.
 /// If `before` is true, the separator is attached before the record instead of after.
 /// Uses vectored I/O (writev) to write directly from mmap'd data — zero intermediate copies.
+/// Threshold below which we use simple reverse write_all instead of vectored I/O.
+/// For small files (< 100 lines), the overhead of building IoSlice arrays isn't worth it.
+const SIMPLE_THRESHOLD: usize = 100;
+
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -49,6 +53,11 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     if positions.is_empty() {
         out.write_all(data)?;
         return Ok(());
+    }
+
+    // For small files, use simple write_all calls (avoids IoSlice overhead)
+    if positions.len() <= SIMPLE_THRESHOLD {
+        return tac_bytes_simple(data, separator, before, &positions, out);
     }
 
     // For files with many records, use BufWriter to avoid excessive IoSlice memory.
@@ -102,6 +111,50 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         write_all_slices(out, &slices)?;
     }
 
+    Ok(())
+}
+
+/// Simple reverse-write path for small files — avoids IoSlice allocation overhead.
+/// Uses direct write_all calls with a small staging buffer.
+fn tac_bytes_simple(
+    data: &[u8],
+    separator: u8,
+    before: bool,
+    positions: &[usize],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if !before {
+        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
+
+        if !has_trailing_sep {
+            let last_sep = *positions.last().unwrap();
+            out.write_all(&data[last_sep + 1..])?;
+            out.write_all(&[separator])?;
+        }
+
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let end = positions[i] + 1;
+            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
+            out.write_all(&data[start..end])?;
+        }
+    } else {
+        let mut i = positions.len();
+        while i > 0 {
+            i -= 1;
+            let start = positions[i];
+            let end = if i + 1 < positions.len() {
+                positions[i + 1]
+            } else {
+                data.len()
+            };
+            out.write_all(&data[start..end])?;
+        }
+        if positions[0] > 0 {
+            out.write_all(&data[..positions[0]])?;
+        }
+    }
     Ok(())
 }
 

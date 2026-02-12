@@ -7,6 +7,7 @@
 /// - par_sort_unstable_by (pdqsort) for non-stable sort
 /// - memchr SIMD for line boundary detection
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
@@ -292,71 +293,150 @@ pub fn check_sorted(inputs: &[String], config: &SortConfig) -> io::Result<bool> 
     Ok(true)
 }
 
-/// Merge already-sorted files.
+/// Entry in the merge BinaryHeap. Stores the line, file index, and a reference
+/// to the config for comparison. BinaryHeap is a max-heap, so we reverse the
+/// comparison to get a min-heap (smallest element first).
+struct MergeEntry {
+    line: Vec<u8>,
+    file_idx: usize,
+    /// Sequence number for stable merge (preserves input order for equal elements).
+    seq: u64,
+}
+
+/// Merge already-sorted files using a BinaryHeap for O(n log k) performance.
+/// Previous implementation used O(k) linear scan per output line.
 pub fn merge_sorted(
     inputs: &[String],
     config: &SortConfig,
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let delimiter = if config.zero_terminated { b'\0' } else { b'\n' };
-    let mut all_lines: Vec<Vec<Vec<u8>>> = Vec::new();
-
-    for input in inputs {
-        let mut file_lines = Vec::new();
-        if input == "-" {
-            let reader = BufReader::new(io::stdin().lock());
-            read_delimited_lines(reader, delimiter, &mut file_lines)?;
-        } else {
-            let file = File::open(input)?;
-            let reader = BufReader::with_capacity(256 * 1024, file);
-            read_delimited_lines(reader, delimiter, &mut file_lines)?;
-        }
-        all_lines.push(file_lines);
-    }
-
-    let mut indices: Vec<usize> = vec![0; all_lines.len()];
-    let mut prev_line: Option<Vec<u8>> = None;
     let terminator: &[u8] = if config.zero_terminated { b"\0" } else { b"\n" };
 
-    loop {
-        let mut best: Option<(usize, &[u8])> = None;
-        for (i, file_lines) in all_lines.iter().enumerate() {
-            if indices[i] < file_lines.len() {
-                let line = &file_lines[indices[i]];
-                match best {
-                    None => best = Some((i, line)),
-                    Some((_, best_line)) => {
-                        if compare_lines(line, best_line, config) == Ordering::Less {
-                            best = Some((i, line));
-                        }
-                    }
-                }
+    // Open readers for all files
+    let mut readers: Vec<Box<dyn BufRead>> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if input == "-" {
+            readers.push(Box::new(BufReader::with_capacity(
+                256 * 1024,
+                io::stdin().lock(),
+            )));
+        } else {
+            let file = File::open(input)?;
+            readers.push(Box::new(BufReader::with_capacity(256 * 1024, file)));
+        }
+    }
+
+    // Helper to read next line from a reader
+    let read_next = |reader: &mut dyn BufRead, delim: u8| -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::with_capacity(256);
+        let n = reader.read_until(delim, &mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if buf.last() == Some(&delim) {
+            buf.pop();
+        }
+        if delim == b'\n' && buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        Ok(Some(buf))
+    };
+
+    // Initialize heap with first line from each file
+    // BinaryHeap is a max-heap, so we wrap comparison in Reverse-like logic
+    let mut seq: u64 = 0;
+    let mut heap: BinaryHeap<std::cmp::Reverse<MergeEntryOrd>> =
+        BinaryHeap::with_capacity(inputs.len());
+
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(line) = read_next(reader.as_mut(), delimiter)? {
+            heap.push(std::cmp::Reverse(MergeEntryOrd {
+                entry: MergeEntry {
+                    line,
+                    file_idx: i,
+                    seq,
+                },
+                config: config.clone(),
+            }));
+            seq += 1;
+        }
+    }
+
+    let mut prev_line: Option<Vec<u8>> = None;
+    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
+
+    while let Some(std::cmp::Reverse(min)) = heap.pop() {
+        let should_output = if config.unique {
+            match &prev_line {
+                Some(prev) => compare_lines(prev, &min.entry.line, config) != Ordering::Equal,
+                None => true,
+            }
+        } else {
+            true
+        };
+
+        if should_output {
+            buf.extend_from_slice(&min.entry.line);
+            buf.extend_from_slice(terminator);
+            if buf.len() >= OUTPUT_BUF_SIZE {
+                writer.write_all(&buf)?;
+                buf.clear();
+            }
+            if config.unique {
+                prev_line = Some(min.entry.line.clone());
             }
         }
 
-        match best {
-            None => break,
-            Some((idx, line)) => {
-                let should_output = if config.unique {
-                    match &prev_line {
-                        Some(prev) => compare_lines(prev, line, config) != Ordering::Equal,
-                        None => true,
-                    }
-                } else {
-                    true
-                };
-
-                if should_output {
-                    writer.write_all(line)?;
-                    writer.write_all(terminator)?;
-                    prev_line = Some(line.to_vec());
-                }
-                indices[idx] += 1;
-            }
+        let file_idx = min.entry.file_idx;
+        if let Some(next_line) = read_next(readers[file_idx].as_mut(), delimiter)? {
+            heap.push(std::cmp::Reverse(MergeEntryOrd {
+                entry: MergeEntry {
+                    line: next_line,
+                    file_idx,
+                    seq,
+                },
+                config: config.clone(),
+            }));
+            seq += 1;
         }
+    }
+
+    if !buf.is_empty() {
+        writer.write_all(&buf)?;
     }
 
     Ok(())
+}
+
+/// Wrapper that implements Ord for MergeEntry using SortConfig.
+struct MergeEntryOrd {
+    entry: MergeEntry,
+    config: SortConfig,
+}
+
+impl PartialEq for MergeEntryOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for MergeEntryOrd {}
+
+impl PartialOrd for MergeEntryOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntryOrd {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let ord = compare_lines(&self.entry.line, &other.entry.line, &self.config);
+        match ord {
+            Ordering::Equal => self.entry.seq.cmp(&other.entry.seq),
+            _ => ord,
+        }
+    }
 }
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
@@ -837,8 +917,64 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         }
 
         write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
+    } else if config.keys.len() > 1 {
+        // FAST PATH 4: Multi-key sort with pre-extracted key offsets for ALL keys.
+        // Eliminates per-comparison key extraction (O(n log n) calls to extract_key).
+        let all_key_offs: Vec<Vec<(usize, usize)>> = config
+            .keys
+            .iter()
+            .map(|key| pre_extract_key_offsets(data, &offsets, key, config.separator))
+            .collect();
+
+        let stable = config.stable;
+        let random_seed = config.random_seed;
+        let keys = &config.keys;
+        let global_opts = &config.global_opts;
+
+        do_sort(&mut indices, stable, |&a, &b| {
+            for (ki, key) in keys.iter().enumerate() {
+                let (sa, ea) = all_key_offs[ki][a];
+                let (sb, eb) = all_key_offs[ki][b];
+                let ka = if sa == ea {
+                    &[] as &[u8]
+                } else {
+                    &data[sa..ea]
+                };
+                let kb = if sb == eb {
+                    &[] as &[u8]
+                } else {
+                    &data[sb..eb]
+                };
+
+                let opts = if key.opts.has_sort_type()
+                    || key.opts.ignore_case
+                    || key.opts.dictionary_order
+                    || key.opts.ignore_nonprinting
+                    || key.opts.ignore_leading_blanks
+                    || key.opts.reverse
+                {
+                    &key.opts
+                } else {
+                    global_opts
+                };
+
+                let result = compare_with_opts(ka, kb, opts, random_seed);
+                if result != Ordering::Equal {
+                    return result;
+                }
+            }
+
+            // All keys equal: last-resort whole-line comparison unless stable
+            if !stable {
+                data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
+            } else {
+                Ordering::Equal
+            }
+        });
+
+        write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
     } else {
-        // GENERAL PATH: Index-based sort with full comparison
+        // GENERAL PATH: Index-based sort with full comparison (fallback)
         do_sort(&mut indices, config.stable, |&a, &b| {
             let (sa, ea) = offsets[a];
             let (sb, eb) = offsets[b];

@@ -368,23 +368,74 @@ fn build_wrapped_output(
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
-/// Reads all input, strips whitespace, decodes in one SIMD pass, writes once.
-/// The caller is expected to provide a suitably buffered or raw fd writer.
+/// Reads 4MB chunks, strips whitespace, decodes, and writes incrementally.
+/// Handles base64 quadruplet boundaries across chunk reads.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut data = Vec::new();
-    reader.read_to_end(&mut data)?;
+    const READ_CHUNK: usize = 4 * 1024 * 1024;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut clean = Vec::with_capacity(READ_CHUNK);
+    let mut carry: Vec<u8> = Vec::with_capacity(4);
 
-    if ignore_garbage {
-        data.retain(|&b| is_base64_char(b));
-    } else {
-        strip_whitespace_inplace(&mut data);
+    loop {
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        // Build clean buffer: carry-over + stripped chunk
+        clean.clear();
+        clean.extend_from_slice(&carry);
+        carry.clear();
+
+        let chunk = &buf[..n];
+        if ignore_garbage {
+            clean.extend(chunk.iter().copied().filter(|&b| is_base64_char(b)));
+        } else {
+            // Strip newlines using SIMD memchr
+            let mut last = 0;
+            for pos in memchr::memchr_iter(b'\n', chunk) {
+                if pos > last {
+                    clean.extend_from_slice(&chunk[last..pos]);
+                }
+                last = pos + 1;
+            }
+            if last < n {
+                clean.extend_from_slice(&chunk[last..]);
+            }
+            // Handle rare non-newline whitespace
+            if clean.iter().any(|&b| is_whitespace(b) && b != b'\n') {
+                clean.retain(|&b| !is_whitespace(b));
+            }
+        }
+
+        let is_last = n < READ_CHUNK;
+
+        if is_last {
+            // Last chunk: decode everything (including padding)
+            decode_owned_clean(&mut clean, writer)?;
+        } else {
+            // Save incomplete base64 quadruplet for next iteration
+            let decode_len = (clean.len() / 4) * 4;
+            if decode_len < clean.len() {
+                carry.extend_from_slice(&clean[decode_len..]);
+            }
+            if decode_len > 0 {
+                clean.truncate(decode_len);
+                decode_owned_clean(&mut clean, writer)?;
+            }
+        }
     }
 
-    decode_owned_clean(&mut data, writer)
+    // Handle any remaining carry-over bytes
+    if !carry.is_empty() {
+        decode_owned_clean(&mut carry, writer)?;
+    }
+
+    Ok(())
 }
 
 /// Read as many bytes as possible into buf, retrying on partial reads.

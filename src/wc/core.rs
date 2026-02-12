@@ -311,13 +311,11 @@ fn count_words_utf8(data: &[u8]) -> u64 {
 }
 
 /// Count lines and words using optimized strategies per locale.
-/// UTF-8: separate SIMD memchr + state machine passes.
+/// UTF-8: fused single-pass for lines+words to avoid extra data traversal.
 /// C locale: single scalar pass with 3-state logic.
 pub fn count_lines_words(data: &[u8], utf8: bool) -> (u64, u64) {
     if utf8 {
-        let lines = count_lines(data);
-        let words = count_words_utf8(data);
-        (lines, words)
+        count_lines_words_utf8_fused(data)
     } else {
         let mut lines = 0u64;
         let mut words = 0u64;
@@ -340,12 +338,103 @@ pub fn count_lines_words(data: &[u8], utf8: bool) -> (u64, u64) {
     }
 }
 
+/// Fused lines+words counting in UTF-8 mode (single pass).
+/// Avoids separate memchr pass for newlines by counting them inline with words.
+fn count_lines_words_utf8_fused(data: &[u8]) -> (u64, u64) {
+    let mut lines = 0u64;
+    let mut words = 0u64;
+    let mut in_word = false;
+    let mut i = 0;
+
+    while i < data.len() {
+        let b = data[i];
+
+        if b < 0x80 {
+            // ASCII fast path: combined newline + word counting
+            if b == b'\n' {
+                lines += 1;
+                in_word = false;
+            } else {
+                let class = BYTE_CLASS_UTF8[b as usize];
+                if class == 1 {
+                    in_word = false;
+                } else if class == 0 {
+                    if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+            }
+            i += 1;
+        } else if b < 0xC2 {
+            i += 1;
+        } else if b < 0xE0 {
+            if i + 1 < data.len() && (data[i + 1] & 0xC0) == 0x80 {
+                let cp = ((b as u32 & 0x1F) << 6) | (data[i + 1] as u32 & 0x3F);
+                if is_unicode_space(cp) {
+                    in_word = false;
+                } else if is_unicode_printable(cp) {
+                    if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if b < 0xF0 {
+            if i + 2 < data.len() && (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 {
+                let cp = ((b as u32 & 0x0F) << 12)
+                    | ((data[i + 1] as u32 & 0x3F) << 6)
+                    | (data[i + 2] as u32 & 0x3F);
+                if is_unicode_space(cp) {
+                    in_word = false;
+                } else if is_unicode_printable(cp) {
+                    if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        } else if b < 0xF5 {
+            if i + 3 < data.len()
+                && (data[i + 1] & 0xC0) == 0x80
+                && (data[i + 2] & 0xC0) == 0x80
+                && (data[i + 3] & 0xC0) == 0x80
+            {
+                let cp = ((b as u32 & 0x07) << 18)
+                    | ((data[i + 1] as u32 & 0x3F) << 12)
+                    | ((data[i + 2] as u32 & 0x3F) << 6)
+                    | (data[i + 3] as u32 & 0x3F);
+                if is_unicode_space(cp) {
+                    in_word = false;
+                } else if is_unicode_printable(cp) {
+                    if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    (lines, words)
+}
+
 /// Count lines, words, and chars using optimized strategies per locale.
 pub fn count_lines_words_chars(data: &[u8], utf8: bool) -> (u64, u64, u64) {
     if utf8 {
-        // Three separate optimized passes (data stays cache-hot between passes)
-        let lines = count_lines(data);
-        let words = count_words_utf8(data);
+        // Fused single-pass for lines+words, then fast char-counting pass
+        let (lines, words) = count_lines_words_utf8_fused(data);
         let chars = count_chars_utf8(data);
         (lines, words, chars)
     } else {
@@ -729,12 +818,23 @@ pub fn max_line_length(data: &[u8], utf8: bool) -> u64 {
 /// specialized loop. After the first pass, data is hot in L2/L3 cache,
 /// making subsequent passes nearly free for memory bandwidth.
 pub fn count_all(data: &[u8], utf8: bool) -> WcCounts {
-    WcCounts {
-        lines: count_lines(data),
-        words: count_words_locale(data, utf8),
-        bytes: data.len() as u64,
-        chars: count_chars(data, utf8),
-        max_line_length: max_line_length(data, utf8),
+    if utf8 {
+        let (lines, words) = count_lines_words_utf8_fused(data);
+        WcCounts {
+            lines,
+            words,
+            bytes: data.len() as u64,
+            chars: count_chars_utf8(data),
+            max_line_length: max_line_length_utf8(data),
+        }
+    } else {
+        WcCounts {
+            lines: count_lines(data),
+            words: count_words_locale(data, false),
+            bytes: data.len() as u64,
+            chars: data.len() as u64,
+            max_line_length: max_line_length_c(data),
+        }
     }
 }
 
@@ -802,6 +902,55 @@ pub fn count_chars_parallel(data: &[u8], utf8: bool) -> u64 {
     let chunk_size = (data.len() / num_threads).max(1024 * 1024);
 
     data.par_chunks(chunk_size).map(count_chars_utf8).sum()
+}
+
+/// Count lines + words + bytes in a single fused pass (the default wc mode).
+/// Avoids separate passes entirely — combines newline counting with word detection.
+pub fn count_lwb(data: &[u8], utf8: bool) -> (u64, u64, u64) {
+    let (lines, words) = count_lines_words(data, utf8);
+    (lines, words, data.len() as u64)
+}
+
+/// Parallel counting of lines + words + bytes only (no chars).
+/// Optimized for the default `wc` mode: avoids unnecessary char-counting pass.
+pub fn count_lwb_parallel(data: &[u8], utf8: bool) -> (u64, u64, u64) {
+    if data.len() < PARALLEL_THRESHOLD {
+        // Small file: use fused single-pass
+        return count_lwb(data, utf8);
+    }
+
+    // Word counting must be sequential for UTF-8 (state machine across chunks)
+    // But we use the fused lines+words approach to avoid a separate memchr pass
+    let (lines, words) = if utf8 {
+        count_lines_words_utf8_fused(data)
+    } else {
+        // C locale: parallel 3-state word counting with boundary adjustment
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / num_threads).max(1024 * 1024);
+
+        let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+        let results: Vec<(u64, bool, bool)> = chunks
+            .par_iter()
+            .map(|chunk| count_words_c_chunk(chunk))
+            .collect();
+
+        let mut word_total = 0u64;
+        for i in 0..results.len() {
+            word_total += results[i].0;
+            if i > 0 && results[i - 1].2 && results[i].1 {
+                word_total -= 1;
+            }
+        }
+
+        let line_total: u64 = data
+            .par_chunks(chunk_size)
+            .map(|chunk| memchr_iter(b'\n', chunk).count() as u64)
+            .sum();
+
+        (line_total, word_total)
+    };
+
+    (lines, words, data.len() as u64)
 }
 
 /// Combined parallel counting of lines + words + chars.

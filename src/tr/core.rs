@@ -2,7 +2,13 @@ use std::io::{self, Read, Write};
 
 use rayon::prelude::*;
 
-const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — reduces syscall overhead
+const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — mmap chunk processing
+
+/// Stream buffer: 256KB — process data immediately after each read().
+/// Stays in L2 cache, matches typical kernel pipe buffer size.
+/// Unlike fill_buf (which loops to accumulate 8MB = ~128 syscalls for pipes),
+/// we read once and process immediately, matching GNU tr's approach.
+const STREAM_BUF: usize = 256 * 1024;
 
 /// Minimum size for parallel translation.
 /// AVX2 SIMD translation is so fast (~16 GB/s) that parallelism only helps for very large inputs.
@@ -235,20 +241,6 @@ fn has_avx2() -> bool {
     is_x86_feature_detected!("avx2")
 }
 
-/// Fill buffer completely from reader (handles short reads from pipes).
-fn fill_buf(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(filled)
-}
-
 /// Translate a chunk of bytes using a lookup table — unrolled 8-byte inner loop.
 #[inline(always)]
 fn translate_chunk(chunk: &[u8], out: &mut [u8], table: &[u8; 256]) {
@@ -314,15 +306,22 @@ fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
 // ============================================================================
 
 /// Translate a chunk using the best available method.
+/// `use_simd` is cached at call site to avoid per-chunk atomic loads.
 #[inline]
-fn translate_chunk_dispatch(chunk: &[u8], out: &mut [u8], table: &[u8; 256], kind: &TranslateKind) {
+fn translate_chunk_dispatch(
+    chunk: &[u8],
+    out: &mut [u8],
+    table: &[u8; 256],
+    kind: &TranslateKind,
+    _use_simd: bool,
+) {
     match kind {
         TranslateKind::Identity => {
             out[..chunk.len()].copy_from_slice(chunk);
         }
         #[cfg(target_arch = "x86_64")]
         TranslateKind::RangeDelta { lo, hi, delta } => {
-            if has_avx2() {
+            if _use_simd {
                 unsafe { simd_tr::range_delta(chunk, out, *lo, *hi, *delta) };
                 return;
             }
@@ -338,14 +337,20 @@ fn translate_chunk_dispatch(chunk: &[u8], out: &mut [u8], table: &[u8; 256], kin
     }
 }
 
-/// In-place translate dispatch (for stdin path).
+/// In-place translate dispatch.
+/// `use_simd` is cached at call site to avoid per-chunk atomic loads.
 #[inline]
-fn translate_inplace_dispatch(data: &mut [u8], table: &[u8; 256], kind: &TranslateKind) {
+fn translate_inplace_dispatch(
+    data: &mut [u8],
+    table: &[u8; 256],
+    kind: &TranslateKind,
+    _use_simd: bool,
+) {
     match kind {
         TranslateKind::Identity => {}
         #[cfg(target_arch = "x86_64")]
         TranslateKind::RangeDelta { lo, hi, delta } => {
-            if has_avx2() {
+            if _use_simd {
                 unsafe { simd_tr::range_delta_inplace(data, *lo, *hi, *delta) };
                 return;
             }
@@ -363,6 +368,8 @@ fn translate_inplace_dispatch(data: &mut [u8], table: &[u8; 256], kind: &Transla
 
 // ============================================================================
 // Streaming functions (Read + Write)
+// Process data immediately after each read() — no fill_buf accumulation.
+// Uses 256KB buffer (L2-friendly) instead of 8MB.
 // ============================================================================
 
 pub fn translate(
@@ -373,28 +380,20 @@ pub fn translate(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
     let kind = analyze_table(&table);
+    #[cfg(target_arch = "x86_64")]
+    let use_simd = has_avx2();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_simd = false;
 
-    // Identity: just copy stdin to stdout
-    if matches!(kind, TranslateKind::Identity) {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            let n = fill_buf(reader, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            writer.write_all(&buf[..n])?;
-        }
-        return Ok(());
-    }
-
-    // In-place translate: read into buffer, translate in-place, write
-    let mut buf = vec![0u8; BUF_SIZE];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
-        let n = fill_buf(reader, &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        translate_inplace_dispatch(&mut buf[..n], &table, &kind);
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        translate_inplace_dispatch(&mut buf[..n], &table, &kind, use_simd);
         writer.write_all(&buf[..n])?;
     }
     Ok(())
@@ -408,15 +407,17 @@ pub fn translate_squeeze(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
     let squeeze_set = build_member_set(set2);
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut inbuf = vec![0u8; BUF_SIZE];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    let mut inbuf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = fill_buf(reader, &mut inbuf)?;
-        if n == 0 {
-            break;
-        }
+        let n = match reader.read(&mut inbuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let mut out_pos = 0;
         for &b in &inbuf[..n] {
             let translated = unsafe { *table.get_unchecked(b as usize) };
@@ -449,14 +450,16 @@ pub fn delete(
     }
 
     let member = build_member_set(delete_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut inbuf = vec![0u8; BUF_SIZE];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    let mut inbuf = vec![0u8; STREAM_BUF];
 
     loop {
-        let n = fill_buf(reader, &mut inbuf)?;
-        if n == 0 {
-            break;
-        }
+        let n = match reader.read(&mut inbuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let mut out_pos = 0;
         for &b in &inbuf[..n] {
             if !is_member(&member, b) {
@@ -477,12 +480,14 @@ fn delete_single_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; BUF_SIZE];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
-        let n = fill_buf(reader, &mut buf)?;
-        if n == 0 {
-            break;
-        }
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let chunk = &buf[..n];
         let mut last = 0;
         for pos in memchr::memchr_iter(ch, chunk) {
@@ -506,15 +511,17 @@ pub fn delete_squeeze(
 ) -> io::Result<()> {
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut inbuf = vec![0u8; BUF_SIZE];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    let mut inbuf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = fill_buf(reader, &mut inbuf)?;
-        if n == 0 {
-            break;
-        }
+        let n = match reader.read(&mut inbuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let mut out_pos = 0;
         for &b in &inbuf[..n] {
             if is_member(&delete_set, b) {
@@ -544,15 +551,17 @@ pub fn squeeze(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let member = build_member_set(squeeze_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut inbuf = vec![0u8; BUF_SIZE];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    let mut inbuf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = fill_buf(reader, &mut inbuf)?;
-        if n == 0 {
-            break;
-        }
+        let n = match reader.read(&mut inbuf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let mut out_pos = 0;
         for &b in &inbuf[..n] {
             if is_member(&member, b) {
@@ -588,6 +597,10 @@ pub fn translate_mmap(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
     let kind = analyze_table(&table);
+    #[cfg(target_arch = "x86_64")]
+    let use_simd = has_avx2();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_simd = false;
 
     if matches!(kind, TranslateKind::Identity) {
         return writer.write_all(data);
@@ -605,7 +618,7 @@ pub fn translate_mmap(
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut out = vec![0u8; chunk.len()];
-                translate_chunk_dispatch(chunk, &mut out, &table, &kind);
+                translate_chunk_dispatch(chunk, &mut out, &table, &kind, use_simd);
                 out
             })
             .collect();
@@ -620,7 +633,7 @@ pub fn translate_mmap(
     // Sequential path for smaller data
     let mut out = vec![0u8; BUF_SIZE];
     for chunk in data.chunks(BUF_SIZE) {
-        translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind);
+        translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;
     }
     Ok(())

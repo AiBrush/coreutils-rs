@@ -90,6 +90,9 @@ md-5 = "0.10"
 # Base64 (SIMD-accelerated)
 base64-simd = "0.8"
 
+# Fast float parsing for sort -g
+fast-float = "0.2"
+
 # Regex for tac -r
 regex = "1"
 

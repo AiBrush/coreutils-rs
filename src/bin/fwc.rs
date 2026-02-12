@@ -165,14 +165,24 @@ fn main() {
         // Uses parallel variants for large files (>4MB) to exploit multi-core CPUs.
         // Default mode uses a combined parallel pass (lines+words+chars together)
         // to keep data cache-warm between metric computations within each chunk.
-        let counts = if show.lines && show.words && !show.max_line_length {
-            // Combined parallel pass — most efficient for default mode
+        let counts = if show.lines && show.words && show.chars && !show.max_line_length {
+            // Full parallel pass: lines + words + chars
             let (lines, words, chars) = wc::count_lwc_parallel(&data, utf8_locale);
             wc::WcCounts {
                 lines,
                 words,
                 bytes: data.len() as u64,
-                chars: if show.chars { chars } else { 0 },
+                chars,
+                max_line_length: 0,
+            }
+        } else if show.lines && show.words && !show.chars && !show.max_line_length {
+            // Default mode: lines + words + bytes only (skip char counting)
+            let (lines, words, bytes) = wc::count_lwb_parallel(&data, utf8_locale);
+            wc::WcCounts {
+                lines,
+                words,
+                bytes,
+                chars: 0,
                 max_line_length: 0,
             }
         } else {

@@ -91,16 +91,17 @@ fn main() {
 
     let set1_str = &cli.sets[0];
 
-    // Raw fd stdout on Unix with 4MB BufWriter for batching.
-    // Raw fd bypasses StdoutLock overhead; BufWriter handles small writes efficiently.
+    // Raw fd stdout on Unix with 64KB BufWriter for batching.
+    // Raw fd bypasses StdoutLock overhead; small BufWriter avoids double-buffering
+    // since our streaming functions already process and write 256KB chunks.
     #[cfg(unix)]
     let mut raw = raw_stdout();
     #[cfg(unix)]
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &mut *raw);
+    let mut writer = BufWriter::with_capacity(64 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();
     #[cfg(not(unix))]
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+    let mut writer = BufWriter::with_capacity(64 * 1024, stdout.lock());
 
     // Try to mmap stdin for zero-copy reads
     let mmap = try_mmap_stdin();
