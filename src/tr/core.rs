@@ -682,8 +682,16 @@ pub fn translate_mmap(
         return Ok(());
     }
 
-    // Sequential path — reuses buffer across chunks
-    let mut out = vec![0u8; data.len().min(BUF_SIZE)];
+    // Single-allocation path: translate entire data into one buffer, single write
+    if data.len() <= BUF_SIZE {
+        let mut out = vec![0u8; data.len()];
+        translate_chunk_dispatch(data, &mut out, &table, &kind, use_simd);
+        writer.write_all(&out)?;
+        return Ok(());
+    }
+
+    // Chunked path for larger data — reuses buffer across chunks
+    let mut out = vec![0u8; BUF_SIZE];
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;

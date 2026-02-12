@@ -9,6 +9,8 @@ use std::process;
 use clap::Parser;
 
 use coreutils_rs::common::io::{FileData, file_size, read_file, read_stdin};
+#[cfg(unix)]
+use memmap2::MmapOptions;
 use coreutils_rs::wc;
 
 #[derive(Parser)]
@@ -80,6 +82,38 @@ fn num_width(n: u64) -> usize {
     width
 }
 
+/// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
+/// Returns None if stdin is a pipe/terminal.
+#[cfg(unix)]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
+    std::mem::forget(file); // Don't close stdin
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+        }
+    }
+    mmap
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -145,7 +179,23 @@ fn main() {
         }
 
         // Read file data (zero-copy mmap for large files)
+        // For stdin: try mmap if it's a regular file redirect (< file)
         let data: FileData = if filename == "-" {
+            #[cfg(unix)]
+            {
+                match try_mmap_stdin() {
+                    Some(mmap) => FileData::Mmap(mmap),
+                    None => match read_stdin() {
+                        Ok(d) => FileData::Owned(d),
+                        Err(e) => {
+                            eprintln!("fwc: standard input: {}", e);
+                            had_error = true;
+                            continue;
+                        }
+                    },
+                }
+            }
+            #[cfg(not(unix))]
             match read_stdin() {
                 Ok(d) => FileData::Owned(d),
                 Err(e) => {
