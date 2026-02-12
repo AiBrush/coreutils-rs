@@ -776,7 +776,8 @@ pub fn delete(
     Ok(())
 }
 
-/// Single-character delete from a reader using SIMD memchr scanning.
+/// Single-character delete from a reader — in-place compaction with SIMD memchr.
+/// Uses memchr for SIMD scanning + ptr::copy for in-place shift + single write_all.
 fn delete_single_streaming(
     ch: u8,
     reader: &mut impl Read,
@@ -790,22 +791,49 @@ fn delete_single_streaming(
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        let chunk = &buf[..n];
-        let mut last = 0;
-        for pos in memchr::memchr_iter(ch, chunk) {
-            if pos > last {
-                writer.write_all(&chunk[last..pos])?;
+        let mut wp = 0;
+        let mut i = 0;
+        while i < n {
+            match memchr::memchr(ch, &buf[i..n]) {
+                Some(offset) => {
+                    if offset > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    offset,
+                                );
+                            }
+                        }
+                        wp += offset;
+                    }
+                    i += offset + 1; // skip the deleted char
+                }
+                None => {
+                    let run_len = n - i;
+                    if run_len > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
+                        }
+                        wp += run_len;
+                    }
+                    break;
+                }
             }
-            last = pos + 1;
         }
-        if last < n {
-            writer.write_all(&chunk[last..n])?;
-        }
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }
 
-/// Multi-character delete (2-3 chars) from a reader using SIMD memchr2/memchr3.
+/// Multi-character delete (2-3 chars) — in-place compaction with SIMD memchr2/memchr3.
 fn delete_multi_streaming(
     chars: &[u8],
     reader: &mut impl Read,
@@ -819,26 +847,49 @@ fn delete_multi_streaming(
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        let chunk = &buf[..n];
-        let mut last = 0;
-        if chars.len() == 2 {
-            for pos in memchr::memchr2_iter(chars[0], chars[1], chunk) {
-                if pos > last {
-                    writer.write_all(&chunk[last..pos])?;
+        let mut wp = 0;
+        let mut i = 0;
+        while i < n {
+            let found = if chars.len() == 2 {
+                memchr::memchr2(chars[0], chars[1], &buf[i..n])
+            } else {
+                memchr::memchr3(chars[0], chars[1], chars[2], &buf[i..n])
+            };
+            match found {
+                Some(offset) => {
+                    if offset > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    offset,
+                                );
+                            }
+                        }
+                        wp += offset;
+                    }
+                    i += offset + 1;
                 }
-                last = pos + 1;
-            }
-        } else {
-            for pos in memchr::memchr3_iter(chars[0], chars[1], chars[2], chunk) {
-                if pos > last {
-                    writer.write_all(&chunk[last..pos])?;
+                None => {
+                    let run_len = n - i;
+                    if run_len > 0 {
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
+                        }
+                        wp += run_len;
+                    }
+                    break;
                 }
-                last = pos + 1;
             }
         }
-        if last < n {
-            writer.write_all(&chunk[last..n])?;
-        }
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }

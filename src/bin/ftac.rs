@@ -123,6 +123,20 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                         mmap.len(),
                         libc::MADV_SEQUENTIAL,
                     );
+                    // WILLNEED triggers async readahead to pre-fault pages
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_WILLNEED,
+                    );
+                    // HUGEPAGE reduces TLB misses for large files
+                    if mmap.len() >= 2 * 1024 * 1024 {
+                        libc::madvise(
+                            mmap.as_ptr() as *mut libc::c_void,
+                            mmap.len(),
+                            libc::MADV_HUGEPAGE,
+                        );
+                    }
                 }
             }
         }
@@ -163,7 +177,7 @@ fn main() {
     #[cfg(unix)]
     let had_error = {
         let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, &mut *raw);
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
         let err = run(&cli, &files, &mut writer);
         let _ = writer.flush();
         err
@@ -171,7 +185,7 @@ fn main() {
     #[cfg(not(unix))]
     let had_error = {
         let stdout = io::stdout();
-        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, stdout.lock());
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
         let err = run(&cli, &files, &mut writer);
         let _ = writer.flush();
         err
