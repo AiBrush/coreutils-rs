@@ -534,10 +534,7 @@ fn radix_sort_entries(entries: &mut Vec<(u64, usize)>, reverse: bool) {
         }
     }
 
-    let mut aux: Vec<(u64, usize)> = Vec::with_capacity(n);
-    unsafe {
-        aux.set_len(n);
-    }
+    let mut aux: Vec<(u64, usize)> = vec![(0, 0); n];
 
     for pass in 0..4u32 {
         let shift = pass * 16;
