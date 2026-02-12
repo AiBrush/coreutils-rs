@@ -58,6 +58,13 @@ impl Write for SortOutput<'_> {
         }
     }
     #[inline]
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            SortOutput::Stdout(w) => w.write_vectored(bufs),
+            SortOutput::File(w) => w.write_vectored(bufs),
+        }
+    }
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         match self {
             SortOutput::Stdout(w) => w.flush(),
