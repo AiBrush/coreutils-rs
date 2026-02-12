@@ -17,6 +17,7 @@ use rayon::prelude::*;
 
 use super::compare::{
     compare_with_opts, parse_general_numeric, parse_human_numeric, parse_numeric_value,
+    select_comparator, skip_leading_blanks,
 };
 use super::key::{KeyDef, KeyOpts, extract_key};
 
@@ -974,20 +975,27 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     indices[i] = idx;
                 }
             } else {
+                // Pre-select comparator: eliminates per-comparison option branching
+                let (cmp_fn, needs_blank, needs_reverse) = select_comparator(opts, random_seed);
                 do_sort(&mut indices, stable, |&a, &b| {
                     let (sa, ea) = key_offs[a];
                     let (sb, eb) = key_offs[b];
                     let ka = if sa == ea {
                         &[] as &[u8]
+                    } else if needs_blank {
+                        skip_leading_blanks(&data[sa..ea])
                     } else {
                         &data[sa..ea]
                     };
                     let kb = if sb == eb {
                         &[] as &[u8]
+                    } else if needs_blank {
+                        skip_leading_blanks(&data[sb..eb])
                     } else {
                         &data[sb..eb]
                     };
-                    let ord = compare_with_opts(ka, kb, opts, random_seed);
+                    let ord = cmp_fn(ka, kb);
+                    let ord = if needs_reverse { ord.reverse() } else { ord };
                     if ord == Ordering::Equal && !stable {
                         data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
                     } else {
@@ -1012,21 +1020,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         let keys = &config.keys;
         let global_opts = &config.global_opts;
 
-        do_sort(&mut indices, stable, |&a, &b| {
-            for (ki, key) in keys.iter().enumerate() {
-                let (sa, ea) = all_key_offs[ki][a];
-                let (sb, eb) = all_key_offs[ki][b];
-                let ka = if sa == ea {
-                    &[] as &[u8]
-                } else {
-                    &data[sa..ea]
-                };
-                let kb = if sb == eb {
-                    &[] as &[u8]
-                } else {
-                    &data[sb..eb]
-                };
-
+        // Pre-select comparators: eliminates per-comparison option branching
+        let comparators: Vec<_> = keys
+            .iter()
+            .map(|key| {
                 let opts = if key.opts.has_sort_type()
                     || key.opts.ignore_case
                     || key.opts.dictionary_order
@@ -1038,8 +1035,35 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 } else {
                     global_opts
                 };
+                select_comparator(opts, random_seed)
+            })
+            .collect();
 
-                let result = compare_with_opts(ka, kb, opts, random_seed);
+        do_sort(&mut indices, stable, |&a, &b| {
+            for (ki, &(cmp_fn, needs_blank, needs_reverse)) in comparators.iter().enumerate() {
+                let (sa, ea) = all_key_offs[ki][a];
+                let (sb, eb) = all_key_offs[ki][b];
+                let ka = if sa == ea {
+                    &[] as &[u8]
+                } else if needs_blank {
+                    skip_leading_blanks(&data[sa..ea])
+                } else {
+                    &data[sa..ea]
+                };
+                let kb = if sb == eb {
+                    &[] as &[u8]
+                } else if needs_blank {
+                    skip_leading_blanks(&data[sb..eb])
+                } else {
+                    &data[sb..eb]
+                };
+
+                let result = cmp_fn(ka, kb);
+                let result = if needs_reverse {
+                    result.reverse()
+                } else {
+                    result
+                };
                 if result != Ordering::Equal {
                     return result;
                 }
