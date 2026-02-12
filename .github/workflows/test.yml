@@ -19,6 +19,11 @@ jobs:
   test-rust:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Override .cargo/config.toml's target-cpu=native to avoid SIGILL
+      # when rust-cache provides artifacts from runners with different CPUs.
+      # Setting RUSTFLAGS replaces (not adds to) config.toml's build.rustflags.
+      RUSTFLAGS: ""
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +47,8 @@ jobs:
     name: Benchmarks
     needs: [test-rust]
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

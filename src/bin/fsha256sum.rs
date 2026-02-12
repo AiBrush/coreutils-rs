@@ -443,7 +443,7 @@ fn check_one(
             || !expected_hash.bytes().all(|b| b.is_ascii_hexdigit())
         {
             format_errors += 1;
-            if cli.warn || cli.strict {
+            if cli.warn {
                 let _ = out.flush();
                 eprintln!(
                     "{}: {}: {}: improperly formatted SHA256 checksum line",
