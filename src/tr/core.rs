@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 const BUF_SIZE: usize = 1024 * 1024; // 1MB — fits L2/L3 cache for locality
 

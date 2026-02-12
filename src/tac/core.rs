@@ -47,8 +47,9 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    // For small data, use simple backward scan with direct writes
-    if data.len() < 64 * 1024 {
+    // For small data (< 256KB), use simple backward scan with direct writes.
+    // Avoids overhead of forward SIMD scan + position Vec + IoSlice Vec allocation.
+    if data.len() < 256 * 1024 {
         return tac_bytes_small(data, separator, before, out);
     }
 
@@ -109,57 +110,58 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     Ok(())
 }
 
-/// Small-file path: backward scan with direct write_all calls.
+/// Small-file path: backward scan collecting IoSlice refs, single writev.
+/// Uses forward SIMD scan to find all separator positions (like the large path),
+/// then builds IoSlice references in reverse. Faster than per-record memrchr calls.
 fn tac_bytes_small(
     data: &[u8],
     separator: u8,
     before: bool,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    if !before {
-        let mut end = data.len();
+    // Forward SIMD scan to find all separator positions
+    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 16);
+    for pos in memchr::memchr_iter(separator, data) {
+        positions.push(pos);
+    }
 
-        // Check for trailing content after last separator
-        if let Some(last_sep) = memchr::memrchr(separator, data) {
-            if last_sep < data.len() - 1 {
-                out.write_all(&data[last_sep + 1..])?;
-                end = last_sep + 1;
-            }
-        } else {
-            out.write_all(data)?;
-            return Ok(());
+    if positions.is_empty() {
+        return out.write_all(data);
+    }
+
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
+
+    if !before {
+        let last_pos = *positions.last().unwrap();
+
+        // Trailing content without separator — output first
+        if last_pos < data.len() - 1 {
+            slices.push(IoSlice::new(&data[last_pos + 1..]));
         }
 
-        let mut cursor = end;
-        while cursor > 0 {
-            let search_end = cursor - 1;
-            let prev_sep = if search_end > 0 {
-                memchr::memrchr(separator, &data[..search_end])
-            } else {
-                None
-            };
-            let start = match prev_sep {
-                Some(pos) => pos + 1,
-                None => 0,
-            };
-            out.write_all(&data[start..cursor])?;
-            cursor = start;
+        // Records in reverse order (each includes its trailing separator)
+        for i in (0..positions.len()).rev() {
+            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
+            slices.push(IoSlice::new(&data[start..positions[i] + 1]));
         }
     } else {
-        let mut cursor = data.len();
-        while cursor > 0 {
-            match memchr::memrchr(separator, &data[..cursor]) {
-                Some(pos) => {
-                    out.write_all(&data[pos..cursor])?;
-                    cursor = pos;
-                }
-                None => {
-                    out.write_all(&data[..cursor])?;
-                    break;
-                }
-            }
+        // separator-before mode
+        for i in (0..positions.len()).rev() {
+            let end = if i + 1 < positions.len() {
+                positions[i + 1]
+            } else {
+                data.len()
+            };
+            slices.push(IoSlice::new(&data[positions[i]..end]));
+        }
+
+        // Leading content before first separator
+        if positions[0] > 0 {
+            slices.push(IoSlice::new(&data[..positions[0]]));
         }
     }
+
+    write_all_slices(out, &slices)?;
     Ok(())
 }
 

@@ -150,7 +150,28 @@ fn main() {
         return;
     }
 
-    // All other modes: use BufWriter for batching variable-size writes
+    // === Mmap fast paths: bypass BufWriter entirely ===
+    // All _mmap functions do internal 1MB buffering (or zero-copy IoSlice),
+    // so BufWriter just adds an extra memcpy. Writing directly to fd is faster.
+    if let Some(ref data) = mmap {
+        #[cfg(unix)]
+        let result = run_mmap_mode(&cli, set1_str, data, &mut *raw);
+        #[cfg(not(unix))]
+        let result = {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            run_mmap_mode(&cli, set1_str, data, &mut lock)
+        };
+        if let Err(e) = result
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("tr: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    // === Streaming paths (stdin pipe): use BufWriter for batching ===
     #[cfg(unix)]
     let mut writer = BufWriter::with_capacity(1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
@@ -158,8 +179,27 @@ fn main() {
     #[cfg(not(unix))]
     let mut writer = BufWriter::with_capacity(1024 * 1024, stdout.lock());
 
-    let result = if cli.delete && cli.squeeze {
-        // -d -s: delete SET1 chars, then squeeze SET2 chars
+    let result = run_streaming_mode(&cli, set1_str, &mut writer);
+
+    // Flush buffered output
+    let _ = writer.flush();
+
+    if let Err(e) = result
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        eprintln!("tr: {}", e);
+        process::exit(1);
+    }
+}
+
+/// Dispatch mmap-based modes — writes directly to raw fd for zero-copy.
+fn run_mmap_mode(
+    cli: &Cli,
+    set1_str: &str,
+    data: &[u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if cli.delete && cli.squeeze {
         if cli.sets.len() < 2 {
             eprintln!("tr: missing operand after '{}'", set1_str);
             eprintln!("Two strings must be given when both deleting and squeezing repeats.");
@@ -173,14 +213,8 @@ fn main() {
         } else {
             set1
         };
-        if let Some(ref data) = mmap {
-            tr::delete_squeeze_mmap(&delete_set, &set2, data, &mut writer)
-        } else {
-            let mut stdin = io::stdin().lock();
-            tr::delete_squeeze(&delete_set, &set2, &mut stdin, &mut writer)
-        }
+        tr::delete_squeeze_mmap(&delete_set, &set2, data, writer)
     } else if cli.delete {
-        // -d only: delete SET1 chars
         if cli.sets.len() > 1 {
             eprintln!("tr: extra operand '{}'", cli.sets[1]);
             eprintln!("Only one string may be given when deleting without squeezing.");
@@ -192,28 +226,16 @@ fn main() {
         } else {
             set1
         };
-        if let Some(ref data) = mmap {
-            tr::delete_mmap(&delete_set, data, &mut writer)
-        } else {
-            let mut stdin = io::stdin().lock();
-            tr::delete(&delete_set, &mut stdin, &mut writer)
-        }
+        tr::delete_mmap(&delete_set, data, writer)
     } else if cli.squeeze && cli.sets.len() < 2 {
-        // -s only with one set: squeeze SET1 chars
         let set1 = tr::parse_set(set1_str);
         let squeeze_set = if cli.complement {
             tr::complement(&set1)
         } else {
             set1
         };
-        if let Some(ref data) = mmap {
-            tr::squeeze_mmap(&squeeze_set, data, &mut writer)
-        } else {
-            let mut stdin = io::stdin().lock();
-            tr::squeeze(&squeeze_set, &mut stdin, &mut writer)
-        }
+        tr::squeeze_mmap(&squeeze_set, data, writer)
     } else if cli.squeeze {
-        // -s with two sets: translate SET1->SET2, then squeeze SET2 chars
         let set2_str = &cli.sets[1];
         let mut set1 = tr::parse_set(set1_str);
         if cli.complement {
@@ -226,26 +248,71 @@ fn main() {
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        if let Some(ref data) = mmap {
-            tr::translate_squeeze_mmap(&set1, &set2, data, &mut writer)
-        } else {
-            let mut stdin = io::stdin().lock();
-            tr::translate_squeeze(&set1, &set2, &mut stdin, &mut writer)
-        }
+        tr::translate_squeeze_mmap(&set1, &set2, data, writer)
     } else {
-        // Missing operand for translate
         eprintln!("tr: missing operand after '{}'", set1_str);
         eprintln!("Two strings must be given when translating.");
         process::exit(1);
-    };
+    }
+}
 
-    // Flush buffered output
-    let _ = writer.flush();
+/// Dispatch streaming modes — uses BufWriter for batching small writes.
+fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io::Result<()> {
+    let mut stdin = io::stdin().lock();
 
-    if let Err(e) = result
-        && e.kind() != io::ErrorKind::BrokenPipe
-    {
-        eprintln!("tr: {}", e);
+    if cli.delete && cli.squeeze {
+        if cli.sets.len() < 2 {
+            eprintln!("tr: missing operand after '{}'", set1_str);
+            eprintln!("Two strings must be given when both deleting and squeezing repeats.");
+            process::exit(1);
+        }
+        let set2_str = &cli.sets[1];
+        let set1 = tr::parse_set(set1_str);
+        let set2 = tr::parse_set(set2_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::delete_squeeze(&delete_set, &set2, &mut stdin, writer)
+    } else if cli.delete {
+        if cli.sets.len() > 1 {
+            eprintln!("tr: extra operand '{}'", cli.sets[1]);
+            eprintln!("Only one string may be given when deleting without squeezing.");
+            process::exit(1);
+        }
+        let set1 = tr::parse_set(set1_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::delete(&delete_set, &mut stdin, writer)
+    } else if cli.squeeze && cli.sets.len() < 2 {
+        let set1 = tr::parse_set(set1_str);
+        let squeeze_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::squeeze(&squeeze_set, &mut stdin, writer)
+    } else if cli.squeeze {
+        let set2_str = &cli.sets[1];
+        let mut set1 = tr::parse_set(set1_str);
+        if cli.complement {
+            set1 = tr::complement(&set1);
+        }
+        let set2 = if cli.truncate {
+            let raw_set = tr::parse_set(set2_str);
+            set1.truncate(raw_set.len());
+            raw_set
+        } else {
+            tr::expand_set2(set2_str, set1.len())
+        };
+        tr::translate_squeeze(&set1, &set2, &mut stdin, writer)
+    } else {
+        eprintln!("tr: missing operand after '{}'", set1_str);
+        eprintln!("Two strings must be given when translating.");
         process::exit(1);
     }
 }
