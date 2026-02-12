@@ -51,8 +51,8 @@ fn test_three_lines() {
 
 #[test]
 fn test_no_trailing_newline() {
-    // GNU tac: trailing "bbb" gets separator appended, then "aaa\n" = "bbb\naaa\n"
-    assert_eq!(run_tac(b"aaa\nbbb", b'\n', false), b"bbb\naaa\n");
+    // GNU tac: trailing "bbb" stays bare (no separator added), then "aaa\n" = "bbbaaa\n"
+    assert_eq!(run_tac(b"aaa\nbbb", b'\n', false), b"bbbaaa\n");
 }
 
 #[test]
@@ -94,8 +94,8 @@ fn test_custom_separator_comma() {
 
 #[test]
 fn test_custom_separator_no_trailing() {
-    // GNU tac: trailing "c" gets separator appended = "c,b,a,"
-    assert_eq!(run_tac(b"a,b,c", b',', false), b"c,b,a,");
+    // GNU tac: trailing "c" stays bare (no separator added) = "cb,a,"
+    assert_eq!(run_tac(b"a,b,c", b',', false), b"cb,a,");
 }
 
 // ---- Multi-byte string separator tests ----
@@ -107,8 +107,8 @@ fn test_string_separator() {
 
 #[test]
 fn test_string_separator_no_trailing() {
-    // GNU tac: trailing "c" gets separator appended = "cXYbXYaXY"
-    assert_eq!(run_tac_str(b"aXYbXYc", b"XY", false), b"cXYbXYaXY");
+    // GNU tac: trailing "c" stays bare (no separator added) = "cbXYaXY"
+    assert_eq!(run_tac_str(b"aXYbXYc", b"XY", false), b"cbXYaXY");
 }
 
 #[test]

@@ -70,7 +70,7 @@ struct Cli {
     stable: bool,
 
     /// Check for sorted input; do not sort
-    #[arg(short = 'c', long = "check", default_missing_value = "diagnose", num_args = 0..=1)]
+    #[arg(short = 'c', long = "check", default_missing_value = "diagnose", num_args = 0..=1, require_equals = true)]
     check: Option<String>,
 
     /// Like -c, but do not report first bad line
