@@ -708,7 +708,8 @@ fn break_ties_line_cmp(entries: &mut [(u64, usize)], data: &[u8], offsets: &[(us
 }
 
 /// Write sorted indices to output, with optional unique dedup.
-/// Uses contiguous output buffer with batched write_all for efficient I/O.
+/// Writes directly to BufWriter — it already handles batching (4MB capacity).
+/// Eliminates intermediate Vec buffer copy (saves ~100MB memcpy for 100MB input).
 fn write_sorted_output(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -717,8 +718,6 @@ fn write_sorted_output(
     writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
-
     if config.unique {
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
@@ -732,34 +731,24 @@ fn write_sorted_output(
                 None => true,
             };
             if should_output {
-                buf.extend_from_slice(line);
-                buf.extend_from_slice(terminator);
+                writer.write_all(line)?;
+                writer.write_all(terminator)?;
                 prev = Some(idx);
-            }
-            if buf.len() >= OUTPUT_BUF_SIZE {
-                writer.write_all(&buf)?;
-                buf.clear();
             }
         }
     } else {
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            buf.extend_from_slice(&data[s..e]);
-            buf.extend_from_slice(terminator);
-            if buf.len() >= OUTPUT_BUF_SIZE {
-                writer.write_all(&buf)?;
-                buf.clear();
-            }
+            writer.write_all(&data[s..e])?;
+            writer.write_all(terminator)?;
         }
-    }
-    if !buf.is_empty() {
-        writer.write_all(&buf)?;
     }
     Ok(())
 }
 
 /// Write sorted (key, index) entries to output. Like write_sorted_output but
 /// iterates (u64, usize) entries directly, avoiding the O(n) copy-back to indices.
+/// Writes directly to BufWriter to eliminate intermediate buffer overhead.
 fn write_sorted_entries(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -768,8 +757,6 @@ fn write_sorted_entries(
     writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
-
     if config.unique {
         let mut prev: Option<usize> = None;
         for &(_, idx) in entries {
@@ -783,28 +770,17 @@ fn write_sorted_entries(
                 None => true,
             };
             if should_output {
-                buf.extend_from_slice(line);
-                buf.extend_from_slice(terminator);
+                writer.write_all(line)?;
+                writer.write_all(terminator)?;
                 prev = Some(idx);
-            }
-            if buf.len() >= OUTPUT_BUF_SIZE {
-                writer.write_all(&buf)?;
-                buf.clear();
             }
         }
     } else {
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            buf.extend_from_slice(&data[s..e]);
-            buf.extend_from_slice(terminator);
-            if buf.len() >= OUTPUT_BUF_SIZE {
-                writer.write_all(&buf)?;
-                buf.clear();
-            }
+            writer.write_all(&data[s..e])?;
+            writer.write_all(terminator)?;
         }
-    }
-    if !buf.is_empty() {
-        writer.write_all(&buf)?;
     }
     Ok(())
 }
