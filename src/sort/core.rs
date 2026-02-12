@@ -1185,7 +1185,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
         };
         if n > 10_000 {
-            entries.par_sort_unstable_by(fold_cmp);
+            if stable {
+                entries.par_sort_by(fold_cmp);
+            } else {
+                entries.par_sort_unstable_by(fold_cmp);
+            }
+        } else if stable {
+            entries.sort_by(fold_cmp);
         } else {
             entries.sort_unstable_by(fold_cmp);
         }
@@ -1236,7 +1242,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         };
         let n = entries.len();
         if n > 10_000 {
-            entries.par_sort_unstable_by(cmp);
+            if stable {
+                entries.par_sort_by(cmp);
+            } else {
+                entries.par_sort_unstable_by(cmp);
+            }
+        } else if stable {
+            entries.sort_by(cmp);
         } else {
             entries.sort_unstable_by(cmp);
         }
@@ -1302,7 +1314,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
             };
             if n > 10_000 {
-                entries.par_sort_unstable_by(cmp);
+                if stable {
+                    entries.par_sort_by(cmp);
+                } else {
+                    entries.par_sort_unstable_by(cmp);
+                }
+            } else if stable {
+                entries.sort_by(cmp);
             } else {
                 entries.sort_unstable_by(cmp);
             }
@@ -1363,7 +1381,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 };
                 if n > 10_000 {
-                    entries.par_sort_unstable_by(prefix_cmp);
+                    if stable {
+                        entries.par_sort_by(prefix_cmp);
+                    } else {
+                        entries.par_sort_unstable_by(prefix_cmp);
+                    }
+                } else if stable {
+                    entries.sort_by(prefix_cmp);
                 } else {
                     entries.sort_unstable_by(prefix_cmp);
                 }
