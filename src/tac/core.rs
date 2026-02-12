@@ -47,9 +47,9 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
         return Ok(());
     }
 
-    // For small/medium data (< 2MB), use simple backward scan with direct writes.
+    // For small/medium data (< 16MB), use simple backward scan with direct writes.
     // A single write_all is faster than writev with many small segments.
-    if data.len() < 2 * 1024 * 1024 {
+    if data.len() < 16 * 1024 * 1024 {
         return tac_bytes_small(data, separator, before, out);
     }
 
@@ -198,7 +198,7 @@ pub fn tac_string_separator(
     let sep_len = separator.len();
 
     // Small data: contiguous buffer + single write (avoids IoSlice/writev overhead)
-    if data.len() < 2 * 1024 * 1024 {
+    if data.len() < 16 * 1024 * 1024 {
         let mut outbuf = Vec::with_capacity(data.len());
 
         if !before {
@@ -369,7 +369,7 @@ pub fn tac_regex_separator(
     }
 
     // Small data: contiguous buffer + single write (avoids IoSlice/writev overhead)
-    if data.len() < 2 * 1024 * 1024 {
+    if data.len() < 16 * 1024 * 1024 {
         let mut outbuf = Vec::with_capacity(data.len());
 
         if !before {

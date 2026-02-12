@@ -216,6 +216,18 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
         return process_fields_prefix(data, delim, line_delim, ranges[0].end, suppress, out);
     }
 
+    // Fast path: open-ended field range from field N (e.g., cut -f3-)
+    // Skip first N-1 delimiters per line instead of per-field selection.
+    if !complement
+        && ranges.len() == 1
+        && ranges[0].end == usize::MAX
+        && ranges[0].start > 1
+        && output_delim.len() == 1
+        && output_delim[0] == delim
+    {
+        return process_fields_suffix(data, delim, line_delim, ranges[0].start, suppress, out);
+    }
+
     // Pre-compute for general field extraction
     let max_field = if complement {
         usize::MAX
@@ -616,6 +628,114 @@ fn fields_prefix_line(
     buf.push(line_delim);
 }
 
+/// Open-ended field suffix extraction (e.g., `cut -f3-`).
+/// Skip the first N-1 delimiters, then output everything from field N to end.
+fn process_fields_suffix(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    suppress: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if data.len() >= PARALLEL_THRESHOLD {
+        let chunks = split_into_chunks(data, line_delim);
+        let results: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut buf = Vec::with_capacity(chunk.len());
+                fields_suffix_chunk(chunk, delim, line_delim, start_field, suppress, &mut buf);
+                buf
+            })
+            .collect();
+        for result in &results {
+            if !result.is_empty() {
+                out.write_all(result)?;
+            }
+        }
+    } else {
+        let mut buf = Vec::with_capacity(data.len());
+        fields_suffix_chunk(data, delim, line_delim, start_field, suppress, &mut buf);
+        if !buf.is_empty() {
+            out.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Process a chunk for open-ended field suffix extraction.
+fn fields_suffix_chunk(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    suppress: bool,
+    buf: &mut Vec<u8>,
+) {
+    let mut start = 0;
+    for end_pos in memchr_iter(line_delim, data) {
+        let line = &data[start..end_pos];
+        fields_suffix_line(line, delim, line_delim, start_field, suppress, buf);
+        start = end_pos + 1;
+    }
+    if start < data.len() {
+        fields_suffix_line(
+            &data[start..],
+            delim,
+            line_delim,
+            start_field,
+            suppress,
+            buf,
+        );
+    }
+}
+
+/// Extract fields from start_field to end from one line.
+/// Skips the first (start_field - 1) delimiters, outputs the rest.
+#[inline(always)]
+fn fields_suffix_line(
+    line: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    suppress: bool,
+    buf: &mut Vec<u8>,
+) {
+    if line.is_empty() {
+        if !suppress {
+            buf.push(line_delim);
+        }
+        return;
+    }
+
+    let skip_delims = start_field - 1;
+    let mut delim_count = 0;
+    let mut has_delim = false;
+
+    for pos in memchr_iter(delim, line) {
+        has_delim = true;
+        delim_count += 1;
+        if delim_count >= skip_delims {
+            // Output from after this delimiter to end of line
+            buf.extend_from_slice(&line[pos + 1..]);
+            buf.push(line_delim);
+            return;
+        }
+    }
+
+    if !has_delim {
+        // No delimiter — output whole line or suppress
+        if !suppress {
+            buf.extend_from_slice(line);
+            buf.push(line_delim);
+        }
+        return;
+    }
+
+    // Fewer delimiters than needed — field doesn't exist, output empty
+    buf.push(line_delim);
+}
+
 /// First-field extraction using combined delimiter+newline SIMD scan.
 /// Single memchr2_iter pass finds both delimiter and newline positions,
 /// eliminating per-line memchr overhead (saves ~250K function calls for 10MB).
@@ -904,6 +1024,61 @@ fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &m
     }
 }
 
+/// Fast path for `cut -bN-`: skip first N-1 bytes per line.
+/// For each line, outputs bytes from position N to end of line.
+fn process_bytes_from_offset(
+    data: &[u8],
+    skip_bytes: usize,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if data.len() >= PARALLEL_THRESHOLD {
+        let chunks = split_into_chunks(data, line_delim);
+        let results: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut buf = Vec::with_capacity(chunk.len());
+                bytes_from_offset_chunk(chunk, skip_bytes, line_delim, &mut buf);
+                buf
+            })
+            .collect();
+        for result in &results {
+            if !result.is_empty() {
+                out.write_all(result)?;
+            }
+        }
+    } else {
+        let mut buf = Vec::with_capacity(data.len());
+        bytes_from_offset_chunk(data, skip_bytes, line_delim, &mut buf);
+        if !buf.is_empty() {
+            out.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Process a chunk for from-offset byte range extraction.
+#[inline]
+fn bytes_from_offset_chunk(data: &[u8], skip_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
+    let mut start = 0;
+    for pos in memchr_iter(line_delim, data) {
+        let line_len = pos - start;
+        if line_len > skip_bytes {
+            buf.extend_from_slice(&data[start + skip_bytes..pos]);
+        }
+        buf.push(line_delim);
+        start = pos + 1;
+    }
+    // Handle last line without terminator
+    if start < data.len() {
+        let line_len = data.len() - start;
+        if line_len > skip_bytes {
+            buf.extend_from_slice(&data[start + skip_bytes..data.len()]);
+        }
+        buf.push(line_delim);
+    }
+}
+
 /// Optimized byte/char extraction with batched output and parallel processing.
 fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io::Result<()> {
     let line_delim = cfg.line_delim;
@@ -917,6 +1092,15 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
         let max_bytes = ranges[0].end;
         if max_bytes < usize::MAX {
             return process_bytes_from_start(data, max_bytes, line_delim, out);
+        }
+    }
+
+    // Fast path: single open-ended range from byte N (e.g., cut -b5-)
+    // Skip first N-1 bytes per line instead of per-byte range checking.
+    if !complement && ranges.len() == 1 && ranges[0].end == usize::MAX && output_delim.is_empty() {
+        let skip_bytes = ranges[0].start.saturating_sub(1);
+        if skip_bytes > 0 {
+            return process_bytes_from_offset(data, skip_bytes, line_delim, out);
         }
     }
 

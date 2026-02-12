@@ -163,6 +163,76 @@ pub fn compare_lines(a: &[u8], b: &[u8], config: &SortConfig) -> Ordering {
     }
 }
 
+/// Parallel line boundary detection for large files (>4MB).
+/// Splits data into thread-count chunks aligned at delimiter boundaries,
+/// then scans each chunk concurrently with SIMD memchr.
+fn find_lines_parallel(data: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = data.len() / num_threads;
+
+    // Find chunk boundaries aligned to delimiter positions
+    let mut boundaries = Vec::with_capacity(num_threads + 1);
+    boundaries.push(0usize);
+    for i in 1..num_threads {
+        let target = i * chunk_size;
+        if target >= data.len() {
+            break;
+        }
+        if let Some(p) = memchr::memchr(delimiter, &data[target..]) {
+            let boundary = target + p + 1;
+            if boundary > *boundaries.last().unwrap() && boundary <= data.len() {
+                boundaries.push(boundary);
+            }
+        }
+    }
+    boundaries.push(data.len());
+
+    let is_newline = delimiter == b'\n';
+    let data_len = data.len();
+
+    // Scan each chunk in parallel
+    let chunk_offsets: Vec<Vec<(usize, usize)>> = boundaries
+        .windows(2)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|w| {
+            let chunk_start = w[0];
+            let chunk_end = w[1];
+            let chunk = &data[chunk_start..chunk_end];
+            let mut offsets = Vec::with_capacity(chunk.len() / 40 + 1);
+            let mut line_start = chunk_start;
+
+            for pos in memchr::memchr_iter(delimiter, chunk) {
+                let abs_pos = chunk_start + pos;
+                let mut line_end = abs_pos;
+                if is_newline && line_end > line_start && data[line_end - 1] == b'\r' {
+                    line_end -= 1;
+                }
+                offsets.push((line_start, line_end));
+                line_start = abs_pos + 1;
+            }
+
+            // Handle last line in chunk (only if this is the final chunk)
+            if line_start < chunk_end && chunk_end == data_len {
+                let mut line_end = chunk_end;
+                if is_newline && line_end > line_start && data[line_end - 1] == b'\r' {
+                    line_end -= 1;
+                }
+                offsets.push((line_start, line_end));
+            }
+
+            offsets
+        })
+        .collect();
+
+    let total: usize = chunk_offsets.iter().map(|v| v.len()).sum();
+    let mut offsets = Vec::with_capacity(total);
+    for chunk in chunk_offsets {
+        offsets.extend_from_slice(&chunk);
+    }
+    offsets
+}
+
 /// Read all input into a single contiguous buffer and compute line offsets.
 /// Uses mmap for single-file input (zero-copy), Vec for stdin/multi-file.
 fn read_all_input(
@@ -203,28 +273,34 @@ fn read_all_input(
     };
 
     // Find line boundaries using SIMD-accelerated memchr
+    // Use parallel scanning for large files (>4MB) to leverage multiple cores
     let data = &*buffer;
-    let mut offsets = Vec::with_capacity(data.len() / 40 + 1);
-    let mut start = 0usize;
+    let offsets = if data.len() > 4 * 1024 * 1024 {
+        find_lines_parallel(data, delimiter)
+    } else {
+        let mut offsets = Vec::with_capacity(data.len() / 40 + 1);
+        let mut start = 0usize;
 
-    for pos in memchr::memchr_iter(delimiter, data) {
-        let mut end = pos;
-        // Strip trailing CR before LF
-        if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
-            end -= 1;
+        for pos in memchr::memchr_iter(delimiter, data) {
+            let mut end = pos;
+            // Strip trailing CR before LF
+            if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
+                end -= 1;
+            }
+            offsets.push((start, end));
+            start = pos + 1;
         }
-        offsets.push((start, end));
-        start = pos + 1;
-    }
 
-    // Handle last line without trailing delimiter
-    if start < data.len() {
-        let mut end = data.len();
-        if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
-            end -= 1;
+        // Handle last line without trailing delimiter
+        if start < data.len() {
+            let mut end = data.len();
+            if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
+                end -= 1;
+            }
+            offsets.push((start, end));
         }
-        offsets.push((start, end));
-    }
+        offsets
+    };
 
     Ok((buffer, offsets))
 }
@@ -942,7 +1018,47 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 while j < n && entries[j].0 == key {
                     j += 1;
                 }
-                if j - i > 1 {
+                if j - i > 256 {
+                    // Two-level radix: sort tied group by secondary prefix (bytes 8-15)
+                    let group = &mut entries[i..j];
+                    let mut secondary: Vec<(u64, usize)> = group
+                        .iter()
+                        .map(|&(_, idx)| {
+                            let (s, e) = offsets[idx];
+                            let p = s + 8;
+                            (if p < e { line_prefix(data, p, e) } else { 0u64 }, idx)
+                        })
+                        .collect();
+                    radix_sort_entries(&mut secondary, reverse);
+                    // Break remaining ties with full comparison
+                    let mut si = 0;
+                    while si < secondary.len() {
+                        let skey = secondary[si].0;
+                        let mut sj = si + 1;
+                        while sj < secondary.len() && secondary[sj].0 == skey {
+                            sj += 1;
+                        }
+                        if sj - si > 1 {
+                            if sj - si > 5000 {
+                                secondary[si..sj].par_sort_unstable_by(|a, b| {
+                                    let ord = data[offsets[a.1].0..offsets[a.1].1]
+                                        .cmp(&data[offsets[b.1].0..offsets[b.1].1]);
+                                    if reverse { ord.reverse() } else { ord }
+                                });
+                            } else {
+                                secondary[si..sj].sort_unstable_by(|a, b| {
+                                    let ord = data[offsets[a.1].0..offsets[a.1].1]
+                                        .cmp(&data[offsets[b.1].0..offsets[b.1].1]);
+                                    if reverse { ord.reverse() } else { ord }
+                                });
+                            }
+                        }
+                        si = sj;
+                    }
+                    for (k, &(_, idx)) in secondary.iter().enumerate() {
+                        group[k] = (group[k].0, idx);
+                    }
+                } else if j - i > 1 {
                     entries[i..j].sort_unstable_by(|a, b| {
                         let ord = data[offsets[a.1].0..offsets[a.1].1]
                             .cmp(&data[offsets[b.1].0..offsets[b.1].1]);
