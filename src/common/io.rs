@@ -3,6 +3,9 @@ use std::io::{self, Read};
 use std::ops::Deref;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use memmap2::{Mmap, MmapOptions};
 
 /// Holds file data — either zero-copy mmap or an owned Vec.
@@ -28,20 +31,31 @@ impl Deref for FileData {
 /// (page table creation, TLB flush on munmap) that exceeds the zero-copy benefit.
 const MMAP_THRESHOLD: u64 = 256 * 1024;
 
+/// Track whether O_NOATIME is supported to avoid repeated failed open() attempts.
+/// After the first EPERM, we never try O_NOATIME again (saves one syscall per file).
+#[cfg(target_os = "linux")]
+static NOATIME_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
 /// Open a file with O_NOATIME on Linux to avoid atime inode writes.
-/// Falls back to normal open if O_NOATIME fails (e.g., not file owner).
+/// Caches whether O_NOATIME works to avoid double-open on every file.
 #[cfg(target_os = "linux")]
 fn open_noatime(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // O_NOATIME = 0o1000000 on Linux
-    match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOATIME)
-        .open(path)
-    {
-        Ok(f) => Ok(f),
-        Err(_) => File::open(path),
+    if NOATIME_SUPPORTED.load(Ordering::Relaxed) {
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            Ok(f) => return Ok(f),
+            Err(ref e) if e.raw_os_error() == Some(libc::EPERM) => {
+                // O_NOATIME requires file ownership or CAP_FOWNER — disable globally
+                NOATIME_SUPPORTED.store(false, Ordering::Relaxed);
+            }
+            Err(e) => return Err(e), // Real error, propagate
+        }
     }
+    File::open(path)
 }
 
 #[cfg(not(target_os = "linux"))]

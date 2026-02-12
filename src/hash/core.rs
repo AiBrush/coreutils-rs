@@ -152,13 +152,23 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
 fn mmap_and_hash(algo: HashAlgorithm, file: &File) -> io::Result<String> {
     match unsafe {
         MmapOptions::new()
-            .populate() // Eagerly populate page tables — avoids page faults during hash
+            // No populate() — lazy faults with async readahead avoids blocking
+            // until all pages are loaded. MADV_WILLNEED below triggers non-blocking
+            // readahead so pages are ready by the time we access them.
             .map(file)
     } {
         Ok(mmap) => {
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
+                // WILLNEED triggers async readahead without blocking (unlike populate)
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_WILLNEED,
+                    );
+                }
                 if mmap.len() >= 2 * 1024 * 1024 {
                     unsafe {
                         libc::madvise(
@@ -181,11 +191,18 @@ fn mmap_and_hash(algo: HashAlgorithm, file: &File) -> io::Result<String> {
 
 /// Mmap a file and hash with BLAKE2b. Shared helper for blake2b_hash_file.
 fn mmap_and_hash_blake2b(file: &File, output_bytes: usize) -> io::Result<String> {
-    match unsafe { MmapOptions::new().populate().map(file) } {
+    match unsafe { MmapOptions::new().map(file) } {
         Ok(mmap) => {
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_WILLNEED,
+                    );
+                }
                 if mmap.len() >= 2 * 1024 * 1024 {
                     unsafe {
                         libc::madvise(
@@ -257,11 +274,18 @@ pub fn estimate_total_size(paths: &[&Path]) -> u64 {
 }
 
 /// Check if parallel hashing is worthwhile for the given file paths.
+/// Only uses rayon when files are individually large enough for the hash
+/// computation to dominate over rayon overhead (thread pool init + work stealing).
+/// For many small files (e.g., 100 × 100KB), sequential is much faster.
 pub fn should_use_parallel(paths: &[&Path]) -> bool {
     if paths.len() < 2 {
         return false;
     }
-    estimate_total_size(paths) >= PARALLEL_THRESHOLD
+    let total = estimate_total_size(paths);
+    let avg = total / paths.len() as u64;
+    // Only parallelize when average file size >= 1MB.
+    // Below this, rayon overhead exceeds the benefit of parallel hashing.
+    avg >= 1024 * 1024
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.
