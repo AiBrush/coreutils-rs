@@ -17,6 +17,13 @@
     clippy::too_many_arguments
 )]
 
+/// Use mimalloc as the global allocator for all binaries.
+/// 2-3x faster than glibc malloc for small allocations,
+/// better thread-local caching, and reduced fragmentation.
+/// Critical for tools like sort/uniq that do many small allocs.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod base64;
 pub mod common;
 pub mod cut;

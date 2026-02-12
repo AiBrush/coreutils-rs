@@ -55,10 +55,12 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 // ── Public hashing API ──────────────────────────────────────────────
 
 /// Buffer size for streaming hash I/O.
-/// 1MB balances syscall count vs L2 cache locality. Smaller buffers keep
-/// data hot in L2 (256KB-1MB) during hash update, while fadvise(SEQUENTIAL)
-/// ensures the kernel pre-fetches the next chunk asynchronously.
-const HASH_READ_BUF: usize = 1024 * 1024;
+/// 2MB gives fewer syscalls while still fitting in L3 cache.
+/// With fadvise(SEQUENTIAL) the kernel prefetches ahead, so the next
+/// 2MB is already in page cache by the time we finish hashing the current chunk.
+/// ring's SHA-NI processes at ~3-4 GB/s, so 2MB takes ~0.5ms — fast enough
+/// that I/O latency dominates and larger buffers just waste memory.
+const HASH_READ_BUF: usize = 2 * 1024 * 1024;
 
 /// Threshold below which we read the entire file + single-shot hash.
 /// Files up to 8MB fit comfortably in memory and benefit from contiguous
@@ -195,14 +197,14 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     if is_regular && len > 0 {
         // Files up to 8MB: read entirely + single-shot hash.
         // Contiguous data enables optimal CPU prefetching and avoids
-        // per-chunk hasher.update() overhead. Vec::with_capacity uses
-        // mmap(MAP_ANONYMOUS) for large allocs — kernel zero-page COW
-        // means pages are only physically allocated on first write (by read).
+        // per-chunk hasher.update() overhead.
+        // Use read_full into exact-size buffer instead of read_to_end
+        // to avoid the grow-and-probe loop (saves 1-2 extra read() syscalls).
         if len <= SINGLE_SHOT_THRESHOLD {
             fadvise_sequential(&file, len);
-            let mut buf = Vec::with_capacity(len as usize);
-            Read::read_to_end(&mut &file, &mut buf)?;
-            return Ok(hash_bytes(algo, &buf));
+            let mut buf = vec![0u8; len as usize];
+            let n = read_full(&mut &file, &mut buf)?;
+            return Ok(hash_bytes(algo, &buf[..n]));
         }
 
         // Large files (>8MB): streaming read with kernel readahead hint.
@@ -343,9 +345,9 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
         // Files up to 8MB: read entirely + single-shot hash.
         if len <= SINGLE_SHOT_THRESHOLD {
             fadvise_sequential(&file, len);
-            let mut buf = Vec::with_capacity(len as usize);
-            Read::read_to_end(&mut &file, &mut buf)?;
-            return Ok(blake2b_hash_data(&buf, output_bytes));
+            let mut buf = vec![0u8; len as usize];
+            let n = read_full(&mut &file, &mut buf)?;
+            return Ok(blake2b_hash_data(&buf[..n], output_bytes));
         }
 
         // Large files (>8MB): streaming read with kernel readahead hint
