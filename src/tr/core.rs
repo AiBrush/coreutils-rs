@@ -524,15 +524,21 @@ pub fn translate_mmap(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
+
+    // Check if table is identity (no translation needed) — pure passthrough
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
     let buf_size = data.len().min(BUF_SIZE);
     let mut buf = vec![0u8; buf_size];
     for chunk in data.chunks(buf_size) {
-        // Single-pass translate: read from source, write translated byte to output
-        for (dst, &src) in buf[..chunk.len()].iter_mut().zip(chunk.iter()) {
-            // SAFETY: src is u8, always in range 0..256
-            *dst = unsafe { *table.get_unchecked(src as usize) };
-        }
-        writer.write_all(&buf[..chunk.len()])?;
+        let len = chunk.len();
+        // Copy + translate with unchecked indexing for tight inner loop
+        buf[..len].copy_from_slice(chunk);
+        translate_inplace(&mut buf[..len], &table);
+        writer.write_all(&buf[..len])?;
     }
     Ok(())
 }
