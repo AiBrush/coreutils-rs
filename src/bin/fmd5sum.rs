@@ -307,7 +307,11 @@ fn write_output(out: &mut impl Write, cli: &Cli, algo: HashAlgorithm, hash: &str
         let _ = out.write_all(&[term]);
     } else {
         // GNU defaults to binary mode on Linux; only -t (text) uses space
-        let mode = if !cli.text { b'*' } else { b' ' };
+        let mode = if cli.binary || (!cli.text && cfg!(windows)) {
+            b'*'
+        } else {
+            b' '
+        };
         let term = if cli.zero { b'\0' } else { b'\n' };
 
         if !cli.zero && needs_escape(filename) {
