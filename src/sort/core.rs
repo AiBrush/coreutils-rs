@@ -457,10 +457,8 @@ impl Ord for MergeEntryOrd {
 fn line_prefix(data: &[u8], start: usize, end: usize) -> u64 {
     let len = end - start;
     if len >= 8 {
-        let slice = &data[start..start + 8];
-        u64::from_be_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ])
+        // Unaligned u64 load + bswap: single instruction on x86_64
+        u64::from_be_bytes(unsafe { *(data.as_ptr().add(start) as *const [u8; 8]) })
     } else {
         let mut bytes = [0u8; 8];
         bytes[..len].copy_from_slice(&data[start..end]);
