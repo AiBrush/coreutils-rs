@@ -227,10 +227,8 @@ pub fn decode_owned(
 /// Strip all whitespace from a Vec in-place using SIMD memchr for newlines
 /// and a fallback scan for rare non-newline whitespace.
 fn strip_whitespace_inplace(data: &mut Vec<u8>) {
-    // First, collect newline positions using SIMD memchr.
-    let positions: Vec<usize> = memchr::memchr_iter(b'\n', data.as_slice()).collect();
-
-    if positions.is_empty() {
+    // Quick check for newlines using SIMD
+    if memchr::memchr(b'\n', data).is_none() {
         // No newlines; check for other whitespace only.
         if data.iter().any(|&b| is_whitespace(b)) {
             data.retain(|&b| !is_whitespace(b));
@@ -238,24 +236,35 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
         return;
     }
 
-    // Compact data in-place, removing newlines using copy_within.
-    let mut wp = 0;
-    let mut rp = 0;
+    // In-place compaction using raw pointers to avoid borrow conflict.
+    // This eliminates the 13.6MB Vec<usize> positions allocation (for 133MB input).
+    // Safety: wp <= rp always (we only skip bytes), so copy regions don't overlap.
+    let ptr = data.as_ptr();
+    let mut_ptr = data.as_mut_ptr();
+    let len = data.len();
+    // Create an immutable slice for memchr_iter that doesn't conflict with mut_ptr
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    for &pos in &positions {
+    let mut wp = 0usize;
+    let mut rp = 0usize;
+
+    for pos in memchr::memchr_iter(b'\n', slice) {
         if pos > rp {
-            let len = pos - rp;
-            data.copy_within(rp..pos, wp);
-            wp += len;
+            let seg = pos - rp;
+            unsafe {
+                std::ptr::copy(ptr.add(rp), mut_ptr.add(wp), seg);
+            }
+            wp += seg;
         }
         rp = pos + 1;
     }
 
-    let data_len = data.len();
-    if rp < data_len {
-        let len = data_len - rp;
-        data.copy_within(rp..data_len, wp);
-        wp += len;
+    if rp < len {
+        let seg = len - rp;
+        unsafe {
+            std::ptr::copy(ptr.add(rp), mut_ptr.add(wp), seg);
+        }
+        wp += seg;
     }
 
     data.truncate(wp);
