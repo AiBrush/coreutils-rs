@@ -893,23 +893,8 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
 }
 
 /// Squeeze a single repeated character from mmap'd data.
-/// Uses SIMD memchr to find all occurrences, then copies runs between them.
+/// Uses SIMD memchr to find runs, copies non-squeezed content in bulk.
 fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    let mut last = 0;
-    let mut in_run = false;
-
-    for pos in memchr::memchr_iter(ch, data) {
-        if in_run {
-            // Skip consecutive occurrences
-            continue;
-        }
-        // First occurrence — include it, mark start of run
-        // Write everything from last to pos+1 (including this occurrence)
-        // Actually we need to handle runs properly
-        in_run = true;
-    }
-
-    // Simpler approach: scan for runs and copy non-run content
     let mut outbuf = vec![0u8; BUF_SIZE];
     let mut out_pos = 0;
     let mut i = 0;
