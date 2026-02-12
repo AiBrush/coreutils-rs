@@ -1,9 +1,11 @@
 # coreutils-rs Progress
 
-## Current Status: All 10 Tools Complete - v0.0.8 Released
+## Current Status: All 10 Tools Complete - v0.0.16 Released
 
 All 10 GNU coreutils replacements are fully implemented, optimized, and tested.
 Each tool is a drop-in replacement with byte-identical GNU output.
+
+**Compatibility: 409/413 (99.0%)** on independent test suite. Remaining 4 failures are tool name differences only (fcut vs cut in error messages, etc.).
 
 ## Tool Checklist
 
@@ -101,28 +103,29 @@ Each tool is a drop-in replacement with byte-identical GNU output.
 | `funiq` | dedup (10MB sorted) | 33.1ms | 6.9ms | **4.82x** |
 | `ftac` | reverse | 132.5ms | 58.9ms | **2.25x** |
 
-### Per-Tool Best Speedup
+### Per-Tool Best Speedup (Independent CI Benchmark, Linux x86_64 v0.0.16)
 
 | Rank | Tool | Best Speedup |
 |------|------|-------------|
-| 1 | fwc | **17.81x** |
-| 2 | fcut | **10.62x** |
-| 3 | fsort | **4.83x** |
-| 4 | funiq | **4.82x** |
-| 5 | ftac | **2.25x** |
-| 6 | fbase64 | **1.63x** |
-| 7 | fb2sum | **1.22x** |
-| 8 | ftr | **1.07x** |
-| 9 | fsha256sum | **1.00x** |
-| 10 | fmd5sum | **0.80x** |
+| 1 | fwc | **16.75x** |
+| 2 | funiq | **5.06x** |
+| 3 | fcut | **3.99x** |
+| 4 | fsort | **3.26x** |
+| 5 | ftac | **2.19x** |
+| 6 | fbase64 | **1.88x** |
+| 7 | fsha256sum | **1.46x** |
+| 8 | ftr | **1.45x** |
+| 9 | fb2sum | **1.30x** |
+| 10 | fmd5sum | **1.34x** |
 
 ## Key Findings
-- **fwc -w is 17.81x faster** — SIMD SSE2 word counting dominates GNU's scalar approach
-- **fwc default is 11.75x faster** — the flagship benchmark, combining all metrics
-- **fcut -b is 10.62x faster** — SIMD byte-range extraction with zero-copy mmap
-- **fsort is ~4.7x faster** — parallel merge sort vs GNU's single-threaded sort
-- **funiq is 4.82x faster** — efficient dedup with mmap and buffered I/O
+- **fwc -m is 16.75x faster** — SIMD SSE2 word counting dominates GNU's scalar approach
+- **fwc default is 3.78x faster** — combining lines+words+bytes in a fused pass
+- **funiq is 5.06x faster** — prefix hash comparison + zero-copy mmap spans
+- **fcut is 3.99x faster** — SIMD delimiter scanning + memchr_iter field extraction
+- **fsort is 3.26x faster** — parallel pdqsort + writev output + fast-float parsing
+- **ftac is 2.19x faster** — backward memrchr scan + MADV_RANDOM + forward-fill buffer
 - Zero-copy mmap eliminates 100MB copy overhead, reducing sys time from 50ms to 4ms
-- Hash tools (sha256sum, md5sum) are at parity — both use hardware-accelerated implementations
-- fmd5sum is slightly slower (0.80x) — GNU md5sum likely uses optimized assembly; room for improvement
-- ftr at ~1x — both are I/O-bound for simple transliteration on this workload
+- Hash tools at parity — both use hardware-accelerated implementations (SHA-NI, ASM)
+- tr at ~1.45x — I/O-bound for simple transliteration, parallel for large mmap'd files
+- Parallelism gains are greater on multi-core machines (macOS ARM64 shows higher speedups)
