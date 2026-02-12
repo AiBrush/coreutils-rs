@@ -298,11 +298,12 @@ fn line_full_at<'a>(data: &'a [u8], line_starts: &[usize], idx: usize) -> &'a [u
     &data[start..end]
 }
 
-/// Binary search for the end of a duplicate group.
+/// Linear scan for the end of a duplicate group.
 /// Returns the index of the first line that differs from line_starts[group_start].
-/// All lines from group_start..result are equal.
+/// Must use linear scan (not binary search) because uniq input may NOT be sorted —
+/// equal lines can appear in non-adjacent groups separated by different lines.
 #[inline]
-fn binary_search_group_end(
+fn linear_scan_group_end(
     data: &[u8],
     line_starts: &[usize],
     group_start: usize,
@@ -310,17 +311,14 @@ fn binary_search_group_end(
     content_end: usize,
 ) -> usize {
     let key = line_content_at(data, line_starts, group_start, content_end);
-    let mut lo = group_start + 1;
-    let mut hi = num_lines;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if lines_equal_fast(key, line_content_at(data, line_starts, mid, content_end)) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    let mut i = group_start + 1;
+    while i < num_lines {
+        if !lines_equal_fast(key, line_content_at(data, line_starts, i, content_end)) {
+            return i;
         }
+        i += 1;
     }
-    lo
+    i
 }
 
 /// Standard processing for Default, RepeatedOnly, UniqueOnly on byte slices.
@@ -373,7 +371,7 @@ fn process_standard_bytes(
 
             if lines_equal_fast(prev, cur) {
                 // Duplicate detected — binary search for end of group
-                let group_end = binary_search_group_end(data, &line_starts, i - 1, num_lines, content_end);
+                let group_end = linear_scan_group_end(data, &line_starts, i - 1, num_lines, content_end);
                 i = group_end;
                 continue;
             }
@@ -401,7 +399,7 @@ fn process_standard_bytes(
             && lines_equal_fast(content, line_content_at(data, &line_starts, i + 1, content_end))
         {
             // Duplicate detected — binary search for end
-            binary_search_group_end(data, &line_starts, i, num_lines, content_end)
+            linear_scan_group_end(data, &line_starts, i, num_lines, content_end)
         } else if !fast
             && i + 1 < num_lines
             && lines_equal(content, line_content_at(data, &line_starts, i + 1, content_end), config)
