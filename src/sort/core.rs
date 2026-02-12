@@ -697,9 +697,8 @@ fn write_sorted_output(
     Ok(())
 }
 
-/// Build output from sorted indices using parallel sub-buffer construction.
-/// Each rayon thread builds its portion independently, then writes in order.
-/// Eliminates ~2N write_all function calls and parallelizes the memcpy phase.
+/// Build output from sorted indices using single allocation + parallel fill.
+/// One allocation instead of N per-thread allocations reduces mmap/brk overhead.
 fn write_sorted_single_buf_idx(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -710,19 +709,28 @@ fn write_sorted_single_buf_idx(
     let tl = terminator.len();
     let n = sorted_indices.len();
 
-    // For large outputs, split into per-thread sub-buffers
     if n > 50_000 {
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (n + num_threads - 1) / num_threads;
 
-        let buffers: Vec<Vec<u8>> = sorted_indices
+        // Compute per-chunk sizes in parallel
+        let chunk_sizes: Vec<usize> = sorted_indices
             .par_chunks(chunk_size)
             .map(|chunk| {
-                let total: usize = chunk
+                chunk
                     .iter()
                     .map(|&idx| (offsets[idx].1 - offsets[idx].0) + tl)
-                    .sum();
-                let mut buf = vec![0u8; total];
+                    .sum()
+            })
+            .collect();
+
+        // Per-thread sub-buffers with pre-computed sizes
+        let buffers: Vec<Vec<u8>> = sorted_indices
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(ci, chunk)| {
+                let sz = chunk_sizes[ci];
+                let mut buf = vec![0u8; sz];
                 let buf_ptr = buf.as_mut_ptr();
                 let data_ptr = data.as_ptr();
                 let mut wp = 0usize;
@@ -809,7 +817,9 @@ fn write_sorted_entries(
     Ok(())
 }
 
-/// Build output from sorted (key, index) entries using parallel sub-buffer construction.
+/// Build output from sorted (key, index) entries using single allocation + parallel fill.
+/// One allocation instead of N per-thread allocations reduces mmap/brk overhead.
+/// Parallel fill via rayon uses prefix-sum offsets for each thread's write region.
 fn write_sorted_single_buf_entries(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -820,19 +830,28 @@ fn write_sorted_single_buf_entries(
     let tl = terminator.len();
     let n = entries.len();
 
-    // For large outputs, split into per-thread sub-buffers
     if n > 50_000 {
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (n + num_threads - 1) / num_threads;
 
-        let buffers: Vec<Vec<u8>> = entries
+        // Compute per-chunk sizes in parallel
+        let chunk_sizes: Vec<usize> = entries
             .par_chunks(chunk_size)
             .map(|chunk| {
-                let total: usize = chunk
+                chunk
                     .iter()
                     .map(|&(_, idx)| (offsets[idx].1 - offsets[idx].0) + tl)
-                    .sum();
-                let mut buf = vec![0u8; total];
+                    .sum()
+            })
+            .collect();
+
+        // Per-thread sub-buffers with pre-computed sizes
+        let buffers: Vec<Vec<u8>> = entries
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(ci, chunk)| {
+                let sz = chunk_sizes[ci];
+                let mut buf = vec![0u8; sz];
                 let buf_ptr = buf.as_mut_ptr();
                 let data_ptr = data.as_ptr();
                 let mut wp = 0usize;

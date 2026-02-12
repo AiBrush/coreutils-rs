@@ -464,11 +464,24 @@ fn process_standard_bytes(
 /// Ultra-fast single-pass default mode: scan with memchr, compare adjacent lines inline.
 /// No pre-computed positions, no binary search, no Vec allocation.
 /// Outputs each line that differs from the previous.
+///
+/// For large files (>4MB), uses parallel chunk processing: each chunk is deduplicated
+/// independently, then cross-chunk boundaries are resolved.
 fn process_default_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
     term: u8,
 ) -> io::Result<()> {
+    // Parallel path for large files
+    if data.len() >= 4 * 1024 * 1024 {
+        return process_default_parallel(data, writer, term);
+    }
+
+    process_default_sequential(data, writer, term)
+}
+
+/// Sequential single-pass dedup for small files.
+fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
     // Batch output into a contiguous buffer for fewer write() syscalls.
     let mut outbuf = Vec::with_capacity(data.len());
 
@@ -521,6 +534,143 @@ fn process_default_fast_singlepass(
     }
 
     writer.write_all(&outbuf)
+}
+
+/// Parallel dedup for large files: split into chunks, dedup each in parallel,
+/// then resolve cross-chunk boundaries. Each chunk produces its own output buffer.
+fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
+    use rayon::prelude::*;
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_target = data.len() / num_threads;
+
+    // Find chunk boundaries aligned to line terminators
+    let mut boundaries = Vec::with_capacity(num_threads + 1);
+    boundaries.push(0usize);
+    for i in 1..num_threads {
+        let target = i * chunk_target;
+        if target >= data.len() {
+            break;
+        }
+        if let Some(p) = memchr::memchr(term, &data[target..]) {
+            let b = target + p + 1;
+            if b > *boundaries.last().unwrap() && b <= data.len() {
+                boundaries.push(b);
+            }
+        }
+    }
+    boundaries.push(data.len());
+
+    let n_chunks = boundaries.len() - 1;
+    if n_chunks <= 1 {
+        return process_default_sequential(data, writer, term);
+    }
+
+    // Process each chunk in parallel: dedup within chunk, record first/last line
+    struct ChunkResult {
+        buf: Vec<u8>,
+        first_line_start: usize,
+        first_line_end: usize,
+        last_line_start: usize,
+        last_line_end: usize,
+    }
+
+    let results: Vec<ChunkResult> = boundaries
+        .windows(2)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|w| {
+            let chunk_start = w[0];
+            let chunk_end = w[1];
+            let chunk = &data[chunk_start..chunk_end];
+
+            let mut buf = Vec::with_capacity(chunk.len());
+            let mut prev_start = 0usize;
+            let mut prev_end = match memchr::memchr(term, chunk) {
+                Some(pos) => pos,
+                None => {
+                    buf.extend_from_slice(chunk);
+                    buf.push(term);
+                    return ChunkResult {
+                        buf,
+                        first_line_start: chunk_start,
+                        first_line_end: chunk_start + chunk.len(),
+                        last_line_start: chunk_start,
+                        last_line_end: chunk_start + chunk.len(),
+                    };
+                }
+            };
+
+            // Always output first line of chunk
+            buf.extend_from_slice(&chunk[0..prev_end + 1]);
+            let first_line_start = chunk_start;
+            let first_line_end = chunk_start + prev_end;
+
+            let mut cur_start = prev_end + 1;
+            let mut last_output_start = prev_start;
+            let mut last_output_end = prev_end;
+
+            while cur_start < chunk.len() {
+                let cur_end = match memchr::memchr(term, &chunk[cur_start..]) {
+                    Some(offset) => cur_start + offset,
+                    None => chunk.len(),
+                };
+
+                if !lines_equal_fast(&chunk[prev_start..prev_end], &chunk[cur_start..cur_end]) {
+                    if cur_end < chunk.len() {
+                        buf.extend_from_slice(&chunk[cur_start..cur_end + 1]);
+                    } else {
+                        buf.extend_from_slice(&chunk[cur_start..cur_end]);
+                        buf.push(term);
+                    }
+                    last_output_start = cur_start;
+                    last_output_end = cur_end;
+                    prev_start = cur_start;
+                    prev_end = cur_end;
+                } else {
+                    prev_start = cur_start;
+                    prev_end = cur_end;
+                }
+
+                if cur_end < chunk.len() {
+                    cur_start = cur_end + 1;
+                } else {
+                    break;
+                }
+            }
+
+            ChunkResult {
+                buf,
+                first_line_start,
+                first_line_end,
+                last_line_start: chunk_start + last_output_start,
+                last_line_end: chunk_start + last_output_end,
+            }
+        })
+        .collect();
+
+    // Write results, skipping first line of chunk[i] if it equals last line of chunk[i-1]
+    for (i, result) in results.iter().enumerate() {
+        if i == 0 {
+            writer.write_all(&result.buf)?;
+        } else {
+            let prev = &results[i - 1];
+            let prev_last = &data[prev.last_line_start..prev.last_line_end];
+            let cur_first = &data[result.first_line_start..result.first_line_end];
+
+            if lines_equal_fast(prev_last, cur_first) {
+                // Skip the first line of this chunk (already output in previous chunk)
+                let first_line_with_term = result.first_line_end - result.first_line_start + 1;
+                if first_line_with_term < result.buf.len() {
+                    writer.write_all(&result.buf[first_line_with_term..])?;
+                }
+            } else {
+                writer.write_all(&result.buf)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
