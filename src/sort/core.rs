@@ -676,6 +676,30 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     }
 
     let terminator: &[u8] = if config.zero_terminated { b"\0" } else { b"\n" };
+
+    // === Already-sorted detection: O(n) scan before sorting ===
+    // If data is already in order, skip the O(n log n) sort entirely.
+    // This turns the "already sorted" benchmark from 2.1x to near-instant.
+    if num_lines > 1 {
+        let mut is_sorted = true;
+        for i in 1..num_lines {
+            let (s1, e1) = offsets[i - 1];
+            let (s2, e2) = offsets[i];
+            let cmp = compare_lines(&data[s1..e1], &data[s2..e2], config);
+            if cmp == Ordering::Greater {
+                is_sorted = false;
+                break;
+            }
+        }
+        if is_sorted {
+            // Data is already sorted — output directly without sorting
+            let indices: Vec<usize> = (0..num_lines).collect();
+            write_sorted_output(data, &offsets, &indices, config, &mut writer, terminator)?;
+            writer.flush()?;
+            return Ok(());
+        }
+    }
+
     let mut indices: Vec<usize> = (0..num_lines).collect();
 
     // Switch to random access for sort phase (comparisons jump to arbitrary lines)

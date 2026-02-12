@@ -146,20 +146,20 @@ fn parse_field_spec(s: &str) -> Result<(usize, usize, String), String> {
 
 /// Find the byte range of the Nth field (0-indexed) in a line.
 /// Returns (start, end) byte offsets. Allocation-free.
+/// Uses SIMD memchr for separator-based field finding.
 #[inline]
 fn find_nth_field(line: &[u8], n: usize, separator: Option<u8>) -> (usize, usize) {
     match separator {
         Some(sep) => {
+            // Use memchr_iter for SIMD-accelerated separator scanning
             let mut field = 0;
             let mut start = 0;
-            for (i, &b) in line.iter().enumerate() {
-                if b == sep {
-                    if field == n {
-                        return (start, i);
-                    }
-                    field += 1;
-                    start = i + 1;
+            for pos in memchr::memchr_iter(sep, line) {
+                if field == n {
+                    return (start, pos);
                 }
+                field += 1;
+                start = pos + 1;
             }
             if field == n {
                 (start, line.len())
