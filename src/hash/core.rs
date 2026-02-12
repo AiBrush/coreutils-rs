@@ -70,6 +70,26 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
 /// For small files, the page table setup + madvise syscalls cost more than a simple read.
 const MMAP_THRESHOLD: u64 = 256 * 1024; // 256KB
 
+/// Open a file with O_NOATIME on Linux to avoid atime update overhead.
+#[cfg(target_os = "linux")]
+fn open_noatime(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Try O_NOATIME first (requires ownership or CAP_FOWNER)
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+    {
+        Ok(f) => Ok(f),
+        Err(_) => File::open(path), // Fall back to normal open
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_noatime(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 /// Hash a file by path. Uses read() for small files, mmap for large files.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let metadata = fs::metadata(path)?;
@@ -88,7 +108,7 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
         }
 
         // Large files: mmap for zero-copy
-        let file = File::open(path)?;
+        let file = open_noatime(path)?;
         match unsafe {
             MmapOptions::new()
                 .populate() // Eagerly populate page tables — avoids page faults
@@ -157,17 +177,18 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.
-/// This should be called before parallel hashing to reduce I/O stalls.
+/// Uses POSIX_FADV_WILLNEED which is non-blocking and batches efficiently.
 #[cfg(target_os = "linux")]
 pub fn readahead_files(paths: &[&Path]) {
     use std::os::unix::io::AsRawFd;
     for path in paths {
-        if let Ok(file) = File::open(path) {
+        if let Ok(file) = open_noatime(path) {
             if let Ok(meta) = file.metadata() {
                 let len = meta.len();
                 if meta.file_type().is_file() && len > 0 {
                     unsafe {
-                        libc::readahead(file.as_raw_fd(), 0, len as usize);
+                        // posix_fadvise is non-blocking and more portable than readahead
+                        libc::posix_fadvise(file.as_raw_fd(), 0, len as i64, libc::POSIX_FADV_WILLNEED);
                     }
                 }
             }
@@ -225,7 +246,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
         }
 
         // Large files: mmap for zero-copy
-        let file = File::open(path)?;
+        let file = open_noatime(path)?;
         match unsafe { MmapOptions::new().populate().map(&file) } {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
