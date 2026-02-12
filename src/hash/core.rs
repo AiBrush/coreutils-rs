@@ -72,24 +72,23 @@ thread_local! {
     static STREAM_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; HASH_READ_BUF]);
 }
 
-/// Compute hash of a byte slice directly (zero-copy fast path).
-pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
-    match algo {
-        HashAlgorithm::Sha256 => {
-            // ring uses BoringSSL assembly with runtime SHA-NI/AVX2 detection
-            hex_encode(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
-        }
-        HashAlgorithm::Md5 => hash_digest::<Md5>(data),
-        HashAlgorithm::Blake2b => {
-            let hash = blake2b_simd::blake2b(data);
-            hex_encode(hash.as_bytes())
-        }
-    }
+// ── SHA-256: ring on non-Apple, sha2 fallback on Apple ───────────────
+
+/// Single-shot SHA-256 using ring's BoringSSL assembly (Linux/Windows).
+#[cfg(not(target_vendor = "apple"))]
+fn sha256_bytes(data: &[u8]) -> String {
+    hex_encode(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
 }
 
-/// Streaming SHA-256 hash using ring's BoringSSL assembly.
-/// Uses ring::digest::Context for incremental updates with SHA-NI/AVX2 acceleration.
-fn hash_reader_ring_sha256(mut reader: impl Read) -> io::Result<String> {
+/// Single-shot SHA-256 using sha2 crate (macOS fallback).
+#[cfg(target_vendor = "apple")]
+fn sha256_bytes(data: &[u8]) -> String {
+    hash_digest::<sha2::Sha256>(data)
+}
+
+/// Streaming SHA-256 using ring's BoringSSL assembly (Linux/Windows).
+#[cfg(not(target_vendor = "apple"))]
+fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
@@ -104,10 +103,28 @@ fn hash_reader_ring_sha256(mut reader: impl Read) -> io::Result<String> {
     })
 }
 
+/// Streaming SHA-256 using sha2 crate (macOS fallback).
+#[cfg(target_vendor = "apple")]
+fn sha256_reader(reader: impl Read) -> io::Result<String> {
+    hash_reader_impl::<sha2::Sha256>(reader)
+}
+
+/// Compute hash of a byte slice directly (zero-copy fast path).
+pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
+    match algo {
+        HashAlgorithm::Sha256 => sha256_bytes(data),
+        HashAlgorithm::Md5 => hash_digest::<Md5>(data),
+        HashAlgorithm::Blake2b => {
+            let hash = blake2b_simd::blake2b(data);
+            hex_encode(hash.as_bytes())
+        }
+    }
+}
+
 /// Compute hash of data from a reader, returning hex string.
 pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String> {
     match algo {
-        HashAlgorithm::Sha256 => hash_reader_ring_sha256(reader),
+        HashAlgorithm::Sha256 => sha256_reader(reader),
         HashAlgorithm::Md5 => hash_reader_impl::<Md5>(reader),
         HashAlgorithm::Blake2b => blake2b_hash_reader(reader, 64),
     }
