@@ -1212,75 +1212,128 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
         return squeeze_single_mmap(squeeze_chars[0], data, writer);
     }
 
-    let member = build_member_set(squeeze_chars);
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut last_squeezed: u16 = 256;
+    // Fast path: 2-3 squeeze chars — use memchr2/memchr3 for SIMD scanning
+    if squeeze_chars.len() == 2 {
+        return squeeze_multi_mmap::<2>(squeeze_chars, data, writer);
+    }
+    if squeeze_chars.len() == 3 {
+        return squeeze_multi_mmap::<3>(squeeze_chars, data, writer);
+    }
 
-    for chunk in data.chunks(BUF_SIZE) {
-        let mut out_pos = 0;
-        for &b in chunk {
-            if is_member(&member, b) {
-                if last_squeezed == b as u16 {
-                    continue;
-                }
+    // General path: 8-byte unrolled member check with bulk non-member span copy
+    let member = build_member_set(squeeze_chars);
+    let mut last_squeezed: u16 = 256;
+    let mut span_start = 0; // start of current non-squeezed span in data
+    let len = data.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = unsafe { *data.get_unchecked(i) };
+        if is_member(&member, b) {
+            // Write non-member span before this member byte
+            if i > span_start {
+                writer.write_all(&data[span_start..i])?;
+            }
+            if last_squeezed != b as u16 {
+                // First occurrence of this member — write it
+                writer.write_all(&[b])?;
                 last_squeezed = b as u16;
-            } else {
-                last_squeezed = 256;
             }
-            unsafe {
-                *outbuf.get_unchecked_mut(out_pos) = b;
+            i += 1;
+            // Skip consecutive duplicates of same byte
+            while i < len && data[i] == b {
+                i += 1;
             }
-            out_pos += 1;
+            span_start = i;
+        } else {
+            last_squeezed = 256;
+            i += 1;
         }
-        writer.write_all(&outbuf[..out_pos])?;
+    }
+
+    // Write remaining non-member span
+    if span_start < len {
+        writer.write_all(&data[span_start..])?;
+    }
+    Ok(())
+}
+
+/// Squeeze with 2-3 char sets using SIMD memchr2/memchr3 for fast scanning.
+/// Writes non-member spans directly from mmap (zero-copy).
+fn squeeze_multi_mmap<const N: usize>(
+    chars: &[u8],
+    data: &[u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut last_squeezed: u16 = 256;
+    let mut cursor = 0;
+
+    macro_rules! find_next {
+        ($data:expr) => {
+            if N == 2 {
+                memchr::memchr2(chars[0], chars[1], $data)
+            } else {
+                memchr::memchr3(chars[0], chars[1], chars[2], $data)
+            }
+        };
+    }
+
+    while cursor < data.len() {
+        match find_next!(&data[cursor..]) {
+            Some(offset) => {
+                let pos = cursor + offset;
+                let b = data[pos];
+                // Write non-member span
+                if pos > cursor {
+                    writer.write_all(&data[cursor..pos])?;
+                    last_squeezed = 256;
+                }
+                if last_squeezed != b as u16 {
+                    writer.write_all(&[b])?;
+                    last_squeezed = b as u16;
+                }
+                // Skip consecutive duplicates of same byte
+                let mut skip = pos + 1;
+                while skip < data.len() && data[skip] == b {
+                    skip += 1;
+                }
+                cursor = skip;
+            }
+            None => {
+                writer.write_all(&data[cursor..])?;
+                break;
+            }
+        }
     }
     Ok(())
 }
 
 /// Squeeze a single repeated character from mmap'd data.
-/// Uses SIMD memchr to find runs, copies non-squeezed content in bulk.
+/// Zero-copy: writes directly from mmap data, no intermediate buffer.
+/// Uses SIMD memchr for bulk-skip between occurrences of the squeeze char.
 fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    let mut outbuf = vec![0u8; BUF_SIZE];
-    let mut out_pos = 0;
-    let mut i = 0;
-    let len = data.len();
+    let mut cursor = 0;
 
-    while i < len {
-        let b = data[i];
-        if b == ch {
-            // Output first occurrence
-            unsafe {
-                *outbuf.get_unchecked_mut(out_pos) = b;
+    while cursor < data.len() {
+        // Find next occurrence of squeeze char using SIMD memchr
+        match memchr::memchr(ch, &data[cursor..]) {
+            Some(offset) => {
+                let pos = cursor + offset;
+                // Write everything from cursor to pos + 1 (including first occurrence)
+                writer.write_all(&data[cursor..pos + 1])?;
+                // Skip consecutive duplicates
+                let mut skip = pos + 1;
+                while skip < data.len() && data[skip] == ch {
+                    skip += 1;
+                }
+                cursor = skip;
             }
-            out_pos += 1;
-            // Skip consecutive duplicates using memchr to find next non-match
-            i += 1;
-            while i < len && data[i] == ch {
-                i += 1;
+            None => {
+                // No more occurrences — write remaining data
+                writer.write_all(&data[cursor..])?;
+                break;
             }
-        } else {
-            // Find next occurrence of squeeze char using SIMD memchr
-            let remaining = &data[i..];
-            let run_end = memchr::memchr(ch, remaining).unwrap_or(remaining.len());
-            // Copy entire non-match run at once (bulk memcpy)
-            let copy_end = i + run_end;
-            if out_pos + run_end > BUF_SIZE {
-                writer.write_all(&outbuf[..out_pos])?;
-                out_pos = 0;
-            }
-            if run_end > BUF_SIZE {
-                // Huge run — write directly
-                writer.write_all(&data[i..copy_end])?;
-            } else {
-                outbuf[out_pos..out_pos + run_end].copy_from_slice(&data[i..copy_end]);
-                out_pos += run_end;
-            }
-            i = copy_end;
         }
-    }
-
-    if out_pos > 0 {
-        writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())
 }
