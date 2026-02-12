@@ -1,10 +1,10 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
 
-/// Minimum data size to use parallel processing (4MB).
-/// Higher threshold avoids rayon overhead on medium files where
-/// sequential memchr SIMD is already fast enough.
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size to use parallel processing (2MB).
+/// Rayon overhead is ~5-10μs per task; at 2MB with memchr SIMD (~10 GB/s),
+/// each chunk takes ~200μs, so overhead is < 5%.
+const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Results from counting a byte slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -524,16 +524,90 @@ pub fn count_lines_words_chars(data: &[u8], utf8: bool) -> (u64, u64, u64) {
 /// A continuation byte has the bit pattern `10xxxxxx` (0x80..0xBF).
 /// Every other byte starts a new character (ASCII, multi-byte leader, or invalid).
 ///
-/// Uses 64-byte block processing with popcount for ~4x throughput vs scalar.
-/// For pure ASCII data, takes a fast path that counts 64 chars per iteration.
+/// Uses AVX2 SIMD on x86_64 for ~32 bytes per cycle throughput.
+/// Falls back to 64-byte block processing with popcount on other architectures.
 pub fn count_chars_utf8(data: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { count_chars_utf8_avx2(data) };
+        }
+    }
+    count_chars_utf8_scalar(data)
+}
+
+/// AVX2 SIMD character counter: counts non-continuation bytes using
+/// vectorized AND+CMP with batched horizontal reduction via PSADBW.
+/// Processes 32 bytes per ~3 instructions, with horizontal sum every 255 iterations.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn count_chars_utf8_avx2(data: &[u8]) -> u64 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let mask_c0 = _mm256_set1_epi8(0xC0u8 as i8);
+        let val_80 = _mm256_set1_epi8(0x80u8 as i8);
+        let ones = _mm256_set1_epi8(1);
+        let zero = _mm256_setzero_si256();
+
+        let mut total = 0u64;
+        let len = data.len();
+        let ptr = data.as_ptr();
+        let mut i = 0;
+        let mut acc = _mm256_setzero_si256();
+        let mut batch = 0u32;
+
+        while i + 32 <= len {
+            let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+            let masked = _mm256_and_si256(v, mask_c0);
+            let is_cont = _mm256_cmpeq_epi8(masked, val_80);
+            let non_cont = _mm256_andnot_si256(is_cont, ones);
+            acc = _mm256_add_epi8(acc, non_cont);
+
+            batch += 1;
+            if batch >= 255 {
+                // Horizontal sum via PSADBW: sum u8 differences against zero
+                let sad = _mm256_sad_epu8(acc, zero);
+                let hi = _mm256_extracti128_si256(sad, 1);
+                let lo = _mm256_castsi256_si128(sad);
+                let sum = _mm_add_epi64(lo, hi);
+                let hi64 = _mm_unpackhi_epi64(sum, sum);
+                let t = _mm_add_epi64(sum, hi64);
+                total += _mm_cvtsi128_si64(t) as u64;
+                acc = _mm256_setzero_si256();
+                batch = 0;
+            }
+            i += 32;
+        }
+
+        // Final horizontal sum
+        if batch > 0 {
+            let sad = _mm256_sad_epu8(acc, zero);
+            let hi = _mm256_extracti128_si256(sad, 1);
+            let lo = _mm256_castsi256_si128(sad);
+            let sum = _mm_add_epi64(lo, hi);
+            let hi64 = _mm_unpackhi_epi64(sum, sum);
+            let t = _mm_add_epi64(sum, hi64);
+            total += _mm_cvtsi128_si64(t) as u64;
+        }
+
+        while i < len {
+            total += ((*ptr.add(i) & 0xC0) != 0x80) as u64;
+            i += 1;
+        }
+
+        total
+    }
+}
+
+/// Scalar fallback for count_chars_utf8.
+fn count_chars_utf8_scalar(data: &[u8]) -> u64 {
     let mut count = 0u64;
     let chunks = data.chunks_exact(64);
     let remainder = chunks.remainder();
 
     for chunk in chunks {
         // Fast path: if all bytes are ASCII (< 0x80), every byte is a character
-        // Check by OR-ing all bytes and testing the high bit
         let mut any_high = 0u8;
         let mut i = 0;
         while i + 8 <= 64 {
@@ -550,12 +624,10 @@ pub fn count_chars_utf8(data: &[u8]) -> u64 {
             i += 8;
         }
         if any_high < 0x80 {
-            // All ASCII — 64 characters
             count += 64;
             continue;
         }
 
-        // Build 64-bit mask: bit i = 1 if chunk[i] is NOT a continuation byte
         let mut char_mask = 0u64;
         i = 0;
         while i + 7 < 64 {
