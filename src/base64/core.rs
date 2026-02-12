@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 
 use base64_simd::AsOut;
+use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
@@ -9,6 +10,9 @@ const STREAM_ENCODE_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
 /// Chunk size for no-wrap encoding: 8MB aligned to 3 bytes.
 const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
+
+/// Minimum input size for parallel encoding.
+const PARALLEL_ENCODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -24,10 +28,33 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
     encode_wrapped(data, wrap_col, out)
 }
 
-/// Encode without wrapping: process in 4MB chunks for bounded memory usage.
-/// Each chunk is SIMD-encoded and written immediately. Reuses a single
-/// encode buffer across chunks to avoid repeated allocation.
+/// Encode without wrapping using parallel SIMD encoding for large inputs.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
+    if data.len() >= PARALLEL_ENCODE_THRESHOLD {
+        // Split into per-thread chunks aligned to 3-byte boundaries
+        let num_threads = rayon::current_num_threads().max(1);
+        let raw_chunk = (data.len() + num_threads - 1) / num_threads;
+        // Align to 3 bytes for clean base64 boundaries (no padding mid-stream)
+        let chunk_size = ((raw_chunk + 2) / 3) * 3;
+
+        let encoded_chunks: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+                let mut buf = vec![0u8; enc_len];
+                let encoded = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
+                let len = encoded.len();
+                buf.truncate(len);
+                buf
+            })
+            .collect();
+
+        for chunk in &encoded_chunks {
+            out.write_all(chunk)?;
+        }
+        return Ok(());
+    }
+
     let enc_max = BASE64_ENGINE.encoded_length(NOWRAP_CHUNK);
     let mut buf = vec![0u8; enc_max];
 
@@ -39,86 +66,107 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Encode with line wrapping using large cache-friendly chunks.
-/// Each chunk is SIMD-encoded, then wrapped with newlines in a pre-allocated
-/// buffer using direct slice copies, and written with a single write_all.
+/// Encode with line wrapping. For large inputs, uses parallel encoding.
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     let bytes_per_line = wrap_col * 3 / 4;
 
-    // Process ~8MB of input per chunk for maximum throughput.
-    // Aligned to bytes_per_line for clean line boundaries.
-    let lines_per_chunk = (8 * 1024 * 1024) / bytes_per_line;
-    let chunk_input = lines_per_chunk * bytes_per_line;
-    let chunk_encoded_max = BASE64_ENGINE.encoded_length(chunk_input);
+    if data.len() >= PARALLEL_ENCODE_THRESHOLD && bytes_per_line > 0 {
+        // Parallel: split input into chunks aligned to bytes_per_line (= 3-byte aligned)
+        // so each chunk produces complete lines (no cross-chunk line splitting).
+        let num_threads = rayon::current_num_threads().max(1);
+        let lines_per_thread = ((data.len() / bytes_per_line) + num_threads - 1) / num_threads;
+        let chunk_input = (lines_per_thread * bytes_per_line).max(bytes_per_line);
 
-    // Pre-allocate reusable buffers (no per-chunk allocation).
+        let wrapped_chunks: Vec<Vec<u8>> = data
+            .par_chunks(chunk_input)
+            .map(|chunk| {
+                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+                let mut encode_buf = vec![0u8; enc_len];
+                let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
+
+                // Wrap the encoded output
+                let line_out = wrap_col + 1;
+                let max_lines = (encoded.len() + wrap_col - 1) / wrap_col + 1;
+                let mut wrap_buf = vec![0u8; max_lines * line_out];
+                let wp = wrap_encoded(encoded, wrap_col, &mut wrap_buf);
+                wrap_buf.truncate(wp);
+                wrap_buf
+            })
+            .collect();
+
+        for chunk in &wrapped_chunks {
+            out.write_all(chunk)?;
+        }
+        return Ok(());
+    }
+
+    // Sequential path
+    let lines_per_chunk = (8 * 1024 * 1024) / bytes_per_line.max(1);
+    let chunk_input = lines_per_chunk * bytes_per_line.max(1);
+    let chunk_encoded_max = BASE64_ENGINE.encoded_length(chunk_input.max(1));
     let mut encode_buf = vec![0u8; chunk_encoded_max];
-    // Wrapped output: each line is wrap_col + 1 bytes (content + newline).
     let wrapped_max = (lines_per_chunk + 1) * (wrap_col + 1);
     let mut wrap_buf = vec![0u8; wrapped_max];
 
-    let line_out = wrap_col + 1; // bytes per output line (content + newline)
-
-    for chunk in data.chunks(chunk_input) {
+    for chunk in data.chunks(chunk_input.max(1)) {
         let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
         let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
-
-        // Build wrapped output with unrolled copies for common case.
-        let mut rp = 0;
-        let mut wp = 0;
-
-        // Unrolled: process 4 lines per iteration for better throughput
-        while rp + 4 * wrap_col <= encoded.len() {
-            unsafe {
-                let src = encoded.as_ptr().add(rp);
-                let dst = wrap_buf.as_mut_ptr().add(wp);
-
-                std::ptr::copy_nonoverlapping(src, dst, wrap_col);
-                *dst.add(wrap_col) = b'\n';
-
-                std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
-                *dst.add(line_out + wrap_col) = b'\n';
-
-                std::ptr::copy_nonoverlapping(
-                    src.add(2 * wrap_col),
-                    dst.add(2 * line_out),
-                    wrap_col,
-                );
-                *dst.add(2 * line_out + wrap_col) = b'\n';
-
-                std::ptr::copy_nonoverlapping(
-                    src.add(3 * wrap_col),
-                    dst.add(3 * line_out),
-                    wrap_col,
-                );
-                *dst.add(3 * line_out + wrap_col) = b'\n';
-            }
-            rp += 4 * wrap_col;
-            wp += 4 * line_out;
-        }
-
-        // Remaining full lines
-        while rp + wrap_col <= encoded.len() {
-            wrap_buf[wp..wp + wrap_col].copy_from_slice(&encoded[rp..rp + wrap_col]);
-            wp += wrap_col;
-            wrap_buf[wp] = b'\n';
-            wp += 1;
-            rp += wrap_col;
-        }
-
-        // Partial last line
-        if rp < encoded.len() {
-            let remaining = encoded.len() - rp;
-            wrap_buf[wp..wp + remaining].copy_from_slice(&encoded[rp..rp + remaining]);
-            wp += remaining;
-            wrap_buf[wp] = b'\n';
-            wp += 1;
-        }
-
+        let wp = wrap_encoded(encoded, wrap_col, &mut wrap_buf);
         out.write_all(&wrap_buf[..wp])?;
     }
 
     Ok(())
+}
+
+/// Wrap encoded base64 data with newlines at `wrap_col` columns.
+/// Returns number of bytes written to `wrap_buf`.
+#[inline]
+fn wrap_encoded(encoded: &[u8], wrap_col: usize, wrap_buf: &mut [u8]) -> usize {
+    let line_out = wrap_col + 1;
+    let mut rp = 0;
+    let mut wp = 0;
+
+    // Unrolled: process 4 lines per iteration
+    while rp + 4 * wrap_col <= encoded.len() {
+        unsafe {
+            let src = encoded.as_ptr().add(rp);
+            let dst = wrap_buf.as_mut_ptr().add(wp);
+
+            std::ptr::copy_nonoverlapping(src, dst, wrap_col);
+            *dst.add(wrap_col) = b'\n';
+
+            std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
+            *dst.add(line_out + wrap_col) = b'\n';
+
+            std::ptr::copy_nonoverlapping(src.add(2 * wrap_col), dst.add(2 * line_out), wrap_col);
+            *dst.add(2 * line_out + wrap_col) = b'\n';
+
+            std::ptr::copy_nonoverlapping(src.add(3 * wrap_col), dst.add(3 * line_out), wrap_col);
+            *dst.add(3 * line_out + wrap_col) = b'\n';
+        }
+        rp += 4 * wrap_col;
+        wp += 4 * line_out;
+    }
+
+    // Remaining full lines
+    while rp + wrap_col <= encoded.len() {
+        wrap_buf[wp..wp + wrap_col].copy_from_slice(&encoded[rp..rp + wrap_col]);
+        wp += wrap_col;
+        wrap_buf[wp] = b'\n';
+        wp += 1;
+        rp += wrap_col;
+    }
+
+    // Partial last line
+    if rp < encoded.len() {
+        let remaining = encoded.len() - rp;
+        wrap_buf[wp..wp + remaining].copy_from_slice(&encoded[rp..rp + remaining]);
+        wp += remaining;
+        wrap_buf[wp] = b'\n';
+        wp += 1;
+    }
+
+    wp
 }
 
 /// Decode base64 data and write to output (borrows data, allocates clean buffer).
@@ -203,6 +251,7 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
 
 /// Decode by stripping all whitespace from the entire input at once,
 /// then performing a single SIMD decode pass. Used when data is borrowed.
+/// For large inputs, decodes in parallel chunks for maximum throughput.
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?
     if memchr::memchr(b'\n', data).is_none() && !data.iter().any(|&b| is_whitespace(b)) {
@@ -227,7 +276,37 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
         clean.retain(|&b| !is_whitespace(b));
     }
 
+    // Parallel decode for large inputs
+    if clean.len() >= PARALLEL_ENCODE_THRESHOLD {
+        return decode_parallel(&clean, out);
+    }
+
     decode_owned_clean(&mut clean, out)
+}
+
+/// Decode clean base64 data in parallel chunks.
+fn decode_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
+    let num_threads = rayon::current_num_threads().max(1);
+    // Each chunk must be aligned to 4 bytes (base64 quadruplet boundary)
+    let raw_chunk = (data.len() + num_threads - 1) / num_threads;
+    let chunk_size = ((raw_chunk + 3) / 4) * 4;
+
+    // Check if last chunk has padding — only the very last chunk can have '='
+    // Split so that all but the last chunk are padless and 4-aligned
+    let decoded_chunks: Vec<Result<Vec<u8>, _>> = data
+        .par_chunks(chunk_size)
+        .map(|chunk| match BASE64_ENGINE.decode_to_vec(chunk) {
+            Ok(decoded) => Ok(decoded),
+            Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input")),
+        })
+        .collect();
+
+    for chunk_result in decoded_chunks {
+        let chunk = chunk_result?;
+        out.write_all(&chunk)?;
+    }
+
+    Ok(())
 }
 
 /// Decode a clean (no whitespace) owned buffer in-place with SIMD.

@@ -11,8 +11,8 @@ const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB — mmap chunk processing
 const STREAM_BUF: usize = 256 * 1024;
 
 /// Minimum size for parallel translation.
-/// AVX2 SIMD translation is so fast (~16 GB/s) that parallelism only helps for very large inputs.
-const PARALLEL_TRANSLATE_THRESHOLD: usize = 256 * 1024 * 1024;
+/// Even with fast SIMD, parallelism helps for 100MB benchmark files when split across cores.
+const PARALLEL_TRANSLATE_THRESHOLD: usize = 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]

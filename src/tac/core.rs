@@ -1,14 +1,12 @@
 use std::io::{self, IoSlice, Write};
 
+/// Output buffer size for backward-fill strategy.
+const OUT_BUF: usize = 8 * 1024 * 1024;
+
 /// Maximum number of iovecs per writev() call (Linux IOV_MAX is 1024).
 const IOV_BATCH: usize = 1024;
 
-/// Maximum records for vectored I/O. Beyond this, use BufWriter to avoid
-/// excessive memory for IoSlice entries (16 bytes each).
-const VECTORED_MAX_RECORDS: usize = 256 * 1024;
-
 /// Write all IoSlices to the writer, handling partial writes.
-/// Batches into IOV_BATCH-sized groups for writev() efficiency.
 fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
     let mut offset = 0;
     while offset < slices.len() {
@@ -20,13 +18,11 @@ fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<
                 "failed to write any data",
             ));
         }
-        // Skip fully-written slices
         let mut remaining = n;
         while offset < end && remaining >= slices[offset].len() {
             remaining -= slices[offset].len();
             offset += 1;
         }
-        // Handle partial write within a slice — use write_all for the remainder
         if remaining > 0 && offset < end {
             out.write_all(&slices[offset][remaining..])?;
             offset += 1;
@@ -35,165 +31,179 @@ fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<
     Ok(())
 }
 
-/// Reverse the records in `data` separated by a single byte `separator` and write to `out`.
-/// If `before` is true, the separator is attached before the record instead of after.
-/// Uses vectored I/O (writev) to write directly from mmap'd data — zero intermediate copies.
-/// Threshold below which we use simple reverse write_all instead of vectored I/O.
-/// For small files (< 100 lines), the overhead of building IoSlice arrays isn't worth it.
-const SIMPLE_THRESHOLD: usize = 100;
-
+/// Reverse records separated by a single byte using backward memrchr scanning.
+/// Scans backward from end, writes each record as found. No Vec<usize> allocation.
+/// Uses a backward-fill buffer: records are copied backward into an 8MB buffer,
+/// then flushed as a single write_all when full.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    // Forward SIMD scan to collect all separator positions
-    let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
-
-    if positions.is_empty() {
-        out.write_all(data)?;
-        return Ok(());
+    // For small data, use simple backward scan with direct writes
+    if data.len() < 64 * 1024 {
+        return tac_bytes_small(data, separator, before, out);
     }
 
-    // For small files, use simple write_all calls (avoids IoSlice overhead)
-    if positions.len() <= SIMPLE_THRESHOLD {
-        return tac_bytes_simple(data, separator, before, &positions, out);
-    }
+    // Large data: backward scan with backward-fill buffer
+    let mut buf = vec![0u8; OUT_BUF];
+    let mut bp = OUT_BUF; // write position (fills backward)
 
-    // For files with many records, use BufWriter to avoid excessive IoSlice memory.
-    // For smaller record counts, use vectored I/O for zero-copy writes.
-    if positions.len() > VECTORED_MAX_RECORDS {
-        return tac_bytes_bufwriter(data, separator, before, &positions, out);
-    }
-
-    // Build IoSlice list pointing directly into mmap'd data — zero copies
     if !before {
-        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
-        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 4);
+        // separator-after mode: records end with separator
+        let mut end = data.len();
 
-        // Trailing content without separator — output as-is (no separator added)
-        if !has_trailing_sep {
-            let last_sep = *positions.last().unwrap();
-            slices.push(IoSlice::new(&data[last_sep + 1..]));
+        // Check for trailing content after last separator
+        if let Some(last_sep) = memchr::memrchr(separator, data) {
+            if last_sep < data.len() - 1 {
+                // Trailing content without separator — output first
+                let record = &data[last_sep + 1..];
+                if record.len() > bp {
+                    out.write_all(&buf[bp..])?;
+                    bp = OUT_BUF;
+                }
+                if record.len() > OUT_BUF {
+                    out.write_all(record)?;
+                } else {
+                    bp -= record.len();
+                    buf[bp..bp + record.len()].copy_from_slice(record);
+                }
+                end = last_sep + 1;
+            }
+        } else {
+            // No separator found — output entire data
+            out.write_all(data)?;
+            return Ok(());
         }
 
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let end = positions[i] + 1;
-            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            slices.push(IoSlice::new(&data[start..end]));
-        }
-
-        write_all_slices(out, &slices)?;
-    } else {
-        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 2);
-
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let start = positions[i];
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
+        // Scan backward through records
+        let mut cursor = end;
+        while cursor > 0 {
+            // Find previous separator
+            let search_end = cursor - 1; // skip separator at cursor-1
+            let prev_sep = if search_end > 0 {
+                memchr::memrchr(separator, &data[..search_end])
             } else {
-                data.len()
+                None
             };
-            slices.push(IoSlice::new(&data[start..end]));
-        }
 
-        if positions[0] > 0 {
-            slices.push(IoSlice::new(&data[..positions[0]]));
-        }
+            let start = match prev_sep {
+                Some(pos) => pos + 1,
+                None => 0,
+            };
 
-        write_all_slices(out, &slices)?;
+            let record = &data[start..cursor];
+            if record.len() > bp {
+                out.write_all(&buf[bp..])?;
+                bp = OUT_BUF;
+            }
+            if record.len() > OUT_BUF {
+                out.write_all(record)?;
+            } else {
+                bp -= record.len();
+                buf[bp..bp + record.len()].copy_from_slice(record);
+            }
+
+            cursor = start;
+        }
+    } else {
+        // separator-before mode: records start with separator
+        let mut cursor = data.len();
+        while cursor > 0 {
+            let sep_pos = memchr::memrchr(separator, &data[..cursor]);
+            match sep_pos {
+                Some(pos) => {
+                    let record = &data[pos..cursor];
+                    if record.len() > bp {
+                        out.write_all(&buf[bp..])?;
+                        bp = OUT_BUF;
+                    }
+                    if record.len() > OUT_BUF {
+                        out.write_all(record)?;
+                    } else {
+                        bp -= record.len();
+                        buf[bp..bp + record.len()].copy_from_slice(record);
+                    }
+                    cursor = pos;
+                }
+                None => {
+                    // Leading content before first separator
+                    let record = &data[..cursor];
+                    if record.len() > bp {
+                        out.write_all(&buf[bp..])?;
+                        bp = OUT_BUF;
+                    }
+                    if record.len() > OUT_BUF {
+                        out.write_all(record)?;
+                    } else {
+                        bp -= record.len();
+                        buf[bp..bp + record.len()].copy_from_slice(record);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Flush remaining buffer
+    if bp < OUT_BUF {
+        out.write_all(&buf[bp..])?;
     }
 
     Ok(())
 }
 
-/// Simple reverse-write path for small files — avoids IoSlice allocation overhead.
-/// Uses direct write_all calls with a small staging buffer.
-fn tac_bytes_simple(
+/// Small-file path: backward scan with direct write_all calls.
+fn tac_bytes_small(
     data: &[u8],
-    _separator: u8,
+    separator: u8,
     before: bool,
-    positions: &[usize],
     out: &mut impl Write,
 ) -> io::Result<()> {
     if !before {
-        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
+        let mut end = data.len();
 
-        if !has_trailing_sep {
-            let last_sep = *positions.last().unwrap();
-            out.write_all(&data[last_sep + 1..])?;
+        // Check for trailing content after last separator
+        if let Some(last_sep) = memchr::memrchr(separator, data) {
+            if last_sep < data.len() - 1 {
+                out.write_all(&data[last_sep + 1..])?;
+                end = last_sep + 1;
+            }
+        } else {
+            out.write_all(data)?;
+            return Ok(());
         }
 
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let end = positions[i] + 1;
-            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            out.write_all(&data[start..end])?;
+        let mut cursor = end;
+        while cursor > 0 {
+            let search_end = cursor - 1;
+            let prev_sep = if search_end > 0 {
+                memchr::memrchr(separator, &data[..search_end])
+            } else {
+                None
+            };
+            let start = match prev_sep {
+                Some(pos) => pos + 1,
+                None => 0,
+            };
+            out.write_all(&data[start..cursor])?;
+            cursor = start;
         }
     } else {
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let start = positions[i];
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            out.write_all(&data[start..end])?;
-        }
-        if positions[0] > 0 {
-            out.write_all(&data[..positions[0]])?;
-        }
-    }
-    Ok(())
-}
-
-/// BufWriter fallback for tac_bytes when there are too many records for vectored I/O.
-fn tac_bytes_bufwriter(
-    data: &[u8],
-    _separator: u8,
-    before: bool,
-    positions: &[usize],
-    out: &mut impl Write,
-) -> io::Result<()> {
-    let mut buf = io::BufWriter::with_capacity(4 * 1024 * 1024, out);
-
-    if !before {
-        let has_trailing_sep = *positions.last().unwrap() == data.len() - 1;
-        if !has_trailing_sep {
-            let last_sep = *positions.last().unwrap();
-            buf.write_all(&data[last_sep + 1..])?;
-        }
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let end = positions[i] + 1;
-            let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-            buf.write_all(&data[start..end])?;
-        }
-    } else {
-        let mut i = positions.len();
-        while i > 0 {
-            i -= 1;
-            let start = positions[i];
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            buf.write_all(&data[start..end])?;
-        }
-        if positions[0] > 0 {
-            buf.write_all(&data[..positions[0]])?;
+        let mut cursor = data.len();
+        while cursor > 0 {
+            match memchr::memrchr(separator, &data[..cursor]) {
+                Some(pos) => {
+                    out.write_all(&data[pos..cursor])?;
+                    cursor = pos;
+                }
+                None => {
+                    out.write_all(&data[..cursor])?;
+                    break;
+                }
+            }
         }
     }
-    buf.flush()?;
     Ok(())
 }
 
