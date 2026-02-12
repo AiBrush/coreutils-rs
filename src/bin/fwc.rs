@@ -11,7 +11,6 @@ use memchr::memchr_iter;
 
 use coreutils_rs::common::io::{FileData, file_size, read_file, read_stdin};
 use coreutils_rs::wc;
-#[cfg(unix)]
 use memmap2::MmapOptions;
 
 #[derive(Parser)]
@@ -77,8 +76,9 @@ impl ShowFlags {
 /// Avoids rayon thread pool initialization cost (~0.5-1ms) for single/small files.
 const WC_PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024; // 16MB
 
-/// Lines-only fast path: stream through file without loading into memory.
-/// Avoids both mmap overhead (page tables) and rayon thread pool init.
+/// Lines-only fast path: mmap + single memchr pass for maximum throughput.
+/// Avoids read() syscalls entirely — single mmap setup then SIMD memchr scan.
+/// Falls back to streaming read if mmap fails (e.g., special files).
 /// Returns (line_count, byte_count).
 fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
     let file = std::fs::File::open(path)?;
@@ -87,6 +87,24 @@ fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
     if !meta.file_type().is_file() || file_bytes == 0 {
         return Ok((0, file_bytes));
     }
+
+    // Fast path: mmap + single SIMD memchr pass — no read() syscalls
+    if let Ok(mmap) = unsafe { MmapOptions::new().map(&file) } {
+        #[cfg(target_os = "linux")]
+        {
+            unsafe {
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_SEQUENTIAL,
+                );
+            }
+        }
+        let lines = memchr_iter(b'\n', &mmap).count() as u64;
+        return Ok((lines, file_bytes));
+    }
+
+    // Fallback: streaming read with 256KB buffer
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -100,7 +118,7 @@ fn count_lines_streaming(path: &Path) -> io::Result<(u64, u64)> {
         }
     }
     let mut lines = 0u64;
-    let mut buf = [0u8; 64 * 1024]; // 64KB fits in L1 cache
+    let mut buf = vec![0u8; 256 * 1024]; // 256KB
     let mut reader = file;
     loop {
         let n = reader.read(&mut buf)?;

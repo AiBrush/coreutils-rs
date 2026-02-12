@@ -49,6 +49,13 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 
 // ── Public hashing API ──────────────────────────────────────────────
 
+/// Chunk size for cache-friendly hashing of large mmap'd data.
+/// 4MB fits in L3 cache, reducing TLB misses and improving memory bus
+/// utilization on large files (100MB+). Without chunking, single-shot
+/// hashing touches all pages before any computation, causing poor
+/// cache behavior.
+const HASH_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
 /// Compute hash of a byte slice directly (zero-copy fast path).
 pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     match algo {
@@ -59,6 +66,52 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
             hex_encode(hash.as_bytes())
         }
     }
+}
+
+/// Chunked hash for cache-friendly processing of large mmap'd data.
+/// Feeds HASH_CHUNK_SIZE chunks to keep working set in L3 cache.
+/// For small data (<= HASH_CHUNK_SIZE), delegates to single-shot hash_bytes.
+fn hash_bytes_chunked(algo: HashAlgorithm, data: &[u8]) -> String {
+    if data.len() <= HASH_CHUNK_SIZE {
+        return hash_bytes(algo, data);
+    }
+    match algo {
+        HashAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            for chunk in data.chunks(HASH_CHUNK_SIZE) {
+                hasher.update(chunk);
+            }
+            hex_encode(&hasher.finalize())
+        }
+        HashAlgorithm::Md5 => {
+            let mut hasher = Md5::new();
+            for chunk in data.chunks(HASH_CHUNK_SIZE) {
+                hasher.update(chunk);
+            }
+            hex_encode(&hasher.finalize())
+        }
+        HashAlgorithm::Blake2b => {
+            let mut state = blake2b_simd::State::new();
+            for chunk in data.chunks(HASH_CHUNK_SIZE) {
+                state.update(chunk);
+            }
+            hex_encode(state.finalize().as_bytes())
+        }
+    }
+}
+
+/// Chunked BLAKE2b hash with variable output length for large mmap'd data.
+fn blake2b_hash_data_chunked(data: &[u8], output_bytes: usize) -> String {
+    if data.len() <= HASH_CHUNK_SIZE {
+        return blake2b_hash_data(data, output_bytes);
+    }
+    let mut state = blake2b_simd::Params::new()
+        .hash_length(output_bytes)
+        .to_state();
+    for chunk in data.chunks(HASH_CHUNK_SIZE) {
+        state.update(chunk);
+    }
+    hex_encode(state.finalize().as_bytes())
 }
 
 /// Compute hash of data from a reader, returning hex string.
@@ -181,7 +234,7 @@ fn mmap_and_hash(algo: HashAlgorithm, file: &File) -> io::Result<String> {
                     }
                 }
             }
-            Ok(hash_bytes(algo, &mmap))
+            Ok(hash_bytes_chunked(algo, &mmap))
         }
         Err(_) => {
             // mmap failed — fall back to buffered read from the same fd
@@ -215,7 +268,7 @@ fn mmap_and_hash_blake2b(file: &File, output_bytes: usize) -> io::Result<String>
                     }
                 }
             }
-            Ok(blake2b_hash_data(&mmap, output_bytes))
+            Ok(blake2b_hash_data_chunked(&mmap, output_bytes))
         }
         Err(_) => {
             let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
@@ -253,7 +306,7 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
                         );
                     }
                 }
-                return Ok(hash_bytes(algo, &mmap));
+                return Ok(hash_bytes_chunked(algo, &mmap));
             }
         }
     }
@@ -413,7 +466,7 @@ pub fn blake2b_hash_stdin(output_bytes: usize) -> io::Result<String> {
                         );
                     }
                 }
-                return Ok(blake2b_hash_data(&mmap, output_bytes));
+                return Ok(blake2b_hash_data_chunked(&mmap, output_bytes));
             }
         }
     }

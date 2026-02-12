@@ -59,7 +59,10 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
         return Ok(());
     }
 
-    let enc_max = BASE64_ENGINE.encoded_length(NOWRAP_CHUNK);
+    // Size buffer for actual data, not max chunk size.
+    // For 100KB input, allocates ~134KB instead of ~2.7MB.
+    let actual_chunk = NOWRAP_CHUNK.min(data.len());
+    let enc_max = BASE64_ENGINE.encoded_length(actual_chunk);
     let mut buf = vec![0u8; enc_max];
 
     for chunk in data.chunks(NOWRAP_CHUNK) {
@@ -105,11 +108,15 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     }
 
     // Sequential path: 2MB chunks fit in L2 cache and reduce initial allocation.
+    // Cap buffer sizes to actual data size to avoid over-allocation for small inputs.
+    // For 100KB input: allocates ~270KB instead of ~5.5MB.
     let lines_per_chunk = (2 * 1024 * 1024) / bytes_per_line.max(1);
     let chunk_input = lines_per_chunk * bytes_per_line.max(1);
-    let chunk_encoded_max = BASE64_ENGINE.encoded_length(chunk_input.max(1));
+    let effective_chunk = chunk_input.max(1).min(data.len());
+    let chunk_encoded_max = BASE64_ENGINE.encoded_length(effective_chunk);
     let mut encode_buf = vec![0u8; chunk_encoded_max];
-    let wrapped_max = (lines_per_chunk + 1) * (wrap_col + 1);
+    let effective_lines = effective_chunk / bytes_per_line.max(1) + 1;
+    let wrapped_max = (effective_lines + 1) * (wrap_col + 1);
     let mut wrap_buf = vec![0u8; wrapped_max];
 
     for chunk in data.chunks(chunk_input.max(1)) {
