@@ -1101,9 +1101,7 @@ pub fn translate_mmap(
 
     // Parallel translation for very large inputs — single shared output buffer
     if data.len() >= PARALLEL_TRANSLATE_THRESHOLD {
-        // Avoid zero-initialization: translate writes every byte of output
-        let mut out = Vec::with_capacity(data.len());
-        unsafe { out.set_len(data.len()) };
+        let mut out = vec![0u8; data.len()];
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() + num_threads - 1) / num_threads;
         // Align to BUF_SIZE boundaries for cache efficiency
@@ -1123,16 +1121,14 @@ pub fn translate_mmap(
 
     // Single-allocation path: translate entire data into one buffer, single write
     if data.len() <= BUF_SIZE {
-        let mut out = Vec::with_capacity(data.len());
-        unsafe { out.set_len(data.len()) };
+        let mut out = vec![0u8; data.len()];
         translate_chunk_dispatch(data, &mut out, &table, &kind, use_simd);
         writer.write_all(&out)?;
         return Ok(());
     }
 
     // Chunked path for larger data — reuses buffer across chunks
-    let mut out = Vec::with_capacity(BUF_SIZE);
-    unsafe { out.set_len(BUF_SIZE) };
+    let mut out = vec![0u8; BUF_SIZE];
     for chunk in data.chunks(BUF_SIZE) {
         translate_chunk_dispatch(chunk, &mut out[..chunk.len()], &table, &kind, use_simd);
         writer.write_all(&out[..chunk.len()])?;
