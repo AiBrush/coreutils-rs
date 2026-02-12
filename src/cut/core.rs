@@ -353,7 +353,8 @@ fn process_single_field_chunk(
     }
 }
 
-/// Extract a single field from one line using SIMD-accelerated memchr.
+/// Extract a single field from one line using a single SIMD memchr_iter pass.
+/// Collects all delimiter positions in one scan, then indexes directly.
 #[inline(always)]
 fn extract_single_field_line(
     line: &[u8],
@@ -370,41 +371,52 @@ fn extract_single_field_line(
         return;
     }
 
-    // Quick check: does line contain delimiter at all? (SIMD-accelerated)
-    let first_delim = match memchr::memchr(delim, line) {
-        Some(pos) => pos,
-        None => {
-            if !suppress {
-                buf.extend_from_slice(line);
-                buf.push(line_delim);
-            }
-            return;
-        }
-    };
+    // Single SIMD pass to find ALL delimiter positions
+    // This reduces N SIMD scans to 1 for field N
+    let mut delim_positions: [usize; 64] = [0; 64];
+    let mut num_delims: usize = 0;
 
-    // Fast path: target is field 1 (cut -f1, most common)
+    for pos in memchr_iter(delim, line) {
+        if num_delims < 64 {
+            delim_positions[num_delims] = pos;
+        }
+        num_delims += 1;
+        // Early exit: we have enough delimiters to extract our target field
+        if num_delims > target_idx {
+            break;
+        }
+    }
+
+    // No delimiters found — output whole line or suppress
+    if num_delims == 0 {
+        if !suppress {
+            buf.extend_from_slice(line);
+            buf.push(line_delim);
+        }
+        return;
+    }
+
+    // Fast path: target is field 1 (cut -f1)
     if target_idx == 0 {
-        buf.extend_from_slice(&line[..first_delim]);
+        buf.extend_from_slice(&line[..delim_positions[0]]);
         buf.push(line_delim);
         return;
     }
 
-    // Skip to target field using repeated SIMD memchr
-    let mut pos = first_delim + 1;
-    for _ in 1..target_idx {
-        match memchr::memchr(delim, &line[pos..]) {
-            Some(idx) => pos += idx + 1,
-            None => {
-                buf.push(line_delim);
-                return;
-            }
-        }
+    // Not enough fields for target
+    if num_delims < target_idx {
+        buf.push(line_delim);
+        return;
     }
 
-    // pos is start of target field. Find end with SIMD.
-    match memchr::memchr(delim, &line[pos..]) {
-        Some(idx) => buf.extend_from_slice(&line[pos..pos + idx]),
-        None => buf.extend_from_slice(&line[pos..]),
+    // Field start is right after the (target_idx-1)th delimiter
+    let field_start = delim_positions[target_idx - 1] + 1;
+
+    // Field end is the target_idx-th delimiter (or end of line)
+    if num_delims > target_idx && target_idx < 64 {
+        buf.extend_from_slice(&line[field_start..delim_positions[target_idx]]);
+    } else {
+        buf.extend_from_slice(&line[field_start..]);
     }
     buf.push(line_delim);
 }

@@ -9,7 +9,8 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IoSlice, Read, Write};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -169,6 +170,7 @@ fn read_all_input(
         let metadata = file.metadata()?;
         if metadata.len() > 0 {
             let mmap = unsafe { Mmap::map(&file)? };
+            // Start with Sequential for line scanning, caller switches to Random for sort
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -348,6 +350,7 @@ pub fn merge_sorted(
     let mut seq: u64 = 0;
     let mut heap: BinaryHeap<std::cmp::Reverse<MergeEntryOrd>> =
         BinaryHeap::with_capacity(inputs.len());
+    let config_arc = Arc::new(config.clone());
 
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(line) = read_next(reader.as_mut(), delimiter)? {
@@ -357,7 +360,7 @@ pub fn merge_sorted(
                     file_idx: i,
                     seq,
                 },
-                config: config.clone(),
+                config: Arc::clone(&config_arc),
             }));
             seq += 1;
         }
@@ -389,6 +392,7 @@ pub fn merge_sorted(
         }
 
         let file_idx = min.entry.file_idx;
+        let entry_config = Arc::clone(&min.config);
         if let Some(next_line) = read_next(readers[file_idx].as_mut(), delimiter)? {
             heap.push(std::cmp::Reverse(MergeEntryOrd {
                 entry: MergeEntry {
@@ -396,7 +400,7 @@ pub fn merge_sorted(
                     file_idx,
                     seq,
                 },
-                config: config.clone(),
+                config: entry_config,
             }));
             seq += 1;
         }
@@ -412,7 +416,7 @@ pub fn merge_sorted(
 /// Wrapper that implements Ord for MergeEntry using SortConfig.
 struct MergeEntryOrd {
     entry: MergeEntry,
-    config: SortConfig,
+    config: Arc<SortConfig>,
 }
 
 impl PartialEq for MergeEntryOrd {
@@ -507,7 +511,36 @@ fn float_to_sortable_u64(f: f64) -> u64 {
     }
 }
 
+/// Maximum IoSlices per writev call (Linux IOV_MAX = 1024).
+const IOV_BATCH: usize = 1024;
+
+/// Write all IoSlices, handling partial writes and batching.
+fn write_all_slices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < slices.len() {
+        let end = (offset + IOV_BATCH).min(slices.len());
+        let n = out.write_vectored(&slices[offset..end])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write any data",
+            ));
+        }
+        let mut remaining = n;
+        while offset < end && remaining >= slices[offset].len() {
+            remaining -= slices[offset].len();
+            offset += 1;
+        }
+        if remaining > 0 && offset < end {
+            out.write_all(&slices[offset][remaining..])?;
+            offset += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Write sorted indices to output, with optional unique dedup.
+/// Uses writev (vectored I/O) to write directly from mmap — zero intermediate copies.
 fn write_sorted_output(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -516,8 +549,9 @@ fn write_sorted_output(
     writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
-    // Use staging buffer to reduce per-line write overhead
-    let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
+    // Build IoSlice entries pointing directly into mmap data
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(sorted_indices.len() * 2);
+
     if config.unique {
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
@@ -531,28 +565,29 @@ fn write_sorted_output(
                 None => true,
             };
             if should_output {
-                buf.extend_from_slice(line);
-                buf.extend_from_slice(terminator);
-                if buf.len() >= OUTPUT_BUF_SIZE {
-                    writer.write_all(&buf)?;
-                    buf.clear();
-                }
+                slices.push(IoSlice::new(line));
+                slices.push(IoSlice::new(terminator));
                 prev = Some(idx);
+            }
+            // Flush batch to avoid excessive memory
+            if slices.len() >= IOV_BATCH {
+                write_all_slices(writer, &slices)?;
+                slices.clear();
             }
         }
     } else {
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            buf.extend_from_slice(&data[s..e]);
-            buf.extend_from_slice(terminator);
-            if buf.len() >= OUTPUT_BUF_SIZE {
-                writer.write_all(&buf)?;
-                buf.clear();
+            slices.push(IoSlice::new(&data[s..e]));
+            slices.push(IoSlice::new(terminator));
+            if slices.len() >= IOV_BATCH {
+                write_all_slices(writer, &slices)?;
+                slices.clear();
             }
         }
     }
-    if !buf.is_empty() {
-        writer.write_all(&buf)?;
+    if !slices.is_empty() {
+        write_all_slices(writer, &slices)?;
     }
     Ok(())
 }
@@ -565,12 +600,12 @@ fn do_sort(
 ) {
     let n = indices.len();
     if stable {
-        if n > 50_000 {
+        if n > 10_000 {
             indices.par_sort_by(cmp);
         } else {
             indices.sort_by(cmp);
         }
-    } else if n > 50_000 {
+    } else if n > 10_000 {
         indices.par_sort_unstable_by(cmp);
     } else {
         indices.sort_unstable_by(cmp);
@@ -636,6 +671,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     let terminator: &[u8] = if config.zero_terminated { b"\0" } else { b"\n" };
     let mut indices: Vec<usize> = (0..num_lines).collect();
 
+    // Switch to random access for sort phase (comparisons jump to arbitrary lines)
+    #[cfg(target_os = "linux")]
+    if let FileData::Mmap(ref mmap) = buffer {
+        let _ = mmap.advise(memmap2::Advice::Random);
+    }
+
     // Detect sort mode and use specialized fast path
     let no_keys = config.keys.is_empty();
     let gopts = &config.global_opts;
@@ -678,19 +719,25 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
         let n = entries.len();
         if config.stable {
-            if n > 50_000 {
+            if n > 10_000 {
                 entries.par_sort_by(prefix_cmp);
             } else {
                 entries.sort_by(prefix_cmp);
             }
-        } else if n > 50_000 {
+        } else if n > 10_000 {
             entries.par_sort_unstable_by(prefix_cmp);
         } else {
             entries.sort_unstable_by(prefix_cmp);
         }
 
-        // Output from entries using staging buffer
-        let mut buf = Vec::with_capacity(OUTPUT_BUF_SIZE);
+        // Output using writev — zero-copy from mmap
+        // Switch to sequential for output phase
+        #[cfg(target_os = "linux")]
+        if let FileData::Mmap(ref mmap) = buffer {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
+
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(entries.len().min(IOV_BATCH) * 2);
         if config.unique {
             let mut prev: Option<usize> = None;
             for &(_, idx) in &entries {
@@ -704,28 +751,28 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     None => true,
                 };
                 if emit {
-                    buf.extend_from_slice(line);
-                    buf.extend_from_slice(terminator);
-                    if buf.len() >= OUTPUT_BUF_SIZE {
-                        writer.write_all(&buf)?;
-                        buf.clear();
-                    }
+                    slices.push(IoSlice::new(line));
+                    slices.push(IoSlice::new(terminator));
                     prev = Some(idx);
+                }
+                if slices.len() >= IOV_BATCH {
+                    write_all_slices(&mut writer, &slices)?;
+                    slices.clear();
                 }
             }
         } else {
             for &(_, idx) in &entries {
                 let (s, e) = offsets[idx];
-                buf.extend_from_slice(&data[s..e]);
-                buf.extend_from_slice(terminator);
-                if buf.len() >= OUTPUT_BUF_SIZE {
-                    writer.write_all(&buf)?;
-                    buf.clear();
+                slices.push(IoSlice::new(&data[s..e]));
+                slices.push(IoSlice::new(terminator));
+                if slices.len() >= IOV_BATCH {
+                    write_all_slices(&mut writer, &slices)?;
+                    slices.clear();
                 }
             }
         }
-        if !buf.is_empty() {
-            writer.write_all(&buf)?;
+        if !slices.is_empty() {
+            write_all_slices(&mut writer, &slices)?;
         }
     } else if is_numeric_only {
         // FAST PATH 2: Pre-parsed numeric sort with u64 comparison
@@ -757,12 +804,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
         let n = entries.len();
         if stable {
-            if n > 50_000 {
+            if n > 10_000 {
                 entries.par_sort_by(cmp);
             } else {
                 entries.sort_by(cmp);
             }
-        } else if n > 50_000 {
+        } else if n > 10_000 {
             entries.par_sort_unstable_by(cmp);
         } else {
             entries.sort_unstable_by(cmp);
@@ -822,12 +869,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
             let n = entries.len();
             if stable {
-                if n > 50_000 {
+                if n > 10_000 {
                     entries.par_sort_by(cmp);
                 } else {
                     entries.sort_by(cmp);
                 }
-            } else if n > 50_000 {
+            } else if n > 10_000 {
                 entries.par_sort_unstable_by(cmp);
             } else {
                 entries.sort_unstable_by(cmp);
@@ -878,12 +925,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
                 let n = entries.len();
                 if stable {
-                    if n > 50_000 {
+                    if n > 10_000 {
                         entries.par_sort_by(cmp);
                     } else {
                         entries.sort_by(cmp);
                     }
-                } else if n > 50_000 {
+                } else if n > 10_000 {
                     entries.par_sort_unstable_by(cmp);
                 } else {
                     entries.sort_unstable_by(cmp);
