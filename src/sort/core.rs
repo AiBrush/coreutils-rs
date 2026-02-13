@@ -569,6 +569,90 @@ impl Ord for MergeEntryOrd {
     }
 }
 
+/// Radix-distribute entries into 65536 buckets by top 2 bytes of prefix,
+/// then sort each bucket independently using rayon. Returns sorted array
+/// and bucket boundary table. This reduces per-bucket sort size by ~60x
+/// for uniform ASCII data, greatly improving cache behavior.
+fn radix_sort_entries(
+    entries: Vec<(u64, u32, u32)>,
+    data: &[u8],
+    stable: bool,
+    reverse: bool,
+) -> (Vec<(u64, u32, u32)>, Vec<usize>) {
+    let nbk: usize = 65536;
+    let mut cnts = vec![0u32; nbk];
+    for &(pfx, _, _) in &entries {
+        cnts[(pfx >> 48) as usize] += 1;
+    }
+    let mut bk_starts = vec![0usize; nbk + 1];
+    {
+        let mut s = 0usize;
+        for i in 0..nbk {
+            bk_starts[i] = s;
+            s += cnts[i] as usize;
+        }
+        bk_starts[nbk] = s;
+    }
+    let mut sorted = vec![(0u64, 0u32, 0u32); entries.len()];
+    {
+        let mut wpos = bk_starts.clone();
+        for &ent in &entries {
+            let b = (ent.0 >> 48) as usize;
+            sorted[wpos[b]] = ent;
+            wpos[b] += 1;
+        }
+    }
+    drop(entries);
+    drop(cnts);
+
+    // Sort each non-trivial bucket independently with rayon
+    {
+        let sorted_ptr = sorted.as_mut_ptr();
+        let sorted_len = sorted.len();
+        let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
+            match a.0.cmp(&b.0) {
+                Ordering::Equal => {
+                    let sa = a.1 as usize;
+                    let la = a.2 as usize;
+                    let sb = b.1 as usize;
+                    let lb = b.2 as usize;
+                    let skip = 8.min(la).min(lb);
+                    data[sa + skip..sa + la].cmp(&data[sb + skip..sb + lb])
+                }
+                ord => ord,
+            }
+        };
+        let mut slices: Vec<&mut [(u64, u32, u32)]> = Vec::new();
+        for i in 0..nbk {
+            let lo = bk_starts[i];
+            let hi = bk_starts[i + 1];
+            if hi - lo > 1 {
+                debug_assert!(hi <= sorted_len);
+                slices.push(unsafe { std::slice::from_raw_parts_mut(sorted_ptr.add(lo), hi - lo) });
+            }
+        }
+        if stable {
+            if !reverse {
+                slices.into_par_iter().for_each(|sl| sl.sort_by(cmp_fn));
+            } else {
+                slices
+                    .into_par_iter()
+                    .for_each(|sl| sl.sort_by(|a, b| cmp_fn(a, b).reverse()));
+            }
+        } else if !reverse {
+            slices
+                .into_par_iter()
+                .for_each(|sl| sl.sort_unstable_by(cmp_fn));
+        } else {
+            slices
+                .into_par_iter()
+                .for_each(|sl| sl.sort_unstable_by(|a, b| cmp_fn(a, b).reverse()));
+        }
+    }
+
+    (sorted, bk_starts)
+}
+
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
 /// Big-endian byte order ensures u64 comparison matches lexicographic order.
 #[inline]
@@ -1041,11 +1125,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     let is_single_key = config.keys.len() == 1;
 
     if is_plain_lex && num_lines > 256 {
-        // FAST PATH 1: Prefix-based lexicographic sort
-        // Store (prefix, start, len) to avoid offsets array lookup during comparison.
-        // Entry is 16 bytes: u64 prefix + u32 start + u32 len (same as (u64, usize)).
+        // FAST PATH 1: Radix bucket sort + prefix comparison.
+        // Distributes entries into 256 buckets by first byte, then sorts each
+        // bucket independently. This eliminates the first byte from comparisons
+        // and reduces per-bucket sort size by ~62x (for uniform ASCII), giving
+        // much better cache behavior and parallel scaling.
         let reverse = gopts.reverse;
-        let mut entries: Vec<(u64, u32, u32)> = if num_lines > 10_000 {
+
+        // Build entries with (prefix, start, len)
+        let entries: Vec<(u64, u32, u32)> = if num_lines > 10_000 {
             offsets
                 .par_iter()
                 .map(|&(s, e)| (line_prefix(data, s, e), s as u32, (e - s) as u32))
@@ -1057,36 +1145,9 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 .collect()
         };
 
-        // Comparison function: u64 prefix resolves most cases.
-        // When equal, compare remaining bytes using inline start/len (no offsets lookup).
-        let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
-            // Single CMP + conditional branch: resolves ~95%+ of comparisons
-            match a.0.cmp(&b.0) {
-                Ordering::Equal => {
-                    // Slow path: equal prefixes, compare remaining bytes
-                    let sa = a.1 as usize;
-                    let la = a.2 as usize;
-                    let sb = b.1 as usize;
-                    let lb = b.2 as usize;
-                    let skip = 8.min(la).min(lb);
-                    data[sa + skip..sa + la].cmp(&data[sb + skip..sb + lb])
-                }
-                ord => ord,
-            }
-        };
-
-        // Parallel prefix-comparison sort.
-        if config.stable {
-            if !reverse {
-                entries.par_sort_by(cmp_fn);
-            } else {
-                entries.par_sort_by(|a, b| cmp_fn(a, b).reverse());
-            }
-        } else if !reverse {
-            entries.par_sort_unstable_by(cmp_fn);
-        } else {
-            entries.par_sort_unstable_by(|a, b| cmp_fn(a, b).reverse());
-        }
+        // Two-level radix distribution + per-bucket sort via helper function
+        let (sorted, bk_starts) = radix_sort_entries(entries, data, config.stable, reverse);
+        let nbk = bk_starts.len() - 1;
 
         // Switch to sequential for output phase
         #[cfg(target_os = "linux")]
@@ -1094,62 +1155,116 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }
 
-        // Output phase: write sorted entries using start/len
+        // Output sorted entries. For reverse, iterate buckets from high to low
+        // (within each bucket, entries are already in reverse order from the sort).
+        // For forward, iterate linearly through the sorted array.
         if config.unique {
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
-            for &(_, s, l) in &entries {
-                let su = s as usize;
-                let lu = l as usize;
-                let should_output = if prev_start == u32::MAX {
-                    true
-                } else {
-                    let ps = prev_start as usize;
-                    let pl = prev_len as usize;
-                    compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
-                        != Ordering::Equal
-                };
-                if should_output {
-                    writer.write_all(&data[su..su + lu])?;
-                    writer.write_all(terminator)?;
-                    prev_start = s;
-                    prev_len = l;
-                }
-            }
-        } else if entries.len() > 50_000 {
-            // Parallel buffer construction for large outputs
-            let tl = terminator.len();
-            let num_threads = rayon::current_num_threads().max(1);
-            let chunk_size = (entries.len() + num_threads - 1) / num_threads;
-
-            let buffers: Vec<Vec<u8>> = entries
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    let sz: usize = chunk.iter().map(|&(_, _, l)| l as usize + tl).sum();
-                    let mut buf: Vec<u8> = Vec::with_capacity(sz);
-                    let data_ptr = data.as_ptr();
-                    for &(_, s, l) in chunk {
+            if reverse {
+                for bi in (0..nbk).rev() {
+                    for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
                         let su = s as usize;
                         let lu = l as usize;
+                        let emit = prev_start == u32::MAX || {
+                            let ps = prev_start as usize;
+                            let pl = prev_len as usize;
+                            compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
+                                != Ordering::Equal
+                        };
+                        if emit {
+                            writer.write_all(&data[su..su + lu])?;
+                            writer.write_all(terminator)?;
+                            prev_start = s;
+                            prev_len = l;
+                        }
+                    }
+                }
+            } else {
+                for &(_, s, l) in &sorted {
+                    let su = s as usize;
+                    let lu = l as usize;
+                    let emit = prev_start == u32::MAX || {
+                        let ps = prev_start as usize;
+                        let pl = prev_len as usize;
+                        compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
+                            != Ordering::Equal
+                    };
+                    if emit {
+                        writer.write_all(&data[su..su + lu])?;
+                        writer.write_all(terminator)?;
+                        prev_start = s;
+                        prev_len = l;
+                    }
+                }
+            }
+        } else if reverse {
+            // Reverse: build per-bucket output, write from highest bucket down
+            let tl = terminator.len();
+            let bucket_bufs: Vec<Vec<u8>> = (0..nbk)
+                .into_par_iter()
+                .map(|bi| {
+                    let lo = bk_starts[bi];
+                    let hi = bk_starts[bi + 1];
+                    if lo == hi {
+                        return Vec::new();
+                    }
+                    let bkt = &sorted[lo..hi];
+                    let sz: usize = bkt.iter().map(|&(_, _, l)| l as usize + tl).sum();
+                    let mut buf = vec![0u8; sz];
+                    let bp = buf.as_mut_ptr();
+                    let dp = data.as_ptr();
+                    let mut wp = 0usize;
+                    for &(_, s, l) in bkt {
                         unsafe {
-                            let old_len = buf.len();
-                            buf.set_len(old_len + lu + tl);
-                            let bp = buf.as_mut_ptr().add(old_len);
-                            std::ptr::copy_nonoverlapping(data_ptr.add(su), bp, lu);
-                            std::ptr::copy_nonoverlapping(terminator.as_ptr(), bp.add(lu), tl);
+                            std::ptr::copy_nonoverlapping(
+                                dp.add(s as usize),
+                                bp.add(wp),
+                                l as usize,
+                            );
+                            wp += l as usize;
+                            std::ptr::copy_nonoverlapping(terminator.as_ptr(), bp.add(wp), tl);
+                            wp += tl;
                         }
                     }
                     buf
                 })
                 .collect();
-
-            for buf in &buffers {
-                writer.write_all(buf)?;
+            for bi in (0..nbk).rev() {
+                if !bucket_bufs[bi].is_empty() {
+                    writer.write_all(&bucket_bufs[bi])?;
+                }
             }
         } else {
-            for &(_, s, l) in &entries {
-                writer.write_all(&data[s as usize..(s + l) as usize])?;
-                writer.write_all(terminator)?;
+            // Forward: parallel chunked output buffer construction
+            let tl = terminator.len();
+            let n = sorted.len();
+            let num_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (n + num_threads - 1) / num_threads;
+            let buffers: Vec<Vec<u8>> = sorted
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let sz: usize = chunk.iter().map(|&(_, _, l)| l as usize + tl).sum();
+                    let mut buf: Vec<u8> = Vec::with_capacity(sz);
+                    let dp = data.as_ptr();
+                    for &(_, s, l) in chunk {
+                        unsafe {
+                            let old_len = buf.len();
+                            buf.set_len(old_len + l as usize + tl);
+                            let bp = buf.as_mut_ptr().add(old_len);
+                            std::ptr::copy_nonoverlapping(dp.add(s as usize), bp, l as usize);
+                            std::ptr::copy_nonoverlapping(
+                                terminator.as_ptr(),
+                                bp.add(l as usize),
+                                tl,
+                            );
+                        }
+                    }
+                    buf
+                })
+                .collect();
+            for buf in &buffers {
+                writer.write_all(buf)?;
             }
         }
     } else if is_fold_case_lex && num_lines > 256 {
