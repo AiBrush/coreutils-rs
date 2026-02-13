@@ -676,12 +676,14 @@ pub fn encode_stream(
 }
 
 /// Streaming encode with NO line wrapping — optimized fast path.
-/// Uses 4MB reads (aligned to 3 bytes) for fewer syscalls, and writes
-/// the encoded output directly without any wrapping logic or IoSlice overhead.
+/// Read size is tuned so the encoded output fits within the 4MB pipe buffer,
+/// enabling single-syscall writes. 3MB input * 4/3 = 4MB encoded output.
+/// This reduces write() syscalls compared to the old 4MB read which produced
+/// 5.3MB encoded output requiring 2 write() calls per chunk.
 fn encode_stream_nowrap(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    // 4MB aligned to 3 bytes for padding-free intermediate encoding.
-    // 4MB matches the enlarged pipe buffer size set in fbase64.rs.
-    const NOWRAP_READ: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3); // 4194300
+    // 3MB aligned to 3 bytes: encoded output = 3MB * 4/3 = 4MB = pipe buffer size.
+    // This means each encode+write is a single read() + single write() syscall pair.
+    const NOWRAP_READ: usize = 3 * 1024 * 1024; // exactly divisible by 3
 
     let mut buf = vec![0u8; NOWRAP_READ];
     let encode_buf_size = BASE64_ENGINE.encoded_length(NOWRAP_READ);

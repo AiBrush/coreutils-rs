@@ -904,14 +904,31 @@ unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
             // keep_mask bits: 1 = keep (NOT in range)
             let keep_mask = !(_mm256_movemask_epi8(in_range) as u32);
 
-            // Compact: copy kept bytes using the mask
-            let mut mask = keep_mask;
-            while mask != 0 {
-                let bit = mask.trailing_zeros() as usize;
-                *dp.add(wp) = *sp.add(ri + bit);
-                wp += 1;
-                mask &= mask - 1; // clear lowest set bit
+            if keep_mask == 0xFFFFFFFF {
+                // All 32 bytes are kept — bulk copy
+                std::ptr::copy_nonoverlapping(sp.add(ri), dp.add(wp), 32);
+                wp += 32;
+            } else if keep_mask != 0 {
+                // Partial keep — process each 8-byte lane with popcnt
+                compact_8bytes(sp.add(ri), dp.add(wp), keep_mask as u8);
+                let c0 = (keep_mask as u8).count_ones() as usize;
+                compact_8bytes(sp.add(ri + 8), dp.add(wp + c0), (keep_mask >> 8) as u8);
+                let c1 = ((keep_mask >> 8) as u8).count_ones() as usize;
+                compact_8bytes(
+                    sp.add(ri + 16),
+                    dp.add(wp + c0 + c1),
+                    (keep_mask >> 16) as u8,
+                );
+                let c2 = ((keep_mask >> 16) as u8).count_ones() as usize;
+                compact_8bytes(
+                    sp.add(ri + 24),
+                    dp.add(wp + c0 + c1 + c2),
+                    (keep_mask >> 24) as u8,
+                );
+                let c3 = ((keep_mask >> 24) as u8).count_ones() as usize;
+                wp += c0 + c1 + c2 + c3;
             }
+            // else: keep_mask == 0 means all bytes deleted, skip entirely
             ri += 32;
         }
 
@@ -927,12 +944,14 @@ unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
             let in_range = _mm_cmpeq_epi8(gt, zero128);
             let keep_mask = !(_mm_movemask_epi8(in_range) as u32) & 0xFFFF;
 
-            let mut mask = keep_mask;
-            while mask != 0 {
-                let bit = mask.trailing_zeros() as usize;
-                *dp.add(wp) = *sp.add(ri + bit);
-                wp += 1;
-                mask &= mask - 1;
+            if keep_mask == 0xFFFF {
+                std::ptr::copy_nonoverlapping(sp.add(ri), dp.add(wp), 16);
+                wp += 16;
+            } else if keep_mask != 0 {
+                compact_8bytes(sp.add(ri), dp.add(wp), keep_mask as u8);
+                let c0 = (keep_mask as u8).count_ones() as usize;
+                compact_8bytes(sp.add(ri + 8), dp.add(wp + c0), (keep_mask >> 8) as u8);
+                wp += c0 + ((keep_mask >> 8) as u8).count_ones() as usize;
             }
             ri += 16;
         }
@@ -948,6 +967,29 @@ unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
         }
 
         wp
+    }
+}
+
+/// Compact 8 source bytes into contiguous output bytes using a keep mask.
+/// Each bit in `mask` indicates whether the corresponding byte should be kept.
+/// Uses branchless writes: always writes 8 bytes (the extras are harmless since
+/// the caller tracks the write pointer by popcount).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn compact_8bytes(src: *const u8, dst: *mut u8, mask: u8) {
+    // For each set bit position in the mask, copy that byte from src to the
+    // next output position. Using a tight trailing_zeros loop is faster than
+    // a lookup table for 8-bit masks because it's branch-predicted well
+    // and avoids cache misses on the table.
+    unsafe {
+        let mut m = mask;
+        let mut w = 0;
+        while m != 0 {
+            let bit = m.trailing_zeros() as usize;
+            *dst.add(w) = *src.add(bit);
+            w += 1;
+            m &= m - 1;
+        }
     }
 }
 
@@ -975,12 +1017,15 @@ unsafe fn delete_range_sse2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
             let in_range = _mm_cmpeq_epi8(gt, zero);
             let keep_mask = !(_mm_movemask_epi8(in_range) as u32) & 0xFFFF;
 
-            let mut mask = keep_mask;
-            while mask != 0 {
-                let bit = mask.trailing_zeros() as usize;
-                *dp.add(wp) = *sp.add(ri + bit);
-                wp += 1;
-                mask &= mask - 1;
+            if keep_mask == 0xFFFF {
+                // All 16 bytes kept — bulk copy
+                std::ptr::copy_nonoverlapping(sp.add(ri), dp.add(wp), 16);
+                wp += 16;
+            } else if keep_mask != 0 {
+                compact_8bytes(sp.add(ri), dp.add(wp), keep_mask as u8);
+                let c0 = (keep_mask as u8).count_ones() as usize;
+                compact_8bytes(sp.add(ri + 8), dp.add(wp + c0), (keep_mask >> 8) as u8);
+                wp += c0 + ((keep_mask >> 8) as u8).count_ones() as usize;
             }
             ri += 16;
         }
@@ -1013,6 +1058,8 @@ fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
 
 /// Streaming delete for contiguous byte ranges using SIMD range detection.
 /// Uses 4MB buffer to reduce syscalls (delete is compute-light, I/O bound).
+/// When no bytes are deleted from a chunk (common for data with few matches),
+/// writes directly from the source buffer to avoid the copy overhead.
 fn delete_range_streaming(
     lo: u8,
     hi: u8,
@@ -1027,7 +1074,10 @@ fn delete_range_streaming(
             break;
         }
         let wp = delete_range_chunk(&src[..n], &mut dst, lo, hi);
-        if wp > 0 {
+        if wp == n {
+            // No bytes deleted — write source directly (avoids copy overhead)
+            writer.write_all(&src[..n])?;
+        } else if wp > 0 {
             writer.write_all(&dst[..wp])?;
         }
     }
@@ -1456,6 +1506,12 @@ fn squeeze_single_stream(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
+    // Use a two-byte pattern finder (ch,ch) to jump directly to squeeze points.
+    // For squeeze-spaces: most of the data has no consecutive spaces, so memmem
+    // skips over huge regions at SIMD speed. When a pair is found, we scan the
+    // run length and collapse it to one occurrence.
+    let pair = [ch, ch];
+    let finder = memchr::memmem::Finder::new(&pair);
     let mut buf = vec![0u8; STREAM_BUF];
     let mut was_squeeze_char = false;
 
@@ -1465,62 +1521,57 @@ fn squeeze_single_stream(
             break;
         }
 
+        let ptr = buf.as_mut_ptr();
         let mut wp = 0;
         let mut i = 0;
 
-        while i < n {
-            if was_squeeze_char && buf[i] == ch {
+        // Handle carry-over: if previous chunk ended with squeeze char,
+        // skip leading occurrences of that char in this chunk.
+        if was_squeeze_char {
+            while i < n && unsafe { *ptr.add(i) } == ch {
                 i += 1;
-                while i < n && buf[i] == ch {
-                    i += 1;
-                }
-                if i >= n {
-                    break;
-                }
             }
+            if i >= n {
+                // Entire chunk is squeeze-char continuation
+                // was_squeeze_char remains true
+                continue;
+            }
+        }
 
-            match memchr::memchr(ch, &buf[i..n]) {
+        // Use memmem to find consecutive pairs (ch, ch) — SIMD-accelerated.
+        // Between pairs, the data passes through unchanged.
+        loop {
+            match finder.find(&buf[i..n]) {
                 Some(offset) => {
-                    let run_len = offset;
-                    if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
+                    // Copy everything up to and including the first char of the pair
+                    let copy_len = offset + 1; // include first ch
+                    if copy_len > 0 && wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i), ptr.add(wp), copy_len);
                         }
-                        wp += run_len;
                     }
-                    i += run_len;
-
-                    unsafe {
-                        *buf.as_mut_ptr().add(wp) = ch;
-                    }
-                    wp += 1;
-                    was_squeeze_char = true;
-                    i += 1;
-                    while i < n && buf[i] == ch {
+                    wp += copy_len;
+                    i += offset + 1; // position after first ch of pair
+                    // Skip all remaining consecutive ch bytes (the run)
+                    while i < n && unsafe { *ptr.add(i) } == ch {
                         i += 1;
+                    }
+                    if i >= n {
+                        was_squeeze_char = true;
+                        break;
                     }
                 }
                 None => {
+                    // No more consecutive pairs — copy remainder
                     let run_len = n - i;
-                    if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
+                    if run_len > 0 && wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i), ptr.add(wp), run_len);
                         }
-                        wp += run_len;
                     }
-                    was_squeeze_char = false;
+                    wp += run_len;
+                    // Check if chunk ends with the squeeze char
+                    was_squeeze_char = n > 0 && unsafe { *ptr.add(n - 1) } == ch;
                     break;
                 }
             }
