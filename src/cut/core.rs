@@ -390,6 +390,12 @@ fn process_single_field(
                     out.write_all(result)?;
                 }
             }
+        } else if target_idx == 0 && !suppress {
+            // Zero-copy fast path for field 1 (most common case):
+            // For each line, either truncate at the first delimiter, or pass through.
+            // Since most lines have a delimiter, and field 1 is a prefix of each line,
+            // we can write contiguous runs directly from the source data.
+            single_field1_zerocopy(data, delim, line_delim, out)?;
         } else {
             let mut buf = Vec::with_capacity(data.len());
             process_nth_field_combined(data, delim, line_delim, target_idx, suppress, &mut buf);
@@ -545,6 +551,8 @@ fn complement_single_field_line(
 }
 
 /// Contiguous from-start field range extraction (e.g., `cut -f1-5`).
+/// Zero-copy for the non-parallel path: identifies the truncation point per line
+/// and writes contiguous runs directly from the source data.
 fn process_fields_prefix(
     data: &[u8],
     delim: u8,
@@ -568,11 +576,87 @@ fn process_fields_prefix(
                 out.write_all(result)?;
             }
         }
+    } else if !suppress {
+        // Zero-copy fast path: scan for truncation points, write runs from source.
+        // When suppress is false, every line is output (with or without delimiter).
+        // Most lines have enough fields, so the output is often identical to input.
+        fields_prefix_zerocopy(data, delim, line_delim, last_field, out)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
         fields_prefix_chunk(data, delim, line_delim, last_field, suppress, &mut buf);
         if !buf.is_empty() {
             out.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Zero-copy field-prefix extraction: writes contiguous runs directly from source data.
+/// For lines where the Nth delimiter exists, we truncate at that point.
+/// For lines with fewer fields, we output them unchanged.
+/// Lines without any delimiter are output unchanged (suppress=false assumed).
+#[inline]
+fn fields_prefix_zerocopy(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    last_field: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut start = 0;
+    let mut run_start: usize = 0;
+
+    for end_pos in memchr_iter(line_delim, data) {
+        let line = &data[start..end_pos];
+        // Find the position of the Nth delimiter to truncate at
+        let mut field_count = 1;
+        let mut truncate_at: Option<usize> = None;
+        for dpos in memchr_iter(delim, line) {
+            if field_count >= last_field {
+                truncate_at = Some(start + dpos);
+                break;
+            }
+            field_count += 1;
+        }
+
+        if let Some(trunc_pos) = truncate_at {
+            // This line has more fields than needed. Flush run, write truncated.
+            if run_start < start {
+                out.write_all(&data[run_start..start])?;
+            }
+            out.write_all(&data[start..trunc_pos])?;
+            out.write_all(&[line_delim])?;
+            run_start = end_pos + 1;
+        }
+        // else: line has <= last_field fields, keep it in the run
+        start = end_pos + 1;
+    }
+    // Handle last line without terminator
+    if start < data.len() {
+        let line = &data[start..];
+        let mut field_count = 1;
+        let mut truncate_at: Option<usize> = None;
+        for dpos in memchr_iter(delim, line) {
+            if field_count >= last_field {
+                truncate_at = Some(start + dpos);
+                break;
+            }
+            field_count += 1;
+        }
+        if let Some(trunc_pos) = truncate_at {
+            if run_start < start {
+                out.write_all(&data[run_start..start])?;
+            }
+            out.write_all(&data[start..trunc_pos])?;
+            out.write_all(&[line_delim])?;
+            return Ok(());
+        }
+    }
+    // Flush remaining run
+    if run_start < data.len() {
+        out.write_all(&data[run_start..])?;
+        if !data.is_empty() && *data.last().unwrap() != line_delim {
+            out.write_all(&[line_delim])?;
         }
     }
     Ok(())
@@ -844,6 +928,68 @@ fn process_nth_field_combined(
     }
 }
 
+/// Zero-copy field-1 extraction: writes contiguous runs directly from source data.
+/// For each line: if delimiter exists, truncate at first delimiter; otherwise pass through.
+/// Uses memchr2 to scan for both delimiter and line terminator in a single SIMD pass.
+#[inline]
+fn single_field1_zerocopy(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut line_start: usize = 0;
+    let mut run_start: usize = 0;
+    let mut first_delim: Option<usize> = None;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *data.get_unchecked(pos) };
+
+        if byte == line_delim {
+            // End of line
+            if let Some(dp) = first_delim {
+                // Line has delimiter — truncate at first delimiter.
+                // Flush current run up to line_start, write truncated line.
+                if run_start < line_start {
+                    out.write_all(&data[run_start..line_start])?;
+                }
+                out.write_all(&data[line_start..dp])?;
+                out.write_all(&[line_delim])?;
+                run_start = pos + 1;
+            }
+            // else: no delimiter in line, output unchanged (stays in run)
+            line_start = pos + 1;
+            first_delim = None;
+        } else {
+            // Delimiter found
+            if first_delim.is_none() {
+                first_delim = Some(pos);
+            }
+        }
+    }
+
+    // Handle last line (no trailing line_delim)
+    if line_start < data.len() {
+        if let Some(dp) = first_delim {
+            if run_start < line_start {
+                out.write_all(&data[run_start..line_start])?;
+            }
+            out.write_all(&data[line_start..dp])?;
+            out.write_all(&[line_delim])?;
+            return Ok(());
+        }
+    }
+
+    // Flush remaining run
+    if run_start < data.len() {
+        out.write_all(&data[run_start..])?;
+        if !data.is_empty() && *data.last().unwrap() != line_delim {
+            out.write_all(&[line_delim])?;
+        }
+    }
+    Ok(())
+}
+
 /// Process a chunk of data for single-field extraction.
 fn process_single_field_chunk(
     data: &[u8],
@@ -1021,7 +1167,9 @@ fn extract_fields_to_buf(
 // ── Fast path: byte/char extraction with batched output ──────────────────
 
 /// Ultra-fast path for `cut -b1-N`: single from-start byte range.
-/// Uses unsafe appends with pre-reserved buffer for zero overhead.
+/// Zero-copy: writes directly from the source data using output runs.
+/// For lines shorter than max_bytes, the output is identical to the input,
+/// so we emit contiguous runs directly. Only lines exceeding max_bytes need truncation.
 fn process_bytes_from_start(
     data: &[u8],
     max_bytes: usize,
@@ -1033,7 +1181,6 @@ fn process_bytes_from_start(
         let results: Vec<Vec<u8>> = chunks
             .par_iter()
             .map(|chunk| {
-                // Output is at most input size (we only truncate lines)
                 let mut buf = Vec::with_capacity(chunk.len());
                 bytes_from_start_chunk(chunk, max_bytes, line_delim, &mut buf);
                 buf
@@ -1045,16 +1192,64 @@ fn process_bytes_from_start(
             }
         }
     } else {
-        let mut buf = Vec::with_capacity(data.len());
-        bytes_from_start_chunk(data, max_bytes, line_delim, &mut buf);
-        if !buf.is_empty() {
-            out.write_all(&buf)?;
+        // Zero-copy path: track contiguous output runs and write directly from source.
+        // For lines <= max_bytes, we include them as-is (no copy needed).
+        // For lines > max_bytes, we flush the run, write the truncated line, start new run.
+        bytes_from_start_zerocopy(data, max_bytes, line_delim, out)?;
+    }
+    Ok(())
+}
+
+/// Zero-copy byte-prefix extraction: writes contiguous runs directly from the source data.
+/// Only copies when a line needs truncation (line > max_bytes).
+#[inline]
+fn bytes_from_start_zerocopy(
+    data: &[u8],
+    max_bytes: usize,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut start = 0;
+    let mut run_start: usize = 0;
+
+    for pos in memchr_iter(line_delim, data) {
+        let line_len = pos - start;
+        if line_len > max_bytes {
+            // This line needs truncation. Flush current run, write truncated line.
+            if run_start < start {
+                out.write_all(&data[run_start..start])?;
+            }
+            out.write_all(&data[start..start + max_bytes])?;
+            out.write_all(&[line_delim])?;
+            run_start = pos + 1;
+        }
+        // else: line fits, keep it in the current contiguous run
+        start = pos + 1;
+    }
+    // Handle last line without terminator
+    if start < data.len() {
+        let line_len = data.len() - start;
+        if line_len > max_bytes {
+            if run_start < start {
+                out.write_all(&data[run_start..start])?;
+            }
+            out.write_all(&data[start..start + max_bytes])?;
+            out.write_all(&[line_delim])?;
+            return Ok(());
+        }
+    }
+    // Flush remaining run (includes all short lines + the last line)
+    if run_start < data.len() {
+        out.write_all(&data[run_start..])?;
+        // Add terminator if last byte isn't one
+        if !data.is_empty() && *data.last().unwrap() != line_delim {
+            out.write_all(&[line_delim])?;
         }
     }
     Ok(())
 }
 
-/// Process a chunk for from-start byte range extraction.
+/// Process a chunk for from-start byte range extraction (parallel path).
 /// Uses unsafe appends to eliminate bounds checking in the hot loop.
 #[inline]
 fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
@@ -1105,11 +1300,35 @@ fn process_bytes_from_offset(
             }
         }
     } else {
-        let mut buf = Vec::with_capacity(data.len());
-        bytes_from_offset_chunk(data, skip_bytes, line_delim, &mut buf);
-        if !buf.is_empty() {
-            out.write_all(&buf)?;
+        // Zero-copy: write suffix of each line directly from source
+        bytes_from_offset_zerocopy(data, skip_bytes, line_delim, out)?;
+    }
+    Ok(())
+}
+
+/// Zero-copy byte-offset extraction: writes suffix of each line directly from source data.
+#[inline]
+fn bytes_from_offset_zerocopy(
+    data: &[u8],
+    skip_bytes: usize,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut start = 0;
+    for pos in memchr_iter(line_delim, data) {
+        let line_len = pos - start;
+        if line_len > skip_bytes {
+            out.write_all(&data[start + skip_bytes..pos])?;
         }
+        out.write_all(&[line_delim])?;
+        start = pos + 1;
+    }
+    if start < data.len() {
+        let line_len = data.len() - start;
+        if line_len > skip_bytes {
+            out.write_all(&data[start + skip_bytes..data.len()])?;
+        }
+        out.write_all(&[line_delim])?;
     }
     Ok(())
 }
@@ -1396,54 +1615,79 @@ pub fn process_cut_data(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> i
 }
 
 /// Process input from a reader (for stdin).
+/// Uses batch reading: reads large chunks (4MB), then processes them in batch
+/// using the fast mmap-based paths, avoiding per-line read_until syscall overhead.
 pub fn process_cut_reader<R: BufRead>(
     mut reader: R,
     cfg: &CutConfig,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = Vec::new();
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB read chunks
+    let line_delim = cfg.line_delim;
+
+    // Read large chunks and process in batch.
+    // We keep a buffer; after processing complete lines, we shift leftover to the front.
+    let mut buf = Vec::with_capacity(CHUNK_SIZE + 4096);
 
     loop {
-        buf.clear();
-        let n = reader.read_until(cfg.line_delim, &mut buf)?;
-        if n == 0 {
+        // Read up to CHUNK_SIZE bytes
+        buf.reserve(CHUNK_SIZE);
+        let read_start = buf.len();
+        unsafe { buf.set_len(read_start + CHUNK_SIZE) };
+        let n = read_fully(&mut reader, &mut buf[read_start..])?;
+        buf.truncate(read_start + n);
+
+        if buf.is_empty() {
             break;
         }
 
-        let has_line_delim = buf.last() == Some(&cfg.line_delim);
-        let line = if has_line_delim {
-            &buf[..buf.len() - 1]
-        } else {
-            &buf[..]
+        if n == 0 {
+            // EOF with leftover data (last line without terminator)
+            process_cut_data(&buf, cfg, out)?;
+            break;
+        }
+
+        // Find the last line delimiter in the buffer so we process complete lines
+        let process_end = match memchr::memrchr(line_delim, &buf) {
+            Some(pos) => pos + 1,
+            None => {
+                // No line delimiter found — keep accumulating
+                continue;
+            }
         };
 
-        let wrote = process_one_line(line, cfg, out)?;
+        // Process the complete lines using the fast batch path
+        process_cut_data(&buf[..process_end], cfg, out)?;
 
-        if wrote {
-            out.write_all(&[cfg.line_delim])?;
+        // Shift leftover to the front for next iteration
+        let leftover_len = buf.len() - process_end;
+        if leftover_len > 0 {
+            buf.copy_within(process_end.., 0);
         }
+        buf.truncate(leftover_len);
     }
 
     Ok(())
 }
 
-/// Process one line according to the cut config (used by stdin reader path).
+/// Read as many bytes as possible into buf, retrying on partial reads.
 #[inline]
-fn process_one_line(line: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io::Result<bool> {
-    match cfg.mode {
-        CutMode::Fields => cut_fields(
-            line,
-            cfg.delim,
-            cfg.ranges,
-            cfg.complement,
-            cfg.output_delim,
-            cfg.suppress_no_delim,
-            out,
-        ),
-        CutMode::Bytes | CutMode::Characters => {
-            cut_bytes(line, cfg.ranges, cfg.complement, cfg.output_delim, out)
+fn read_fully<R: BufRead>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let n = reader.read(buf)?;
+    if n == buf.len() || n == 0 {
+        return Ok(n);
+    }
+    // Slow path: partial read — retry to fill buffer
+    let mut total = n;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
+    Ok(total)
 }
 
 /// Cut operation mode
