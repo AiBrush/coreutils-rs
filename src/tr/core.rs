@@ -1,17 +1,8 @@
 use std::io::{self, Read, Write};
 
-use rayon::prelude::*;
-
 /// Main processing buffer: 8MB — large enough to amortize write() syscall overhead.
 /// For mmap translate, this determines write chunk size.
 const BUF_SIZE: usize = 8 * 1024 * 1024;
-
-/// Threshold for parallel processing: 4MB.
-/// Below this, rayon thread pool overhead exceeds the benefit.
-const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
-
-/// Chunk size for parallel processing: 4MB per thread.
-const PAR_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Stream buffer: 4MB — process data immediately after each read().
 /// Larger buffers = fewer syscalls = faster on Celeron N5100.
@@ -571,21 +562,8 @@ pub fn translate_mmap(
         return writer.write_all(data);
     }
 
-    // For large inputs, use rayon parallel translation
-    if data.len() >= PAR_THRESHOLD {
-        let mut output = vec![0u8; data.len()];
-        output
-            .par_chunks_mut(PAR_CHUNK)
-            .enumerate()
-            .for_each(|(i, out_chunk)| {
-                let start = i * PAR_CHUNK;
-                let src = &data[start..start + out_chunk.len()];
-                translate_to(src, out_chunk, &table);
-            });
-        return writer.write_all(&output);
-    }
-
-    // Small input: direct translate src -> dst in 8MB chunks
+    // Direct translate src -> dst in 8MB chunks (sequential is faster than parallel
+    // for table-lookup because it's memory-bandwidth-bound, not CPU-bound)
     let buf_size = data.len().min(BUF_SIZE);
     let mut buf = vec![0u8; buf_size];
     for chunk in data.chunks(buf_size) {
@@ -649,63 +627,6 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
     }
 
     let member = build_member_set(delete_chars);
-
-    // For large inputs, use rayon parallel filtering
-    if data.len() >= PAR_THRESHOLD {
-        // Each thread filters its chunk independently, then we write results in order
-        let chunks: Vec<&[u8]> = data.chunks(PAR_CHUNK).collect();
-        let filtered: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut out: Vec<u8> = Vec::with_capacity(chunk.len());
-                let len = chunk.len();
-                let mut i = 0;
-                unsafe {
-                    let outp: *mut u8 = out.as_mut_ptr();
-                    let mut wp = 0;
-                    while i + 8 <= len {
-                        let b0 = *chunk.get_unchecked(i);
-                        let b1 = *chunk.get_unchecked(i + 1);
-                        let b2 = *chunk.get_unchecked(i + 2);
-                        let b3 = *chunk.get_unchecked(i + 3);
-                        let b4 = *chunk.get_unchecked(i + 4);
-                        let b5 = *chunk.get_unchecked(i + 5);
-                        let b6 = *chunk.get_unchecked(i + 6);
-                        let b7 = *chunk.get_unchecked(i + 7);
-                        *outp.add(wp) = b0;
-                        wp += !is_member(&member, b0) as usize;
-                        *outp.add(wp) = b1;
-                        wp += !is_member(&member, b1) as usize;
-                        *outp.add(wp) = b2;
-                        wp += !is_member(&member, b2) as usize;
-                        *outp.add(wp) = b3;
-                        wp += !is_member(&member, b3) as usize;
-                        *outp.add(wp) = b4;
-                        wp += !is_member(&member, b4) as usize;
-                        *outp.add(wp) = b5;
-                        wp += !is_member(&member, b5) as usize;
-                        *outp.add(wp) = b6;
-                        wp += !is_member(&member, b6) as usize;
-                        *outp.add(wp) = b7;
-                        wp += !is_member(&member, b7) as usize;
-                        i += 8;
-                    }
-                    while i < len {
-                        let b = *chunk.get_unchecked(i);
-                        *outp.add(wp) = b;
-                        wp += !is_member(&member, b) as usize;
-                        i += 1;
-                    }
-                    out.set_len(wp);
-                }
-                out
-            })
-            .collect();
-        for chunk in &filtered {
-            writer.write_all(chunk)?;
-        }
-        return Ok(());
-    }
 
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
