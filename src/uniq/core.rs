@@ -359,6 +359,13 @@ fn process_standard_bytes(
         return process_filter_fast_singlepass(data, writer, config, term);
     }
 
+    // Ultra-fast path: count mode with no key extraction.
+    // Single-pass: scan with memchr, count groups inline, emit count-prefixed lines.
+    // Avoids the line_starts Vec allocation (20MB+ for large files).
+    if fast && config.count {
+        return process_count_fast_singlepass(data, writer, config, term);
+    }
+
     // General path: pre-computed line positions for binary search on groups
     let estimated_lines = (data.len() / 40).max(64);
     let mut line_starts: Vec<usize> = Vec::with_capacity(estimated_lines);
@@ -781,6 +788,82 @@ fn process_filter_fast_singlepass(
             writer.write_all(&data[prev_start..prev_end])?;
             writer.write_all(&[term])?;
         }
+    }
+
+    Ok(())
+}
+
+/// Fast single-pass for count mode (-c) with all standard output modes.
+/// Zero line_starts allocation: scans with memchr, counts groups inline,
+/// and writes count-prefixed lines directly.
+fn process_count_fast_singlepass(
+    data: &[u8],
+    writer: &mut impl Write,
+    config: &UniqConfig,
+    term: u8,
+) -> io::Result<()> {
+    let first_term = match memchr::memchr(term, data) {
+        Some(pos) => pos,
+        None => {
+            // Single line: count=1
+            let should_print = match config.mode {
+                OutputMode::Default => true,
+                OutputMode::RepeatedOnly => false,
+                OutputMode::UniqueOnly => true,
+                _ => true,
+            };
+            if should_print {
+                write_count_line(writer, 1, data, term)?;
+            }
+            return Ok(());
+        }
+    };
+
+    let mut prev_start: usize = 0;
+    let mut prev_end: usize = first_term;
+    let mut count: u64 = 1;
+    let mut cur_start = first_term + 1;
+
+    while cur_start < data.len() {
+        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
+            Some(offset) => cur_start + offset,
+            None => data.len(),
+        };
+
+        if lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+            count += 1;
+        } else {
+            // Output previous group with count
+            let should_print = match config.mode {
+                OutputMode::Default => true,
+                OutputMode::RepeatedOnly => count > 1,
+                OutputMode::UniqueOnly => count == 1,
+                _ => true,
+            };
+            if should_print {
+                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+            }
+            prev_start = cur_start;
+            prev_end = cur_end;
+            count = 1;
+        }
+
+        if cur_end < data.len() {
+            cur_start = cur_end + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Output last group
+    let should_print = match config.mode {
+        OutputMode::Default => true,
+        OutputMode::RepeatedOnly => count > 1,
+        OutputMode::UniqueOnly => count == 1,
+        _ => true,
+    };
+    if should_print {
+        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
     }
 
     Ok(())

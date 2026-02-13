@@ -69,6 +69,13 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
                 m.len(),
                 libc::MADV_SEQUENTIAL,
             );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
     }
     mmap
@@ -116,7 +123,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
         // tac uses backward SIMD scan (memrchr_iter) for single-byte separator,
         // so MADV_RANDOM is optimal (no sequential readahead benefit).
         // WILLNEED still helps pre-fault all pages, HUGEPAGE reduces TLB misses.
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             if let FileData::Mmap(ref mmap) = data {
                 unsafe {
@@ -126,6 +133,14 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                         mmap.len(),
                         libc::MADV_WILLNEED,
                     );
+                    // Reduce TLB misses for large files
+                    if mmap.len() >= 2 * 1024 * 1024 {
+                        libc::madvise(
+                            mmap.as_ptr() as *mut libc::c_void,
+                            mmap.len(),
+                            libc::MADV_HUGEPAGE,
+                        );
+                    }
                 }
             }
         }
@@ -153,12 +168,13 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
     had_error
 }
 
-/// Enlarge stdout pipe buffer on Linux for higher throughput.
+/// Enlarge pipe buffers on Linux for higher throughput.
 #[cfg(target_os = "linux")]
-fn enlarge_stdout_pipe() {
+fn enlarge_pipes() {
     const PIPE_SIZE: i32 = 4 * 1024 * 1024;
     unsafe {
-        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE);
+        libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
+        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout
     }
 }
 
@@ -166,7 +182,7 @@ fn main() {
     coreutils_rs::common::reset_sigpipe();
 
     #[cfg(target_os = "linux")]
-    enlarge_stdout_pipe();
+    enlarge_pipes();
 
     let cli = Cli::parse();
 

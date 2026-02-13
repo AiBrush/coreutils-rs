@@ -78,6 +78,13 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
                 m.len(),
                 libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED,
             );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
     }
     mmap
