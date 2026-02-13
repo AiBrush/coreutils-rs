@@ -8,20 +8,20 @@
 
 High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
 
-## Performance (independent benchmarks v0.0.45, Linux x86_64, hyperfine)
+## Performance (independent benchmarks v0.0.47, Linux x86_64, hyperfine)
 
 | Tool | Speedup vs GNU | Benchmark |
 |------|---------------:|-----------|
-| wc | **41.1x** | default 100MB text |
-| uniq | **9.0x** | repetitive 10MB |
-| cut | **6.8x** | -b1-100 10MB CSV |
-| sort | **5.6x** | lexicographic 10MB |
-| tr | **3.4x** | -d lowercase 10MB |
+| wc | **31.2x** | default 100MB text |
+| uniq | **7.3x** | repetitive 10MB |
+| sort | **6.3x** | -r reverse 10MB |
+| cut | **6.2x** | -b1-100 10MB CSV |
 | base64 | **2.9x** | decode 10MB |
-| tac | **2.3x** | reverse 100MB text |
-| b2sum | **1.4x** | single 100MB text |
-| md5sum | **1.1x** | single 100MB text |
-| sha256sum | **1.1x** | single 100MB text |
+| tr | **2.7x** | -d lowercase 10MB |
+| tac | **2.5x** | reverse 100MB text |
+| b2sum | **1.3x** | single 100MB text |
+| sha256sum | **1.0x** | single 100MB text |
+| md5sum | **1.0x** | single 100MB text |
 
 ## Tools
 
