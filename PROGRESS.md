@@ -129,3 +129,17 @@ Each tool is a drop-in replacement with byte-identical GNU output.
 - Hash tools at parity — both use hardware-accelerated implementations (SHA-NI, ASM)
 - tr at ~1.45x — I/O-bound for simple transliteration, parallel for large mmap'd files
 - Parallelism gains are greater on multi-core machines (macOS ARM64 shows higher speedups)
+
+## Optimization Round 6 (perf-round6-a)
+
+### fsort memory + output optimizations:
+- **Uninit radix scatter allocation**: Replaced `vec![(0,0,0); n]` with `Vec::with_capacity + set_len` — avoids ~15ms of zero-fill page faults for the 40MB scatter buffer on large inputs
+- **Single contiguous output buffer**: Replaced N per-thread buffer allocations + N write syscalls with 1 allocation + parallel fill + 1 write. Reduces mmap/brk overhead and memory fragmentation on busy systems
+- **Zero-init elimination**: Applied `Vec::with_capacity + set_len` pattern to all output buffer construction (forward, reverse, index-based, entry-based paths)
+- These optimizations reduce peak memory pressure by avoiding duplicate zero-fill, which is critical for performance under CPU contention (the 9x→4x drop on busy systems)
+
+### fwc -l line counting optimizations:
+- **Removed `populate()`** from mmap — avoids upfront PTE creation overhead (~25K page faults for 100MB) in warm benchmarks. Kernel readahead via MADV_SEQUENTIAL handles page faults on demand.
+- **Added `MADV_WILLNEED`** — triggers aggressive kernel readahead immediately after mmap
+- **Increased parallel chunk min** from 512KB to 1MB — reduces rayon scheduling overhead
+- **Increased streaming fallback buffer** from 256KB to 2MB — matches huge page boundaries
