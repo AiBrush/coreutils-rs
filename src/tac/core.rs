@@ -1,5 +1,7 @@
 use std::io::{self, IoSlice, Write};
 
+use rayon::prelude::*;
+
 /// Max IoSlice entries per write_vectored batch.
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
@@ -8,6 +10,47 @@ const MAX_IOV: usize = 1024;
 /// Below this limit, allocate one output buffer and do a single write_all
 /// instead of building IoSlice vectors and doing multiple writev syscalls.
 const SINGLE_ALLOC_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Minimum data size to trigger parallel record copying (1MB).
+/// Below this, sequential copy is faster than rayon overhead.
+const PARALLEL_TAC_THRESHOLD: usize = 1024 * 1024;
+
+/// Copy records from data into buf at computed offsets.
+/// Uses rayon parallel copy for large data with many records, sequential otherwise.
+/// SAFETY: records must contain valid (start, len) pairs within data bounds.
+/// Offsets must be a prefix sum of record lengths, fitting within buf.
+#[inline]
+fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize)], offsets: &[usize]) {
+    if data.len() >= PARALLEL_TAC_THRESHOLD && records.len() >= 64 {
+        let dst_base = buf.as_mut_ptr() as usize;
+        let src_base = data.as_ptr() as usize;
+
+        // SAFETY: Each record writes to a non-overlapping region of buf.
+        // We pass base addresses as usize (which is Send+Sync) and
+        // reconstruct pointers inside the closure.
+        records.par_iter().zip(offsets.par_iter()).for_each(
+            |(&(src_start, src_len), &dst_off)| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (src_base + src_start) as *const u8,
+                    (dst_base + dst_off) as *mut u8,
+                    src_len,
+                );
+            },
+        );
+    } else {
+        let buf_ptr = buf.as_mut_ptr();
+        let data_ptr = data.as_ptr();
+        for (&(src_start, src_len), &dst_off) in records.iter().zip(offsets.iter()) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data_ptr.add(src_start),
+                    buf_ptr.add(dst_off),
+                    src_len,
+                );
+            }
+        }
+    }
+}
 
 /// Flush a batch of IoSlice entries using write_vectored.
 /// Falls back to individual write_all for each slice if write_vectored
@@ -249,119 +292,155 @@ pub fn tac_string_separator(
 // ============================================================================
 
 /// Single-allocation reverse for after-separator mode (single byte).
-/// Copies reversed records into one contiguous buffer, then single write_all.
-/// Eliminates Vec<IoSlice> allocation, writev batching, and kernel per-iov overhead.
+/// Two-phase approach: Phase 1 scans all separator positions (sequential, SIMD memrchr).
+/// Phase 2 copies records into output buffer in parallel using rayon.
 fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // SAFETY: every byte in [0..data.len()) is written by copy_nonoverlapping below
-    // before being read. Avoids wasted memset for buffers up to 256MB.
-    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(data.len());
-    }
-    let mut wp: usize = 0;
-    let mut end = data.len();
-
-    let Some(mut pos) = memchr::memrchr(sep, data) else {
+    let Some(first_sep) = memchr::memrchr(sep, data) else {
         return out.write_all(data);
     };
 
-    // Trailing content after last separator
-    if pos + 1 < end {
-        let len = end - (pos + 1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(pos + 1),
-                buf.as_mut_ptr().add(wp),
-                len,
-            );
-        }
-        wp += len;
-    }
-    end = pos + 1;
-
-    // Scan backward for remaining separators
+    // Phase 1: Find ALL separator positions using backward SIMD scan.
+    // Collect into Vec in reverse order (last separator first).
+    let mut sep_positions: Vec<usize> = Vec::new();
+    let mut pos = first_sep;
+    sep_positions.push(pos);
     while pos > 0 {
         match memchr::memrchr(sep, &data[..pos]) {
             Some(prev) => {
-                let len = end - (prev + 1);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(prev + 1),
-                        buf.as_mut_ptr().add(wp),
-                        len,
-                    );
-                }
-                wp += len;
-                end = prev + 1;
+                sep_positions.push(prev);
                 pos = prev;
             }
             None => break,
         }
     }
+    // sep_positions is in reverse order: [last_sep, ..., first_sep]
 
-    // First record (from start of data)
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+    // Build record descriptors: (src_start, src_len) in output order (reversed).
+    // Record layout (after-separator mode):
+    //   - Trailing data after last separator (if any)
+    //   - For each separator pair: data[prev+1..cur+1] (includes separator at cur)
+    //   - First record: data[0..first_sep_in_data+1]
+    let num_records = sep_positions.len() + 1 + if first_sep + 1 < data.len() { 1 } else { 0 };
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
+
+    // Trailing content after last separator
+    if first_sep + 1 < data.len() {
+        records.push((first_sep + 1, data.len() - (first_sep + 1)));
     }
-    wp += end;
 
-    out.write_all(&buf[..wp])
+    // Records between separators (sep_positions is already in reverse = output order)
+    for i in 0..sep_positions.len() {
+        let cur_sep = sep_positions[i];
+        let prev_end = if i + 1 < sep_positions.len() {
+            sep_positions[i + 1] + 1
+        } else {
+            0
+        };
+        let start = prev_end;
+        let end = cur_sep + 1;
+        if end > start {
+            records.push((start, end - start));
+        }
+    }
+
+    // Compute output offsets (prefix sum of record lengths)
+    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
+    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
+    let mut off = 0usize;
+    for &(_, len) in &records {
+        offsets.push(off);
+        off += len;
+    }
+
+    // Allocate output buffer (uninit for speed -- every byte will be written)
+    let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(total_len);
+    }
+
+    // Phase 2: Copy records (parallel for large data, sequential for small).
+    copy_records_to_buf(data, &mut buf, &records, &offsets);
+
+    out.write_all(&buf[..total_len])
 }
 
 /// Single-allocation reverse for before-separator mode (single byte).
+/// Two-phase: scan separators, then parallel copy records.
 fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(data.len());
-    }
-    let mut wp: usize = 0;
-    let mut end = data.len();
-
-    let Some(pos) = memchr::memrchr(sep, data) else {
+    let Some(last_sep) = memchr::memrchr(sep, data) else {
         return out.write_all(data);
     };
 
-    // Last record: from last separator to end
-    let len = end - pos;
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), buf.as_mut_ptr().add(wp), len);
-    }
-    wp += len;
-    end = pos;
-
-    // Scan backward
-    while end > 0 {
-        match memchr::memrchr(sep, &data[..end]) {
+    // Phase 1: Find ALL separator positions using backward SIMD scan.
+    let mut sep_positions: Vec<usize> = Vec::new();
+    let mut pos = last_sep;
+    sep_positions.push(pos);
+    while pos > 0 {
+        match memchr::memrchr(sep, &data[..pos]) {
             Some(prev) => {
-                let len = end - prev;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(prev),
-                        buf.as_mut_ptr().add(wp),
-                        len,
-                    );
-                }
-                wp += len;
-                end = prev;
+                sep_positions.push(prev);
+                pos = prev;
             }
             None => break,
         }
     }
+    // sep_positions is in reverse order: [last_sep, ..., first_sep]
 
-    // Leading content before first separator
-    if end > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+    // Build record descriptors: (src_start, src_len) in output order.
+    // Before-separator mode: each record starts with its separator byte.
+    // Output order: last record first.
+    //   - Last record: data[last_sep..data.len()]
+    //   - Between separators (in reverse): data[sep_i..sep_{i-1 in original order}]
+    //   - Leading content before first separator (if any)
+    let first_sep_in_data = *sep_positions.last().unwrap();
+    let has_leading = first_sep_in_data > 0;
+    let num_records = sep_positions.len() + if has_leading { 1 } else { 0 };
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
+
+    // sep_positions[0] = last_sep, sep_positions[last] = first_sep
+    // Output: last_sep..end, then prev_sep..last_sep, etc.
+    for i in 0..sep_positions.len() {
+        let start = sep_positions[i];
+        let end = if i == 0 {
+            data.len()
+        } else {
+            sep_positions[i - 1]
+        };
+        if end > start {
+            records.push((start, end - start));
         }
-        wp += end;
     }
 
-    out.write_all(&buf[..wp])
+    // Leading content before first separator
+    if has_leading {
+        records.push((0, first_sep_in_data));
+    }
+
+    // Compute output offsets (prefix sum)
+    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
+    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
+    let mut off = 0usize;
+    for &(_, len) in &records {
+        offsets.push(off);
+        off += len;
+    }
+
+    // Allocate output buffer
+    let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(total_len);
+    }
+
+    // Phase 2: Copy records (parallel for large data, sequential for small).
+    copy_records_to_buf(data, &mut buf, &records, &offsets);
+
+    out.write_all(&buf[..total_len])
 }
 
 /// Single-allocation reverse for string separator, after mode.
+/// Two-phase: scan separator positions, then parallel copy.
 fn tac_string_backward_after_alloc(
     data: &[u8],
     separator: &[u8],
@@ -369,118 +448,133 @@ fn tac_string_backward_after_alloc(
 ) -> io::Result<()> {
     let sep_len = separator.len();
     let finder = memchr::memmem::FinderRev::new(separator);
-    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(data.len());
-    }
-    let mut wp: usize = 0;
-    let mut end = data.len();
 
-    let Some(mut pos) = finder.rfind(data) else {
+    let Some(first_sep) = finder.rfind(data) else {
         return out.write_all(data);
     };
 
-    // Trailing content after last separator
-    if pos + sep_len < end {
-        let src_start = pos + sep_len;
-        let len = end - src_start;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(src_start),
-                buf.as_mut_ptr().add(wp),
-                len,
-            );
-        }
-        wp += len;
-    }
-    end = pos + sep_len;
-
-    // Scan backward
+    // Phase 1: Find all separator positions (reverse order)
+    let mut sep_positions: Vec<usize> = Vec::new();
+    let mut pos = first_sep;
+    sep_positions.push(pos);
     while pos > 0 {
         match finder.rfind(&data[..pos]) {
             Some(prev) => {
-                let src_start = prev + sep_len;
-                let len = end - src_start;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(src_start),
-                        buf.as_mut_ptr().add(wp),
-                        len,
-                    );
-                }
-                wp += len;
-                end = prev + sep_len;
+                sep_positions.push(prev);
                 pos = prev;
             }
             None => break,
         }
     }
 
-    // First record
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
-    }
-    wp += end;
+    // Build record descriptors in output order (reversed)
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(sep_positions.len() + 2);
 
-    out.write_all(&buf[..wp])
+    // Trailing content after last separator
+    if first_sep + sep_len < data.len() {
+        records.push((first_sep + sep_len, data.len() - (first_sep + sep_len)));
+    }
+
+    // Records between separators
+    for i in 0..sep_positions.len() {
+        let cur_sep = sep_positions[i];
+        let prev_end = if i + 1 < sep_positions.len() {
+            sep_positions[i + 1] + sep_len
+        } else {
+            0
+        };
+        let end = cur_sep + sep_len;
+        if end > prev_end {
+            records.push((prev_end, end - prev_end));
+        }
+    }
+
+    // Compute output offsets and total
+    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
+    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
+    let mut off = 0usize;
+    for &(_, len) in &records {
+        offsets.push(off);
+        off += len;
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(total_len);
+    }
+
+    copy_records_to_buf(data, &mut buf, &records, &offsets);
+
+    out.write_all(&buf[..total_len])
 }
 
 /// Single-allocation reverse for string separator, before mode.
+/// Two-phase: scan separator positions, then parallel copy.
 fn tac_string_backward_before_alloc(
     data: &[u8],
     separator: &[u8],
     out: &mut impl Write,
 ) -> io::Result<()> {
     let finder = memchr::memmem::FinderRev::new(separator);
-    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(data.len());
-    }
-    let mut wp: usize = 0;
-    let mut end = data.len();
 
-    let Some(pos) = finder.rfind(data) else {
+    let Some(last_sep) = finder.rfind(data) else {
         return out.write_all(data);
     };
 
-    // Last record: from last separator to end
-    let len = end - pos;
-    unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), buf.as_mut_ptr().add(wp), len);
-    }
-    wp += len;
-    end = pos;
-
-    // Scan backward
-    while end > 0 {
-        match finder.rfind(&data[..end]) {
+    // Phase 1: Find all separator positions (reverse order)
+    let mut sep_positions: Vec<usize> = Vec::new();
+    let mut pos = last_sep;
+    sep_positions.push(pos);
+    while pos > 0 {
+        match finder.rfind(&data[..pos]) {
             Some(prev) => {
-                let len = end - prev;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(prev),
-                        buf.as_mut_ptr().add(wp),
-                        len,
-                    );
-                }
-                wp += len;
-                end = prev;
+                sep_positions.push(prev);
+                pos = prev;
             }
             None => break,
         }
     }
 
-    // Leading content before first separator
-    if end > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+    // Build record descriptors in output order
+    let first_sep_in_data = *sep_positions.last().unwrap();
+    let has_leading = first_sep_in_data > 0;
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(sep_positions.len() + 1);
+
+    for i in 0..sep_positions.len() {
+        let start = sep_positions[i];
+        let end = if i == 0 {
+            data.len()
+        } else {
+            sep_positions[i - 1]
+        };
+        if end > start {
+            records.push((start, end - start));
         }
-        wp += end;
     }
 
-    out.write_all(&buf[..wp])
+    if has_leading {
+        records.push((0, first_sep_in_data));
+    }
+
+    // Compute output offsets and total
+    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
+    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
+    let mut off = 0usize;
+    for &(_, len) in &records {
+        offsets.push(off);
+        off += len;
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(total_len);
+    }
+
+    copy_records_to_buf(data, &mut buf, &records, &offsets);
+
+    out.write_all(&buf[..total_len])
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
