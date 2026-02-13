@@ -1,9 +1,12 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IoSlice, Write};
 
 /// Minimum file size for parallel processing (2MB).
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Max iovec entries per writev call (Linux default).
+const MAX_IOV: usize = 1024;
 
 /// Configuration for cut operations.
 pub struct CutConfig<'a> {
@@ -154,6 +157,39 @@ unsafe fn buf_push(buf: &mut Vec<u8>, b: u8) {
     }
 }
 
+/// Write multiple IoSlice buffers using write_vectored (writev syscall).
+/// Batches into MAX_IOV-sized groups. Falls back to write_all per slice for partial writes.
+#[inline]
+fn write_ioslices(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
+    if slices.is_empty() {
+        return Ok(());
+    }
+    for batch in slices.chunks(MAX_IOV) {
+        let total: usize = batch.iter().map(|s| s.len()).sum();
+        match out.write_vectored(batch) {
+            Ok(n) if n >= total => continue,
+            Ok(mut written) => {
+                // Partial write: fall back to write_all per remaining slice
+                for slice in batch {
+                    let slen = slice.len();
+                    if written >= slen {
+                        written -= slen;
+                        continue;
+                    }
+                    if written > 0 {
+                        out.write_all(&slice[written..])?;
+                        written = 0;
+                    } else {
+                        out.write_all(slice)?;
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 // ── Chunk splitting for parallel processing ──────────────────────────────
 
 /// Split data into chunks aligned to line boundaries for parallel processing.
@@ -284,11 +320,13 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
         process_fields_chunk(
@@ -419,11 +457,13 @@ fn process_single_field(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len() / 4);
         process_single_field_chunk(data, delim, target_idx, line_delim, suppress, &mut buf);
@@ -457,11 +497,13 @@ fn process_complement_single_field(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
         complement_single_field_chunk(data, delim, skip_idx, line_delim, suppress, &mut buf);
@@ -571,11 +613,13 @@ fn process_fields_prefix(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else if !suppress {
         // Zero-copy fast path: scan for truncation points, write runs from source.
         // When suppress is false, every line is output (with or without delimiter).
@@ -751,11 +795,13 @@ fn process_fields_suffix(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
         fields_suffix_chunk(data, delim, line_delim, start_field, suppress, &mut buf);
@@ -1111,8 +1157,12 @@ fn extract_fields_to_buf(
         return;
     }
 
-    // Reserve enough: output line <= input line + output delimiters + line terminator
-    buf.reserve(len + output_delim.len() * 16 + 1);
+    // Only reserve if remaining capacity is insufficient. The caller pre-sizes the
+    // buffer to data.len(), so this check avoids redundant reserve() calls per line.
+    let needed = len + output_delim.len() * 16 + 1;
+    if buf.capacity() - buf.len() < needed {
+        buf.reserve(needed);
+    }
 
     let mut field_num: usize = 1;
     let mut field_start: usize = 0;
@@ -1186,11 +1236,13 @@ fn process_bytes_from_start(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         // Zero-copy path: track contiguous output runs and write directly from source.
         // For lines <= max_bytes, we include them as-is (no copy needed).
@@ -1294,11 +1346,13 @@ fn process_bytes_from_offset(
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         // Zero-copy: write suffix of each line directly from source
         bytes_from_offset_zerocopy(data, skip_bytes, line_delim, out)?;
@@ -1307,6 +1361,8 @@ fn process_bytes_from_offset(
 }
 
 /// Zero-copy byte-offset extraction: writes suffix of each line directly from source data.
+/// Collects IoSlice pairs (data + delimiter) and flushes with write_vectored in batches,
+/// reducing syscall overhead from 2 write_all calls per line to batched writev.
 #[inline]
 fn bytes_from_offset_zerocopy(
     data: &[u8],
@@ -1314,21 +1370,32 @@ fn bytes_from_offset_zerocopy(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    let delim_buf = [line_delim];
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(256);
+
     let mut start = 0;
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         if line_len > skip_bytes {
-            out.write_all(&data[start + skip_bytes..pos])?;
+            iov.push(IoSlice::new(&data[start + skip_bytes..pos]));
         }
-        out.write_all(&[line_delim])?;
+        iov.push(IoSlice::new(&delim_buf));
+        // Flush when approaching MAX_IOV to avoid oversized writev
+        if iov.len() >= MAX_IOV - 1 {
+            write_ioslices(out, &iov)?;
+            iov.clear();
+        }
         start = pos + 1;
     }
     if start < data.len() {
         let line_len = data.len() - start;
         if line_len > skip_bytes {
-            out.write_all(&data[start + skip_bytes..data.len()])?;
+            iov.push(IoSlice::new(&data[start + skip_bytes..data.len()]));
         }
-        out.write_all(&[line_delim])?;
+        iov.push(IoSlice::new(&delim_buf));
+    }
+    if !iov.is_empty() {
+        write_ioslices(out, &iov)?;
     }
     Ok(())
 }
@@ -1405,11 +1472,13 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
                 buf
             })
             .collect();
-        for result in &results {
-            if !result.is_empty() {
-                out.write_all(result)?;
-            }
-        }
+        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
         process_bytes_chunk(data, ranges, complement, output_delim, line_delim, &mut buf);
