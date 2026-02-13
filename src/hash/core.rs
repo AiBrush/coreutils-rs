@@ -232,9 +232,8 @@ fn open_noatime(path: &Path) -> io::Result<File> {
 #[cfg(target_os = "linux")]
 const FADVISE_MIN_SIZE: u64 = 1024 * 1024;
 
-/// Hash a file by path. Uses streaming read with sequential fadvise hint.
-/// Streaming avoids MAP_POPULATE blocking (pre-faults all pages upfront)
-/// and mmap setup/teardown overhead for small files.
+/// Hash a file by path. Uses mmap for large files (zero-copy, no read() syscalls)
+/// and streaming read as fallback for small files or non-regular files.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
@@ -244,7 +243,37 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
         return Ok(hash_bytes(algo, &[]));
     }
 
-    // Only hint kernel for files large enough to benefit from readahead
+    if file_size > 0 && metadata.file_type().is_file() {
+        // mmap for large files — zero-copy, eliminates multiple read() syscalls
+        if file_size >= 1024 * 1024 {
+            #[cfg(target_os = "linux")]
+            if file_size >= FADVISE_MIN_SIZE {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(
+                        file.as_raw_fd(),
+                        0,
+                        file_size as i64,
+                        libc::POSIX_FADV_SEQUENTIAL,
+                    );
+                }
+            }
+            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise(memmap2::Advice::Sequential);
+                    if file_size >= 2 * 1024 * 1024 {
+                        let _ = mmap.advise(memmap2::Advice::HugePage);
+                    }
+                }
+                return Ok(hash_bytes(algo, &mmap));
+            }
+        }
+        // Small files: single read into thread-local buffer (avoids mmap setup overhead)
+        // Falls through to streaming reader which handles this efficiently
+    }
+
+    // Non-regular files or fallback: stream
     #[cfg(target_os = "linux")]
     if file_size >= FADVISE_MIN_SIZE {
         use std::os::unix::io::AsRawFd;
@@ -252,7 +281,6 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
     }
-
     hash_reader(algo, file)
 }
 
@@ -348,7 +376,7 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
 }
 
 /// Hash a file with BLAKE2b variable output length.
-/// Uses streaming read with sequential fadvise for overlapped I/O.
+/// Uses mmap for large files (zero-copy), streaming read as fallback.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
@@ -358,7 +386,36 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
         return Ok(blake2b_hash_data(&[], output_bytes));
     }
 
-    // Only hint kernel for files large enough to benefit from readahead
+    if file_size > 0 && metadata.file_type().is_file() {
+        // mmap for large files — zero-copy, eliminates multiple read() syscalls
+        if file_size >= 1024 * 1024 {
+            #[cfg(target_os = "linux")]
+            if file_size >= FADVISE_MIN_SIZE {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(
+                        file.as_raw_fd(),
+                        0,
+                        file_size as i64,
+                        libc::POSIX_FADV_SEQUENTIAL,
+                    );
+                }
+            }
+            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise(memmap2::Advice::Sequential);
+                    if file_size >= 2 * 1024 * 1024 {
+                        let _ = mmap.advise(memmap2::Advice::HugePage);
+                    }
+                }
+                return Ok(blake2b_hash_data(&mmap, output_bytes));
+            }
+        }
+        // Small files: fall through to streaming reader
+    }
+
+    // Non-regular files or fallback: stream
     #[cfg(target_os = "linux")]
     if file_size >= FADVISE_MIN_SIZE {
         use std::os::unix::io::AsRawFd;
@@ -366,7 +423,6 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
     }
-
     blake2b_hash_reader(file, output_bytes)
 }
 
