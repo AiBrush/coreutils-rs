@@ -83,9 +83,10 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
     write_all_vectored(out, &iov)
 }
 
-/// Encode with line wrapping — fused encode+wrap in a single output buffer.
-/// Encodes aligned input chunks, then interleaves newlines directly into
-/// a single output buffer, eliminating the separate wrap pass.
+/// Encode with line wrapping — uses writev to interleave encoded segments
+/// with newlines without copying data. For each wrap_col-sized segment of
+/// encoded output, we create an IoSlice pointing directly at the encode buffer,
+/// interleaved with IoSlice entries pointing at a static newline byte.
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     // Calculate bytes_per_line: input bytes that produce exactly wrap_col encoded chars.
     // For default wrap_col=76: 76*3/4 = 57 bytes per line.
@@ -97,13 +98,11 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 
     // Parallel encoding for large data when bytes_per_line is a multiple of 3.
     // This guarantees each chunk encodes to complete base64 without padding.
-    if data.len() >= PARALLEL_ENCODE_THRESHOLD && bytes_per_line.is_multiple_of(3) {
+    if data.len() >= PARALLEL_ENCODE_THRESHOLD && bytes_per_line % 3 == 0 {
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
     // Align input chunk to bytes_per_line for complete output lines.
-    // Use 32MB chunks — large enough to process most files in a single pass,
-    // reducing write() syscalls.
     let lines_per_chunk = (32 * 1024 * 1024) / bytes_per_line;
     let max_input_chunk = (lines_per_chunk * bytes_per_line).max(bytes_per_line);
     let input_chunk = max_input_chunk.min(data.len());
@@ -115,29 +114,123 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         encode_buf.set_len(enc_max);
     }
 
-    // Fused output buffer: holds encoded data with newlines interleaved
-    let max_lines = enc_max / wrap_col + 2;
-    let fused_max = enc_max + max_lines;
-    let mut fused_buf: Vec<u8> = Vec::with_capacity(fused_max);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        fused_buf.set_len(fused_max);
-    }
-
     for chunk in data.chunks(max_input_chunk.max(1)) {
         let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
         let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
 
-        // Fuse: copy encoded data into fused_buf with newlines interleaved
-        let wp = fuse_wrap(encoded, wrap_col, &mut fused_buf);
-        out.write_all(&fused_buf[..wp])?;
+        // Use writev: build IoSlice entries pointing at wrap_col-sized segments
+        // of the encoded buffer interleaved with newline IoSlices.
+        // This eliminates the fused_buf copy entirely.
+        write_wrapped_iov(encoded, wrap_col, out)?;
     }
 
     Ok(())
 }
 
+/// Static newline byte for IoSlice references in writev calls.
+static NEWLINE: [u8; 1] = [b'\n'];
+
+/// Write encoded base64 data with line wrapping using write_vectored (writev).
+/// Builds IoSlice entries pointing at wrap_col-sized segments of the encoded buffer,
+/// interleaved with newline IoSlices, then writes in batches of MAX_WRITEV_IOV.
+/// This is zero-copy: no fused output buffer needed.
+#[inline]
+fn write_wrapped_iov(encoded: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
+    // Max IoSlice entries per writev batch. Linux UIO_MAXIOV is 1024.
+    // Each line needs 2 entries (data + newline), so 512 lines per batch.
+    const MAX_IOV: usize = 1024;
+
+    let num_full_lines = encoded.len() / wrap_col;
+    let remainder = encoded.len() % wrap_col;
+    let total_iov = num_full_lines * 2 + if remainder > 0 { 2 } else { 0 };
+
+    // Small output: build all IoSlices and write in one call
+    if total_iov <= MAX_IOV {
+        let mut iov: Vec<io::IoSlice> = Vec::with_capacity(total_iov);
+        let mut pos = 0;
+        for _ in 0..num_full_lines {
+            iov.push(io::IoSlice::new(&encoded[pos..pos + wrap_col]));
+            iov.push(io::IoSlice::new(&NEWLINE));
+            pos += wrap_col;
+        }
+        if remainder > 0 {
+            iov.push(io::IoSlice::new(&encoded[pos..pos + remainder]));
+            iov.push(io::IoSlice::new(&NEWLINE));
+        }
+        return write_all_vectored(out, &iov);
+    }
+
+    // Large output: write in batches
+    let mut iov: Vec<io::IoSlice> = Vec::with_capacity(MAX_IOV);
+    let mut pos = 0;
+    for _ in 0..num_full_lines {
+        iov.push(io::IoSlice::new(&encoded[pos..pos + wrap_col]));
+        iov.push(io::IoSlice::new(&NEWLINE));
+        pos += wrap_col;
+        if iov.len() >= MAX_IOV {
+            write_all_vectored(out, &iov)?;
+            iov.clear();
+        }
+    }
+    if remainder > 0 {
+        iov.push(io::IoSlice::new(&encoded[pos..pos + remainder]));
+        iov.push(io::IoSlice::new(&NEWLINE));
+    }
+    if !iov.is_empty() {
+        write_all_vectored(out, &iov)?;
+    }
+    Ok(())
+}
+
+/// Write encoded base64 data with line wrapping using writev, tracking column state
+/// across calls. Used by encode_stream for piped input where chunks don't align
+/// to line boundaries.
+#[inline]
+fn write_wrapped_iov_streaming(
+    encoded: &[u8],
+    wrap_col: usize,
+    col: &mut usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    const MAX_IOV: usize = 1024;
+    let mut iov: Vec<io::IoSlice> = Vec::with_capacity(MAX_IOV);
+    let mut rp = 0;
+
+    while rp < encoded.len() {
+        let space = wrap_col - *col;
+        let avail = encoded.len() - rp;
+
+        if avail <= space {
+            // Remaining data fits in current line
+            iov.push(io::IoSlice::new(&encoded[rp..rp + avail]));
+            *col += avail;
+            if *col == wrap_col {
+                iov.push(io::IoSlice::new(&NEWLINE));
+                *col = 0;
+            }
+            break;
+        } else {
+            // Fill current line and add newline
+            iov.push(io::IoSlice::new(&encoded[rp..rp + space]));
+            iov.push(io::IoSlice::new(&NEWLINE));
+            rp += space;
+            *col = 0;
+        }
+
+        if iov.len() >= MAX_IOV - 1 {
+            write_all_vectored(out, &iov)?;
+            iov.clear();
+        }
+    }
+
+    if !iov.is_empty() {
+        write_all_vectored(out, &iov)?;
+    }
+    Ok(())
+}
+
 /// Parallel wrapped encoding: split at bytes_per_line boundaries, encode + wrap in parallel.
-/// Requires bytes_per_line.is_multiple_of(3) so each chunk encodes without intermediate padding.
+/// Requires bytes_per_line % 3 == 0 so each chunk encodes without intermediate padding.
 /// Uses write_vectored (writev) to send all encoded+wrapped chunks in a single syscall.
 fn encode_wrapped_parallel(
     data: &[u8],
@@ -581,9 +674,9 @@ pub fn encode_stream(
             writer.write_all(encoded)?;
         }
     } else {
-        // Wrapping: fused encode+wrap into a single output buffer.
-        let max_fused = encode_buf_size + (encode_buf_size / wrap_col + 2);
-        let mut fused_buf = vec![0u8; max_fused];
+        // Wrapping: use writev with IoSlice to interleave newlines without copying.
+        // For streaming, we need to track the column position across chunks
+        // because the last encoded chunk may not fill a complete line.
         let mut col = 0usize;
 
         loop {
@@ -594,9 +687,8 @@ pub fn encode_stream(
             let enc_len = BASE64_ENGINE.encoded_length(n);
             let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
 
-            // Build fused output in a single buffer, then one write.
-            let wp = build_fused_output(encoded, wrap_col, &mut col, &mut fused_buf);
-            writer.write_all(&fused_buf[..wp])?;
+            // For streaming wrapping: build IoSlice entries with column tracking
+            write_wrapped_iov_streaming(encoded, wrap_col, &mut col, writer)?;
         }
 
         if col > 0 {
@@ -605,47 +697,6 @@ pub fn encode_stream(
     }
 
     Ok(())
-}
-
-/// Build fused encode+wrap output into a pre-allocated buffer.
-/// Returns the number of bytes written.
-/// Uses unsafe ptr ops to avoid bounds checks in the hot loop.
-#[inline]
-fn build_fused_output(data: &[u8], wrap_col: usize, col: &mut usize, out_buf: &mut [u8]) -> usize {
-    let mut rp = 0;
-    let mut wp = 0;
-    let len = data.len();
-    let src = data.as_ptr();
-    let dst = out_buf.as_mut_ptr();
-
-    while rp < len {
-        let space = wrap_col - *col;
-        let avail = len - rp;
-
-        if avail <= space {
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), avail);
-            }
-            wp += avail;
-            *col += avail;
-            if *col == wrap_col {
-                unsafe { *dst.add(wp) = b'\n' };
-                wp += 1;
-                *col = 0;
-            }
-            break;
-        } else {
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), space);
-                *dst.add(wp + space) = b'\n';
-            }
-            wp += space + 1;
-            rp += space;
-            *col = 0;
-        }
-    }
-
-    wp
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.

@@ -72,9 +72,35 @@ fn main() {
 
     let filename = cli.file.as_deref().unwrap_or("-");
 
-    // Raw fd stdout with BufWriter for batching small writes.
+    // Encode path: write directly to raw fd (chunks are 3MB+, BufWriter is overhead).
+    // Decode path: use BufWriter since decode_clean_slice writes variable-sized chunks.
     #[cfg(unix)]
     let mut raw = raw_stdout();
+
+    // For encode on Unix: write directly to raw fd (our callers write 3MB+ chunks).
+    // For decode: use BufWriter since decode writes variable-sized chunks.
+    #[cfg(unix)]
+    if !cli.decode {
+        let result = if filename == "-" {
+            process_stdin(&cli, &mut *raw)
+        } else {
+            process_file(filename, &cli, &mut *raw)
+        };
+
+        if let Err(e) = result {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            if filename != "-" {
+                eprintln!("base64: {}: {}", filename, io_error_msg(&e));
+            } else {
+                eprintln!("base64: {}", io_error_msg(&e));
+            }
+            process::exit(1);
+        }
+        return;
+    }
+
     #[cfg(unix)]
     let mut out = io::BufWriter::with_capacity(2 * 1024 * 1024, &mut *raw);
     #[cfg(not(unix))]

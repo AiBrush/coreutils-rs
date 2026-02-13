@@ -18,8 +18,8 @@ use rayon::prelude::*;
 use crate::common::io_error_msg;
 
 use super::compare::{
-    compare_with_opts, parse_general_numeric, parse_human_numeric, parse_numeric_value,
-    select_comparator, skip_leading_blanks,
+    compare_with_opts, int_to_sortable_u64, parse_general_numeric, parse_human_numeric,
+    parse_numeric_value, select_comparator, skip_leading_blanks, try_parse_integer,
 };
 use super::key::{KeyDef, KeyOpts, extract_key};
 
@@ -1430,37 +1430,95 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
         write_sorted_entries(data, &offsets, &entries, config, &mut writer, terminator)?;
     } else if is_numeric_only {
-        // FAST PATH 2: Pre-parsed numeric sort with u64 comparison
-        // float_to_sortable_u64 enables branchless u64::cmp instead of f64::partial_cmp
-        // Parallelize numeric parsing for large inputs (parsing is CPU-bound)
-        let mut entries: Vec<(u64, usize)> = if num_lines > 10_000 {
-            offsets
-                .par_iter()
-                .enumerate()
-                .map(|(i, &(s, e))| {
-                    (
-                        float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
-                        i,
-                    )
-                })
-                .collect()
-        } else {
-            offsets
-                .iter()
-                .enumerate()
-                .map(|(i, &(s, e))| {
-                    (
-                        float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
-                        i,
-                    )
-                })
-                .collect()
-        };
+        // FAST PATH 2: Pre-parsed numeric sort with u64 comparison.
+        // For pure -n sort (not -g or -h), try integer-only fast path first:
+        // parse directly to i64 -> sortable u64, avoiding f64 conversion entirely.
         let reverse = gopts.reverse;
         let stable = config.stable;
 
-        // Parallel sort on pre-parsed numeric values (u64-encoded floats).
-        // par_sort scales across cores; radix sort's random writes hurt cache.
+        let mut entries: Vec<(u64, usize)> = if gopts.numeric {
+            // Try integer fast path: parse all values as i64 first.
+            // If any value has a decimal point, fall back to f64 path.
+            let int_entries: Option<Vec<(u64, usize)>> = if num_lines > 10_000 {
+                let results: Vec<Option<(u64, usize)>> = offsets
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, &(s, e))| {
+                        try_parse_integer(&data[s..e])
+                            .map(|v| (int_to_sortable_u64(v), i))
+                    })
+                    .collect();
+                // Check if all parses succeeded (no decimal points)
+                if results.iter().all(|r| r.is_some()) {
+                    Some(results.into_iter().map(|r| r.unwrap()).collect())
+                } else {
+                    None
+                }
+            } else {
+                let mut entries = Vec::with_capacity(num_lines);
+                let mut all_int = true;
+                for (i, &(s, e)) in offsets.iter().enumerate() {
+                    match try_parse_integer(&data[s..e]) {
+                        Some(v) => entries.push((int_to_sortable_u64(v), i)),
+                        None => {
+                            all_int = false;
+                            break;
+                        }
+                    }
+                }
+                if all_int { Some(entries) } else { None }
+            };
+
+            if let Some(entries) = int_entries {
+                entries
+            } else {
+                // Fall back to f64 path
+                if num_lines > 10_000 {
+                    offsets
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, &(s, e))| {
+                            (float_to_sortable_u64(parse_numeric_value(&data[s..e])), i)
+                        })
+                        .collect()
+                } else {
+                    offsets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(s, e))| {
+                            (float_to_sortable_u64(parse_numeric_value(&data[s..e])), i)
+                        })
+                        .collect()
+                }
+            }
+        } else {
+            // General numeric (-g) or human numeric (-h): always use f64
+            if num_lines > 10_000 {
+                offsets
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, &(s, e))| {
+                        (
+                            float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
+                            i,
+                        )
+                    })
+                    .collect()
+            } else {
+                offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(s, e))| {
+                        (
+                            float_to_sortable_u64(parse_value_for_opts(&data[s..e], gopts)),
+                            i,
+                        )
+                    })
+                    .collect()
+            }
+        };
+
+        // Parallel sort on pre-parsed numeric values (u64-encoded floats or ints).
         let cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
             let ord = a.0.cmp(&b.0);
             if ord != Ordering::Equal {
@@ -1506,31 +1564,80 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
         if is_key_numeric {
             // Single key, numeric: u64-based branchless comparison
-            // Parallelize numeric parsing for large inputs
+            // For pure -n (not -g or -h), try integer fast path first.
             let is_gen = opts.general_numeric;
-            let parse_entry = |i: usize, &(s, e): &(usize, usize)| {
-                let f = if s == e {
-                    if is_gen { f64::NAN } else { 0.0 }
-                } else {
-                    parse_value_for_opts(&data[s..e], opts)
-                };
-                (float_to_sortable_u64(f), i)
-            };
-            let mut entries: Vec<(u64, usize)> = if num_lines > 10_000 {
-                key_offs
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, ko)| parse_entry(i, ko))
-                    .collect()
-            } else {
-                key_offs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ko)| parse_entry(i, ko))
-                    .collect()
-            };
+            let is_pure_numeric = opts.numeric && !opts.general_numeric && !opts.human_numeric;
             let reverse = opts.reverse;
             let stable = config.stable;
+
+            let mut entries: Vec<(u64, usize)> = if is_pure_numeric {
+                // Try integer fast path for single-key -n sort
+                let int_entries: Option<Vec<(u64, usize)>> = if num_lines > 10_000 {
+                    let results: Vec<Option<(u64, usize)>> = key_offs
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, &(s, e))| {
+                            if s == e {
+                                Some((int_to_sortable_u64(0), i))
+                            } else {
+                                try_parse_integer(&data[s..e])
+                                    .map(|v| (int_to_sortable_u64(v), i))
+                            }
+                        })
+                        .collect();
+                    if results.iter().all(|r| r.is_some()) {
+                        Some(results.into_iter().map(|r| r.unwrap()).collect())
+                    } else {
+                        None
+                    }
+                } else {
+                    let mut entries = Vec::with_capacity(num_lines);
+                    let mut all_int = true;
+                    for (i, &(s, e)) in key_offs.iter().enumerate() {
+                        if s == e {
+                            entries.push((int_to_sortable_u64(0), i));
+                        } else {
+                            match try_parse_integer(&data[s..e]) {
+                                Some(v) => entries.push((int_to_sortable_u64(v), i)),
+                                None => {
+                                    all_int = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if all_int { Some(entries) } else { None }
+                };
+
+                if let Some(entries) = int_entries {
+                    entries
+                } else {
+                    // Fall back to f64
+                    let parse_entry = |i: usize, &(s, e): &(usize, usize)| {
+                        let f = if s == e { 0.0 } else { parse_numeric_value(&data[s..e]) };
+                        (float_to_sortable_u64(f), i)
+                    };
+                    if num_lines > 10_000 {
+                        key_offs.par_iter().enumerate().map(|(i, ko)| parse_entry(i, ko)).collect()
+                    } else {
+                        key_offs.iter().enumerate().map(|(i, ko)| parse_entry(i, ko)).collect()
+                    }
+                }
+            } else {
+                let parse_entry = |i: usize, &(s, e): &(usize, usize)| {
+                    let f = if s == e {
+                        if is_gen { f64::NAN } else { 0.0 }
+                    } else {
+                        parse_value_for_opts(&data[s..e], opts)
+                    };
+                    (float_to_sortable_u64(f), i)
+                };
+                if num_lines > 10_000 {
+                    key_offs.par_iter().enumerate().map(|(i, ko)| parse_entry(i, ko)).collect()
+                } else {
+                    key_offs.iter().enumerate().map(|(i, ko)| parse_entry(i, ko)).collect()
+                }
+            };
 
             // Parallel sort on single-key numeric values
             let n = entries.len();
