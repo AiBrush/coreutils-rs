@@ -52,8 +52,22 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
 }
 
+/// Enlarge pipe buffers on Linux for higher throughput.
+#[cfg(target_os = "linux")]
+fn enlarge_pipes() {
+    const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+    unsafe {
+        libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
+        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout
+    }
+}
+
 fn main() {
     coreutils_rs::common::reset_sigpipe();
+
+    #[cfg(target_os = "linux")]
+    enlarge_pipes();
+
     let cli = Cli::parse();
 
     let filename = cli.file.as_deref().unwrap_or("-");
@@ -118,6 +132,13 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
                 m.len(),
                 libc::MADV_SEQUENTIAL,
             );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
     }
     mmap

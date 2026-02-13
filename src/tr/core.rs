@@ -826,10 +826,18 @@ fn squeeze_single_stream(
 // Mmap-based functions (zero-copy input from byte slice)
 // ============================================================================
 
+/// Maximum data size for single-allocation translate approach.
+/// Below this limit, translate ALL data into one buffer and do a single write_all.
+/// Above this, use chunked approach to limit memory usage.
+const SINGLE_WRITE_LIMIT: usize = 16 * 1024 * 1024;
+
 /// Translate bytes from an mmap'd byte slice.
 /// Detects single-range translations (e.g., a-z→A-Z) and uses SIMD vectorized
 /// arithmetic (AVX2: 32 bytes/iter, SSE2: 16 bytes/iter) for those cases.
 /// Falls back to scalar 256-byte table lookup for general translations.
+///
+/// For data <= 16MB: single allocation + single write_all (1 syscall).
+/// For data > 16MB: chunked approach to limit memory (N syscalls where N = data/4MB).
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -846,19 +854,31 @@ pub fn translate_mmap(
 
     // Try SIMD fast path for single-range constant-offset translations
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {
-        let buf_size = data.len().min(BUF_SIZE);
-        let mut buf = vec![0u8; buf_size];
-        for chunk in data.chunks(buf_size) {
+        // Single-alloc fast path: one buffer, one write
+        if data.len() <= SINGLE_WRITE_LIMIT {
+            let mut buf = vec![0u8; data.len()];
+            translate_range_simd(data, &mut buf, lo, hi, offset);
+            return writer.write_all(&buf);
+        }
+        // Chunked path for large data
+        let mut buf = vec![0u8; BUF_SIZE];
+        for chunk in data.chunks(BUF_SIZE) {
             translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
             writer.write_all(&buf[..chunk.len()])?;
         }
         return Ok(());
     }
 
-    // General case: scalar table lookup in chunks
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut buf = vec![0u8; buf_size];
-    for chunk in data.chunks(buf_size) {
+    // General case: scalar table lookup
+    // Single-alloc fast path: one buffer, one write
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut buf = vec![0u8; data.len()];
+        translate_to(data, &mut buf, &table);
+        return writer.write_all(&buf);
+    }
+    // Chunked path for large data
+    let mut buf = vec![0u8; BUF_SIZE];
+    for chunk in data.chunks(BUF_SIZE) {
         translate_to(chunk, &mut buf[..chunk.len()], &table);
         writer.write_all(&buf[..chunk.len()])?;
     }
