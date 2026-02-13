@@ -123,58 +123,60 @@ fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) 
 unsafe fn translate_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
     use std::arch::x86_64::*;
 
-    let range = hi - lo;
-    // Bias: shift range so lo maps to -128 (signed min).
-    // For input in [lo, hi]: biased = input + (0x80 - lo) is in [-128, -128+range].
-    // For input < lo: biased wraps to large positive (signed), > threshold.
-    // For input > hi: biased > -128+range, > threshold.
-    let bias_v = _mm256_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
-    let threshold_v = _mm256_set1_epi8(0x80u8.wrapping_add(range) as i8);
-    let offset_v = _mm256_set1_epi8(offset);
-    let zero = _mm256_setzero_si256();
+    unsafe {
+        let range = hi - lo;
+        // Bias: shift range so lo maps to -128 (signed min).
+        // For input in [lo, hi]: biased = input + (0x80 - lo) is in [-128, -128+range].
+        // For input < lo: biased wraps to large positive (signed), > threshold.
+        // For input > hi: biased > -128+range, > threshold.
+        let bias_v = _mm256_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm256_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let offset_v = _mm256_set1_epi8(offset);
+        let zero = _mm256_setzero_si256();
 
-    let len = src.len();
-    let mut i = 0;
+        let len = src.len();
+        let mut i = 0;
 
-    while i + 32 <= len {
-        let input = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
-        let biased = _mm256_add_epi8(input, bias_v);
-        // gt = 0xFF where biased > threshold (OUT of range)
-        let gt = _mm256_cmpgt_epi8(biased, threshold_v);
-        // mask = 0xFF where IN range (NOT gt)
-        let mask = _mm256_cmpeq_epi8(gt, zero);
-        let offset_masked = _mm256_and_si256(mask, offset_v);
-        let result = _mm256_add_epi8(input, offset_masked);
-        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut _, result);
-        i += 32;
-    }
+        while i + 32 <= len {
+            let input = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
+            let biased = _mm256_add_epi8(input, bias_v);
+            // gt = 0xFF where biased > threshold (OUT of range)
+            let gt = _mm256_cmpgt_epi8(biased, threshold_v);
+            // mask = 0xFF where IN range (NOT gt)
+            let mask = _mm256_cmpeq_epi8(gt, zero);
+            let offset_masked = _mm256_and_si256(mask, offset_v);
+            let result = _mm256_add_epi8(input, offset_masked);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut _, result);
+            i += 32;
+        }
 
-    // SSE2 tail for 16-byte remainder
-    if i + 16 <= len {
-        let bias_v128 = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
-        let threshold_v128 = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
-        let offset_v128 = _mm_set1_epi8(offset);
-        let zero128 = _mm_setzero_si128();
+        // SSE2 tail for 16-byte remainder
+        if i + 16 <= len {
+            let bias_v128 = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+            let threshold_v128 = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+            let offset_v128 = _mm_set1_epi8(offset);
+            let zero128 = _mm_setzero_si128();
 
-        let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
-        let biased = _mm_add_epi8(input, bias_v128);
-        let gt = _mm_cmpgt_epi8(biased, threshold_v128);
-        let mask = _mm_cmpeq_epi8(gt, zero128);
-        let offset_masked = _mm_and_si128(mask, offset_v128);
-        let result = _mm_add_epi8(input, offset_masked);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
-    }
+            let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
+            let biased = _mm_add_epi8(input, bias_v128);
+            let gt = _mm_cmpgt_epi8(biased, threshold_v128);
+            let mask = _mm_cmpeq_epi8(gt, zero128);
+            let offset_masked = _mm_and_si128(mask, offset_v128);
+            let result = _mm_add_epi8(input, offset_masked);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
+            i += 16;
+        }
 
-    // Scalar tail
-    while i < len {
-        let b = *src.get_unchecked(i);
-        *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
-            b.wrapping_add(offset as u8)
-        } else {
-            b
-        };
-        i += 1;
+        // Scalar tail
+        while i < len {
+            let b = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
+                b.wrapping_add(offset as u8)
+            } else {
+                b
+            };
+            i += 1;
+        }
     }
 }
 
@@ -183,34 +185,36 @@ unsafe fn translate_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offse
 unsafe fn translate_range_sse2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
     use std::arch::x86_64::*;
 
-    let range = hi - lo;
-    let bias_v = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
-    let threshold_v = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
-    let offset_v = _mm_set1_epi8(offset);
-    let zero = _mm_setzero_si128();
+    unsafe {
+        let range = hi - lo;
+        let bias_v = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let offset_v = _mm_set1_epi8(offset);
+        let zero = _mm_setzero_si128();
 
-    let len = src.len();
-    let mut i = 0;
+        let len = src.len();
+        let mut i = 0;
 
-    while i + 16 <= len {
-        let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
-        let biased = _mm_add_epi8(input, bias_v);
-        let gt = _mm_cmpgt_epi8(biased, threshold_v);
-        let mask = _mm_cmpeq_epi8(gt, zero);
-        let offset_masked = _mm_and_si128(mask, offset_v);
-        let result = _mm_add_epi8(input, offset_masked);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
-    }
+        while i + 16 <= len {
+            let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
+            let biased = _mm_add_epi8(input, bias_v);
+            let gt = _mm_cmpgt_epi8(biased, threshold_v);
+            let mask = _mm_cmpeq_epi8(gt, zero);
+            let offset_masked = _mm_and_si128(mask, offset_v);
+            let result = _mm_add_epi8(input, offset_masked);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
+            i += 16;
+        }
 
-    while i < len {
-        let b = *src.get_unchecked(i);
-        *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
-            b.wrapping_add(offset as u8)
-        } else {
-            b
-        };
-        i += 1;
+        while i < len {
+            let b = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
+                b.wrapping_add(offset as u8)
+            } else {
+                b
+            };
+            i += 1;
+        }
     }
 }
 
