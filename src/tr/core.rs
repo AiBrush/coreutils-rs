@@ -5,8 +5,8 @@ use rayon::prelude::*;
 /// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Stream buffer: 4MB (L3-cache-friendly).
-const STREAM_BUF: usize = 4 * 1024 * 1024;
+/// Stream buffer: 8MB — larger buffer = fewer read/write syscalls for streaming.
+const STREAM_BUF: usize = 8 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// Below this, single-threaded is faster due to thread pool overhead.
@@ -385,14 +385,19 @@ pub fn translate(
         return translate_range_stream(lo, hi, offset, reader, writer);
     }
 
-    let mut buf = vec![0u8; STREAM_BUF];
+    // General case: use separate src/dst buffers with 8x-unrolled translate_to.
+    // This avoids the read-modify-write cache penalty of in-place translation:
+    // reading and writing the same cache line forces store-to-load forwarding stalls.
+    // With separate buffers, the CPU can pipeline reads from src while writing to dst.
+    let mut src = vec![0u8; STREAM_BUF];
+    let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_full(reader, &mut src)?;
         if n == 0 {
             break;
         }
-        translate_inplace(&mut buf[..n], &table);
-        writer.write_all(&buf[..n])?;
+        translate_to(&src[..n], &mut dst[..n], &table);
+        writer.write_all(&dst[..n])?;
     }
     Ok(())
 }
@@ -442,17 +447,28 @@ pub fn translate_squeeze(
     let table = build_translate_table(set1, set2);
     let squeeze_set = build_member_set(set2);
 
+    // Two-pass optimization for range translations:
+    // Pass 1: SIMD range translate in-place (10x faster than scalar table lookup)
+    // Pass 2: scalar squeeze (inherently sequential due to state dependency)
+    // Even though it's two passes, the translate pass is so much faster with SIMD
+    // that the total is still a net win.
+    let range_info = detect_range_offset(&table);
+
     let mut buf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        translate_inplace(&mut buf[..n], &table);
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        // Pass 1: translate
+        if let Some((lo, hi, offset)) = range_info {
+            translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+        } else {
+            translate_inplace(&mut buf[..n], &table);
+        }
+        // Pass 2: squeeze in-place
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();
@@ -491,12 +507,10 @@ pub fn delete(
     let mut buf = vec![0u8; STREAM_BUF];
 
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();
@@ -686,12 +700,10 @@ pub fn delete_squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();
@@ -731,12 +743,10 @@ pub fn squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();

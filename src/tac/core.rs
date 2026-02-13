@@ -15,6 +15,29 @@ const SINGLE_ALLOC_LIMIT: usize = 256 * 1024 * 1024;
 /// Below this, sequential copy is faster than rayon overhead.
 const PARALLEL_TAC_THRESHOLD: usize = 1024 * 1024;
 
+/// Threshold above which we split output into smaller write chunks.
+/// For very large outputs (> 16MB), a single write_all can stall due to
+/// pipe backpressure or kernel buffer limits. Chunking into 4MB writes
+/// allows the kernel to process data incrementally.
+const CHUNKED_WRITE_THRESHOLD: usize = 16 * 1024 * 1024;
+
+/// Chunk size for chunked output writing.
+const WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Write buf to out, using chunked writes for large buffers to avoid
+/// pipe backpressure stalls.
+#[inline]
+fn write_maybe_chunked(out: &mut impl Write, buf: &[u8]) -> io::Result<()> {
+    if buf.len() > CHUNKED_WRITE_THRESHOLD {
+        for chunk in buf.chunks(WRITE_CHUNK_SIZE) {
+            out.write_all(chunk)?;
+        }
+        Ok(())
+    } else {
+        out.write_all(buf)
+    }
+}
+
 /// Copy records from data into buf at computed offsets.
 /// Uses rayon parallel copy for large data with many records, sequential otherwise.
 /// SAFETY: records must contain valid (start, len) pairs within data bounds.
@@ -362,7 +385,7 @@ fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) ->
     // Phase 2: Copy records (parallel for large data, sequential for small).
     copy_records_to_buf(data, &mut buf, &records, &offsets);
 
-    out.write_all(&buf[..total_len])
+    write_maybe_chunked(out, &buf[..total_len])
 }
 
 /// Single-allocation reverse for before-separator mode (single byte).
@@ -436,7 +459,7 @@ fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -
     // Phase 2: Copy records (parallel for large data, sequential for small).
     copy_records_to_buf(data, &mut buf, &records, &offsets);
 
-    out.write_all(&buf[..total_len])
+    write_maybe_chunked(out, &buf[..total_len])
 }
 
 /// Single-allocation reverse for string separator, after mode.
@@ -506,7 +529,7 @@ fn tac_string_backward_after_alloc(
 
     copy_records_to_buf(data, &mut buf, &records, &offsets);
 
-    out.write_all(&buf[..total_len])
+    write_maybe_chunked(out, &buf[..total_len])
 }
 
 /// Single-allocation reverse for string separator, before mode.
@@ -574,7 +597,7 @@ fn tac_string_backward_before_alloc(
 
     copy_records_to_buf(data, &mut buf, &records, &offsets);
 
-    out.write_all(&buf[..total_len])
+    write_maybe_chunked(out, &buf[..total_len])
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
