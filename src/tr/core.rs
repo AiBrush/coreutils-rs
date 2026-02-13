@@ -13,6 +13,11 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 /// process, and write phases. Larger buffers (4-8MB) cause cache thrashing.
 const STREAM_BUF: usize = 1024 * 1024;
 
+/// Translate stream buffer: 4MB — translate is compute-light (single table lookup
+/// per byte) so the bottleneck is I/O syscalls, not cache pressure. Larger buffer
+/// means fewer read()/write() syscall pairs (3 for 10MB instead of 10).
+const TRANSLATE_STREAM_BUF: usize = 4 * 1024 * 1024;
+
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// Below this, single-threaded is faster due to thread pool overhead.
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
@@ -94,10 +99,28 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
 }
 
 /// Translate bytes in-place using a 256-byte lookup table.
+/// Uses 8x unrolling for better instruction-level parallelism.
 #[inline(always)]
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
-    for b in data.iter_mut() {
-        *b = unsafe { *table.get_unchecked(*b as usize) };
+    let len = data.len();
+    let ptr = data.as_mut_ptr();
+    let mut i = 0;
+    unsafe {
+        while i + 8 <= len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            *ptr.add(i + 1) = *table.get_unchecked(*ptr.add(i + 1) as usize);
+            *ptr.add(i + 2) = *table.get_unchecked(*ptr.add(i + 2) as usize);
+            *ptr.add(i + 3) = *table.get_unchecked(*ptr.add(i + 3) as usize);
+            *ptr.add(i + 4) = *table.get_unchecked(*ptr.add(i + 4) as usize);
+            *ptr.add(i + 5) = *table.get_unchecked(*ptr.add(i + 5) as usize);
+            *ptr.add(i + 6) = *table.get_unchecked(*ptr.add(i + 6) as usize);
+            *ptr.add(i + 7) = *table.get_unchecked(*ptr.add(i + 7) as usize);
+            i += 8;
+        }
+        while i < len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            i += 1;
+        }
     }
 }
 
@@ -618,30 +641,38 @@ pub fn translate(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
 
+    // Check for identity table — pure passthrough (no transformation needed)
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return passthrough_stream(reader, writer);
+    }
+
     // Try SIMD fast path for range translations (in-place, single buffer)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {
         return translate_range_stream(lo, hi, offset, reader, writer);
     }
 
-    // General case: use separate src/dst buffers with 8x-unrolled translate_to.
-    // This avoids the read-modify-write cache penalty of in-place translation:
-    // reading and writing the same cache line forces store-to-load forwarding stalls.
-    // With separate buffers, the CPU can pipeline reads from src while writing to dst.
-    let mut src = vec![0u8; STREAM_BUF];
-    let mut dst = alloc_uninit_vec(STREAM_BUF);
+    // General case: IN-PLACE translation on a SINGLE 4MB buffer.
+    // This halves memory bandwidth vs the old separate src/dst approach:
+    // - Old: read into src (4MB), translate from src→dst (read 4MB + write 4MB), write dst (4MB) = 12MB
+    // - New: read into buf (4MB), translate in-place (read+write 4MB), write buf (4MB) = 8MB
+    // The 8x-unrolled in-place translate avoids store-to-load forwarding stalls
+    // because consecutive reads are 8 bytes apart (sequential), not aliased.
+    // Using 4MB buffer (vs 1MB) reduces syscall count from 10 to 3 for 10MB.
+    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
     loop {
-        let n = read_full(reader, &mut src)?;
+        let n = read_full(reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        translate_to(&src[..n], &mut dst[..n], &table);
-        writer.write_all(&dst[..n])?;
+        translate_inplace(&mut buf[..n], &table);
+        writer.write_all(&buf[..n])?;
     }
     Ok(())
 }
 
 /// Streaming SIMD range translation — single buffer, in-place transform.
-/// Saves 16MB allocation + memcpy vs separate src/dst buffers.
+/// Uses 4MB buffer for fewer syscalls (translate is compute-light).
 fn translate_range_stream(
     lo: u8,
     hi: u8,
@@ -649,13 +680,27 @@ fn translate_range_stream(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
             break;
         }
         translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+        writer.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+/// Pure passthrough: copy stdin to stdout without transformation.
+/// Uses a single 4MB buffer with direct read/write, no processing overhead.
+fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
+    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
+    loop {
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         writer.write_all(&buf[..n])?;
     }
     Ok(())

@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -146,11 +146,18 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // For decode: read directly to Vec — avoids mmap setup + copy overhead.
-        // mmap would require .to_vec() anyway since in-place decode needs owned data.
-        let mut data = Vec::new();
-        io::stdin().lock().read_to_end(&mut data)?;
-        return b64::decode_owned(&mut data, cli.ignore_garbage, out);
+        // Try mmap first for file-redirected stdin (zero-copy + parallel decode)
+        #[cfg(unix)]
+        if let Some(mmap) = try_mmap_stdin() {
+            let mut data = mmap.to_vec();
+            return b64::decode_owned(&mut data, cli.ignore_garbage, out);
+        }
+
+        // For piped stdin: use streaming decode which processes in chunks
+        // with SIMD whitespace stripping, instead of read_to_end() which
+        // does many small allocations via the Vec growth strategy.
+        let mut stdin = io::stdin().lock();
+        return b64::decode_stream(&mut stdin, cli.ignore_garbage, out);
     }
 
     // For encode: try mmap for zero-copy stdin when redirected from a file

@@ -5,9 +5,6 @@ use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Streaming encode chunk: 24MB aligned to 3 bytes.
-const STREAM_ENCODE_CHUNK: usize = 24 * 1024 * 1024 - (24 * 1024 * 1024 % 3);
-
 /// Chunk size for no-wrap encoding: 32MB aligned to 3 bytes.
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
@@ -557,14 +554,19 @@ fn is_base64_char(b: u8) -> bool {
 }
 
 /// Stream-encode from a reader to a writer. Used for stdin processing.
+/// Uses 3MB read chunks (aligned to 3 bytes for padding-free intermediate encoding).
+/// 3MB is optimal for piped input: large enough for good throughput, small enough
+/// that read_full() fills the buffer quickly from pipes (3 reads at 1MB pipe size).
 pub fn encode_stream(
     reader: &mut impl Read,
     wrap_col: usize,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_ENCODE_CHUNK];
+    // 3MB aligned to 3 bytes — sweet spot for pipe throughput
+    const STREAM_READ: usize = 3 * 1024 * 1024;
+    let mut buf = vec![0u8; STREAM_READ];
 
-    let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_ENCODE_CHUNK);
+    let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_READ);
     let mut encode_buf = vec![0u8; encode_buf_size];
 
     if wrap_col == 0 {
@@ -607,30 +609,37 @@ pub fn encode_stream(
 
 /// Build fused encode+wrap output into a pre-allocated buffer.
 /// Returns the number of bytes written.
+/// Uses unsafe ptr ops to avoid bounds checks in the hot loop.
 #[inline]
 fn build_fused_output(data: &[u8], wrap_col: usize, col: &mut usize, out_buf: &mut [u8]) -> usize {
     let mut rp = 0;
     let mut wp = 0;
+    let len = data.len();
+    let src = data.as_ptr();
+    let dst = out_buf.as_mut_ptr();
 
-    while rp < data.len() {
+    while rp < len {
         let space = wrap_col - *col;
-        let avail = data.len() - rp;
+        let avail = len - rp;
 
         if avail <= space {
-            out_buf[wp..wp + avail].copy_from_slice(&data[rp..rp + avail]);
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), avail);
+            }
             wp += avail;
             *col += avail;
             if *col == wrap_col {
-                out_buf[wp] = b'\n';
+                unsafe { *dst.add(wp) = b'\n' };
                 wp += 1;
                 *col = 0;
             }
             break;
         } else {
-            out_buf[wp..wp + space].copy_from_slice(&data[rp..rp + space]);
-            wp += space;
-            out_buf[wp] = b'\n';
-            wp += 1;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), space);
+                *dst.add(wp + space) = b'\n';
+            }
+            wp += space + 1;
             rp += space;
             *col = 0;
         }
@@ -650,8 +659,11 @@ pub fn decode_stream(
 ) -> io::Result<()> {
     const READ_CHUNK: usize = 16 * 1024 * 1024;
     let mut buf = vec![0u8; READ_CHUNK];
-    let mut clean = Vec::with_capacity(READ_CHUNK);
-    let mut carry: Vec<u8> = Vec::with_capacity(4);
+    // Pre-allocate clean buffer once and reuse across iterations.
+    // Use Vec with set_len for zero-overhead reset instead of clear() + extend().
+    let mut clean: Vec<u8> = Vec::with_capacity(READ_CHUNK + 4);
+    let mut carry = [0u8; 4];
+    let mut carry_len = 0usize;
 
     loop {
         let n = read_full(reader, &mut buf)?;
@@ -659,27 +671,33 @@ pub fn decode_stream(
             break;
         }
 
-        // Fused: build clean buffer from carry-over + stripped chunk in one pass
-        clean.clear();
-        clean.extend_from_slice(&carry);
-        carry.clear();
+        // Copy carry bytes to start of clean buffer (0-3 bytes from previous chunk)
+        unsafe {
+            std::ptr::copy_nonoverlapping(carry.as_ptr(), clean.as_mut_ptr(), carry_len);
+        }
 
         let chunk = &buf[..n];
         if ignore_garbage {
-            clean.extend(chunk.iter().copied().filter(|&b| is_base64_char(b)));
+            // Scalar filter for ignore_garbage mode (rare path)
+            let dst = unsafe { clean.as_mut_ptr().add(carry_len) };
+            let mut wp = 0usize;
+            for &b in chunk {
+                if is_base64_char(b) {
+                    unsafe { *dst.add(wp) = b };
+                    wp += 1;
+                }
+            }
+            unsafe { clean.set_len(carry_len + wp) };
         } else {
             // SIMD gap-copy: use memchr2 to find \n and \r positions, then copy
             // the gaps between them. For typical base64 (76-char lines), newlines
             // are ~1/77 of the data, so we process ~76 bytes per memchr hit
             // instead of 1 byte per scalar iteration.
-            clean.reserve(n);
-            let base_len = clean.len();
-            let dst = unsafe { clean.as_mut_ptr().add(base_len) };
+            let dst = unsafe { clean.as_mut_ptr().add(carry_len) };
             let mut wp = 0usize;
             let mut gap_start = 0usize;
 
             for pos in memchr::memchr2_iter(b'\n', b'\r', chunk) {
-                // Copy the gap before this \n or \r
                 let gap_len = pos - gap_start;
                 if gap_len > 0 {
                     unsafe {
@@ -693,7 +711,6 @@ pub fn decode_stream(
                 }
                 gap_start = pos + 1;
             }
-            // Copy the final gap after the last \n/\r
             let tail_len = n - gap_start;
             if tail_len > 0 {
                 unsafe {
@@ -705,21 +722,19 @@ pub fn decode_stream(
                 }
                 wp += tail_len;
             }
-            unsafe { clean.set_len(base_len + wp) };
+            let total_clean = carry_len + wp;
+            unsafe { clean.set_len(total_clean) };
 
             // Second pass for rare whitespace (tab, space, VT, FF) using lookup table.
             // In typical base64 streams this does nothing, but we need correctness.
-            let has_rare_ws = clean[base_len..]
+            let has_rare_ws = clean[carry_len..total_clean]
                 .iter()
                 .any(|&b| !NOT_WHITESPACE[b as usize]);
             if has_rare_ws {
-                // Compact in-place within the clean region we just wrote
-                let start = base_len;
-                let end = clean.len();
                 let ptr = clean.as_mut_ptr();
-                let mut rp = start;
-                let mut cwp = start;
-                while rp < end {
+                let mut rp = carry_len;
+                let mut cwp = carry_len;
+                while rp < total_clean {
                     let b = unsafe { *ptr.add(rp) };
                     if NOT_WHITESPACE[b as usize] {
                         unsafe { *ptr.add(cwp) = b };
@@ -731,6 +746,7 @@ pub fn decode_stream(
             }
         }
 
+        carry_len = 0;
         let is_last = n < READ_CHUNK;
 
         if is_last {
@@ -738,9 +754,18 @@ pub fn decode_stream(
             decode_clean_slice(&mut clean, writer)?;
         } else {
             // Save incomplete base64 quadruplet for next iteration
-            let decode_len = (clean.len() / 4) * 4;
-            if decode_len < clean.len() {
-                carry.extend_from_slice(&clean[decode_len..]);
+            let clean_len = clean.len();
+            let decode_len = (clean_len / 4) * 4;
+            let leftover = clean_len - decode_len;
+            if leftover > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        clean.as_ptr().add(decode_len),
+                        carry.as_mut_ptr(),
+                        leftover,
+                    );
+                }
+                carry_len = leftover;
             }
             if decode_len > 0 {
                 clean.truncate(decode_len);
@@ -750,8 +775,9 @@ pub fn decode_stream(
     }
 
     // Handle any remaining carry-over bytes
-    if !carry.is_empty() {
-        decode_clean_slice(&mut carry, writer)?;
+    if carry_len > 0 {
+        let mut carry_buf = carry[..carry_len].to_vec();
+        decode_clean_slice(&mut carry_buf, writer)?;
     }
 
     Ok(())
