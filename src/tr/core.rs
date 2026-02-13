@@ -1314,26 +1314,28 @@ fn delete_single_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut src = vec![0u8; STREAM_BUF];
+    let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_full(reader, &mut src)?;
         if n == 0 {
             break;
         }
+        // Use memchr to find byte positions, gap-copy to separate dst buffer.
+        // Separate src/dst allows copy_nonoverlapping (faster than memmove)
+        // and avoids aliasing concerns in the hot loop.
         let mut wp = 0;
         let mut i = 0;
         while i < n {
-            match memchr::memchr(ch, &buf[i..n]) {
+            match memchr::memchr(ch, &src[i..n]) {
                 Some(offset) => {
                     if offset > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    offset,
-                                );
-                            }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(i),
+                                dst.as_mut_ptr().add(wp),
+                                offset,
+                            );
                         }
                         wp += offset;
                     }
@@ -1342,14 +1344,12 @@ fn delete_single_streaming(
                 None => {
                     let run_len = n - i;
                     if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(i),
+                                dst.as_mut_ptr().add(wp),
+                                run_len,
+                            );
                         }
                         wp += run_len;
                     }
@@ -1357,7 +1357,12 @@ fn delete_single_streaming(
                 }
             }
         }
-        writer.write_all(&buf[..wp])?;
+        // If nothing was deleted, write from src directly (avoids extra copy)
+        if wp == n {
+            writer.write_all(&src[..n])?;
+        } else if wp > 0 {
+            writer.write_all(&dst[..wp])?;
+        }
     }
     Ok(())
 }
@@ -1367,31 +1372,32 @@ fn delete_multi_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut src = vec![0u8; STREAM_BUF];
+    let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_full(reader, &mut src)?;
         if n == 0 {
             break;
         }
+        // Use memchr2/memchr3 to find byte positions, gap-copy to separate dst buffer.
+        // Separate src/dst allows copy_nonoverlapping (faster than memmove).
         let mut wp = 0;
         let mut i = 0;
         while i < n {
             let found = if chars.len() == 2 {
-                memchr::memchr2(chars[0], chars[1], &buf[i..n])
+                memchr::memchr2(chars[0], chars[1], &src[i..n])
             } else {
-                memchr::memchr3(chars[0], chars[1], chars[2], &buf[i..n])
+                memchr::memchr3(chars[0], chars[1], chars[2], &src[i..n])
             };
             match found {
                 Some(offset) => {
                     if offset > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    offset,
-                                );
-                            }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(i),
+                                dst.as_mut_ptr().add(wp),
+                                offset,
+                            );
                         }
                         wp += offset;
                     }
@@ -1400,14 +1406,12 @@ fn delete_multi_streaming(
                 None => {
                     let run_len = n - i;
                     if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(i),
+                                dst.as_mut_ptr().add(wp),
+                                run_len,
+                            );
                         }
                         wp += run_len;
                     }
@@ -1415,7 +1419,11 @@ fn delete_multi_streaming(
                 }
             }
         }
-        writer.write_all(&buf[..wp])?;
+        if wp == n {
+            writer.write_all(&src[..n])?;
+        } else if wp > 0 {
+            writer.write_all(&dst[..wp])?;
+        }
     }
     Ok(())
 }
