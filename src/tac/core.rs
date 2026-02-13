@@ -1,31 +1,25 @@
 use std::io::{self, Write};
 
-/// Output buffer for buffered record assembly.
-/// 16MB minimizes write() syscall count: ~6 calls for 100MB input,
-/// vs ~1000 writev() calls with scattered IoSlices.
+/// Output buffer: 16MB minimizes write() syscall count.
 const OUT_BUF: usize = 16 * 1024 * 1024;
 
 /// Copy a slice into the output buffer, flushing to the writer when full.
-/// Common path (fits in buffer) uses copy_nonoverlapping for zero overhead.
 #[inline]
 fn emit_slice(out: &mut impl Write, buf: &mut [u8], wp: &mut usize, s: &[u8]) -> io::Result<()> {
     let cap = buf.len();
     if *wp + s.len() <= cap {
-        // Fast path: fits in remaining buffer
         unsafe {
             std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr().add(*wp), s.len());
         }
         *wp += s.len();
         Ok(())
     } else if s.len() > cap {
-        // Oversized slice: flush buffer then write directly
         if *wp > 0 {
             out.write_all(&buf[..*wp])?;
             *wp = 0;
         }
         out.write_all(s)
     } else {
-        // Buffer full: flush then copy to beginning
         out.write_all(&buf[..*wp])?;
         unsafe {
             std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr(), s.len());
@@ -36,48 +30,52 @@ fn emit_slice(out: &mut impl Write, buf: &mut [u8], wp: &mut usize, s: &[u8]) ->
 }
 
 /// Reverse records separated by a single byte.
-/// Uses forward SIMD scan (memchr_iter) to collect separator positions,
-/// then writes records in reverse order using buffered output.
+/// Uses backward SIMD scan (memrchr) — zero Vec allocation, single pass.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-
-    // Forward SIMD scan: collect all separator positions in one pass.
-    let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
     if !before {
-        tac_bytes_after(data, &positions, out)
+        tac_bytes_backward_after(data, separator, out)
     } else {
-        tac_bytes_before(data, &positions, out)
+        tac_bytes_backward_before(data, separator, out)
     }
 }
 
-/// Separator-after mode.
-/// Each record runs from (prev_sep+1) to (cur_sep+1), inclusive of separator.
-/// Copies records into a contiguous output buffer for minimal write() syscalls.
-fn tac_bytes_after(data: &[u8], positions: &[usize], out: &mut impl Write) -> io::Result<()> {
+/// After-separator mode: backward scan with memrchr.
+/// Each record includes its trailing separator byte.
+/// Scans from end to start, emitting records directly — no position Vec needed.
+fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let buf_size = data.len().min(OUT_BUF);
     let mut buf = vec![0u8; buf_size];
     let mut wp = 0;
 
-    let last_sep = *positions.last().unwrap();
+    let mut end = data.len();
 
-    // Trailing content without separator — output first
-    if last_sep + 1 < data.len() {
-        emit_slice(out, &mut buf, &mut wp, &data[last_sep + 1..])?;
+    let Some(mut pos) = memchr::memrchr(sep, data) else {
+        return out.write_all(data);
+    };
+
+    // Trailing content after last separator
+    if pos + 1 < end {
+        emit_slice(out, &mut buf, &mut wp, &data[pos + 1..end])?;
+    }
+    end = pos + 1;
+
+    // Scan backward for remaining separators
+    while pos > 0 {
+        match memchr::memrchr(sep, &data[..pos]) {
+            Some(prev) => {
+                emit_slice(out, &mut buf, &mut wp, &data[prev + 1..end])?;
+                end = prev + 1;
+                pos = prev;
+            }
+            None => break,
+        }
     }
 
-    // Records in reverse order
-    for i in (0..positions.len()).rev() {
-        let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
-        let end = positions[i] + 1;
-        emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
-    }
+    // First record (from start of data)
+    emit_slice(out, &mut buf, &mut wp, &data[0..end])?;
 
     if wp > 0 {
         out.write_all(&buf[..wp])?;
@@ -85,27 +83,37 @@ fn tac_bytes_after(data: &[u8], positions: &[usize], out: &mut impl Write) -> io
     Ok(())
 }
 
-/// Separator-before mode.
-/// Copies records into a contiguous output buffer for minimal write() syscalls.
-fn tac_bytes_before(data: &[u8], positions: &[usize], out: &mut impl Write) -> io::Result<()> {
+/// Before-separator mode: backward scan with memrchr.
+/// Each record starts with its separator byte.
+fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let buf_size = data.len().min(OUT_BUF);
     let mut buf = vec![0u8; buf_size];
     let mut wp = 0;
 
-    // Records in reverse order (each starts with separator)
-    for i in (0..positions.len()).rev() {
-        let start = positions[i];
-        let end = if i + 1 < positions.len() {
-            positions[i + 1]
-        } else {
-            data.len()
-        };
-        emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
+    let mut end = data.len();
+
+    let Some(pos) = memchr::memrchr(sep, data) else {
+        return out.write_all(data);
+    };
+
+    // Last record: from last separator to end
+    emit_slice(out, &mut buf, &mut wp, &data[pos..end])?;
+    end = pos;
+
+    // Scan backward
+    while end > 0 {
+        match memchr::memrchr(sep, &data[..end]) {
+            Some(prev) => {
+                emit_slice(out, &mut buf, &mut wp, &data[prev..end])?;
+                end = prev;
+            }
+            None => break,
+        }
     }
 
     // Leading content before first separator
-    if positions[0] > 0 {
-        emit_slice(out, &mut buf, &mut wp, &data[..positions[0]])?;
+    if end > 0 {
+        emit_slice(out, &mut buf, &mut wp, &data[0..end])?;
     }
 
     if wp > 0 {
@@ -115,7 +123,7 @@ fn tac_bytes_before(data: &[u8], positions: &[usize], out: &mut impl Write) -> i
 }
 
 /// Reverse records using a multi-byte string separator.
-/// Uses SIMD-accelerated memmem for substring search + buffered output.
+/// Uses backward SIMD-accelerated memmem (FinderRev) + buffered output.
 pub fn tac_string_separator(
     data: &[u8],
     separator: &[u8],
@@ -130,48 +138,65 @@ pub fn tac_string_separator(
         return tac_bytes(data, separator[0], before, out);
     }
 
-    // Find all occurrences of the separator using SIMD-accelerated memmem
-    let positions: Vec<usize> = memchr::memmem::find_iter(data, separator).collect();
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
     let sep_len = separator.len();
+    let finder = memchr::memmem::FinderRev::new(separator);
+
     let buf_size = data.len().min(OUT_BUF);
     let mut buf = vec![0u8; buf_size];
     let mut wp = 0;
 
     if !before {
-        let last_end = positions.last().unwrap() + sep_len;
-        if last_end < data.len() {
-            emit_slice(out, &mut buf, &mut wp, &data[last_end..])?;
+        let mut end = data.len();
+
+        let Some(mut pos) = finder.rfind(data) else {
+            return out.write_all(data);
+        };
+
+        // Trailing content after last separator
+        if pos + sep_len < end {
+            emit_slice(out, &mut buf, &mut wp, &data[pos + sep_len..end])?;
         }
-        for i in (0..positions.len()).rev() {
-            let rec_start = if i == 0 {
-                0
-            } else {
-                positions[i - 1] + sep_len
-            };
-            emit_slice(
-                out,
-                &mut buf,
-                &mut wp,
-                &data[rec_start..positions[i] + sep_len],
-            )?;
+        end = pos + sep_len;
+
+        // Scan backward
+        while pos > 0 {
+            match finder.rfind(&data[..pos]) {
+                Some(prev) => {
+                    emit_slice(out, &mut buf, &mut wp, &data[prev + sep_len..end])?;
+                    end = prev + sep_len;
+                    pos = prev;
+                }
+                None => break,
+            }
         }
+
+        // First record
+        emit_slice(out, &mut buf, &mut wp, &data[0..end])?;
     } else {
-        for i in (0..positions.len()).rev() {
-            let start = positions[i];
-            let end = if i + 1 < positions.len() {
-                positions[i + 1]
-            } else {
-                data.len()
-            };
-            emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
+        let mut end = data.len();
+
+        let Some(pos) = finder.rfind(data) else {
+            return out.write_all(data);
+        };
+
+        // Last record: from last separator to end
+        emit_slice(out, &mut buf, &mut wp, &data[pos..end])?;
+        end = pos;
+
+        // Scan backward
+        while end > 0 {
+            match finder.rfind(&data[..end]) {
+                Some(prev) => {
+                    emit_slice(out, &mut buf, &mut wp, &data[prev..end])?;
+                    end = prev;
+                }
+                None => break,
+            }
         }
-        if positions[0] > 0 {
-            emit_slice(out, &mut buf, &mut wp, &data[..positions[0]])?;
+
+        // Leading content before first separator
+        if end > 0 {
+            emit_slice(out, &mut buf, &mut wp, &data[0..end])?;
         }
     }
 

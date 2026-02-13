@@ -1,11 +1,9 @@
 use std::io::{self, Read, Write};
 
-/// Main processing buffer: 32MB — large enough to amortize write() syscall overhead.
-/// Larger chunks = fewer write() syscalls = less kernel overhead.
+/// Main processing buffer: 32MB.
 const BUF_SIZE: usize = 32 * 1024 * 1024;
 
-/// Stream buffer: 16MB — process data immediately after each read().
-/// Larger buffers = fewer syscalls = faster throughput.
+/// Stream buffer: 16MB.
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
@@ -39,18 +37,14 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
 }
 
 /// Translate bytes in-place using a 256-byte lookup table.
-/// The table fits in L1 cache (256 bytes). Uses unchecked indexing
-/// to eliminate bounds checks; LLVM generates a tight scalar loop.
 #[inline(always)]
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
     for b in data.iter_mut() {
-        // SAFETY: *b is u8, always in range 0..256
         *b = unsafe { *table.get_unchecked(*b as usize) };
     }
 }
 
 /// Translate bytes from source to destination using a 256-byte lookup table.
-/// Avoids the memcpy of copy_from_slice by translating directly src -> dst.
 #[inline(always)]
 fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
     debug_assert!(dst.len() >= src.len());
@@ -59,7 +53,6 @@ fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
         let dp = dst.as_mut_ptr();
         let len = src.len();
         let mut i = 0;
-        // Unrolled: process 8 bytes per iteration to reduce loop overhead
         while i + 8 <= len {
             *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
             *dp.add(i + 1) = *table.get_unchecked(*sp.add(i + 1) as usize);
@@ -79,6 +72,161 @@ fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
 }
 
 // ============================================================================
+// SIMD range translation (x86_64)
+// ============================================================================
+
+/// Detect if the translate table is a single contiguous range with constant offset.
+/// Returns Some((lo, hi, offset)) if all non-identity entries form [lo..=hi] with
+/// table[i] = i + offset for all i in [lo, hi].
+#[inline]
+fn detect_range_offset(table: &[u8; 256]) -> Option<(u8, u8, i8)> {
+    let mut lo: Option<u8> = None;
+    let mut hi = 0u8;
+    let mut offset = 0i16;
+
+    for i in 0..256 {
+        if table[i] != i as u8 {
+            let diff = table[i] as i16 - i as i16;
+            match lo {
+                None => {
+                    lo = Some(i as u8);
+                    hi = i as u8;
+                    offset = diff;
+                }
+                Some(_) => {
+                    if diff != offset || i as u8 != hi.wrapping_add(1) {
+                        return None;
+                    }
+                    hi = i as u8;
+                }
+            }
+        }
+    }
+
+    lo.map(|l| (l, hi, offset as i8))
+}
+
+/// SIMD-accelerated range translation for mmap'd data.
+/// For tables where only a contiguous range [lo..=hi] is translated by a constant offset,
+/// uses AVX2 (32 bytes/iter) or SSE2 (16 bytes/iter) vectorized arithmetic.
+#[cfg(target_arch = "x86_64")]
+fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    if is_x86_feature_detected!("avx2") {
+        unsafe { translate_range_avx2(src, dst, lo, hi, offset) };
+    } else {
+        unsafe { translate_range_sse2(src, dst, lo, hi, offset) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn translate_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    use std::arch::x86_64::*;
+
+    let range = hi - lo;
+    // Bias: shift range so lo maps to -128 (signed min).
+    // For input in [lo, hi]: biased = input + (0x80 - lo) is in [-128, -128+range].
+    // For input < lo: biased wraps to large positive (signed), > threshold.
+    // For input > hi: biased > -128+range, > threshold.
+    let bias_v = _mm256_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+    let threshold_v = _mm256_set1_epi8(0x80u8.wrapping_add(range) as i8);
+    let offset_v = _mm256_set1_epi8(offset);
+    let zero = _mm256_setzero_si256();
+
+    let len = src.len();
+    let mut i = 0;
+
+    while i + 32 <= len {
+        let input = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
+        let biased = _mm256_add_epi8(input, bias_v);
+        // gt = 0xFF where biased > threshold (OUT of range)
+        let gt = _mm256_cmpgt_epi8(biased, threshold_v);
+        // mask = 0xFF where IN range (NOT gt)
+        let mask = _mm256_cmpeq_epi8(gt, zero);
+        let offset_masked = _mm256_and_si256(mask, offset_v);
+        let result = _mm256_add_epi8(input, offset_masked);
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut _, result);
+        i += 32;
+    }
+
+    // SSE2 tail for 16-byte remainder
+    if i + 16 <= len {
+        let bias_v128 = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v128 = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let offset_v128 = _mm_set1_epi8(offset);
+        let zero128 = _mm_setzero_si128();
+
+        let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
+        let biased = _mm_add_epi8(input, bias_v128);
+        let gt = _mm_cmpgt_epi8(biased, threshold_v128);
+        let mask = _mm_cmpeq_epi8(gt, zero128);
+        let offset_masked = _mm_and_si128(mask, offset_v128);
+        let result = _mm_add_epi8(input, offset_masked);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
+        i += 16;
+    }
+
+    // Scalar tail
+    while i < len {
+        let b = *src.get_unchecked(i);
+        *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
+            b.wrapping_add(offset as u8)
+        } else {
+            b
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn translate_range_sse2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    use std::arch::x86_64::*;
+
+    let range = hi - lo;
+    let bias_v = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+    let threshold_v = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+    let offset_v = _mm_set1_epi8(offset);
+    let zero = _mm_setzero_si128();
+
+    let len = src.len();
+    let mut i = 0;
+
+    while i + 16 <= len {
+        let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
+        let biased = _mm_add_epi8(input, bias_v);
+        let gt = _mm_cmpgt_epi8(biased, threshold_v);
+        let mask = _mm_cmpeq_epi8(gt, zero);
+        let offset_masked = _mm_and_si128(mask, offset_v);
+        let result = _mm_add_epi8(input, offset_masked);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
+        i += 16;
+    }
+
+    while i < len {
+        let b = *src.get_unchecked(i);
+        *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
+            b.wrapping_add(offset as u8)
+        } else {
+            b
+        };
+        i += 1;
+    }
+}
+
+/// Scalar range translation fallback for non-x86_64.
+#[cfg(not(target_arch = "x86_64"))]
+fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    for (i, &b) in src.iter().enumerate() {
+        dst[i] = if b >= lo && b <= hi {
+            b.wrapping_add(offset as u8)
+        } else {
+            b
+        };
+    }
+}
+
+// ============================================================================
 // Streaming functions (Read + Write)
 // ============================================================================
 
@@ -89,6 +237,12 @@ pub fn translate(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
+
+    // Try SIMD fast path for range translations
+    if let Some((lo, hi, offset)) = detect_range_offset(&table) {
+        return translate_range_stream(lo, hi, offset, reader, writer);
+    }
+
     let mut buf = vec![0u8; STREAM_BUF];
     loop {
         let n = read_full(reader, &mut buf)?;
@@ -97,6 +251,27 @@ pub fn translate(
         }
         translate_inplace(&mut buf[..n], &table);
         writer.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+/// Streaming SIMD range translation.
+fn translate_range_stream(
+    lo: u8,
+    hi: u8,
+    offset: i8,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut inbuf = vec![0u8; STREAM_BUF];
+    let mut outbuf = vec![0u8; STREAM_BUF];
+    loop {
+        let n = read_full(reader, &mut inbuf)?;
+        if n == 0 {
+            break;
+        }
+        translate_range_simd(&inbuf[..n], &mut outbuf[..n], lo, hi, offset);
+        writer.write_all(&outbuf[..n])?;
     }
     Ok(())
 }
@@ -135,9 +310,7 @@ pub fn translate_squeeze(
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        // Phase 1: translate in-place
         translate_inplace(&mut buf[..n], &table);
-        // Phase 2: squeeze in-place compaction (wp <= i always, safe)
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();
@@ -165,18 +338,14 @@ pub fn delete(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // Fast path: single character delete using SIMD memchr
     if delete_chars.len() == 1 {
         return delete_single_streaming(delete_chars[0], reader, writer);
     }
-
-    // Fast paths: 2-3 char delete using SIMD memchr2/memchr3
     if delete_chars.len() <= 3 {
         return delete_multi_streaming(delete_chars, reader, writer);
     }
 
     let member = build_member_set(delete_chars);
-    // Single buffer with in-place compaction — eliminates outbuf allocation + memcpy
     let mut buf = vec![0u8; STREAM_BUF];
 
     loop {
@@ -190,7 +359,6 @@ pub fn delete(
         unsafe {
             let ptr = buf.as_mut_ptr();
             let mut i = 0;
-            // 8-byte unrolled in-place compaction
             while i + 8 <= n {
                 let b0 = *ptr.add(i);
                 let b1 = *ptr.add(i + 1);
@@ -249,7 +417,6 @@ pub fn delete(
     Ok(())
 }
 
-/// Single-character delete from a reader — in-place compaction with SIMD memchr.
 fn delete_single_streaming(
     ch: u8,
     reader: &mut impl Read,
@@ -280,7 +447,7 @@ fn delete_single_streaming(
                         }
                         wp += offset;
                     }
-                    i += offset + 1; // skip the deleted char
+                    i += offset + 1;
                 }
                 None => {
                     let run_len = n - i;
@@ -305,7 +472,6 @@ fn delete_single_streaming(
     Ok(())
 }
 
-/// Multi-character delete (2-3 chars) — in-place compaction with SIMD memchr2/memchr3.
 fn delete_multi_streaming(
     chars: &[u8],
     reader: &mut impl Read,
@@ -374,7 +540,6 @@ pub fn delete_squeeze(
 ) -> io::Result<()> {
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
-    // Single buffer with in-place compaction
     let mut buf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
@@ -415,13 +580,11 @@ pub fn squeeze(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // Fast path: single squeeze char — bulk copy non-match runs
     if squeeze_chars.len() == 1 {
         return squeeze_single_stream(squeeze_chars[0], reader, writer);
     }
 
     let member = build_member_set(squeeze_chars);
-    // Single buffer with in-place compaction — eliminates outbuf allocation + memcpy
     let mut buf = vec![0u8; STREAM_BUF];
     let mut last_squeezed: u16 = 256;
 
@@ -454,7 +617,6 @@ pub fn squeeze(
     Ok(())
 }
 
-/// Squeeze a single character from a stream — in-place compaction with SIMD memchr.
 fn squeeze_single_stream(
     ch: u8,
     reader: &mut impl Read,
@@ -475,7 +637,6 @@ fn squeeze_single_stream(
         let mut i = 0;
 
         while i < n {
-            // Cross-chunk continuation: skip squeeze chars from previous chunk
             if was_squeeze_char && buf[i] == ch {
                 i += 1;
                 while i < n && buf[i] == ch {
@@ -486,7 +647,6 @@ fn squeeze_single_stream(
                 }
             }
 
-            // Find next occurrence of squeeze char using SIMD memchr
             match memchr::memchr(ch, &buf[i..n]) {
                 Some(offset) => {
                     let run_len = offset;
@@ -504,7 +664,6 @@ fn squeeze_single_stream(
                     }
                     i += run_len;
 
-                    // Emit one squeeze char, skip consecutive duplicates
                     unsafe {
                         *buf.as_mut_ptr().add(wp) = ch;
                     }
@@ -545,9 +704,9 @@ fn squeeze_single_stream(
 // ============================================================================
 
 /// Translate bytes from an mmap'd byte slice.
-/// For large inputs (>4MB), uses rayon to translate chunks in parallel across
-/// all cores, then writes the entire buffer at once.
-/// For small inputs, translates directly src -> dst in 8MB sequential chunks.
+/// Detects single-range translations (e.g., a-z→A-Z) and uses SIMD vectorized
+/// arithmetic (AVX2: 32 bytes/iter, SSE2: 16 bytes/iter) for those cases.
+/// Falls back to scalar 256-byte table lookup for general translations.
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -556,14 +715,24 @@ pub fn translate_mmap(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
 
-    // Check if table is identity (no translation needed) — pure passthrough
+    // Check if table is identity — pure passthrough
     let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
     if is_identity {
         return writer.write_all(data);
     }
 
-    // Direct translate src -> dst in 8MB chunks (sequential is faster than parallel
-    // for table-lookup because it's memory-bandwidth-bound, not CPU-bound)
+    // Try SIMD fast path for single-range constant-offset translations
+    if let Some((lo, hi, offset)) = detect_range_offset(&table) {
+        let buf_size = data.len().min(BUF_SIZE);
+        let mut buf = vec![0u8; buf_size];
+        for chunk in data.chunks(buf_size) {
+            translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
+            writer.write_all(&buf[..chunk.len()])?;
+        }
+        return Ok(());
+    }
+
+    // General case: scalar table lookup in chunks
     let buf_size = data.len().min(BUF_SIZE);
     let mut buf = vec![0u8; buf_size];
     for chunk in data.chunks(buf_size) {
@@ -587,9 +756,7 @@ pub fn translate_squeeze_mmap(
     let mut last_squeezed: u16 = 256;
 
     for chunk in data.chunks(buf_size) {
-        // Translate directly from source to destination (no intermediate copy)
         translate_to(chunk, &mut buf[..chunk.len()], &table);
-        // Squeeze in-place compaction
         let mut wp = 0;
         unsafe {
             let ptr = buf.as_mut_ptr();
@@ -613,21 +780,15 @@ pub fn translate_squeeze_mmap(
 }
 
 /// Delete from mmap'd byte slice.
-/// Uses SIMD memchr for single/multi char fast paths.
-/// For large inputs with 4+ delete chars, uses rayon parallel filtering.
 pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    // Fast path: single character delete uses SIMD memchr
     if delete_chars.len() == 1 {
         return delete_single_char_mmap(delete_chars[0], data, writer);
     }
-
-    // Fast path: 2-3 char delete uses SIMD memchr2/memchr3
     if delete_chars.len() <= 3 {
         return delete_multi_memchr_mmap(delete_chars, data, writer);
     }
 
     let member = build_member_set(delete_chars);
-
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
 
@@ -681,7 +842,6 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
     Ok(())
 }
 
-/// Single-character delete from mmap using SIMD memchr + bulk copy between matches.
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
@@ -707,7 +867,6 @@ fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::
     Ok(())
 }
 
-/// Multi-character delete (2-3 chars) using SIMD memchr2/memchr3 + bulk copy.
 fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     let c0 = chars[0];
     let c1 = if chars.len() >= 2 { chars[1] } else { 0 };
@@ -787,12 +946,9 @@ pub fn delete_squeeze_mmap(
 
 /// Squeeze from mmap'd byte slice.
 pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    // Fast path: single squeeze character — use SIMD memchr to find runs
     if squeeze_chars.len() == 1 {
         return squeeze_single_mmap(squeeze_chars[0], data, writer);
     }
-
-    // Fast path: 2-3 squeeze chars — use memchr2/memchr3 for SIMD scanning
     if squeeze_chars.len() == 2 {
         return squeeze_multi_mmap::<2>(squeeze_chars, data, writer);
     }
@@ -800,7 +956,6 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
         return squeeze_multi_mmap::<3>(squeeze_chars, data, writer);
     }
 
-    // General path: chunked output buffer with member check
     let member = build_member_set(squeeze_chars);
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
@@ -824,7 +979,6 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
                         last_squeezed = b as u16;
                     }
                     i += 1;
-                    // Skip consecutive duplicates
                     while i < len && *inp.add(i) == b {
                         i += 1;
                     }
@@ -841,7 +995,6 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
     Ok(())
 }
 
-/// Squeeze with 2-3 char sets using SIMD memchr2/memchr3 for fast scanning.
 fn squeeze_multi_mmap<const N: usize>(
     chars: &[u8],
     data: &[u8],
@@ -883,7 +1036,6 @@ fn squeeze_multi_mmap<const N: usize>(
             Some(offset) => {
                 let pos = cursor + offset;
                 let b = data[pos];
-                // Copy non-member span to output buffer
                 if pos > cursor {
                     let span = pos - cursor;
                     flush_and_copy!(&data[cursor..pos], span);
@@ -898,7 +1050,6 @@ fn squeeze_multi_mmap<const N: usize>(
                     wp += 1;
                     last_squeezed = b as u16;
                 }
-                // Skip consecutive duplicates of same byte
                 let mut skip = pos + 1;
                 while skip < data.len() && data[skip] == b {
                     skip += 1;
@@ -918,14 +1069,11 @@ fn squeeze_multi_mmap<const N: usize>(
     Ok(())
 }
 
-/// Squeeze a single repeated character from mmap'd data.
-/// Uses SIMD memchr for fast scanning + buffered output.
 fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    // Fast path: no consecutive duplicates — zero-copy output
     if memchr::memmem::find(data, &[ch, ch]).is_none() {
         return writer.write_all(data);
     }
