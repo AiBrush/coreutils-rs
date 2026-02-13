@@ -1,12 +1,12 @@
 use std::io::{self, Read, Write};
 
-/// Main processing buffer: 4MB — large enough to amortize write() syscall overhead
-/// while still fitting in L3 cache.
-const BUF_SIZE: usize = 4 * 1024 * 1024;
+/// Main processing buffer: 8MB — large enough to amortize write() syscall overhead.
+/// For mmap translate, this determines write chunk size.
+const BUF_SIZE: usize = 8 * 1024 * 1024;
 
-/// Stream buffer: 1MB — process data immediately after each read().
-/// Larger than typical pipe buffer (64KB) to batch multiple reads into one process cycle.
-const STREAM_BUF: usize = 1024 * 1024;
+/// Stream buffer: 4MB — process data immediately after each read().
+/// Larger buffers = fewer syscalls = faster on Celeron N5100.
+const STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
@@ -39,11 +39,13 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
 }
 
 /// Translate bytes in-place using a 256-byte lookup table.
-/// The table fits in L1 cache (256 bytes). The simple loop auto-vectorizes via LLVM.
+/// The table fits in L1 cache (256 bytes). Uses unchecked indexing
+/// to eliminate bounds checks; LLVM generates a tight scalar loop.
 #[inline(always)]
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
     for b in data.iter_mut() {
-        *b = table[*b as usize];
+        // SAFETY: *b is u8, always in range 0..256
+        *b = unsafe { *table.get_unchecked(*b as usize) };
     }
 }
 
@@ -58,18 +60,31 @@ pub fn translate(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
-    let mut buf = vec![0u8; BUF_SIZE];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         translate_inplace(&mut buf[..n], &table);
         writer.write_all(&buf[..n])?;
     }
     Ok(())
+}
+
+/// Read as many bytes as possible into buf, retrying on partial reads.
+#[inline]
+fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 pub fn translate_squeeze(
@@ -501,7 +516,7 @@ fn squeeze_single_stream(
 // ============================================================================
 
 /// Translate bytes from an mmap'd byte slice.
-/// Simple chunked approach: translate into a 4MB buffer, write each chunk.
+/// Uses table lookup with unchecked indexing for maximum throughput.
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -509,14 +524,20 @@ pub fn translate_mmap(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
+
+    // Check if table is identity (no translation needed) — pure passthrough
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
     let buf_size = data.len().min(BUF_SIZE);
     let mut buf = vec![0u8; buf_size];
     for chunk in data.chunks(buf_size) {
-        let out = &mut buf[..chunk.len()];
-        for (o, &b) in out.iter_mut().zip(chunk) {
-            *o = table[b as usize];
-        }
-        writer.write_all(out)?;
+        let len = chunk.len();
+        buf[..len].copy_from_slice(chunk);
+        translate_inplace(&mut buf[..len], &table);
+        writer.write_all(&buf[..len])?;
     }
     Ok(())
 }
