@@ -126,9 +126,8 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
 /// On Linux, uses raw libc::read() to bypass Rust's StdinLock/BufReader overhead.
 /// Uses a direct read() loop into a pre-allocated buffer instead of read_to_end(),
 /// which avoids Vec's grow-and-probe pattern (extra read() calls and memcpy).
-/// On Linux, enlarges the pipe buffer to 4MB first for fewer read() syscalls.
-/// Uses the full spare capacity for each read() to minimize syscalls — after
-/// the pipe is enlarged to 4MB, each read() returns up to 4MB of data.
+/// Callers should enlarge the pipe buffer via fcntl(F_SETPIPE_SZ) before calling.
+/// Uses the full spare capacity for each read() to minimize syscalls.
 pub fn read_stdin() -> io::Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     return read_stdin_raw();
@@ -141,15 +140,14 @@ pub fn read_stdin() -> io::Result<Vec<u8>> {
 /// and BufReader layers entirely. StdinLock uses an internal 8KB BufReader
 /// which adds an extra memcpy for every read; raw read() goes directly
 /// from the kernel pipe buffer to our Vec.
+///
+/// Note: callers (ftac, ftr, fbase64) are expected to enlarge the pipe
+/// buffer via fcntl(F_SETPIPE_SZ) before calling this function. We don't
+/// do it here to avoid accidentally shrinking a previously enlarged pipe.
 #[cfg(target_os = "linux")]
 fn read_stdin_raw() -> io::Result<Vec<u8>> {
     const PREALLOC: usize = 16 * 1024 * 1024;
-    const READ_BUF: usize = 4 * 1024 * 1024;
-
-    // Enlarge pipe buffer for fewer read() syscalls
-    unsafe {
-        libc::fcntl(0, libc::F_SETPIPE_SZ, READ_BUF as i32);
-    }
+    const READ_BUF: usize = 8 * 1024 * 1024;
 
     let mut buf: Vec<u8> = Vec::with_capacity(PREALLOC);
 
