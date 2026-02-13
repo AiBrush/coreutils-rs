@@ -6,7 +6,9 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(target_os = "linux"))]
 use digest::Digest;
+#[cfg(not(target_os = "linux"))]
 use md5::Md5;
 
 /// Supported hash algorithms.
@@ -29,14 +31,14 @@ impl HashAlgorithm {
 
 // ── Generic hash helpers ────────────────────────────────────────────
 
-/// Single-shot hash using the Digest trait.
+/// Single-shot hash using the Digest trait (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn hash_digest<D: Digest>(data: &[u8]) -> String {
     hex_encode(&D::digest(data))
 }
 
-/// Streaming hash using thread-local buffer for optimal cache behavior.
-/// Uses read_full to ensure each update() gets a full buffer, minimizing
-/// per-chunk hasher overhead and maximizing SIMD-friendly aligned updates.
+/// Streaming hash using thread-local buffer (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -143,8 +145,18 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     }
 }
 
-/// Single-shot MD5 using md-5 crate with ASM acceleration.
-/// Avoids OpenSSL FFI overhead (~13µs per call saved).
+// ── MD5 ─────────────────────────────────────────────────────────────
+
+/// Single-shot MD5 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn md5_bytes(data: &[u8]) -> String {
+    let digest =
+        openssl::hash::hash(openssl::hash::MessageDigest::md5(), data).expect("MD5 hash failed");
+    hex_encode(&digest)
+}
+
+/// Single-shot MD5 using md-5 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn md5_bytes(data: &[u8]) -> String {
     hash_digest::<Md5>(data)
 }
@@ -158,7 +170,27 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
     }
 }
 
-/// Streaming MD5 hash using md-5 crate with ASM acceleration.
+/// Streaming MD5 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn md5_reader(mut reader: impl Read) -> io::Result<String> {
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::md5())
+            .map_err(|e| io::Error::other(e))?;
+        loop {
+            let n = read_full(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
+        }
+        let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
+        Ok(hex_encode(&digest))
+    })
+}
+
+/// Streaming MD5 using md-5 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn md5_reader(reader: impl Read) -> io::Result<String> {
     hash_reader_impl::<Md5>(reader)
 }
@@ -241,20 +273,10 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
 }
 
 /// Check if parallel hashing is worthwhile for the given file paths.
-/// For many small files, sequential processing avoids rayon thread pool
-/// init and work-stealing overhead (~13µs per file). Only parallelize
-/// when total data exceeds 10MB to amortize thread pool cost.
+/// Always parallelize with 2+ files — rayon's thread pool is initialized
+/// lazily once, and work-stealing overhead is negligible compared to I/O.
 pub fn should_use_parallel(paths: &[&Path]) -> bool {
-    if paths.len() < 2 {
-        return false;
-    }
-    // Only parallelize if we have substantial work per thread
-    let total_size: u64 = paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    total_size > 10 * 1024 * 1024
+    paths.len() >= 2
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.

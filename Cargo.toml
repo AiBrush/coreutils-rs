@@ -147,4 +147,4 @@ md-5 = { version = "0.10", features = ["asm"] }
 # OpenSSL for optimized MD5 and SHA-256 on Linux (uses system OpenSSL assembly)
 # Windows doesn't have OpenSSL by default; falls back to md-5/ring crates
 [target.'cfg(target_os = "linux")'.dependencies]
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
