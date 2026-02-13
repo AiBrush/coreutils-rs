@@ -25,17 +25,33 @@ const CHUNKED_WRITE_THRESHOLD: usize = 16 * 1024 * 1024;
 const WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Write buf to out, using chunked writes for large buffers to avoid
-/// pipe backpressure stalls.
+/// pipe backpressure stalls. After writing, hint the kernel to release
+/// the buffer pages immediately (MADV_DONTNEED) since we're done with them.
 #[inline]
 fn write_maybe_chunked(out: &mut impl Write, buf: &[u8]) -> io::Result<()> {
-    if buf.len() > CHUNKED_WRITE_THRESHOLD {
+    let result = if buf.len() > CHUNKED_WRITE_THRESHOLD {
         for chunk in buf.chunks(WRITE_CHUNK_SIZE) {
             out.write_all(chunk)?;
         }
         Ok(())
     } else {
         out.write_all(buf)
+    };
+
+    // Hint kernel to release these pages immediately — we're done with the buffer.
+    // This reduces RSS for large files and avoids LRU pressure on the page cache.
+    #[cfg(target_os = "linux")]
+    if buf.len() >= 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                buf.as_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MADV_DONTNEED,
+            );
+        }
     }
+
+    result
 }
 
 /// Copy records from data into buf at computed offsets.

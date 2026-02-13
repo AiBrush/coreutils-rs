@@ -232,8 +232,19 @@ fn open_noatime(path: &Path) -> io::Result<File> {
 #[cfg(target_os = "linux")]
 const FADVISE_MIN_SIZE: u64 = 1024 * 1024;
 
-/// Hash a file by path. Uses mmap for large files (zero-copy, no read() syscalls)
-/// and streaming read as fallback for small files or non-regular files.
+/// Maximum file size for single-read hash optimization.
+/// Files up to this size are read entirely into a thread-local buffer and hashed
+/// with single-shot hash (avoids Hasher allocation + streaming overhead).
+const SMALL_FILE_LIMIT: u64 = 1024 * 1024;
+
+// Thread-local reusable buffer for small-file single-read hash.
+// Avoids repeated allocation for many small files (e.g., 100 files of 1KB each).
+thread_local! {
+    static SMALL_FILE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+}
+
+/// Hash a file by path. Uses mmap for large files (zero-copy, no read() syscalls),
+/// single-read + single-shot hash for small files, and streaming read as fallback.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
@@ -245,7 +256,7 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
 
     if file_size > 0 && metadata.file_type().is_file() {
         // mmap for large files — zero-copy, eliminates multiple read() syscalls
-        if file_size >= 1024 * 1024 {
+        if file_size >= SMALL_FILE_LIMIT {
             #[cfg(target_os = "linux")]
             if file_size >= FADVISE_MIN_SIZE {
                 use std::os::unix::io::AsRawFd;
@@ -269,8 +280,12 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
                 return Ok(hash_bytes(algo, &mmap));
             }
         }
-        // Small files: single read into thread-local buffer (avoids mmap setup overhead)
-        // Falls through to streaming reader which handles this efficiently
+        // Small files: single read into thread-local buffer, then single-shot hash.
+        // This avoids Hasher context allocation + streaming overhead for each file.
+        // Especially beneficial for many small files (100+ files of a few KB each).
+        if file_size < SMALL_FILE_LIMIT {
+            return hash_file_small(algo, file, file_size as usize);
+        }
     }
 
     // Non-regular files or fallback: stream
@@ -282,6 +297,23 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
         }
     }
     hash_reader(algo, file)
+}
+
+/// Hash a small file by reading it entirely into a thread-local buffer,
+/// then using the single-shot hash function. Avoids per-file Hasher allocation.
+#[inline]
+fn hash_file_small(algo: HashAlgorithm, mut file: File, size: usize) -> io::Result<String> {
+    SMALL_FILE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        // Pre-allocate to known file size to avoid reallocation
+        let cap = buf.capacity();
+        if cap < size {
+            buf.reserve(size - cap);
+        }
+        file.read_to_end(&mut buf)?;
+        Ok(hash_bytes(algo, &buf))
+    })
 }
 
 /// Hash stdin. Uses fadvise for file redirects, streaming for pipes.
@@ -376,7 +408,8 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
 }
 
 /// Hash a file with BLAKE2b variable output length.
-/// Uses mmap for large files (zero-copy), streaming read as fallback.
+/// Uses mmap for large files (zero-copy), single-read for small files,
+/// and streaming read as fallback.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
@@ -388,7 +421,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
 
     if file_size > 0 && metadata.file_type().is_file() {
         // mmap for large files — zero-copy, eliminates multiple read() syscalls
-        if file_size >= 1024 * 1024 {
+        if file_size >= SMALL_FILE_LIMIT {
             #[cfg(target_os = "linux")]
             if file_size >= FADVISE_MIN_SIZE {
                 use std::os::unix::io::AsRawFd;
@@ -412,7 +445,10 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
                 return Ok(blake2b_hash_data(&mmap, output_bytes));
             }
         }
-        // Small files: fall through to streaming reader
+        // Small files: single read into thread-local buffer, then single-shot hash
+        if file_size < SMALL_FILE_LIMIT {
+            return blake2b_hash_file_small(file, file_size as usize, output_bytes);
+        }
     }
 
     // Non-regular files or fallback: stream
@@ -424,6 +460,21 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
         }
     }
     blake2b_hash_reader(file, output_bytes)
+}
+
+/// Hash a small file with BLAKE2b by reading it entirely into a thread-local buffer.
+#[inline]
+fn blake2b_hash_file_small(mut file: File, size: usize, output_bytes: usize) -> io::Result<String> {
+    SMALL_FILE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let cap = buf.capacity();
+        if cap < size {
+            buf.reserve(size - cap);
+        }
+        file.read_to_end(&mut buf)?;
+        Ok(blake2b_hash_data(&buf, output_bytes))
+    })
 }
 
 /// Hash stdin with BLAKE2b variable output length.

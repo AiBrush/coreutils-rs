@@ -2,6 +2,10 @@ use std::io::{self, Read, Write};
 
 use rayon::prelude::*;
 
+/// Maximum IoSlice entries per write_vectored batch.
+/// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
+const MAX_IOV: usize = 1024;
+
 /// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 
@@ -11,6 +15,39 @@ const STREAM_BUF: usize = 8 * 1024 * 1024;
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// Below this, single-threaded is faster due to thread pool overhead.
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Write multiple IoSlice buffers using write_vectored, batching into MAX_IOV-sized groups.
+/// Falls back to write_all per slice for partial writes.
+#[inline]
+fn write_ioslices(writer: &mut impl Write, slices: &[std::io::IoSlice]) -> io::Result<()> {
+    if slices.is_empty() {
+        return Ok(());
+    }
+    for batch in slices.chunks(MAX_IOV) {
+        let total: usize = batch.iter().map(|s| s.len()).sum();
+        match writer.write_vectored(batch) {
+            Ok(n) if n >= total => continue,
+            Ok(mut written) => {
+                // Partial write: fall back to write_all per remaining slice
+                for slice in batch {
+                    let slen = slice.len();
+                    if written >= slen {
+                        written -= slen;
+                        continue;
+                    }
+                    if written > 0 {
+                        writer.write_all(&slice[written..])?;
+                        written = 0;
+                    } else {
+                        writer.write_all(slice)?;
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 
 /// Allocate a Vec<u8> of given length without zero-initialization.
 /// SAFETY: Caller must write all bytes before reading them.
@@ -1125,13 +1162,13 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
             })
             .collect();
 
-        // Write results in order
-        for result in &results {
-            if !result.is_empty() {
-                writer.write_all(result)?;
-            }
-        }
-        return Ok(());
+        // Use writev to batch all results into fewer syscalls
+        let slices: Vec<std::io::IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| std::io::IoSlice::new(r))
+            .collect();
+        return write_ioslices(writer, &slices);
     }
 
     // Single-write fast path: delete into one buffer, one write
@@ -1254,7 +1291,8 @@ fn delete_chunk_bitset_into(chunk: &[u8], member: &[u8; 32], outbuf: &mut [u8]) 
 }
 
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    // Parallel path for large data: each thread deletes from its chunk
+    // Parallel path for large data: each thread deletes from its chunk,
+    // then use writev to write all results in one syscall batch.
     if data.len() >= PARALLEL_THRESHOLD {
         let n_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() / n_threads).max(32 * 1024);
@@ -1277,12 +1315,13 @@ fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::
             })
             .collect();
 
-        for result in &results {
-            if !result.is_empty() {
-                writer.write_all(result)?;
-            }
-        }
-        return Ok(());
+        // Use writev to batch all results into fewer syscalls
+        let slices: Vec<std::io::IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| std::io::IoSlice::new(r))
+            .collect();
+        return write_ioslices(writer, &slices);
     }
 
     // Single-write fast path: collect all non-deleted spans into one buffer
@@ -1364,12 +1403,13 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
             })
             .collect();
 
-        for result in &results {
-            if !result.is_empty() {
-                writer.write_all(result)?;
-            }
-        }
-        return Ok(());
+        // Use writev to batch all results into fewer syscalls
+        let slices: Vec<std::io::IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| std::io::IoSlice::new(r))
+            .collect();
+        return write_ioslices(writer, &slices);
     }
 
     // Single-write fast path: collect all non-deleted spans into one buffer
@@ -1537,9 +1577,11 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
             .map(|chunk| squeeze_chunk_bitset(chunk, &member))
             .collect();
 
-        // Write results, fixing boundaries: if chunk N ends with byte B
+        // Build IoSlice list, fixing boundaries: if chunk N ends with byte B
         // and chunk N+1 starts with same byte B, and B is in squeeze set,
         // skip the first byte(s) of chunk N+1 that equal B.
+        // Collect slices for writev to minimize syscalls.
+        let mut slices: Vec<std::io::IoSlice> = Vec::with_capacity(results.len());
         for (idx, result) in results.iter().enumerate() {
             if result.is_empty() {
                 continue;
@@ -1551,15 +1593,15 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
                         // Skip leading bytes in this chunk that equal prev_last
                         let skip = result.iter().take_while(|&&b| b == prev_last).count();
                         if skip < result.len() {
-                            writer.write_all(&result[skip..])?;
+                            slices.push(std::io::IoSlice::new(&result[skip..]));
                         }
                         continue;
                     }
                 }
             }
-            writer.write_all(result)?;
+            slices.push(std::io::IoSlice::new(result));
         }
-        return Ok(());
+        return write_ioslices(writer, &slices);
     }
 
     // Single-write fast path: squeeze all data into one buffer, one write
@@ -1680,6 +1722,39 @@ fn squeeze_multi_mmap<const N: usize>(
     data: &[u8],
     writer: &mut impl Write,
 ) -> io::Result<()> {
+    // Parallel path for large data: squeeze each chunk, fix boundaries with writev
+    if data.len() >= PARALLEL_THRESHOLD {
+        let member = build_member_set(chars);
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| squeeze_chunk_bitset(chunk, &member))
+            .collect();
+
+        // Build IoSlice list, fixing boundaries
+        let mut slices: Vec<std::io::IoSlice> = Vec::with_capacity(results.len());
+        for (idx, result) in results.iter().enumerate() {
+            if result.is_empty() {
+                continue;
+            }
+            if idx > 0 {
+                if let Some(&prev_last) = results[..idx].iter().rev().find_map(|r| r.last()) {
+                    if is_member(&member, prev_last) {
+                        let skip = result.iter().take_while(|&&b| b == prev_last).count();
+                        if skip < result.len() {
+                            slices.push(std::io::IoSlice::new(&result[skip..]));
+                        }
+                        continue;
+                    }
+                }
+            }
+            slices.push(std::io::IoSlice::new(result));
+        }
+        return write_ioslices(writer, &slices);
+    }
+
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
     let mut wp = 0;
@@ -1791,7 +1866,9 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
             })
             .collect();
 
-        // Write results, fixing boundary squeezability
+        // Build IoSlice list, fixing boundary squeezability.
+        // Use writev to minimize syscalls.
+        let mut slices: Vec<std::io::IoSlice> = Vec::with_capacity(results.len());
         for (idx, result) in results.iter().enumerate() {
             if result.is_empty() {
                 continue;
@@ -1802,15 +1879,15 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
                         // Skip leading ch bytes in this chunk result
                         let skip = result.iter().take_while(|&&b| b == ch).count();
                         if skip < result.len() {
-                            writer.write_all(&result[skip..])?;
+                            slices.push(std::io::IoSlice::new(&result[skip..]));
                         }
                         continue;
                     }
                 }
             }
-            writer.write_all(result)?;
+            slices.push(std::io::IoSlice::new(result));
         }
-        return Ok(());
+        return write_ioslices(writer, &slices);
     }
 
     let buf_size = data.len().min(BUF_SIZE);
