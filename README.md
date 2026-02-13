@@ -8,20 +8,20 @@
 
 High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
 
-## Performance (independent benchmarks v0.0.38, 100MB text file, hyperfine)
+## Performance (independent benchmarks v0.0.45, Linux x86_64, hyperfine)
 
-| Tool | Speedup vs GNU |
-|------|---------------:|
-| wc | **33.9x** |
-| sort | **31.5x** |
-| uniq | **13.1x** |
-| sha256sum | **6.5x** |
-| cut | **6.4x** |
-| base64 | **4.3x** |
-| tr | **2.9x** |
-| tac | **2.3x** |
-| b2sum | **1.4x** |
-| md5sum | **1.3x** |
+| Tool | Speedup vs GNU | Benchmark |
+|------|---------------:|-----------|
+| wc | **41.1x** | default 100MB text |
+| uniq | **9.0x** | repetitive 10MB |
+| cut | **6.8x** | -b1-100 10MB CSV |
+| sort | **5.6x** | lexicographic 10MB |
+| tr | **3.4x** | -d lowercase 10MB |
+| base64 | **2.9x** | decode 10MB |
+| tac | **2.3x** | reverse 100MB text |
+| b2sum | **1.4x** | single 100MB text |
+| md5sum | **1.1x** | single 100MB text |
+| sha256sum | **1.1x** | single 100MB text |
 
 ## Tools
 
@@ -34,9 +34,9 @@ High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleratio
 | b2sum | `fb2sum` | Optimized | BLAKE2b checksums (mmap, madvise, readahead) |
 | base64 | `fbase64` | Optimized | Base64 encode/decode (SIMD, 4MB chunks, raw fd stdout) |
 | sort | `fsort` | Optimized | Line sorting (parallel merge sort) |
-| tr | `ftr` | Optimized | Character translation (mmap, 4MB buffers, lookup tables) |
-| uniq | `funiq` | Optimized | Filter duplicate lines (mmap, 1MB buffers) |
-| tac | `ftac` | Optimized | Reverse file lines (forward SIMD scan, 1MB buffers) |
+| tr | `ftr` | Optimized | Character translation (SIMD range translate/delete, AVX2/SSE2, parallel) |
+| uniq | `funiq` | Optimized | Filter duplicate lines (mmap, zero-copy, single-pass) |
+| tac | `ftac` | Optimized | Reverse file lines (chunk-based SIMD scan, zero-copy writev) |
 
 ## Installation
 
@@ -103,8 +103,8 @@ ftac file.txt             # Print lines in reverse order
 - **Hardware-accelerated hashing**: sha2 detects SHA-NI, blake2 uses optimized implementations
 - **SIMD base64**: Vectorized encode/decode with 4MB chunked streaming
 - **Parallel processing**: Multi-file hashing and wc use thread pools
-- **Lookup tables**: `tr` uses 256-byte translation tables for O(1) character mapping
-- **Forward SIMD scan**: `tac` scans forward with memchr for newlines, then reverses output
+- **SIMD range translate/delete**: `tr` detects contiguous byte ranges and uses AVX2/SSE2 SIMD
+- **Chunk-based reverse scan**: `tac` processes backward in 512KB chunks with forward SIMD within each chunk
 - **Optimized release profile**: Fat LTO, single codegen unit, abort on panic, stripped binaries
 
 ## GNU Compatibility
