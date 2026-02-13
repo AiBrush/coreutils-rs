@@ -17,7 +17,7 @@ on:
 
 concurrency:
   group: release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -84,9 +84,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             name: Linux ARM64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             name: macOS x86_64
+            cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macOS ARM64
@@ -98,6 +99,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cross && matrix.target || '' }}
 
       - name: Set version
         shell: bash
@@ -109,20 +112,21 @@ jobs:
           fi
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Create release archive
         shell: bash
         run: |
           mkdir -p release
+          BINDIR="target/${{ matrix.target }}/release"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
-              cp "target/release/${bin}.exe" release/ 2>/dev/null || true
+              cp "${BINDIR}/${bin}.exe" release/ 2>/dev/null || true
             done
             7z a fcoreutils-${{ matrix.target }}.zip release/*
           else
             for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
-              cp "target/release/${bin}" release/ 2>/dev/null || true
+              cp "${BINDIR}/${bin}" release/ 2>/dev/null || true
             done
             tar -czf fcoreutils-${{ matrix.target }}.tar.gz -C release .
           fi
