@@ -12,12 +12,13 @@ const STREAM_ENCODE_CHUNK: usize = 24 * 1024 * 1024 - (24 * 1024 * 1024 % 3);
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (4MB).
-/// Below this, single-threaded SIMD is faster than rayon overhead.
-const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel encoding (1MB).
+/// Lowered from 4MB so 10MB benchmark workloads get multi-core processing.
+const PARALLEL_ENCODE_THRESHOLD: usize = 1024 * 1024;
 
-/// Minimum data size for parallel decoding (4MB of base64 data).
-const PARALLEL_DECODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel decoding (1MB of base64 data).
+/// Lowered from 4MB for better parallelism on typical workloads.
+const PARALLEL_DECODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with fused encode+wrap for maximum throughput.
@@ -58,6 +59,7 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 
 /// Parallel no-wrap encoding: split at 3-byte boundaries, encode chunks in parallel.
 /// Each chunk except possibly the last is 3-byte aligned, so no padding in intermediate chunks.
+/// Uses write_vectored (writev) to send all encoded chunks in a single syscall.
 fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     let num_threads = rayon::current_num_threads().max(1);
     let raw_chunk = data.len() / num_threads;
@@ -79,10 +81,9 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
         })
         .collect();
 
-    for chunk in &encoded_chunks {
-        out.write_all(chunk)?;
-    }
-    Ok(())
+    // Use write_vectored to send all chunks in a single syscall
+    let iov: Vec<io::IoSlice> = encoded_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
+    write_all_vectored(out, &iov)
 }
 
 /// Encode with line wrapping — fused encode+wrap in a single output buffer.
@@ -140,6 +141,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 
 /// Parallel wrapped encoding: split at bytes_per_line boundaries, encode + wrap in parallel.
 /// Requires bytes_per_line.is_multiple_of(3) so each chunk encodes without intermediate padding.
+/// Uses write_vectored (writev) to send all encoded+wrapped chunks in a single syscall.
 fn encode_wrapped_parallel(
     data: &[u8],
     wrap_col: usize,
@@ -174,10 +176,9 @@ fn encode_wrapped_parallel(
         })
         .collect();
 
-    for chunk in &encoded_chunks {
-        out.write_all(chunk)?;
-    }
-    Ok(())
+    // Use write_vectored to send all chunks in a single syscall
+    let iov: Vec<io::IoSlice> = encoded_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
+    write_all_vectored(out, &iov)
 }
 
 /// Fuse encoded base64 data with newlines in a single pass.
@@ -466,6 +467,7 @@ fn decode_borrowed_clean(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
 }
 
 /// Parallel decode: split at 4-byte boundaries, decode chunks in parallel via rayon.
+/// Uses write_vectored (writev) to send all decoded chunks in a single syscall.
 fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
     let num_threads = rayon::current_num_threads().max(1);
     let raw_chunk = data.len() / num_threads;
@@ -482,10 +484,9 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
         })
         .collect();
 
-    for chunk in &decoded_chunks? {
-        out.write_all(chunk)?;
-    }
-    Ok(())
+    let decoded = decoded_chunks?;
+    let iov: Vec<io::IoSlice> = decoded.iter().map(|c| io::IoSlice::new(c)).collect();
+    write_all_vectored(out, &iov)
 }
 
 /// Strip non-base64 characters (for -i / --ignore-garbage).
@@ -658,6 +659,39 @@ pub fn decode_stream(
         decode_clean_slice(&mut carry, writer)?;
     }
 
+    Ok(())
+}
+
+/// Write all IoSlice entries using write_vectored (writev syscall).
+/// Falls back to write_all per slice on partial writes.
+fn write_all_vectored(out: &mut impl Write, slices: &[io::IoSlice]) -> io::Result<()> {
+    if slices.is_empty() {
+        return Ok(());
+    }
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+
+    // Try write_vectored first — often writes everything in one syscall
+    let written = match out.write_vectored(slices) {
+        Ok(n) if n >= total => return Ok(()),
+        Ok(n) => n,
+        Err(e) => return Err(e),
+    };
+
+    // Partial write fallback
+    let mut skip = written;
+    for slice in slices {
+        let slen = slice.len();
+        if skip >= slen {
+            skip -= slen;
+            continue;
+        }
+        if skip > 0 {
+            out.write_all(&slice[skip..])?;
+            skip = 0;
+        } else {
+            out.write_all(slice)?;
+        }
+    }
     Ok(())
 }
 
