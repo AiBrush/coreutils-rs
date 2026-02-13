@@ -1,4 +1,4 @@
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -204,11 +204,46 @@ fn main() {
         }
     };
 
+    // Pre-read all stdin data for piped input (avoids chunked reader overhead).
+    // This is the same strategy uniq/sort use: read_to_end then process_cut_data.
+    #[cfg(unix)]
+    let stdin_buf: Option<Vec<u8>> = if stdin_mmap.is_none() && files.iter().any(|f| f == "-") {
+        let mut buf = Vec::new();
+        if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                eprintln!("cut: {}", io_error_msg(&e));
+                process::exit(1);
+            }
+            Some(Vec::new())
+        } else {
+            Some(buf)
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let stdin_buf: Option<Vec<u8>> = if files.iter().any(|f| f == "-") {
+        let mut buf = Vec::new();
+        if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                eprintln!("cut: {}", io_error_msg(&e));
+                process::exit(1);
+            }
+            Some(Vec::new())
+        } else {
+            Some(buf)
+        }
+    } else {
+        None
+    };
+
     for filename in &files {
         let result: io::Result<()> = if filename == "-" {
             #[cfg(unix)]
             {
                 if let Some(ref data) = stdin_mmap {
+                    cut::process_cut_data(data, &cfg, &mut out)
+                } else if let Some(ref data) = stdin_buf {
                     cut::process_cut_data(data, &cfg, &mut out)
                 } else {
                     let reader = BufReader::new(io::stdin().lock());
@@ -217,8 +252,12 @@ fn main() {
             }
             #[cfg(not(unix))]
             {
-                let reader = BufReader::new(io::stdin().lock());
-                cut::process_cut_reader(reader, &cfg, &mut out)
+                if let Some(ref data) = stdin_buf {
+                    cut::process_cut_data(data, &cfg, &mut out)
+                } else {
+                    let reader = BufReader::new(io::stdin().lock());
+                    cut::process_cut_reader(reader, &cfg, &mut out)
+                }
             }
         } else {
             match read_file(Path::new(filename)) {
