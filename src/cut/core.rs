@@ -291,6 +291,25 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
         return process_fields_suffix(data, delim, line_delim, ranges[0].start, suppress, out);
     }
 
+    // Fast path: contiguous field range with start > 1 (e.g., cut -f2-4)
+    if !complement
+        && ranges.len() == 1
+        && ranges[0].start > 1
+        && ranges[0].end < usize::MAX
+        && output_delim.len() == 1
+        && output_delim[0] == delim
+    {
+        return process_fields_mid_range(
+            data,
+            delim,
+            line_delim,
+            ranges[0].start,
+            ranges[0].end,
+            suppress,
+            out,
+        );
+    }
+
     // General field extraction
     let max_field = if complement {
         usize::MAX
@@ -364,9 +383,50 @@ fn process_fields_chunk(
     complement: bool,
     buf: &mut Vec<u8>,
 ) {
-    // Single-pass path: when delim != line_delim, use memchr2_iter for both bytes
-    // in one SIMD scan. This eliminates 10M inner-loop memchr_iter startups for
-    // a file with 10M lines.
+    // When delim != line_delim and max_field is bounded, use two-level approach:
+    // outer memchr for newlines, inner memchr_iter for delimiters with early exit.
+    // This avoids scanning past max_field on each line (significant for lines with
+    // many columns but small field selection like -f1,3,5 on 20-column CSV).
+    // For complement or unbounded ranges, use single-pass memchr2_iter which
+    // needs to process all delimiters anyway.
+    if delim != line_delim && max_field < usize::MAX && !complement {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            extract_fields_to_buf(
+                line,
+                delim,
+                ranges,
+                output_delim,
+                suppress,
+                max_field,
+                field_mask,
+                line_delim,
+                buf,
+                complement,
+            );
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            extract_fields_to_buf(
+                &data[start..],
+                delim,
+                ranges,
+                output_delim,
+                suppress,
+                max_field,
+                field_mask,
+                line_delim,
+                buf,
+                complement,
+            );
+        }
+        return;
+    }
+
+    // Single-pass path for complement or unbounded ranges: memchr2_iter for both
+    // delimiter and line_delim in one SIMD scan.
     if delim != line_delim {
         buf.reserve(data.len());
 
@@ -425,11 +485,6 @@ fn process_fields_chunk(
 
                 field_num += 1;
                 field_start = pos + 1;
-
-                if field_num > max_field && !complement {
-                    // Skip remaining delimiters on this line; find next line_delim
-                    // We'll let the next memchr2 iteration handle the line_delim
-                }
             }
         }
 
@@ -992,6 +1047,169 @@ fn fields_suffix_line(
 
     // Fewer delimiters than needed
     unsafe { buf_push(buf, line_delim) };
+}
+
+/// Contiguous mid-range field extraction (e.g., `cut -f2-4`).
+/// Optimized: skip to start_field using memchr, then output until end_field.
+fn process_fields_mid_range(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    end_field: usize,
+    suppress: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if data.len() >= PARALLEL_THRESHOLD {
+        let chunks = split_into_chunks(data, line_delim);
+        let results: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut buf = Vec::with_capacity(chunk.len());
+                fields_mid_range_chunk(
+                    chunk,
+                    delim,
+                    line_delim,
+                    start_field,
+                    end_field,
+                    suppress,
+                    &mut buf,
+                );
+                buf
+            })
+            .collect();
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
+    } else {
+        let mut buf = Vec::with_capacity(data.len());
+        fields_mid_range_chunk(
+            data,
+            delim,
+            line_delim,
+            start_field,
+            end_field,
+            suppress,
+            &mut buf,
+        );
+        if !buf.is_empty() {
+            out.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Process a chunk for contiguous mid-range field extraction.
+fn fields_mid_range_chunk(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    end_field: usize,
+    suppress: bool,
+    buf: &mut Vec<u8>,
+) {
+    let mut start = 0;
+    for end_pos in memchr_iter(line_delim, data) {
+        let line = &data[start..end_pos];
+        fields_mid_range_line(
+            line,
+            delim,
+            line_delim,
+            start_field,
+            end_field,
+            suppress,
+            buf,
+        );
+        start = end_pos + 1;
+    }
+    if start < data.len() {
+        fields_mid_range_line(
+            &data[start..],
+            delim,
+            line_delim,
+            start_field,
+            end_field,
+            suppress,
+            buf,
+        );
+    }
+}
+
+/// Extract fields start_field..=end_field from one line.
+/// Uses memchr_iter to skip to start_field, then counts delimiters to end_field.
+#[inline(always)]
+fn fields_mid_range_line(
+    line: &[u8],
+    delim: u8,
+    line_delim: u8,
+    start_field: usize,
+    end_field: usize,
+    suppress: bool,
+    buf: &mut Vec<u8>,
+) {
+    if line.is_empty() {
+        if !suppress {
+            buf.push(line_delim);
+        }
+        return;
+    }
+
+    buf.reserve(line.len() + 1);
+
+    // Count delimiters to find start_field and end_field boundaries
+    let skip_before = start_field - 1; // delimiters to skip before start_field
+    let field_span = end_field - start_field; // additional delimiters within the range
+    let mut delim_count = 0;
+    let mut range_start = 0;
+    let mut has_delim = false;
+
+    for pos in memchr_iter(delim, line) {
+        has_delim = true;
+        delim_count += 1;
+        if delim_count == skip_before {
+            range_start = pos + 1;
+        }
+        if delim_count == skip_before + field_span + 1 {
+            // Found the delimiter after end_field — output the range
+            if skip_before == 0 {
+                range_start = 0;
+            }
+            unsafe {
+                buf_extend(buf, &line[range_start..pos]);
+                buf_push(buf, line_delim);
+            }
+            return;
+        }
+    }
+
+    if !has_delim {
+        if !suppress {
+            unsafe {
+                buf_extend(buf, line);
+                buf_push(buf, line_delim);
+            }
+        }
+        return;
+    }
+
+    // Line has delimiters but fewer fields than end_field
+    if delim_count >= skip_before {
+        // We have at least start_field, output from range_start to end
+        if skip_before == 0 {
+            range_start = 0;
+        }
+        unsafe {
+            buf_extend(buf, &line[range_start..]);
+            buf_push(buf, line_delim);
+        }
+    } else {
+        // Not enough fields even for start_field — output empty line
+        unsafe { buf_push(buf, line_delim) };
+    }
 }
 
 /// Combined SIMD scan for arbitrary single field extraction.

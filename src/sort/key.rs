@@ -147,24 +147,19 @@ fn parse_field_spec(s: &str) -> Result<(usize, usize, String), String> {
 /// Find the byte range of the Nth field (0-indexed) in a line.
 /// Returns (start, end) byte offsets. Allocation-free.
 /// Uses SIMD memchr for separator-based field finding.
+/// Optimized: for small N with a separator, uses successive memchr calls
+/// instead of memchr_iter to avoid iterator setup overhead.
 #[inline]
 fn find_nth_field(line: &[u8], n: usize, separator: Option<u8>) -> (usize, usize) {
     match separator {
         Some(sep) => {
-            // Use memchr_iter for SIMD-accelerated separator scanning
-            let mut field = 0;
-            let mut start = 0;
-            for pos in memchr::memchr_iter(sep, line) {
-                if field == n {
-                    return (start, pos);
-                }
-                field += 1;
-                start = pos + 1;
-            }
-            if field == n {
-                (start, line.len())
+            // For small field indices (N < 4), use successive memchr calls.
+            // Each memchr call is SIMD-accelerated and avoids the iterator overhead.
+            // For larger N, use memchr_iter which amortizes setup over many hits.
+            if n < 4 {
+                find_nth_field_memchr(line, n, sep)
             } else {
-                (line.len(), line.len())
+                find_nth_field_iter(line, n, sep)
             }
         }
         None => {
@@ -190,6 +185,44 @@ fn find_nth_field(line: &[u8], n: usize, separator: Option<u8>) -> (usize, usize
 
             (line.len(), line.len())
         }
+    }
+}
+
+/// Find the Nth field using successive memchr calls (optimal for small N).
+/// Each memchr is a single SIMD scan that stops at the first separator.
+#[inline(always)]
+fn find_nth_field_memchr(line: &[u8], n: usize, sep: u8) -> (usize, usize) {
+    let mut start = 0;
+    // Skip past N separators to reach the start of field N
+    for _ in 0..n {
+        match memchr::memchr(sep, &line[start..]) {
+            Some(pos) => start = start + pos + 1,
+            None => return (line.len(), line.len()),
+        }
+    }
+    // Find the end of field N (next separator or end of line)
+    match memchr::memchr(sep, &line[start..]) {
+        Some(pos) => (start, start + pos),
+        None => (start, line.len()),
+    }
+}
+
+/// Find the Nth field using memchr_iter (optimal for large N).
+#[inline]
+fn find_nth_field_iter(line: &[u8], n: usize, sep: u8) -> (usize, usize) {
+    let mut field = 0;
+    let mut start = 0;
+    for pos in memchr::memchr_iter(sep, line) {
+        if field == n {
+            return (start, pos);
+        }
+        field += 1;
+        start = pos + 1;
+    }
+    if field == n {
+        (start, line.len())
+    } else {
+        (line.len(), line.len())
     }
 }
 

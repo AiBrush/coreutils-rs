@@ -694,12 +694,58 @@ fn line_prefix_upper(data: &[u8], start: usize, end: usize) -> u64 {
 /// Pre-extract key byte offsets into the data buffer for all lines.
 /// Avoids repeated key extraction during sort comparisons.
 /// Parallelized with rayon for large inputs (>10K lines).
+///
+/// Specialized fast path for `-t SEP -k N` (whole Nth field, no char offsets):
+/// uses direct memchr calls instead of the general extract_key machinery.
 fn pre_extract_key_offsets(
     data: &[u8],
     offsets: &[(usize, usize)],
     key: &KeyDef,
     separator: Option<u8>,
 ) -> Vec<(usize, usize)> {
+    // Fast path: separator-based single whole field extraction (e.g., -t, -k2 or -t, -k2,2)
+    // No char offsets, and end_field is either 0 (to end of line) or same as start_field.
+    // This avoids the overhead of extract_key's general field/char computation.
+    let is_whole_field = separator.is_some()
+        && key.start_char == 0
+        && key.end_char == 0
+        && (key.end_field == 0 || key.end_field == key.start_field);
+    if is_whole_field {
+        let sep = separator.unwrap();
+        let field_idx = key.start_field.saturating_sub(1);
+        let to_end = key.end_field == 0; // -kN means from field N to end of line
+        let extract_fast = move |&(s, e): &(usize, usize)| {
+            let line = &data[s..e];
+            // Find start of the target field
+            let mut fstart = 0usize;
+            for _ in 0..field_idx {
+                match memchr::memchr(sep, &line[fstart..]) {
+                    Some(pos) => fstart = fstart + pos + 1,
+                    None => return (0usize, 0usize),
+                }
+            }
+            if fstart > line.len() {
+                return (0, 0);
+            }
+            if to_end {
+                // -kN: from field N to end of line
+                (s + fstart, e)
+            } else {
+                // -kN,N: just field N
+                match memchr::memchr(sep, &line[fstart..]) {
+                    Some(pos) => (s + fstart, s + fstart + pos),
+                    None => (s + fstart, e),
+                }
+            }
+        };
+
+        return if offsets.len() > 10_000 {
+            offsets.par_iter().map(extract_fast).collect()
+        } else {
+            offsets.iter().map(extract_fast).collect()
+        };
+    }
+
     let extract = |&(s, e): &(usize, usize)| {
         let line = &data[s..e];
         let extracted = extract_key(line, key, separator);
