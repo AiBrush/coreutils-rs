@@ -4,6 +4,10 @@ use std::io::{self, IoSlice, Write};
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
+/// Chunk size for the forward-scan-within-backward-chunks strategy.
+/// 512KB balances L2/L3 cache residency with amortised memchr_iter overhead.
+const CHUNK: usize = 512 * 1024;
+
 /// Flush a batch of IoSlice entries using write_vectored.
 /// Falls back to individual write_all for each slice if write_vectored
 /// doesn't write everything (handles partial writes).
@@ -41,7 +45,8 @@ fn flush_iov(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
 }
 
 /// Reverse records separated by a single byte.
-/// Uses backward SIMD scan (memrchr) — zero Vec allocation, single pass.
+/// Uses chunk-based forward SIMD scan processed in reverse order for
+/// maximum throughput — eliminates per-line memrchr call overhead.
 /// Output uses write_vectored (writev) for zero-copy from mmap'd data.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
@@ -54,115 +59,138 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 }
 
-/// After-separator mode: backward scan with memrchr.
-/// Each record includes its trailing separator byte.
-/// Uses IoSlice batching for zero-copy output directly from mmap'd data.
+/// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.
 ///
-/// Pre-counts separators with SIMD-accelerated memchr_iter to right-size
-/// the IoSlice Vec, avoiding reallocations for files with many lines.
+/// Instead of calling memrchr once per line (high per-call overhead for short
+/// lines), we process the file backward in large chunks. Within each chunk a
+/// single memchr_iter forward pass finds ALL separator positions with full SIMD
+/// pipeline utilisation, then we emit the records (slices) in reverse order.
+///
+/// This converts ~200K memrchr calls (for a 10MB / 50-byte-line file) into
+/// ~20 memchr_iter calls, each scanning a contiguous 512KB region.
 fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Pre-count separators with SIMD (memchr at 30+ GB/s) to right-size IoSlice Vec.
-    // For a 100MB file with 10M lines, this avoids many Vec reallocations.
-    let sep_count = memchr::memchr_iter(sep, data).count();
-    if sep_count == 0 {
-        return out.write_all(data);
-    }
+    // No pre-count: capacity is always capped at MAX_IOV anyway.
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
-    // +1 for the first record (before first separator), +1 for possible trailing content
-    let mut iov: Vec<IoSlice> = Vec::with_capacity((sep_count + 2).min(MAX_IOV));
+    // `global_end` tracks where the current (rightmost unseen) record ends.
+    // We walk it leftward as we discover separators.
+    let mut global_end = data.len();
 
-    let mut end = data.len();
+    // Process the file from right to left in CHUNK-sized windows.
+    // Each iteration handles [chunk_start .. chunk_end) where
+    // chunk_end = min(global_end, data.len()).
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
 
-    let Some(mut pos) = memchr::memrchr(sep, data) else {
-        // Should not happen since sep_count > 0, but handle gracefully
-        return out.write_all(data);
-    };
-
-    // Trailing content after last separator
-    if pos + 1 < end {
-        iov.push(IoSlice::new(&data[pos + 1..end]));
-    }
-    end = pos + 1;
-
-    // Scan backward for remaining separators
-    while pos > 0 {
-        match memchr::memrchr(sep, &data[..pos]) {
-            Some(prev) => {
-                iov.push(IoSlice::new(&data[prev + 1..end]));
-                if iov.len() >= MAX_IOV {
-                    flush_iov(out, &iov)?;
-                    iov.clear();
-                }
-                end = prev + 1;
-                pos = prev;
+    loop {
+        let chunk_end = global_end.min(data.len());
+        if chunk_start >= chunk_end {
+            // Chunk is empty — nothing to scan in this window.
+            if chunk_start == 0 {
+                break;
             }
-            None => break,
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
         }
+        let chunk = &data[chunk_start..chunk_end];
+
+        // Single SIMD forward pass finds every separator in the chunk.
+        // Collect into a small stack vec; worst case is CHUNK/1 entries
+        // but typical density is much lower, and we only need the positions.
+        let positions: Vec<usize> = memchr::memchr_iter(sep, chunk)
+            .map(|p| p + chunk_start) // convert to global offset
+            .collect();
+
+        // Emit records in reverse (rightmost first).
+        for &pos in positions.iter().rev() {
+            // In "after" mode, separator is at the END of a record.
+            // The record is data[pos+1 .. global_end].
+            // But if pos+1 == global_end the record after the separator is
+            // empty (consecutive separators) — still must emit the empty
+            // IoSlice so the separator byte itself is part of the PREVIOUS
+            // record we haven't emitted yet.
+            if pos + 1 < global_end {
+                iov.push(IoSlice::new(&data[pos + 1..global_end]));
+            }
+            global_end = pos + 1; // include the separator in the next (leftward) record
+
+            if iov.len() >= MAX_IOV {
+                flush_iov(out, &iov)?;
+                iov.clear();
+            }
+        }
+
+        if chunk_start == 0 {
+            break;
+        }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // First record (from start of data)
-    iov.push(IoSlice::new(&data[0..end]));
+    // First record: everything from data start up to global_end (includes
+    // the leftmost separator byte, which belongs to this record in "after" mode).
+    if global_end > 0 {
+        iov.push(IoSlice::new(&data[0..global_end]));
+    }
     flush_iov(out, &iov)?;
-
     Ok(())
 }
 
-/// Before-separator mode: backward scan with memrchr.
-/// Each record starts with its separator byte.
-/// Uses IoSlice batching for zero-copy output.
+/// Before-separator mode: chunk-based forward SIMD scan, emitted in reverse.
 ///
-/// Pre-counts separators with SIMD-accelerated memchr_iter to right-size
-/// the IoSlice Vec.
+/// Same chunked strategy as after-mode, but each record STARTS with its
+/// separator byte instead of ending with it.
 fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Pre-count separators with SIMD to right-size IoSlice Vec.
-    let sep_count = memchr::memchr_iter(sep, data).count();
-    if sep_count == 0 {
-        return out.write_all(data);
-    }
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
-    // +1 for possible leading content before first separator
-    let mut iov: Vec<IoSlice> = Vec::with_capacity((sep_count + 1).min(MAX_IOV));
+    // `global_end` tracks where the current record ends (exclusive).
+    let mut global_end = data.len();
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
 
-    let mut end = data.len();
-
-    let Some(pos) = memchr::memrchr(sep, data) else {
-        // Should not happen since sep_count > 0, but handle gracefully
-        return out.write_all(data);
-    };
-
-    // Last record: from last separator to end
-    iov.push(IoSlice::new(&data[pos..end]));
-    end = pos;
-
-    // Scan backward
-    while end > 0 {
-        match memchr::memrchr(sep, &data[..end]) {
-            Some(prev) => {
-                iov.push(IoSlice::new(&data[prev..end]));
-                if iov.len() >= MAX_IOV {
-                    flush_iov(out, &iov)?;
-                    iov.clear();
-                }
-                end = prev;
+    loop {
+        let chunk_end = global_end.min(data.len());
+        if chunk_start >= chunk_end {
+            if chunk_start == 0 {
+                break;
             }
-            None => break,
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
         }
+        let chunk = &data[chunk_start..chunk_end];
+
+        let positions: Vec<usize> = memchr::memchr_iter(sep, chunk)
+            .map(|p| p + chunk_start)
+            .collect();
+
+        // Emit records in reverse (rightmost first).
+        for &pos in positions.iter().rev() {
+            // In "before" mode the separator is at the START of a record.
+            // Record = data[pos .. global_end].
+            iov.push(IoSlice::new(&data[pos..global_end]));
+            global_end = pos;
+
+            if iov.len() >= MAX_IOV {
+                flush_iov(out, &iov)?;
+                iov.clear();
+            }
+        }
+
+        if chunk_start == 0 {
+            break;
+        }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // Leading content before first separator
-    if end > 0 {
-        iov.push(IoSlice::new(&data[0..end]));
+    // Leading content before the first separator (if any).
+    if global_end > 0 {
+        iov.push(IoSlice::new(&data[0..global_end]));
     }
-
     flush_iov(out, &iov)?;
     Ok(())
 }
 
 /// Reverse records using a multi-byte string separator.
-/// Uses backward SIMD-accelerated memmem (FinderRev) + IoSlice zero-copy output.
+/// Uses chunk-based forward SIMD-accelerated memmem + IoSlice zero-copy output.
 ///
 /// For single-byte separators, delegates to tac_bytes which uses memchr (faster).
-/// Pre-counts separators to right-size the IoSlice Vec.
 pub fn tac_string_separator(
     data: &[u8],
     separator: &[u8],
@@ -178,82 +206,127 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-    let finder = memchr::memmem::FinderRev::new(separator);
 
-    // Pre-count separators for right-sized IoSlice Vec.
-    // Use forward Finder for counting (more cache-friendly than backward scan).
-    let sep_count = memchr::memmem::find_iter(data, separator).count();
-    if sep_count == 0 {
-        return out.write_all(data);
-    }
-
-    let mut iov: Vec<IoSlice> = Vec::with_capacity((sep_count + 2).min(MAX_IOV));
+    // For multi-byte separators we use the same chunk-based strategy but with
+    // memmem::find_iter instead of memchr_iter. We need FinderRev only for a
+    // quick "any separator exists?" check — the actual work uses forward Finder.
+    //
+    // We still need to handle the case where a separator straddles a chunk
+    // boundary. We do this by extending each chunk's left edge by (sep_len - 1)
+    // bytes and deduplicating matches that fall in the overlap zone.
 
     if !before {
-        let mut end = data.len();
-
-        let Some(mut pos) = finder.rfind(data) else {
-            // Should not happen since sep_count > 0
-            return out.write_all(data);
-        };
-
-        // Trailing content after last separator
-        if pos + sep_len < end {
-            iov.push(IoSlice::new(&data[pos + sep_len..end]));
-        }
-        end = pos + sep_len;
-
-        // Scan backward
-        while pos > 0 {
-            match finder.rfind(&data[..pos]) {
-                Some(prev) => {
-                    iov.push(IoSlice::new(&data[prev + sep_len..end]));
-                    if iov.len() >= MAX_IOV {
-                        flush_iov(out, &iov)?;
-                        iov.clear();
-                    }
-                    end = prev + sep_len;
-                    pos = prev;
-                }
-                None => break,
-            }
-        }
-
-        // First record
-        iov.push(IoSlice::new(&data[0..end]));
+        tac_string_after(data, separator, sep_len, out)
     } else {
-        let mut end = data.len();
+        tac_string_before(data, separator, sep_len, out)
+    }
+}
 
-        let Some(pos) = finder.rfind(data) else {
-            // Should not happen since sep_count > 0
-            return out.write_all(data);
-        };
+/// Multi-byte string separator, after mode (separator at end of record).
+fn tac_string_after(
+    data: &[u8],
+    separator: &[u8],
+    sep_len: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
+    let mut global_end = data.len();
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
 
-        // Last record: from last separator to end
-        iov.push(IoSlice::new(&data[pos..end]));
-        end = pos;
+    loop {
+        let chunk_end = global_end.min(data.len());
+        // Extend left edge by sep_len-1 to catch separators that straddle boundaries.
+        let scan_start = chunk_start.saturating_sub(sep_len - 1);
+        if scan_start >= chunk_end {
+            if chunk_start == 0 {
+                break;
+            }
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
+        }
+        let scan_region = &data[scan_start..chunk_end];
 
-        // Scan backward
-        while end > 0 {
-            match finder.rfind(&data[..end]) {
-                Some(prev) => {
-                    iov.push(IoSlice::new(&data[prev..end]));
-                    if iov.len() >= MAX_IOV {
-                        flush_iov(out, &iov)?;
-                        iov.clear();
-                    }
-                    end = prev;
-                }
-                None => break,
+        // Forward SIMD pass to find all separator occurrences in the scan region.
+        let positions: Vec<usize> = memchr::memmem::find_iter(scan_region, separator)
+            .map(|p| p + scan_start) // global offset
+            .filter(|&p| p >= chunk_start || chunk_start == 0) // skip overlap duplicates (already processed)
+            .filter(|&p| p + sep_len <= global_end) // skip positions past our current frontier
+            .collect();
+
+        for &pos in positions.iter().rev() {
+            let rec_end_exclusive = pos + sep_len;
+            if rec_end_exclusive < global_end {
+                iov.push(IoSlice::new(&data[rec_end_exclusive..global_end]));
+            }
+            global_end = rec_end_exclusive;
+            if iov.len() >= MAX_IOV {
+                flush_iov(out, &iov)?;
+                iov.clear();
             }
         }
 
-        // Leading content before first separator
-        if end > 0 {
-            iov.push(IoSlice::new(&data[0..end]));
+        if chunk_start == 0 {
+            break;
         }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
+    // First record
+    if global_end > 0 {
+        iov.push(IoSlice::new(&data[0..global_end]));
+    }
+    flush_iov(out, &iov)?;
+    Ok(())
+}
+
+/// Multi-byte string separator, before mode (separator at start of record).
+fn tac_string_before(
+    data: &[u8],
+    separator: &[u8],
+    sep_len: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
+    let mut global_end = data.len();
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
+
+    loop {
+        let chunk_end = global_end.min(data.len());
+        let scan_start = chunk_start.saturating_sub(sep_len - 1);
+        if scan_start >= chunk_end {
+            if chunk_start == 0 {
+                break;
+            }
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
+        }
+        let scan_region = &data[scan_start..chunk_end];
+
+        let positions: Vec<usize> = memchr::memmem::find_iter(scan_region, separator)
+            .map(|p| p + scan_start)
+            .filter(|&p| p >= chunk_start || chunk_start == 0)
+            .filter(|&p| p < global_end)
+            .collect();
+
+        for &pos in positions.iter().rev() {
+            iov.push(IoSlice::new(&data[pos..global_end]));
+            global_end = pos;
+            if iov.len() >= MAX_IOV {
+                flush_iov(out, &iov)?;
+                iov.clear();
+            }
+        }
+
+        if chunk_start == 0 {
+            break;
+        }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
+    }
+
+    // Leading content before first separator
+    if global_end > 0 {
+        iov.push(IoSlice::new(&data[0..global_end]));
+    }
     flush_iov(out, &iov)?;
     Ok(())
 }
