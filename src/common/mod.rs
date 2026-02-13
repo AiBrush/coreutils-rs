@@ -21,6 +21,8 @@ pub fn reset_sigpipe() {
 /// Format an IO error message without the "(os error N)" suffix.
 /// GNU coreutils prints e.g. "No such file or directory" while Rust's
 /// Display impl adds " (os error 2)". This strips the suffix for compat.
+#[cold]
+#[inline(never)]
 pub fn io_error_msg(e: &std::io::Error) -> String {
     if let Some(raw) = e.raw_os_error() {
         let os_err = std::io::Error::from_raw_os_error(raw);
