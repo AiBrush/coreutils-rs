@@ -56,15 +56,15 @@ fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize, us
         // SAFETY: Each record writes to a non-overlapping region of buf.
         // We pass base addresses as usize (which is Send+Sync) and
         // reconstruct pointers inside the closure.
-        records.par_iter().for_each(
-            |&(src_start, src_len, dst_off)| unsafe {
+        records
+            .par_iter()
+            .for_each(|&(src_start, src_len, dst_off)| unsafe {
                 std::ptr::copy_nonoverlapping(
                     (src_base + src_start) as *const u8,
                     (dst_base + dst_off) as *mut u8,
                     src_len,
                 );
-            },
-        );
+            });
     } else {
         let buf_ptr = buf.as_mut_ptr();
         let data_ptr = data.as_ptr();

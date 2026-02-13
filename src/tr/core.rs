@@ -1158,9 +1158,7 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         let chunk_lens: Vec<usize> = data
             .par_chunks(chunk_size)
             .zip(outbuf.par_chunks_mut(chunk_size))
-            .map(|(src_chunk, dst_chunk)| {
-                delete_chunk_bitset_into(src_chunk, &member, dst_chunk)
-            })
+            .map(|(src_chunk, dst_chunk)| delete_chunk_bitset_into(src_chunk, &member, dst_chunk))
             .collect();
 
         // Compact: move each chunk's output to be contiguous.
