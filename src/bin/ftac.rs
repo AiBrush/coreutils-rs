@@ -180,9 +180,10 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
+/// 8MB pipe buffers enable larger writev batches and faster stdin reads.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
     unsafe {
         libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
         libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout

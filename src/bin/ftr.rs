@@ -96,11 +96,12 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
-/// Default pipe buffer is 64KB; increasing to 4MB reduces syscalls by ~64x
+/// Default pipe buffer is 64KB; increasing to 8MB reduces syscalls
 /// when reading/writing through pipes (e.g., `cat file | ftr`).
+/// 8MB allows the 8MB stream buffer to be filled/written in one syscall.
 #[cfg(target_os = "linux")]
 fn enlarge_pipe_bufs() {
-    const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
     unsafe {
         libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
         libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout

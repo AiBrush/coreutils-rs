@@ -123,28 +123,78 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
 }
 
 /// Read all bytes from stdin into a Vec.
+/// On Linux, uses raw libc::read() to bypass Rust's StdinLock/BufReader overhead.
 /// Uses a direct read() loop into a pre-allocated buffer instead of read_to_end(),
 /// which avoids Vec's grow-and-probe pattern (extra read() calls and memcpy).
 /// On Linux, enlarges the pipe buffer to 4MB first for fewer read() syscalls.
 /// Uses the full spare capacity for each read() to minimize syscalls — after
 /// the pipe is enlarged to 4MB, each read() returns up to 4MB of data.
 pub fn read_stdin() -> io::Result<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    return read_stdin_raw();
+
+    #[cfg(not(target_os = "linux"))]
+    read_stdin_generic()
+}
+
+/// Raw libc::read() implementation for Linux — bypasses Rust's StdinLock
+/// and BufReader layers entirely. StdinLock uses an internal 8KB BufReader
+/// which adds an extra memcpy for every read; raw read() goes directly
+/// from the kernel pipe buffer to our Vec.
+#[cfg(target_os = "linux")]
+fn read_stdin_raw() -> io::Result<Vec<u8>> {
     const PREALLOC: usize = 16 * 1024 * 1024;
     const READ_BUF: usize = 4 * 1024 * 1024;
 
-    // Enlarge pipe buffer on Linux for fewer read() syscalls
-    #[cfg(target_os = "linux")]
+    // Enlarge pipe buffer for fewer read() syscalls
     unsafe {
         libc::fcntl(0, libc::F_SETPIPE_SZ, READ_BUF as i32);
     }
 
+    let mut buf: Vec<u8> = Vec::with_capacity(PREALLOC);
+
+    loop {
+        let spare_cap = buf.capacity() - buf.len();
+        if spare_cap < READ_BUF {
+            buf.reserve(PREALLOC);
+        }
+        let spare_cap = buf.capacity() - buf.len();
+        let start = buf.len();
+
+        // SAFETY: we read into the uninitialized spare capacity and extend
+        // set_len only by the number of bytes actually read.
+        let ret = unsafe {
+            libc::read(
+                0,
+                buf.as_mut_ptr().add(start) as *mut libc::c_void,
+                spare_cap,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ret == 0 {
+            break;
+        }
+        unsafe { buf.set_len(start + ret as usize) };
+    }
+
+    Ok(buf)
+}
+
+/// Generic read_stdin for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn read_stdin_generic() -> io::Result<Vec<u8>> {
+    const PREALLOC: usize = 16 * 1024 * 1024;
+    const READ_BUF: usize = 4 * 1024 * 1024;
+
     let mut stdin = io::stdin().lock();
     let mut buf: Vec<u8> = Vec::with_capacity(PREALLOC);
 
-    // Direct read loop: read into all available spare capacity at once.
-    // With 16MB pre-allocation, the first read attempt uses the entire 16MB
-    // spare capacity, letting the kernel return as much as possible per call.
-    // For a 10MB pipe input, this often completes in just 3-4 reads.
     loop {
         let spare_cap = buf.capacity() - buf.len();
         if spare_cap < READ_BUF {
@@ -152,8 +202,6 @@ pub fn read_stdin() -> io::Result<Vec<u8>> {
         }
         let spare_cap = buf.capacity() - buf.len();
 
-        // SAFETY: we read into the uninitialized spare capacity and extend
-        // set_len only by the number of bytes actually read.
         let start = buf.len();
         unsafe { buf.set_len(start + spare_cap) };
         match stdin.read(&mut buf[start..start + spare_cap]) {

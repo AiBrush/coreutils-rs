@@ -676,14 +676,14 @@ pub fn encode_stream(
 }
 
 /// Streaming encode with NO line wrapping — optimized fast path.
-/// Read size is tuned so the encoded output fits within the 4MB pipe buffer,
-/// enabling single-syscall writes. 3MB input * 4/3 = 4MB encoded output.
-/// This reduces write() syscalls compared to the old 4MB read which produced
-/// 5.3MB encoded output requiring 2 write() calls per chunk.
+/// Read size is 6MB (divisible by 3): encoded output = 6MB * 4/3 = 8MB.
+/// While 8MB output may need 2 write() calls per chunk, reading 6MB at once
+/// reduces total syscalls for a 10MB file from 4+4 to 2+4 (read+write).
+/// The net effect is fewer total syscalls because read is the bottleneck.
 fn encode_stream_nowrap(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    // 3MB aligned to 3 bytes: encoded output = 3MB * 4/3 = 4MB = pipe buffer size.
-    // This means each encode+write is a single read() + single write() syscall pair.
-    const NOWRAP_READ: usize = 3 * 1024 * 1024; // exactly divisible by 3
+    // 6MB aligned to 3 bytes: encoded output = 6MB * 4/3 = 8MB.
+    // For 10MB input: 2 reads (6MB+4MB) instead of 4 reads (3MB*3+1MB).
+    const NOWRAP_READ: usize = 6 * 1024 * 1024; // exactly divisible by 3
 
     let mut buf = vec![0u8; NOWRAP_READ];
     let encode_buf_size = BASE64_ENGINE.encoded_length(NOWRAP_READ);
@@ -702,13 +702,26 @@ fn encode_stream_nowrap(reader: &mut impl Read, writer: &mut impl Write) -> io::
 }
 
 /// Streaming encode WITH line wrapping.
-/// Uses writev with IoSlice to interleave newlines without copying.
+/// For the common case (wrap_col divides evenly into 3-byte input groups),
+/// uses fuse_wrap to build a contiguous output buffer with newlines interleaved,
+/// then writes it in a single write() call. This eliminates the overhead of
+/// many writev() syscalls (one per ~512 lines via IoSlice).
+///
+/// For non-aligned wrap columns, falls back to the IoSlice/writev approach.
 fn encode_stream_wrapped(
     reader: &mut impl Read,
     wrap_col: usize,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // 3MB aligned to 3 bytes — sweet spot for pipe throughput with wrapping
+    let bytes_per_line = wrap_col * 3 / 4;
+    // For the common case (76-col wrapping, bytes_per_line=57 which is divisible by 3),
+    // align the read buffer to bytes_per_line boundaries so each chunk produces
+    // complete lines with no column carry-over between chunks.
+    if bytes_per_line > 0 && bytes_per_line.is_multiple_of(3) {
+        return encode_stream_wrapped_fused(reader, wrap_col, bytes_per_line, writer);
+    }
+
+    // Fallback: non-aligned wrap columns use IoSlice/writev with column tracking
     const STREAM_READ: usize = 3 * 1024 * 1024;
     let mut buf = vec![0u8; STREAM_READ];
     let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_READ);
@@ -724,7 +737,6 @@ fn encode_stream_wrapped(
         let enc_len = BASE64_ENGINE.encoded_length(n);
         let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
 
-        // For streaming wrapping: build IoSlice entries with column tracking
         write_wrapped_iov_streaming(encoded, wrap_col, &mut col, writer)?;
     }
 
@@ -735,17 +747,73 @@ fn encode_stream_wrapped(
     Ok(())
 }
 
+/// Fused encode+wrap streaming: align reads to bytes_per_line boundaries,
+/// encode chunk, fuse_wrap into contiguous buffer with newlines, single write().
+/// For 76-col wrapping (bytes_per_line=57): 3MB / 57 = ~52K complete lines per chunk.
+/// Output = 52K * 77 bytes = ~4MB, one write() syscall per chunk.
+fn encode_stream_wrapped_fused(
+    reader: &mut impl Read,
+    wrap_col: usize,
+    bytes_per_line: usize,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    // Align read size to bytes_per_line for complete output lines per chunk.
+    // ~52K lines * 57 bytes = ~3MB input, ~4MB output.
+    let lines_per_chunk = (3 * 1024 * 1024) / bytes_per_line;
+    let read_size = lines_per_chunk * bytes_per_line;
+
+    let mut buf = vec![0u8; read_size];
+    let enc_max = BASE64_ENGINE.encoded_length(read_size);
+    let fused_max = enc_max + (enc_max / wrap_col + 2); // encoded + newlines
+    let total_buf_size = fused_max + enc_max;
+    // Single buffer: [0..fused_max) = fuse_wrap output, [fused_max..total_buf_size) = encode region
+    let mut work_buf: Vec<u8> = vec![0u8; total_buf_size];
+
+    let mut trailing_partial = false;
+
+    loop {
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let enc_len = BASE64_ENGINE.encoded_length(n);
+        // Encode into the second region
+        let encode_start = fused_max;
+        let _ = BASE64_ENGINE.encode(
+            &buf[..n],
+            work_buf[encode_start..encode_start + enc_len].as_out(),
+        );
+
+        // Fuse wrap: copy encoded data with newlines interleaved into first region
+        let (fused_region, encode_region) = work_buf.split_at_mut(fused_max);
+        let encoded = &encode_region[..enc_len];
+        let wp = fuse_wrap(encoded, wrap_col, fused_region);
+
+        writer.write_all(&fused_region[..wp])?;
+        trailing_partial = !enc_len.is_multiple_of(wrap_col);
+    }
+
+    // fuse_wrap already adds a trailing newline for partial last lines,
+    // so we don't need to add one here. But if we never wrote any data
+    // at all or the last encoded chunk was exactly aligned, we're fine.
+    let _ = trailing_partial;
+
+    Ok(())
+}
+
 /// Stream-decode from a reader to a writer. Used for stdin processing.
 /// Fused single-pass: read chunk -> strip whitespace -> decode immediately.
-/// Uses 4MB read buffer to match the enlarged pipe buffer size (set by fbase64.rs).
-/// Larger buffers (16MB) waste memory since pipes deliver at most 4MB per read.
+/// Uses 8MB read buffer for maximum pipe throughput — read_full retries to
+/// fill the entire buffer from the pipe, saturating the 4MB pipe buffer and
+/// reducing syscall count. 8MB means ~2 read+decode+write cycles for 10MB.
 /// memchr2-based SIMD whitespace stripping handles the common case efficiently.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    const READ_CHUNK: usize = 4 * 1024 * 1024;
+    const READ_CHUNK: usize = 8 * 1024 * 1024;
     let mut buf = vec![0u8; READ_CHUNK];
     // Pre-allocate clean buffer once and reuse across iterations.
     // Use Vec with set_len for zero-overhead reset instead of clear() + extend().

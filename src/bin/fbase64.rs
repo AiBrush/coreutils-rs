@@ -53,9 +53,11 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
+/// 8MB pipe buffers allow larger reads/writes per syscall, reducing total
+/// syscall count for the streaming encode/decode paths.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
     unsafe {
         libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
         libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout

@@ -50,15 +50,148 @@ fn flush_iov(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
 /// Uses chunk-based forward SIMD scan processed in reverse order for
 /// maximum throughput — eliminates per-line memrchr call overhead.
 /// Output uses write_vectored (writev) for zero-copy from mmap'd data.
+///
+/// For data up to CONTIG_LIMIT, builds a contiguous reversed output buffer
+/// and writes it in a single write() call. This is faster for pipe output
+/// because it eliminates the overhead of many writev() syscalls (a 10MB file
+/// with 50-byte lines would need ~200 writev calls of 1024 entries each;
+/// a single 10MB write() is much faster).
+///
+/// For larger data, uses the writev approach to avoid doubling memory usage.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-    if !before {
+    // For data up to 32MB, build contiguous output buffer for single write().
+    // This trades one memcpy (fast, sequential) for N writev syscalls.
+    if data.len() <= CONTIG_LIMIT {
+        if !before {
+            tac_bytes_contig_after(data, separator, out)
+        } else {
+            tac_bytes_contig_before(data, separator, out)
+        }
+    } else if !before {
         tac_bytes_backward_after(data, separator, out)
     } else {
         tac_bytes_backward_before(data, separator, out)
     }
+}
+
+/// Threshold for contiguous output buffer strategy.
+/// Up to 32MB, the extra memcpy is cheaper than hundreds of writev() syscalls.
+const CONTIG_LIMIT: usize = 32 * 1024 * 1024;
+
+/// Contiguous-output after-separator mode: build reversed output in one buffer,
+/// then write it all at once. For pipe output, a single large write() is
+/// significantly faster than many writev() calls.
+fn tac_bytes_contig_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    // Pre-allocate output buffer (same size as input since tac preserves all bytes)
+    let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
+    let dst = outbuf.as_mut_ptr();
+    let mut wp = 0usize;
+
+    let mut global_end = data.len();
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
+
+    loop {
+        let chunk_end = global_end.min(data.len());
+        if chunk_start >= chunk_end {
+            if chunk_start == 0 {
+                break;
+            }
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
+        }
+        let chunk = &data[chunk_start..chunk_end];
+
+        positions_buf.clear();
+        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
+
+        for &pos in positions_buf.iter().rev() {
+            let rec_start = pos + 1;
+            let rec_len = global_end - rec_start;
+            if rec_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(rec_start),
+                        dst.add(wp),
+                        rec_len,
+                    );
+                }
+                wp += rec_len;
+            }
+            global_end = pos + 1;
+        }
+
+        if chunk_start == 0 {
+            break;
+        }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
+    }
+
+    // First record
+    if global_end > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(wp), global_end);
+        }
+        wp += global_end;
+    }
+
+    unsafe { outbuf.set_len(wp) };
+    out.write_all(&outbuf)
+}
+
+/// Contiguous-output before-separator mode.
+fn tac_bytes_contig_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
+    let dst = outbuf.as_mut_ptr();
+    let mut wp = 0usize;
+
+    let mut global_end = data.len();
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
+    let mut chunk_start = data.len().saturating_sub(CHUNK);
+
+    loop {
+        let chunk_end = global_end.min(data.len());
+        if chunk_start >= chunk_end {
+            if chunk_start == 0 {
+                break;
+            }
+            chunk_start = chunk_start.saturating_sub(CHUNK);
+            continue;
+        }
+        let chunk = &data[chunk_start..chunk_end];
+
+        positions_buf.clear();
+        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
+
+        for &pos in positions_buf.iter().rev() {
+            let rec_len = global_end - pos;
+            if rec_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), dst.add(wp), rec_len);
+                }
+                wp += rec_len;
+            }
+            global_end = pos;
+        }
+
+        if chunk_start == 0 {
+            break;
+        }
+        chunk_start = chunk_start.saturating_sub(CHUNK);
+    }
+
+    if global_end > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(wp), global_end);
+        }
+        wp += global_end;
+    }
+
+    unsafe { outbuf.set_len(wp) };
+    out.write_all(&outbuf)
 }
 
 /// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.
