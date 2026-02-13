@@ -469,7 +469,9 @@ static NOT_WHITESPACE: [bool; 256] = {
 /// Decode by stripping whitespace and decoding in a single fused pass.
 /// For data with no whitespace, decodes directly without any copy.
 /// Uses memchr2 SIMD gap-copy for \n/\r (the dominant whitespace in base64),
-/// then a fallback pass for rare whitespace types (tab, space, VT, FF).
+/// then a conditional fallback pass for rare whitespace types (tab, space, VT, FF).
+/// Tracks rare whitespace presence during the gap-copy to skip the second scan
+/// entirely in the common case (pure \n/\r whitespace only).
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?  Use the lookup table for a single scan.
     let has_ws = data.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
@@ -485,10 +487,20 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
     let dst = clean.as_mut_ptr();
     let mut wp = 0usize;
     let mut gap_start = 0usize;
+    // Track whether any rare whitespace (tab, space, VT, FF) exists in gap regions.
+    // This avoids the second full-scan pass when only \n/\r are present.
+    let mut has_rare_ws = false;
 
     for pos in memchr::memchr2_iter(b'\n', b'\r', data) {
         let gap_len = pos - gap_start;
         if gap_len > 0 {
+            // Check gap region for rare whitespace during copy.
+            // This adds ~1 branch per gap but eliminates the second full scan.
+            if !has_rare_ws {
+                has_rare_ws = data[gap_start..pos]
+                    .iter()
+                    .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr().add(gap_start), dst.add(wp), gap_len);
             }
@@ -499,6 +511,11 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
     // Copy the final gap after the last \n/\r
     let tail_len = data.len() - gap_start;
     if tail_len > 0 {
+        if !has_rare_ws {
+            has_rare_ws = data[gap_start..]
+                .iter()
+                .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr().add(gap_start), dst.add(wp), tail_len);
         }
@@ -508,9 +525,8 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
         clean.set_len(wp);
     }
 
-    // Second pass for rare whitespace (tab, space, VT, FF) using lookup table.
-    // In typical base64 streams this does nothing, but correctness requires it.
-    let has_rare_ws = clean.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
+    // Second pass for rare whitespace (tab, space, VT, FF) — only runs when needed.
+    // In typical base64 streams (76-char lines with \n), this is skipped entirely.
     if has_rare_ws {
         let ptr = clean.as_mut_ptr();
         let len = clean.len();
@@ -647,53 +663,71 @@ fn is_base64_char(b: u8) -> bool {
 }
 
 /// Stream-encode from a reader to a writer. Used for stdin processing.
-/// Uses 3MB read chunks (aligned to 3 bytes for padding-free intermediate encoding).
-/// 3MB is optimal for piped input: large enough for good throughput, small enough
-/// that read_full() fills the buffer quickly from pipes (3 reads at 1MB pipe size).
+/// Dispatches to specialized paths for wrap_col=0 (no wrap) and wrap_col>0 (wrapping).
 pub fn encode_stream(
     reader: &mut impl Read,
     wrap_col: usize,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // 3MB aligned to 3 bytes — sweet spot for pipe throughput
+    if wrap_col == 0 {
+        return encode_stream_nowrap(reader, writer);
+    }
+    encode_stream_wrapped(reader, wrap_col, writer)
+}
+
+/// Streaming encode with NO line wrapping — optimized fast path.
+/// Uses 4MB reads (aligned to 3 bytes) for fewer syscalls, and writes
+/// the encoded output directly without any wrapping logic or IoSlice overhead.
+fn encode_stream_nowrap(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
+    // 4MB aligned to 3 bytes for padding-free intermediate encoding.
+    // 4MB matches the enlarged pipe buffer size set in fbase64.rs.
+    const NOWRAP_READ: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3); // 4194300
+
+    let mut buf = vec![0u8; NOWRAP_READ];
+    let encode_buf_size = BASE64_ENGINE.encoded_length(NOWRAP_READ);
+    let mut encode_buf = vec![0u8; encode_buf_size];
+
+    loop {
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let enc_len = BASE64_ENGINE.encoded_length(n);
+        let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
+        writer.write_all(encoded)?;
+    }
+    Ok(())
+}
+
+/// Streaming encode WITH line wrapping.
+/// Uses writev with IoSlice to interleave newlines without copying.
+fn encode_stream_wrapped(
+    reader: &mut impl Read,
+    wrap_col: usize,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    // 3MB aligned to 3 bytes — sweet spot for pipe throughput with wrapping
     const STREAM_READ: usize = 3 * 1024 * 1024;
     let mut buf = vec![0u8; STREAM_READ];
-
     let encode_buf_size = BASE64_ENGINE.encoded_length(STREAM_READ);
     let mut encode_buf = vec![0u8; encode_buf_size];
 
-    if wrap_col == 0 {
-        // No wrapping: encode each chunk and write directly.
-        loop {
-            let n = read_full(reader, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let enc_len = BASE64_ENGINE.encoded_length(n);
-            let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
-            writer.write_all(encoded)?;
-        }
-    } else {
-        // Wrapping: use writev with IoSlice to interleave newlines without copying.
-        // For streaming, we need to track the column position across chunks
-        // because the last encoded chunk may not fill a complete line.
-        let mut col = 0usize;
+    let mut col = 0usize;
 
-        loop {
-            let n = read_full(reader, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let enc_len = BASE64_ENGINE.encoded_length(n);
-            let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
-
-            // For streaming wrapping: build IoSlice entries with column tracking
-            write_wrapped_iov_streaming(encoded, wrap_col, &mut col, writer)?;
+    loop {
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
         }
+        let enc_len = BASE64_ENGINE.encoded_length(n);
+        let encoded = BASE64_ENGINE.encode(&buf[..n], encode_buf[..enc_len].as_out());
 
-        if col > 0 {
-            writer.write_all(b"\n")?;
-        }
+        // For streaming wrapping: build IoSlice entries with column tracking
+        write_wrapped_iov_streaming(encoded, wrap_col, &mut col, writer)?;
+    }
+
+    if col > 0 {
+        writer.write_all(b"\n")?;
     }
 
     Ok(())
@@ -701,14 +735,15 @@ pub fn encode_stream(
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
 /// Fused single-pass: read chunk -> strip whitespace -> decode immediately.
-/// Uses 16MB read buffer to reduce syscalls and memchr2-based SIMD whitespace
-/// stripping for the common case (only \n and \r whitespace in base64 streams).
+/// Uses 4MB read buffer to match the enlarged pipe buffer size (set by fbase64.rs).
+/// Larger buffers (16MB) waste memory since pipes deliver at most 4MB per read.
+/// memchr2-based SIMD whitespace stripping handles the common case efficiently.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    const READ_CHUNK: usize = 16 * 1024 * 1024;
+    const READ_CHUNK: usize = 4 * 1024 * 1024;
     let mut buf = vec![0u8; READ_CHUNK];
     // Pre-allocate clean buffer once and reuse across iterations.
     // Use Vec with set_len for zero-overhead reset instead of clear() + extend().
@@ -744,13 +779,20 @@ pub fn decode_stream(
             // the gaps between them. For typical base64 (76-char lines), newlines
             // are ~1/77 of the data, so we process ~76 bytes per memchr hit
             // instead of 1 byte per scalar iteration.
+            // Track rare whitespace during gap-copy to skip the second scan.
             let dst = unsafe { clean.as_mut_ptr().add(carry_len) };
             let mut wp = 0usize;
             let mut gap_start = 0usize;
+            let mut has_rare_ws = false;
 
             for pos in memchr::memchr2_iter(b'\n', b'\r', chunk) {
                 let gap_len = pos - gap_start;
                 if gap_len > 0 {
+                    if !has_rare_ws {
+                        has_rare_ws = chunk[gap_start..pos]
+                            .iter()
+                            .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+                    }
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             chunk.as_ptr().add(gap_start),
@@ -764,6 +806,11 @@ pub fn decode_stream(
             }
             let tail_len = n - gap_start;
             if tail_len > 0 {
+                if !has_rare_ws {
+                    has_rare_ws = chunk[gap_start..n]
+                        .iter()
+                        .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+                }
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         chunk.as_ptr().add(gap_start),
@@ -776,11 +823,8 @@ pub fn decode_stream(
             let total_clean = carry_len + wp;
             unsafe { clean.set_len(total_clean) };
 
-            // Second pass for rare whitespace (tab, space, VT, FF) using lookup table.
-            // In typical base64 streams this does nothing, but we need correctness.
-            let has_rare_ws = clean[carry_len..total_clean]
-                .iter()
-                .any(|&b| !NOT_WHITESPACE[b as usize]);
+            // Second pass for rare whitespace (tab, space, VT, FF) — only when detected.
+            // In typical base64 streams (76-char lines with \n), this is skipped entirely.
             if has_rare_ws {
                 let ptr = clean.as_mut_ptr();
                 let mut rp = carry_len;

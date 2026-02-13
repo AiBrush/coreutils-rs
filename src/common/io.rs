@@ -123,13 +123,52 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
 }
 
 /// Read all bytes from stdin into a Vec.
-/// Pre-allocates 16MB to avoid the repeated reallocation overhead of
-/// Vec's default growth strategy (which doubles from 0 -> 8K -> 16K -> ...),
-/// causing multiple memcpy of already-read data for large piped inputs.
+/// Uses a direct read() loop into a pre-allocated buffer instead of read_to_end(),
+/// which avoids Vec's grow-and-probe pattern (extra read() calls and memcpy).
+/// On Linux, enlarges the pipe buffer to 4MB first for fewer read() syscalls.
 pub fn read_stdin() -> io::Result<Vec<u8>> {
     const PREALLOC: usize = 16 * 1024 * 1024;
-    let mut buf = Vec::with_capacity(PREALLOC);
-    io::stdin().lock().read_to_end(&mut buf)?;
+    const READ_BUF: usize = 4 * 1024 * 1024;
+
+    // Enlarge pipe buffer on Linux for fewer read() syscalls
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::fcntl(0, libc::F_SETPIPE_SZ, READ_BUF as i32);
+    }
+
+    let mut stdin = io::stdin().lock();
+    let mut buf: Vec<u8> = Vec::with_capacity(PREALLOC);
+
+    // Direct read loop: read in large chunks, grow Vec only when needed.
+    // This avoids the overhead of read_to_end()'s small initial reads and
+    // zero-filling of the buffer on each grow.
+    loop {
+        if buf.len() + READ_BUF > buf.capacity() {
+            buf.reserve(READ_BUF);
+        }
+        let spare_cap = buf.capacity() - buf.len();
+        let read_size = spare_cap.min(READ_BUF);
+
+        // SAFETY: we read into the uninitialized spare capacity and extend
+        // set_len only by the number of bytes actually read.
+        let start = buf.len();
+        unsafe { buf.set_len(start + read_size) };
+        match stdin.read(&mut buf[start..start + read_size]) {
+            Ok(0) => {
+                buf.truncate(start);
+                break;
+            }
+            Ok(n) => {
+                buf.truncate(start + n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                buf.truncate(start);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     Ok(buf)
 }
 

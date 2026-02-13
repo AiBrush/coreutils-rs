@@ -9,14 +9,12 @@ const MAX_IOV: usize = 1024;
 /// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Stream buffer: 1MB — fits in L2/L3 cache so data stays hot between read,
-/// process, and write phases. Larger buffers (4-8MB) cause cache thrashing.
-const STREAM_BUF: usize = 1024 * 1024;
-
-/// Translate stream buffer: 4MB — translate is compute-light (single table lookup
-/// per byte) so the bottleneck is I/O syscalls, not cache pressure. Larger buffer
-/// means fewer read()/write() syscall pairs (3 for 10MB instead of 10).
-const TRANSLATE_STREAM_BUF: usize = 4 * 1024 * 1024;
+/// Stream buffer: 4MB — all tr streaming operations (translate, delete, squeeze)
+/// are compute-light (single table lookup or bitset check per byte), so the
+/// bottleneck is I/O syscalls, not cache pressure. 4MB buffer means only
+/// 3 read()/write() syscall pairs for a 10MB input instead of 10+.
+/// This applies to ALL streaming modes (delete, squeeze, translate).
+const STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// Below this, single-threaded is faster due to thread pool overhead.
@@ -1014,6 +1012,7 @@ fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
 }
 
 /// Streaming delete for contiguous byte ranges using SIMD range detection.
+/// Uses 4MB buffer to reduce syscalls (delete is compute-light, I/O bound).
 fn delete_range_streaming(
     lo: u8,
     hi: u8,
@@ -1065,7 +1064,7 @@ pub fn translate(
     // The 8x-unrolled in-place translate avoids store-to-load forwarding stalls
     // because consecutive reads are 8 bytes apart (sequential), not aliased.
     // Using 4MB buffer (vs 1MB) reduces syscall count from 10 to 3 for 10MB.
-    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1086,7 +1085,7 @@ fn translate_range_stream(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1101,7 +1100,7 @@ fn translate_range_stream(
 /// Pure passthrough: copy stdin to stdout without transformation.
 /// Uses a single 4MB buffer with direct read/write, no processing overhead.
 fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    let mut buf = vec![0u8; TRANSLATE_STREAM_BUF];
+    let mut buf = vec![0u8; STREAM_BUF];
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1113,9 +1112,16 @@ fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Re
 }
 
 /// Read as many bytes as possible into buf, retrying on partial reads.
+/// Fast path: first read() often fills the entire buffer for regular files.
 #[inline]
 fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut total = 0;
+    // Fast path: first read() usually fills the entire buffer for regular files
+    let n = reader.read(buf)?;
+    if n == buf.len() || n == 0 {
+        return Ok(n);
+    }
+    // Slow path: partial read — retry to fill buffer (pipes, slow devices)
+    let mut total = n;
     while total < buf.len() {
         match reader.read(&mut buf[total..]) {
             Ok(0) => break,
@@ -1221,46 +1227,30 @@ pub fn delete(
                 let b6 = *ptr.add(i + 6);
                 let b7 = *ptr.add(i + 7);
 
-                if !is_member(&member, b0) {
-                    *ptr.add(wp) = b0;
-                    wp += 1;
-                }
-                if !is_member(&member, b1) {
-                    *ptr.add(wp) = b1;
-                    wp += 1;
-                }
-                if !is_member(&member, b2) {
-                    *ptr.add(wp) = b2;
-                    wp += 1;
-                }
-                if !is_member(&member, b3) {
-                    *ptr.add(wp) = b3;
-                    wp += 1;
-                }
-                if !is_member(&member, b4) {
-                    *ptr.add(wp) = b4;
-                    wp += 1;
-                }
-                if !is_member(&member, b5) {
-                    *ptr.add(wp) = b5;
-                    wp += 1;
-                }
-                if !is_member(&member, b6) {
-                    *ptr.add(wp) = b6;
-                    wp += 1;
-                }
-                if !is_member(&member, b7) {
-                    *ptr.add(wp) = b7;
-                    wp += 1;
-                }
+                // Branchless: write byte then conditionally advance pointer.
+                // Avoids branch mispredictions when most bytes are kept.
+                *ptr.add(wp) = b0;
+                wp += !is_member(&member, b0) as usize;
+                *ptr.add(wp) = b1;
+                wp += !is_member(&member, b1) as usize;
+                *ptr.add(wp) = b2;
+                wp += !is_member(&member, b2) as usize;
+                *ptr.add(wp) = b3;
+                wp += !is_member(&member, b3) as usize;
+                *ptr.add(wp) = b4;
+                wp += !is_member(&member, b4) as usize;
+                *ptr.add(wp) = b5;
+                wp += !is_member(&member, b5) as usize;
+                *ptr.add(wp) = b6;
+                wp += !is_member(&member, b6) as usize;
+                *ptr.add(wp) = b7;
+                wp += !is_member(&member, b7) as usize;
                 i += 8;
             }
             while i < n {
                 let b = *ptr.add(i);
-                if !is_member(&member, b) {
-                    *ptr.add(wp) = b;
-                    wp += 1;
-                }
+                *ptr.add(wp) = b;
+                wp += !is_member(&member, b) as usize;
                 i += 1;
             }
         }
@@ -1276,12 +1266,10 @@ fn delete_single_streaming(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; STREAM_BUF];
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let mut wp = 0;
         let mut i = 0;
         while i < n {
@@ -1331,12 +1319,10 @@ fn delete_multi_streaming(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; STREAM_BUF];
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
         let mut wp = 0;
         let mut i = 0;
         while i < n {
@@ -1474,12 +1460,10 @@ fn squeeze_single_stream(
     let mut was_squeeze_char = false;
 
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
+        let n = read_full(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
 
         let mut wp = 0;
         let mut i = 0;
