@@ -1,12 +1,43 @@
-use std::io::{self, IoSlice, Write};
+use std::io::{self, Write};
 
-/// Maximum number of IoSlice entries for write_vectored.
-/// Linux UIO_MAXIOV is 1024, so we batch in groups of 1024.
-const MAX_IOV: usize = 1024;
+/// Output buffer for buffered record assembly.
+/// 16MB minimizes write() syscall count: ~6 calls for 100MB input,
+/// vs ~1000 writev() calls with scattered IoSlices.
+const OUT_BUF: usize = 16 * 1024 * 1024;
+
+/// Copy a slice into the output buffer, flushing to the writer when full.
+/// Common path (fits in buffer) uses copy_nonoverlapping for zero overhead.
+#[inline]
+fn emit_slice(out: &mut impl Write, buf: &mut [u8], wp: &mut usize, s: &[u8]) -> io::Result<()> {
+    let cap = buf.len();
+    if *wp + s.len() <= cap {
+        // Fast path: fits in remaining buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr().add(*wp), s.len());
+        }
+        *wp += s.len();
+        Ok(())
+    } else if s.len() > cap {
+        // Oversized slice: flush buffer then write directly
+        if *wp > 0 {
+            out.write_all(&buf[..*wp])?;
+            *wp = 0;
+        }
+        out.write_all(s)
+    } else {
+        // Buffer full: flush then copy to beginning
+        out.write_all(&buf[..*wp])?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr(), s.len());
+        }
+        *wp = s.len();
+        Ok(())
+    }
+}
 
 /// Reverse records separated by a single byte.
 /// Uses forward SIMD scan (memchr_iter) to collect separator positions,
-/// then writes records in reverse order using zero-copy vectored I/O (writev).
+/// then writes records in reverse order using buffered output.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -20,44 +51,46 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 
     if !before {
-        // separator-after mode: records end with separator
         tac_bytes_after(data, &positions, out)
     } else {
-        // separator-before mode: records start with separator
         tac_bytes_before(data, &positions, out)
     }
 }
 
 /// Separator-after mode.
 /// Each record runs from (prev_sep+1) to (cur_sep+1), inclusive of separator.
-/// Uses zero-copy vectored I/O (writev) from mmap'd data.
+/// Copies records into a contiguous output buffer for minimal write() syscalls.
 fn tac_bytes_after(data: &[u8], positions: &[usize], out: &mut impl Write) -> io::Result<()> {
-    let last_sep = *positions.last().unwrap();
+    let buf_size = data.len().min(OUT_BUF);
+    let mut buf = vec![0u8; buf_size];
+    let mut wp = 0;
 
-    // Build list of record slices in reverse order
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(positions.len() + 1);
+    let last_sep = *positions.last().unwrap();
 
     // Trailing content without separator — output first
     if last_sep + 1 < data.len() {
-        slices.push(&data[last_sep + 1..]);
+        emit_slice(out, &mut buf, &mut wp, &data[last_sep + 1..])?;
     }
 
     // Records in reverse order
     for i in (0..positions.len()).rev() {
         let start = if i == 0 { 0 } else { positions[i - 1] + 1 };
         let end = positions[i] + 1;
-        slices.push(&data[start..end]);
+        emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
     }
 
-    // Write all slices using vectored I/O in batches
-    write_vectored_batched(out, &slices)
+    if wp > 0 {
+        out.write_all(&buf[..wp])?;
+    }
+    Ok(())
 }
 
 /// Separator-before mode.
-/// Uses zero-copy vectored I/O (writev) from mmap'd data.
+/// Copies records into a contiguous output buffer for minimal write() syscalls.
 fn tac_bytes_before(data: &[u8], positions: &[usize], out: &mut impl Write) -> io::Result<()> {
-    // Vectored I/O: build slices, zero-copy from mmap
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(positions.len() + 1);
+    let buf_size = data.len().min(OUT_BUF);
+    let mut buf = vec![0u8; buf_size];
+    let mut wp = 0;
 
     // Records in reverse order (each starts with separator)
     for i in (0..positions.len()).rev() {
@@ -67,88 +100,22 @@ fn tac_bytes_before(data: &[u8], positions: &[usize], out: &mut impl Write) -> i
         } else {
             data.len()
         };
-        slices.push(&data[start..end]);
+        emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
     }
 
     // Leading content before first separator
     if positions[0] > 0 {
-        slices.push(&data[..positions[0]]);
+        emit_slice(out, &mut buf, &mut wp, &data[..positions[0]])?;
     }
 
-    write_vectored_batched(out, &slices)
-}
-
-/// Write a list of slices using batched write_vectored (writev syscall).
-/// Batches up to MAX_IOV slices per syscall to stay within OS limits.
-fn write_vectored_batched(out: &mut impl Write, slices: &[&[u8]]) -> io::Result<()> {
-    // For small number of slices, use direct write_vectored
-    if slices.len() <= MAX_IOV {
-        let io_slices: Vec<IoSlice<'_>> = slices.iter().map(|s| IoSlice::new(s)).collect();
-        write_all_vectored(out, &io_slices)?;
-        return Ok(());
-    }
-
-    // For large files with many records, batch in groups
-    for batch in slices.chunks(MAX_IOV) {
-        let io_slices: Vec<IoSlice<'_>> = batch.iter().map(|s| IoSlice::new(s)).collect();
-        write_all_vectored(out, &io_slices)?;
-    }
-    Ok(())
-}
-
-/// Write all IoSlices, handling partial writes.
-fn write_all_vectored(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
-    // Compute total bytes
-    let total: usize = slices.iter().map(|s| s.len()).sum();
-    if total == 0 {
-        return Ok(());
-    }
-
-    // Try write_vectored first
-    let mut written = 0;
-    let mut remaining_slices = slices;
-
-    while written < total {
-        match out.write_vectored(remaining_slices) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write all data",
-                ));
-            }
-            Ok(n) => {
-                written += n;
-                if written >= total {
-                    break;
-                }
-                // Find where we left off — skip fully-written slices
-                let mut skip_bytes = n;
-                let mut skip_idx = 0;
-                for (idx, slice) in remaining_slices.iter().enumerate() {
-                    if skip_bytes >= slice.len() {
-                        skip_bytes -= slice.len();
-                        skip_idx = idx + 1;
-                    } else {
-                        break;
-                    }
-                }
-                remaining_slices = &remaining_slices[skip_idx..];
-                // If we're partway through a slice, fall back to write_all for remainder
-                if skip_bytes > 0 && !remaining_slices.is_empty() {
-                    out.write_all(&remaining_slices[0][skip_bytes..])?;
-                    written += remaining_slices[0].len() - skip_bytes;
-                    remaining_slices = &remaining_slices[1..];
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
+    if wp > 0 {
+        out.write_all(&buf[..wp])?;
     }
     Ok(())
 }
 
 /// Reverse records using a multi-byte string separator.
-/// Uses SIMD-accelerated memmem for substring search + zero-copy vectored I/O.
+/// Uses SIMD-accelerated memmem for substring search + buffered output.
 pub fn tac_string_separator(
     data: &[u8],
     separator: &[u8],
@@ -171,14 +138,14 @@ pub fn tac_string_separator(
     }
 
     let sep_len = separator.len();
-
-    // Build list of record slices in reverse order, then use vectored I/O
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(positions.len() + 1);
+    let buf_size = data.len().min(OUT_BUF);
+    let mut buf = vec![0u8; buf_size];
+    let mut wp = 0;
 
     if !before {
         let last_end = positions.last().unwrap() + sep_len;
         if last_end < data.len() {
-            slices.push(&data[last_end..]);
+            emit_slice(out, &mut buf, &mut wp, &data[last_end..])?;
         }
         for i in (0..positions.len()).rev() {
             let rec_start = if i == 0 {
@@ -186,7 +153,12 @@ pub fn tac_string_separator(
             } else {
                 positions[i - 1] + sep_len
             };
-            slices.push(&data[rec_start..positions[i] + sep_len]);
+            emit_slice(
+                out,
+                &mut buf,
+                &mut wp,
+                &data[rec_start..positions[i] + sep_len],
+            )?;
         }
     } else {
         for i in (0..positions.len()).rev() {
@@ -196,14 +168,17 @@ pub fn tac_string_separator(
             } else {
                 data.len()
             };
-            slices.push(&data[start..end]);
+            emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
         }
         if positions[0] > 0 {
-            slices.push(&data[..positions[0]]);
+            emit_slice(out, &mut buf, &mut wp, &data[..positions[0]])?;
         }
     }
 
-    write_vectored_batched(out, &slices)
+    if wp > 0 {
+        out.write_all(&buf[..wp])?;
+    }
+    Ok(())
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
@@ -265,21 +240,22 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    // Build slices in reverse order
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(matches.len() + 1);
+    let buf_size = data.len().min(OUT_BUF);
+    let mut buf = vec![0u8; buf_size];
+    let mut wp = 0;
 
     if !before {
         let last_end = matches.last().unwrap().1;
 
         if last_end < data.len() {
-            slices.push(&data[last_end..]);
+            emit_slice(out, &mut buf, &mut wp, &data[last_end..])?;
         }
 
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
             let rec_start = if i == 0 { 0 } else { matches[i - 1].1 };
-            slices.push(&data[rec_start..matches[i].1]);
+            emit_slice(out, &mut buf, &mut wp, &data[rec_start..matches[i].1])?;
         }
     } else {
         let mut i = matches.len();
@@ -291,13 +267,16 @@ pub fn tac_regex_separator(
             } else {
                 data.len()
             };
-            slices.push(&data[start..end]);
+            emit_slice(out, &mut buf, &mut wp, &data[start..end])?;
         }
 
         if matches[0].0 > 0 {
-            slices.push(&data[..matches[0].0]);
+            emit_slice(out, &mut buf, &mut wp, &data[..matches[0].0])?;
         }
     }
 
-    write_vectored_batched(out, &slices)
+    if wp > 0 {
+        out.write_all(&buf[..wp])?;
+    }
+    Ok(())
 }

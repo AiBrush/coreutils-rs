@@ -4,12 +4,12 @@ use base64_simd::AsOut;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Streaming encode chunk: 12MB aligned to 3 bytes.
+/// Streaming encode chunk: 24MB aligned to 3 bytes.
 /// Larger chunks = fewer loop iterations = fewer encode setup calls.
-const STREAM_ENCODE_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
+const STREAM_ENCODE_CHUNK: usize = 24 * 1024 * 1024 - (24 * 1024 * 1024 % 3);
 
-/// Chunk size for no-wrap encoding: 12MB aligned to 3 bytes.
-const NOWRAP_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
+/// Chunk size for no-wrap encoding: 24MB aligned to 3 bytes.
+const NOWRAP_CHUNK: usize = 24 * 1024 * 1024 - (24 * 1024 * 1024 % 3);
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.

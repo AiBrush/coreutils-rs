@@ -1,12 +1,12 @@
 use std::io::{self, Read, Write};
 
-/// Main processing buffer: 8MB — large enough to amortize write() syscall overhead.
-/// For mmap translate, this determines write chunk size.
-const BUF_SIZE: usize = 8 * 1024 * 1024;
+/// Main processing buffer: 32MB — large enough to amortize write() syscall overhead.
+/// Larger chunks = fewer write() syscalls = less kernel overhead.
+const BUF_SIZE: usize = 32 * 1024 * 1024;
 
-/// Stream buffer: 4MB — process data immediately after each read().
-/// Larger buffers = fewer syscalls = faster on Celeron N5100.
-const STREAM_BUF: usize = 4 * 1024 * 1024;
+/// Stream buffer: 16MB — process data immediately after each read().
+/// Larger buffers = fewer syscalls = faster throughput.
+const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]

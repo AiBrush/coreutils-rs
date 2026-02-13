@@ -63,10 +63,9 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 // ── Public hashing API ──────────────────────────────────────────────
 
 /// Buffer size for streaming hash I/O.
-/// 8MB: large enough to amortize syscall overhead, small enough for
-/// kernel readahead to keep up. Two 8MB buffers fit in RAM while the
-/// kernel prefetches the next chunk into page cache.
-const HASH_READ_BUF: usize = 8 * 1024 * 1024;
+/// 16MB: large enough to amortize syscall overhead and reduce the number
+/// of hash update() calls. Fewer updates = less per-chunk hasher overhead.
+const HASH_READ_BUF: usize = 16 * 1024 * 1024;
 
 // Thread-local reusable buffer for streaming hash I/O.
 // Allocated once per thread, reused across all hash_reader calls.

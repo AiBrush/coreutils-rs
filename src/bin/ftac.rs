@@ -59,7 +59,7 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     }
 
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
+    let mmap = unsafe { MmapOptions::new().populate().map(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
