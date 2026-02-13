@@ -4,6 +4,11 @@ use std::io::{self, IoSlice, Write};
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
+/// Maximum data size for single-allocation reverse approach.
+/// Below this limit, allocate one output buffer and do a single write_all
+/// instead of building IoSlice vectors and doing multiple writev syscalls.
+const SINGLE_ALLOC_LIMIT: usize = 256 * 1024 * 1024;
+
 /// Flush a batch of IoSlice entries using write_vectored.
 /// Falls back to individual write_all for each slice if write_vectored
 /// doesn't write everything (handles partial writes).
@@ -58,6 +63,10 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
 /// Each record includes its trailing separator byte.
 /// Uses IoSlice batching for zero-copy output directly from mmap'd data.
 fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    if data.len() <= SINGLE_ALLOC_LIMIT {
+        return tac_bytes_backward_after_alloc(data, sep, out);
+    }
+
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
     let mut end = data.len();
@@ -99,6 +108,10 @@ fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 /// Each record starts with its separator byte.
 /// Uses IoSlice batching for zero-copy output.
 fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    if data.len() <= SINGLE_ALLOC_LIMIT {
+        return tac_bytes_backward_before_alloc(data, sep, out);
+    }
+
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
     let mut end = data.len();
@@ -149,6 +162,15 @@ pub fn tac_string_separator(
 
     if separator.len() == 1 {
         return tac_bytes(data, separator[0], before, out);
+    }
+
+    // Single-alloc fast path for multi-byte separators
+    if data.len() <= SINGLE_ALLOC_LIMIT {
+        return if !before {
+            tac_string_backward_after_alloc(data, separator, out)
+        } else {
+            tac_string_backward_before_alloc(data, separator, out)
+        };
     }
 
     let sep_len = separator.len();
@@ -220,6 +242,227 @@ pub fn tac_string_separator(
 
     flush_iov(out, &iov)?;
     Ok(())
+}
+
+// ============================================================================
+// Single-allocation reverse functions (data <= SINGLE_ALLOC_LIMIT)
+// ============================================================================
+
+/// Single-allocation reverse for after-separator mode (single byte).
+/// Copies reversed records into one contiguous buffer, then single write_all.
+/// Eliminates Vec<IoSlice> allocation, writev batching, and kernel per-iov overhead.
+fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    let mut buf = vec![0u8; data.len()];
+    let mut wp: usize = 0;
+    let mut end = data.len();
+
+    let Some(mut pos) = memchr::memrchr(sep, data) else {
+        return out.write_all(data);
+    };
+
+    // Trailing content after last separator
+    if pos + 1 < end {
+        let len = end - (pos + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(pos + 1),
+                buf.as_mut_ptr().add(wp),
+                len,
+            );
+        }
+        wp += len;
+    }
+    end = pos + 1;
+
+    // Scan backward for remaining separators
+    while pos > 0 {
+        match memchr::memrchr(sep, &data[..pos]) {
+            Some(prev) => {
+                let len = end - (prev + 1);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(prev + 1),
+                        buf.as_mut_ptr().add(wp),
+                        len,
+                    );
+                }
+                wp += len;
+                end = prev + 1;
+                pos = prev;
+            }
+            None => break,
+        }
+    }
+
+    // First record (from start of data)
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+    }
+    wp += end;
+
+    out.write_all(&buf[..wp])
+}
+
+/// Single-allocation reverse for before-separator mode (single byte).
+fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+    let mut buf = vec![0u8; data.len()];
+    let mut wp: usize = 0;
+    let mut end = data.len();
+
+    let Some(pos) = memchr::memrchr(sep, data) else {
+        return out.write_all(data);
+    };
+
+    // Last record: from last separator to end
+    let len = end - pos;
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), buf.as_mut_ptr().add(wp), len);
+    }
+    wp += len;
+    end = pos;
+
+    // Scan backward
+    while end > 0 {
+        match memchr::memrchr(sep, &data[..end]) {
+            Some(prev) => {
+                let len = end - prev;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(prev),
+                        buf.as_mut_ptr().add(wp),
+                        len,
+                    );
+                }
+                wp += len;
+                end = prev;
+            }
+            None => break,
+        }
+    }
+
+    // Leading content before first separator
+    if end > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+        }
+        wp += end;
+    }
+
+    out.write_all(&buf[..wp])
+}
+
+/// Single-allocation reverse for string separator, after mode.
+fn tac_string_backward_after_alloc(
+    data: &[u8],
+    separator: &[u8],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let sep_len = separator.len();
+    let finder = memchr::memmem::FinderRev::new(separator);
+    let mut buf = vec![0u8; data.len()];
+    let mut wp: usize = 0;
+    let mut end = data.len();
+
+    let Some(mut pos) = finder.rfind(data) else {
+        return out.write_all(data);
+    };
+
+    // Trailing content after last separator
+    if pos + sep_len < end {
+        let src_start = pos + sep_len;
+        let len = end - src_start;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(src_start),
+                buf.as_mut_ptr().add(wp),
+                len,
+            );
+        }
+        wp += len;
+    }
+    end = pos + sep_len;
+
+    // Scan backward
+    while pos > 0 {
+        match finder.rfind(&data[..pos]) {
+            Some(prev) => {
+                let src_start = prev + sep_len;
+                let len = end - src_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(src_start),
+                        buf.as_mut_ptr().add(wp),
+                        len,
+                    );
+                }
+                wp += len;
+                end = prev + sep_len;
+                pos = prev;
+            }
+            None => break,
+        }
+    }
+
+    // First record
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+    }
+    wp += end;
+
+    out.write_all(&buf[..wp])
+}
+
+/// Single-allocation reverse for string separator, before mode.
+fn tac_string_backward_before_alloc(
+    data: &[u8],
+    separator: &[u8],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let finder = memchr::memmem::FinderRev::new(separator);
+    let mut buf = vec![0u8; data.len()];
+    let mut wp: usize = 0;
+    let mut end = data.len();
+
+    let Some(pos) = finder.rfind(data) else {
+        return out.write_all(data);
+    };
+
+    // Last record: from last separator to end
+    let len = end - pos;
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), buf.as_mut_ptr().add(wp), len);
+    }
+    wp += len;
+    end = pos;
+
+    // Scan backward
+    while end > 0 {
+        match finder.rfind(&data[..end]) {
+            Some(prev) => {
+                let len = end - prev;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(prev),
+                        buf.as_mut_ptr().add(wp),
+                        len,
+                    );
+                }
+                wp += len;
+                end = prev;
+            }
+            None => break,
+        }
+    }
+
+    // Leading content before first separator
+    if end > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(wp), end);
+        }
+        wp += end;
+    }
+
+    out.write_all(&buf[..wp])
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.

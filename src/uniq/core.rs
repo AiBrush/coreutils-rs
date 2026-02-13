@@ -715,6 +715,7 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
 }
 
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
+/// Zero-copy: writes directly from input data, no output buffer allocation.
 fn process_filter_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -722,25 +723,23 @@ fn process_filter_fast_singlepass(
     term: u8,
 ) -> io::Result<()> {
     let repeated = matches!(config.mode, OutputMode::RepeatedOnly);
-    let mut outbuf = Vec::with_capacity(data.len() / 2);
 
-    let prev_start: usize = 0;
-    let prev_end: usize = match memchr::memchr(term, data) {
+    let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
         None => {
             // Single line: unique (count=1)
             if !repeated {
-                outbuf.extend_from_slice(data);
-                outbuf.push(term);
+                writer.write_all(data)?;
+                writer.write_all(&[term])?;
             }
-            return writer.write_all(&outbuf);
+            return Ok(());
         }
     };
 
-    let mut prev_start_mut = prev_start;
-    let mut prev_end_mut = prev_end;
+    let mut prev_start: usize = 0;
+    let mut prev_end: usize = first_term;
     let mut count: u64 = 1;
-    let mut cur_start = prev_end + 1;
+    let mut cur_start = first_term + 1;
 
     while cur_start < data.len() {
         let cur_end = match memchr::memchr(term, &data[cur_start..]) {
@@ -748,24 +747,21 @@ fn process_filter_fast_singlepass(
             None => data.len(),
         };
 
-        let prev_content = &data[prev_start_mut..prev_end_mut];
-        let cur_content = &data[cur_start..cur_end];
-
-        if lines_equal_fast(prev_content, cur_content) {
+        if lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
             count += 1;
         } else {
-            // Output previous group based on mode
+            // Output previous group — write directly from input data (zero-copy)
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                if prev_end_mut < data.len() && data.get(prev_end_mut) == Some(&term) {
-                    outbuf.extend_from_slice(&data[prev_start_mut..prev_end_mut + 1]);
+                if prev_end < data.len() && data[prev_end] == term {
+                    writer.write_all(&data[prev_start..prev_end + 1])?;
                 } else {
-                    outbuf.extend_from_slice(&data[prev_start_mut..prev_end_mut]);
-                    outbuf.push(term);
+                    writer.write_all(&data[prev_start..prev_end])?;
+                    writer.write_all(&[term])?;
                 }
             }
-            prev_start_mut = cur_start;
-            prev_end_mut = cur_end;
+            prev_start = cur_start;
+            prev_end = cur_end;
             count = 1;
         }
 
@@ -779,15 +775,15 @@ fn process_filter_fast_singlepass(
     // Output last group
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        if prev_end_mut < data.len() && data.get(prev_end_mut) == Some(&term) {
-            outbuf.extend_from_slice(&data[prev_start_mut..prev_end_mut + 1]);
+        if prev_end < data.len() && data[prev_end] == term {
+            writer.write_all(&data[prev_start..prev_end + 1])?;
         } else {
-            outbuf.extend_from_slice(&data[prev_start_mut..prev_end_mut]);
-            outbuf.push(term);
+            writer.write_all(&data[prev_start..prev_end])?;
+            writer.write_all(&[term])?;
         }
     }
 
-    writer.write_all(&outbuf)
+    Ok(())
 }
 
 /// Output a group for standard modes (bytes path).

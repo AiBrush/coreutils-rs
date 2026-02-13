@@ -1,10 +1,10 @@
 use std::io::{self, Read, Write};
 
-/// Main processing buffer: 32MB.
-const BUF_SIZE: usize = 32 * 1024 * 1024;
+/// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
+const BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Stream buffer: 16MB.
-const STREAM_BUF: usize = 16 * 1024 * 1024;
+/// Stream buffer: 4MB (L3-cache-friendly).
+const STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
