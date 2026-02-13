@@ -349,6 +349,9 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
 }
 
 /// Process a chunk of data for general field extraction.
+/// When `delim != line_delim`, uses a single-pass memchr2_iter scan to find both
+/// delimiters and line terminators in one SIMD pass, eliminating per-line memchr_iter
+/// setup overhead. When `delim == line_delim`, falls back to the two-level approach.
 fn process_fields_chunk(
     data: &[u8],
     delim: u8,
@@ -361,6 +364,109 @@ fn process_fields_chunk(
     complement: bool,
     buf: &mut Vec<u8>,
 ) {
+    // Single-pass path: when delim != line_delim, use memchr2_iter for both bytes
+    // in one SIMD scan. This eliminates 10M inner-loop memchr_iter startups for
+    // a file with 10M lines.
+    if delim != line_delim {
+        buf.reserve(data.len());
+
+        let mut line_start: usize = 0;
+        let mut field_start: usize = 0;
+        let mut field_num: usize = 1;
+        let mut first_output = true;
+        let mut has_delim = false;
+
+        for pos in memchr::memchr2_iter(delim, line_delim, data) {
+            let byte = unsafe { *data.get_unchecked(pos) };
+
+            if byte == line_delim {
+                // End of line: flush final field and emit line delimiter
+                if (field_num <= max_field || complement)
+                    && has_delim
+                    && is_selected(field_num, field_mask, ranges, complement)
+                {
+                    if !first_output {
+                        unsafe { buf_extend(buf, output_delim) };
+                    }
+                    unsafe { buf_extend(buf, &data[field_start..pos]) };
+                    first_output = false;
+                }
+
+                if !first_output {
+                    unsafe { buf_push(buf, line_delim) };
+                } else if !has_delim {
+                    if !suppress {
+                        unsafe {
+                            buf_extend(buf, &data[line_start..pos]);
+                            buf_push(buf, line_delim);
+                        }
+                    }
+                } else {
+                    unsafe { buf_push(buf, line_delim) };
+                }
+
+                // Reset state for next line
+                line_start = pos + 1;
+                field_start = pos + 1;
+                field_num = 1;
+                first_output = true;
+                has_delim = false;
+            } else {
+                // Field delimiter hit
+                has_delim = true;
+
+                if is_selected(field_num, field_mask, ranges, complement) {
+                    if !first_output {
+                        unsafe { buf_extend(buf, output_delim) };
+                    }
+                    unsafe { buf_extend(buf, &data[field_start..pos]) };
+                    first_output = false;
+                }
+
+                field_num += 1;
+                field_start = pos + 1;
+
+                if field_num > max_field && !complement {
+                    // Skip remaining delimiters on this line; find next line_delim
+                    // We'll let the next memchr2 iteration handle the line_delim
+                }
+            }
+        }
+
+        // Handle last line without trailing line_delim
+        if line_start < data.len() {
+            let line = &data[line_start..];
+            if !line.is_empty() {
+                if (field_num <= max_field || complement)
+                    && has_delim
+                    && is_selected(field_num, field_mask, ranges, complement)
+                {
+                    if !first_output {
+                        unsafe { buf_extend(buf, output_delim) };
+                    }
+                    unsafe { buf_extend(buf, &data[field_start..data.len()]) };
+                    first_output = false;
+                }
+
+                if !first_output {
+                    unsafe { buf_push(buf, line_delim) };
+                } else if !has_delim {
+                    if !suppress {
+                        unsafe {
+                            buf_extend(buf, &data[line_start..data.len()]);
+                            buf_push(buf, line_delim);
+                        }
+                    }
+                } else {
+                    unsafe { buf_push(buf, line_delim) };
+                }
+            }
+        }
+
+        return;
+    }
+
+    // Fallback: when delim == line_delim, use the two-level scan approach
     let mut start = 0;
     for end_pos in memchr_iter(line_delim, data) {
         let line = &data[start..end_pos];

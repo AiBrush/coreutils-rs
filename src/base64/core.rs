@@ -378,8 +378,8 @@ static NOT_WHITESPACE: [bool; 256] = {
 
 /// Decode by stripping whitespace and decoding in a single fused pass.
 /// For data with no whitespace, decodes directly without any copy.
-/// Uses a 256-byte lookup table to classify all whitespace types in one pass,
-/// eliminating the previous triple-scan (check, strip CR/LF, strip other ws).
+/// Uses memchr2 SIMD gap-copy for \n/\r (the dominant whitespace in base64),
+/// then a fallback pass for rare whitespace types (tab, space, VT, FF).
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     // Quick check: any whitespace at all?  Use the lookup table for a single scan.
     let has_ws = data.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
@@ -388,23 +388,53 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
         return decode_borrowed_clean(out, data);
     }
 
-    // Single fused pass: copy only non-whitespace bytes using the lookup table.
-    // This replaces the previous triple-scan approach (memchr2 for CR/LF,
-    // then a second scan for tab/space, then retain).
+    // SIMD gap-copy: use memchr2 to find \n and \r positions, then copy the
+    // gaps between them. For typical base64 (76-char lines), newlines are ~1/77
+    // of the data, so we process ~76 bytes per memchr hit instead of 1 per scalar.
     let mut clean: Vec<u8> = Vec::with_capacity(data.len());
-    let mut wp = 0usize;
-    let src = data.as_ptr();
     let dst = clean.as_mut_ptr();
+    let mut wp = 0usize;
+    let mut gap_start = 0usize;
 
-    for i in 0..data.len() {
-        let b = unsafe { *src.add(i) };
-        if NOT_WHITESPACE[b as usize] {
-            unsafe { *dst.add(wp) = b };
-            wp += 1;
+    for pos in memchr::memchr2_iter(b'\n', b'\r', data) {
+        let gap_len = pos - gap_start;
+        if gap_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(gap_start), dst.add(wp), gap_len);
+            }
+            wp += gap_len;
         }
+        gap_start = pos + 1;
+    }
+    // Copy the final gap after the last \n/\r
+    let tail_len = data.len() - gap_start;
+    if tail_len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(gap_start), dst.add(wp), tail_len);
+        }
+        wp += tail_len;
     }
     unsafe {
         clean.set_len(wp);
+    }
+
+    // Second pass for rare whitespace (tab, space, VT, FF) using lookup table.
+    // In typical base64 streams this does nothing, but correctness requires it.
+    let has_rare_ws = clean.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
+    if has_rare_ws {
+        let ptr = clean.as_mut_ptr();
+        let len = clean.len();
+        let mut rp = 0;
+        let mut cwp = 0;
+        while rp < len {
+            let b = unsafe { *ptr.add(rp) };
+            if NOT_WHITESPACE[b as usize] {
+                unsafe { *ptr.add(cwp) = b };
+                cwp += 1;
+            }
+            rp += 1;
+        }
+        clean.truncate(cwp);
     }
 
     decode_clean_slice(&mut clean, out)
@@ -448,8 +478,8 @@ fn decode_borrowed_clean(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
 }
 
 /// Parallel decode: split at 4-byte boundaries, decode chunks in parallel via rayon.
-/// Pre-allocates a single contiguous output buffer of data.len()*3/4, has each thread
-/// decode into its non-overlapping slice, then writes the buffer with a single write_all.
+/// Pre-allocates a single contiguous output buffer with exact decoded offsets computed
+/// upfront, so each thread decodes directly to its final position. No compaction needed.
 fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
     let num_threads = rayon::current_num_threads().max(1);
     let raw_chunk = data.len() / num_threads;
@@ -458,63 +488,58 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
 
     let chunks: Vec<&[u8]> = data.chunks(chunk_size.max(4)).collect();
 
-    // Pre-allocate contiguous output buffer: each 4 base64 chars decode to 3 bytes.
-    // Add padding for the last chunk which may have padding chars.
-    let max_decoded = data.len() * 3 / 4 + 4;
-    let mut output_buf: Vec<u8> = Vec::with_capacity(max_decoded);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output_buf.set_len(max_decoded);
-    }
-
-    // Compute output offsets for each chunk so threads write to non-overlapping slices
+    // Compute exact decoded sizes per chunk upfront to eliminate the compaction pass.
+    // For all chunks except the last, decoded size is exactly chunk.len() * 3 / 4.
+    // For the last chunk, account for '=' padding bytes.
     let mut offsets: Vec<usize> = Vec::with_capacity(chunks.len() + 1);
     offsets.push(0);
+    let mut total_decoded = 0usize;
     for (i, chunk) in chunks.iter().enumerate() {
-        let prev = offsets[i];
-        // Each 4 base64 chars = 3 decoded bytes; last chunk may have padding
-        let decoded_size = chunk.len() * 3 / 4 + 3;
-        offsets.push(prev + decoded_size);
+        let decoded_size = if i == chunks.len() - 1 {
+            // Last chunk: count '=' padding to get exact decoded size
+            let pad = chunk.iter().rev().take(2).filter(|&&b| b == b'=').count();
+            chunk.len() * 3 / 4 - pad
+        } else {
+            // Non-last chunks: 4-byte aligned, no padding, exact 3/4 ratio
+            chunk.len() * 3 / 4
+        };
+        total_decoded += decoded_size;
+        offsets.push(total_decoded);
     }
 
-    // Parallel decode: each thread decodes into its pre-assigned output slice.
-    // We collect actual decoded lengths to know the true total.
+    // Pre-allocate contiguous output buffer with exact total size
+    let mut output_buf: Vec<u8> = Vec::with_capacity(total_decoded);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output_buf.set_len(total_decoded);
+    }
+
+    // Parallel decode: each thread decodes directly into its exact final position.
+    // No compaction pass needed since offsets are computed from exact decoded sizes.
     // SAFETY: each thread writes to a non-overlapping region of the output buffer.
     // Use usize representation of the pointer for Send+Sync compatibility with rayon.
     let out_addr = output_buf.as_mut_ptr() as usize;
-    let decode_result: Result<Vec<usize>, io::Error> = chunks
+    let decode_result: Result<Vec<()>, io::Error> = chunks
         .par_iter()
         .enumerate()
         .map(|(i, chunk)| {
             let offset = offsets[i];
-            let region_size = offsets[i + 1] - offset;
-            // SAFETY: each thread writes to non-overlapping region [offset..offset+region_size]
+            let expected_size = offsets[i + 1] - offset;
+            // SAFETY: each thread writes to non-overlapping region [offset..offset+expected_size]
             let out_slice = unsafe {
-                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(offset), region_size)
+                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(offset), expected_size)
             };
-            BASE64_ENGINE
+            let decoded = BASE64_ENGINE
                 .decode(chunk, out_slice.as_out())
-                .map(|decoded| decoded.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid input"))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid input"))?;
+            debug_assert_eq!(decoded.len(), expected_size);
+            Ok(())
         })
         .collect();
 
-    let decoded_lens = decode_result?;
+    decode_result?;
 
-    // Compact: move decoded data to be contiguous (regions may be smaller than allocated)
-    let raw_ptr = output_buf.as_mut_ptr();
-    let mut write_pos = 0;
-    for (i, &len) in decoded_lens.iter().enumerate() {
-        let src_offset = offsets[i];
-        if write_pos != src_offset && len > 0 {
-            unsafe {
-                std::ptr::copy(raw_ptr.add(src_offset), raw_ptr.add(write_pos), len);
-            }
-        }
-        write_pos += len;
-    }
-
-    out.write_all(&output_buf[..write_pos])
+    out.write_all(&output_buf[..total_decoded])
 }
 
 /// Strip non-base64 characters (for -i / --ignore-garbage).
@@ -615,13 +640,15 @@ fn build_fused_output(data: &[u8], wrap_col: usize, col: &mut usize, out_buf: &m
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
-/// Fused single-pass: read chunk → strip whitespace in-place → decode immediately.
+/// Fused single-pass: read chunk -> strip whitespace -> decode immediately.
+/// Uses 16MB read buffer to reduce syscalls and memchr2-based SIMD whitespace
+/// stripping for the common case (only \n and \r whitespace in base64 streams).
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    const READ_CHUNK: usize = 4 * 1024 * 1024;
+    const READ_CHUNK: usize = 16 * 1024 * 1024;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut clean = Vec::with_capacity(READ_CHUNK);
     let mut carry: Vec<u8> = Vec::with_capacity(4);
@@ -641,19 +668,67 @@ pub fn decode_stream(
         if ignore_garbage {
             clean.extend(chunk.iter().copied().filter(|&b| is_base64_char(b)));
         } else {
-            // Single-pass strip using lookup table — handles all whitespace types at once.
+            // SIMD gap-copy: use memchr2 to find \n and \r positions, then copy
+            // the gaps between them. For typical base64 (76-char lines), newlines
+            // are ~1/77 of the data, so we process ~76 bytes per memchr hit
+            // instead of 1 byte per scalar iteration.
             clean.reserve(n);
-            let src = chunk.as_ptr();
-            let dst = unsafe { clean.as_mut_ptr().add(clean.len()) };
+            let base_len = clean.len();
+            let dst = unsafe { clean.as_mut_ptr().add(base_len) };
             let mut wp = 0usize;
-            for i in 0..n {
-                let b = unsafe { *src.add(i) };
-                if NOT_WHITESPACE[b as usize] {
-                    unsafe { *dst.add(wp) = b };
-                    wp += 1;
+            let mut gap_start = 0usize;
+
+            for pos in memchr::memchr2_iter(b'\n', b'\r', chunk) {
+                // Copy the gap before this \n or \r
+                let gap_len = pos - gap_start;
+                if gap_len > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            chunk.as_ptr().add(gap_start),
+                            dst.add(wp),
+                            gap_len,
+                        );
+                    }
+                    wp += gap_len;
                 }
+                gap_start = pos + 1;
             }
-            unsafe { clean.set_len(clean.len() + wp) };
+            // Copy the final gap after the last \n/\r
+            let tail_len = n - gap_start;
+            if tail_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.as_ptr().add(gap_start),
+                        dst.add(wp),
+                        tail_len,
+                    );
+                }
+                wp += tail_len;
+            }
+            unsafe { clean.set_len(base_len + wp) };
+
+            // Second pass for rare whitespace (tab, space, VT, FF) using lookup table.
+            // In typical base64 streams this does nothing, but we need correctness.
+            let has_rare_ws = clean[base_len..]
+                .iter()
+                .any(|&b| !NOT_WHITESPACE[b as usize]);
+            if has_rare_ws {
+                // Compact in-place within the clean region we just wrote
+                let start = base_len;
+                let end = clean.len();
+                let ptr = clean.as_mut_ptr();
+                let mut rp = start;
+                let mut cwp = start;
+                while rp < end {
+                    let b = unsafe { *ptr.add(rp) };
+                    if NOT_WHITESPACE[b as usize] {
+                        unsafe { *ptr.add(cwp) = b };
+                        cwp += 1;
+                    }
+                    rp += 1;
+                }
+                clean.truncate(cwp);
+            }
         }
 
         let is_last = n < READ_CHUNK;
