@@ -79,47 +79,33 @@ fn main() {
     #[cfg(unix)]
     let mut raw = raw_stdout();
 
-    // For encode on Unix: write directly to raw fd (our callers write 3MB+ chunks).
-    // For decode: use BufWriter since decode writes variable-sized chunks.
+    // Write directly to raw fd for both encode and decode — bypasses BufWriter.
+    // Encode writes 3MB+ chunks; decode (now batch mode via read_stdin + decode_owned)
+    // writes the entire decoded output in a single write_all. No intermediate
+    // buffering needed since all callers produce large contiguous output.
     #[cfg(unix)]
-    if !cli.decode {
-        let result = if filename == "-" {
-            process_stdin(&cli, &mut *raw)
-        } else {
-            process_file(filename, &cli, &mut *raw)
-        };
-
-        if let Err(e) = result {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            if filename != "-" {
-                eprintln!("base64: {}: {}", filename, io_error_msg(&e));
-            } else {
-                eprintln!("base64: {}", io_error_msg(&e));
-            }
-            process::exit(1);
-        }
-        return;
-    }
-
-    #[cfg(unix)]
-    let mut out = io::BufWriter::with_capacity(8 * 1024 * 1024, &mut *raw);
-    #[cfg(not(unix))]
-    let mut out = io::BufWriter::with_capacity(8 * 1024 * 1024, io::stdout().lock());
-
     let result = if filename == "-" {
-        process_stdin(&cli, &mut out)
+        process_stdin(&cli, &mut *raw)
     } else {
-        process_file(filename, &cli, &mut out)
+        process_file(filename, &cli, &mut *raw)
     };
-
-    if let Err(e) = out.flush()
-        && e.kind() != io::ErrorKind::BrokenPipe
-    {
-        eprintln!("base64: {}", io_error_msg(&e));
-        process::exit(1);
-    }
+    #[cfg(not(unix))]
+    let result = {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+        let r = if filename == "-" {
+            process_stdin(&cli, &mut out)
+        } else {
+            process_file(filename, &cli, &mut out)
+        };
+        if let Err(e) = out.flush() {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                eprintln!("base64: {}", io_error_msg(&e));
+                process::exit(1);
+            }
+        }
+        r
+    };
 
     if let Err(e) = result {
         if e.kind() == io::ErrorKind::BrokenPipe {
