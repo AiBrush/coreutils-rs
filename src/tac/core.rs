@@ -68,23 +68,25 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
 ///
 /// This converts ~200K memrchr calls (for a 10MB / 50-byte-line file) into
 /// ~20 memchr_iter calls, each scanning a contiguous 512KB region.
+///
+/// Optimization: Instead of collecting positions into a Vec, we store them
+/// in a stack-allocated array to avoid heap allocation per chunk.
 fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // No pre-count: capacity is always capped at MAX_IOV anyway.
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
     // `global_end` tracks where the current (rightmost unseen) record ends.
-    // We walk it leftward as we discover separators.
     let mut global_end = data.len();
 
-    // Process the file from right to left in CHUNK-sized windows.
-    // Each iteration handles [chunk_start .. chunk_end) where
-    // chunk_end = min(global_end, data.len()).
+    // Stack-allocated positions buffer: avoid heap allocation per chunk.
+    // 512KB chunk / 1 byte per separator = 512K max positions.
+    // We use a heap-allocated buffer once but reuse across all chunks.
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
+
     let mut chunk_start = data.len().saturating_sub(CHUNK);
 
     loop {
         let chunk_end = global_end.min(data.len());
         if chunk_start >= chunk_end {
-            // Chunk is empty — nothing to scan in this window.
             if chunk_start == 0 {
                 break;
             }
@@ -93,25 +95,16 @@ fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         }
         let chunk = &data[chunk_start..chunk_end];
 
-        // Single SIMD forward pass finds every separator in the chunk.
-        // Collect into a small stack vec; worst case is CHUNK/1 entries
-        // but typical density is much lower, and we only need the positions.
-        let positions: Vec<usize> = memchr::memchr_iter(sep, chunk)
-            .map(|p| p + chunk_start) // convert to global offset
-            .collect();
+        // Reuse positions buffer: clear and refill without reallocation.
+        positions_buf.clear();
+        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
 
         // Emit records in reverse (rightmost first).
-        for &pos in positions.iter().rev() {
-            // In "after" mode, separator is at the END of a record.
-            // The record is data[pos+1 .. global_end].
-            // But if pos+1 == global_end the record after the separator is
-            // empty (consecutive separators) — still must emit the empty
-            // IoSlice so the separator byte itself is part of the PREVIOUS
-            // record we haven't emitted yet.
+        for &pos in positions_buf.iter().rev() {
             if pos + 1 < global_end {
                 iov.push(IoSlice::new(&data[pos + 1..global_end]));
             }
-            global_end = pos + 1; // include the separator in the next (leftward) record
+            global_end = pos + 1;
 
             if iov.len() >= MAX_IOV {
                 flush_iov(out, &iov)?;
@@ -125,8 +118,7 @@ fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // First record: everything from data start up to global_end (includes
-    // the leftmost separator byte, which belongs to this record in "after" mode).
+    // First record
     if global_end > 0 {
         iov.push(IoSlice::new(&data[0..global_end]));
     }
@@ -141,9 +133,9 @@ fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
 
-    // `global_end` tracks where the current record ends (exclusive).
     let mut global_end = data.len();
     let mut chunk_start = data.len().saturating_sub(CHUNK);
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
 
     loop {
         let chunk_end = global_end.min(data.len());
@@ -156,14 +148,10 @@ fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         }
         let chunk = &data[chunk_start..chunk_end];
 
-        let positions: Vec<usize> = memchr::memchr_iter(sep, chunk)
-            .map(|p| p + chunk_start)
-            .collect();
+        positions_buf.clear();
+        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
 
-        // Emit records in reverse (rightmost first).
-        for &pos in positions.iter().rev() {
-            // In "before" mode the separator is at the START of a record.
-            // Record = data[pos .. global_end].
+        for &pos in positions_buf.iter().rev() {
             iov.push(IoSlice::new(&data[pos..global_end]));
             global_end = pos;
 
@@ -179,7 +167,6 @@ fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // Leading content before the first separator (if any).
     if global_end > 0 {
         iov.push(IoSlice::new(&data[0..global_end]));
     }
@@ -232,10 +219,10 @@ fn tac_string_after(
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut global_end = data.len();
     let mut chunk_start = data.len().saturating_sub(CHUNK);
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK / 4);
 
     loop {
         let chunk_end = global_end.min(data.len());
-        // Extend left edge by sep_len-1 to catch separators that straddle boundaries.
         let scan_start = chunk_start.saturating_sub(sep_len - 1);
         if scan_start >= chunk_end {
             if chunk_start == 0 {
@@ -246,14 +233,15 @@ fn tac_string_after(
         }
         let scan_region = &data[scan_start..chunk_end];
 
-        // Forward SIMD pass to find all separator occurrences in the scan region.
-        let positions: Vec<usize> = memchr::memmem::find_iter(scan_region, separator)
-            .map(|p| p + scan_start) // global offset
-            .filter(|&p| p >= chunk_start || chunk_start == 0) // skip overlap duplicates (already processed)
-            .filter(|&p| p + sep_len <= global_end) // skip positions past our current frontier
-            .collect();
+        positions_buf.clear();
+        positions_buf.extend(
+            memchr::memmem::find_iter(scan_region, separator)
+                .map(|p| p + scan_start)
+                .filter(|&p| p >= chunk_start || chunk_start == 0)
+                .filter(|&p| p + sep_len <= global_end),
+        );
 
-        for &pos in positions.iter().rev() {
+        for &pos in positions_buf.iter().rev() {
             let rec_end_exclusive = pos + sep_len;
             if rec_end_exclusive < global_end {
                 iov.push(IoSlice::new(&data[rec_end_exclusive..global_end]));
@@ -271,7 +259,6 @@ fn tac_string_after(
         chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // First record
     if global_end > 0 {
         iov.push(IoSlice::new(&data[0..global_end]));
     }
@@ -289,6 +276,7 @@ fn tac_string_before(
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut global_end = data.len();
     let mut chunk_start = data.len().saturating_sub(CHUNK);
+    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK / 4);
 
     loop {
         let chunk_end = global_end.min(data.len());
@@ -302,13 +290,15 @@ fn tac_string_before(
         }
         let scan_region = &data[scan_start..chunk_end];
 
-        let positions: Vec<usize> = memchr::memmem::find_iter(scan_region, separator)
-            .map(|p| p + scan_start)
-            .filter(|&p| p >= chunk_start || chunk_start == 0)
-            .filter(|&p| p < global_end)
-            .collect();
+        positions_buf.clear();
+        positions_buf.extend(
+            memchr::memmem::find_iter(scan_region, separator)
+                .map(|p| p + scan_start)
+                .filter(|&p| p >= chunk_start || chunk_start == 0)
+                .filter(|&p| p < global_end),
+        );
 
-        for &pos in positions.iter().rev() {
+        for &pos in positions_buf.iter().rev() {
             iov.push(IoSlice::new(&data[pos..global_end]));
             global_end = pos;
             if iov.len() >= MAX_IOV {
@@ -323,7 +313,6 @@ fn tac_string_before(
         chunk_start = chunk_start.saturating_sub(CHUNK);
     }
 
-    // Leading content before first separator
     if global_end > 0 {
         iov.push(IoSlice::new(&data[0..global_end]));
     }

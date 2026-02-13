@@ -123,8 +123,12 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
 }
 
 /// Read all bytes from stdin into a Vec.
+/// Pre-allocates 16MB to avoid the repeated reallocation overhead of
+/// Vec's default growth strategy (which doubles from 0 -> 8K -> 16K -> ...),
+/// causing multiple memcpy of already-read data for large piped inputs.
 pub fn read_stdin() -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    const PREALLOC: usize = 16 * 1024 * 1024;
+    let mut buf = Vec::with_capacity(PREALLOC);
     io::stdin().lock().read_to_end(&mut buf)?;
     Ok(buf)
 }

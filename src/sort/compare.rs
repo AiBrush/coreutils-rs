@@ -94,6 +94,57 @@ const POW10: [f64; 20] = [
     1e17, 1e18, 1e19,
 ];
 
+/// Fast integer-only parser for numeric sort (-n).
+/// Returns Some(i64) if the value is a pure integer (no decimal point, no exponent).
+/// Returns None if the value has a decimal point or is not a valid integer.
+/// This avoids the f64 conversion path for integer-only data.
+#[inline]
+pub fn try_parse_integer(s: &[u8]) -> Option<i64> {
+    let s = skip_leading_blanks(s);
+    if s.is_empty() {
+        return Some(0);
+    }
+
+    let mut i = 0;
+    let negative = if s[i] == b'-' {
+        i += 1;
+        true
+    } else {
+        if s[i] == b'+' {
+            i += 1;
+        }
+        false
+    };
+
+    // Parse digits
+    let mut value: i64 = 0;
+    let mut has_digits = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        // Check for overflow before multiplying
+        value = value.checked_mul(10)?.checked_add((s[i] - b'0') as i64)?;
+        has_digits = true;
+        i += 1;
+    }
+
+    // If there's a decimal point, this is not a pure integer
+    if i < s.len() && s[i] == b'.' {
+        return None;
+    }
+
+    if !has_digits {
+        return Some(0);
+    }
+
+    Some(if negative { -value } else { value })
+}
+
+/// Convert an i64 to a sortable u64 whose natural ordering matches signed integer ordering.
+/// Adds i64::MAX + 1 (0x8000000000000000) to shift the range to unsigned.
+#[inline]
+pub fn int_to_sortable_u64(v: i64) -> u64 {
+    (v as u64).wrapping_add(0x8000000000000000)
+}
+
 fn find_numeric_end(s: &[u8]) -> usize {
     let mut i = 0;
     if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
