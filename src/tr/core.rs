@@ -886,6 +886,9 @@ pub fn translate_mmap(
 }
 
 /// Translate + squeeze from mmap'd byte slice.
+///
+/// For data <= 16MB: single-pass translate+squeeze into one buffer, one write syscall.
+/// For data > 16MB: chunked approach to limit memory.
 pub fn translate_squeeze_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -894,6 +897,39 @@ pub fn translate_squeeze_mmap(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
     let squeeze_set = build_member_set(set2);
+
+    // Single-write fast path: translate+squeeze all data in one pass, one write
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut buf: Vec<u8> = Vec::with_capacity(data.len());
+        let mut last_squeezed: u16 = 256;
+        unsafe {
+            buf.set_len(data.len());
+            let outp: *mut u8 = buf.as_mut_ptr();
+            let inp = data.as_ptr();
+            let len = data.len();
+            let mut wp = 0;
+            let mut i = 0;
+            while i < len {
+                let translated = *table.get_unchecked(*inp.add(i) as usize);
+                if is_member(&squeeze_set, translated) {
+                    if last_squeezed == translated as u16 {
+                        i += 1;
+                        continue;
+                    }
+                    last_squeezed = translated as u16;
+                } else {
+                    last_squeezed = 256;
+                }
+                *outp.add(wp) = translated;
+                wp += 1;
+                i += 1;
+            }
+            buf.set_len(wp);
+        }
+        return writer.write_all(&buf);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut buf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;
@@ -923,6 +959,9 @@ pub fn translate_squeeze_mmap(
 }
 
 /// Delete from mmap'd byte slice.
+///
+/// For data <= 16MB: delete into one buffer, one write syscall.
+/// For data > 16MB: chunked approach to limit memory.
 pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     if delete_chars.len() == 1 {
         return delete_single_char_mmap(delete_chars[0], data, writer);
@@ -932,6 +971,58 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
     }
 
     let member = build_member_set(delete_chars);
+
+    // Single-write fast path: delete into one buffer, one write
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf = vec![0u8; data.len()];
+        let mut out_pos = 0;
+        let len = data.len();
+        let mut i = 0;
+
+        while i + 8 <= len {
+            unsafe {
+                let b0 = *data.get_unchecked(i);
+                let b1 = *data.get_unchecked(i + 1);
+                let b2 = *data.get_unchecked(i + 2);
+                let b3 = *data.get_unchecked(i + 3);
+                let b4 = *data.get_unchecked(i + 4);
+                let b5 = *data.get_unchecked(i + 5);
+                let b6 = *data.get_unchecked(i + 6);
+                let b7 = *data.get_unchecked(i + 7);
+
+                *outbuf.get_unchecked_mut(out_pos) = b0;
+                out_pos += !is_member(&member, b0) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b1;
+                out_pos += !is_member(&member, b1) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b2;
+                out_pos += !is_member(&member, b2) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b3;
+                out_pos += !is_member(&member, b3) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b4;
+                out_pos += !is_member(&member, b4) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b5;
+                out_pos += !is_member(&member, b5) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b6;
+                out_pos += !is_member(&member, b6) as usize;
+                *outbuf.get_unchecked_mut(out_pos) = b7;
+                out_pos += !is_member(&member, b7) as usize;
+            }
+            i += 8;
+        }
+
+        while i < len {
+            unsafe {
+                let b = *data.get_unchecked(i);
+                *outbuf.get_unchecked_mut(out_pos) = b;
+                out_pos += !is_member(&member, b) as usize;
+            }
+            i += 1;
+        }
+
+        return writer.write_all(&outbuf[..out_pos]);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
 
@@ -986,6 +1077,23 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 }
 
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    // Single-write fast path: collect all non-deleted spans into one buffer
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf = Vec::with_capacity(data.len());
+        let mut last = 0;
+        for pos in memchr::memchr_iter(ch, data) {
+            if pos > last {
+                outbuf.extend_from_slice(&data[last..pos]);
+            }
+            last = pos + 1;
+        }
+        if last < data.len() {
+            outbuf.extend_from_slice(&data[last..]);
+        }
+        return writer.write_all(&outbuf);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
 
@@ -1016,6 +1124,32 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
     let c2 = if chars.len() >= 3 { chars[2] } else { 0 };
     let is_three = chars.len() >= 3;
 
+    // Single-write fast path: collect all non-deleted spans into one buffer
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf = Vec::with_capacity(data.len());
+        let mut last = 0;
+        if is_three {
+            for pos in memchr::memchr3_iter(c0, c1, c2, data) {
+                if pos > last {
+                    outbuf.extend_from_slice(&data[last..pos]);
+                }
+                last = pos + 1;
+            }
+        } else {
+            for pos in memchr::memchr2_iter(c0, c1, data) {
+                if pos > last {
+                    outbuf.extend_from_slice(&data[last..pos]);
+                }
+                last = pos + 1;
+            }
+        }
+        if last < data.len() {
+            outbuf.extend_from_slice(&data[last..]);
+        }
+        return writer.write_all(&outbuf);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
 
@@ -1051,6 +1185,9 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
 }
 
 /// Delete + squeeze from mmap'd byte slice.
+///
+/// For data <= 16MB: delete+squeeze into one buffer, one write syscall.
+/// For data > 16MB: chunked approach to limit memory.
 pub fn delete_squeeze_mmap(
     delete_chars: &[u8],
     squeeze_chars: &[u8],
@@ -1059,6 +1196,43 @@ pub fn delete_squeeze_mmap(
 ) -> io::Result<()> {
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
+
+    // Single-write fast path: delete+squeeze all data in one pass, one write
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
+        let mut last_squeezed: u16 = 256;
+        unsafe {
+            outbuf.set_len(data.len());
+            let outp: *mut u8 = outbuf.as_mut_ptr();
+            let inp = data.as_ptr();
+            let len = data.len();
+            let mut out_pos = 0;
+            let mut i = 0;
+            while i < len {
+                let b = *inp.add(i);
+                if is_member(&delete_set, b) {
+                    i += 1;
+                    continue;
+                }
+                if is_member(&squeeze_set, b) {
+                    if last_squeezed == b as u16 {
+                        i += 1;
+                        continue;
+                    }
+                    last_squeezed = b as u16;
+                } else {
+                    last_squeezed = 256;
+                }
+                *outp.add(out_pos) = b;
+                out_pos += 1;
+                i += 1;
+            }
+            outbuf.set_len(out_pos);
+        }
+        return writer.write_all(&outbuf);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;
@@ -1088,6 +1262,9 @@ pub fn delete_squeeze_mmap(
 }
 
 /// Squeeze from mmap'd byte slice.
+///
+/// For data <= 16MB: squeeze into one buffer, one write syscall.
+/// For data > 16MB: chunked approach to limit memory.
 pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
     if squeeze_chars.len() == 1 {
         return squeeze_single_mmap(squeeze_chars[0], data, writer);
@@ -1100,6 +1277,45 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
     }
 
     let member = build_member_set(squeeze_chars);
+
+    // Single-write fast path: squeeze all data into one buffer, one write
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
+        let mut last_squeezed: u16 = 256;
+        let len = data.len();
+        let mut wp = 0;
+        let mut i = 0;
+
+        unsafe {
+            outbuf.set_len(data.len());
+            let inp = data.as_ptr();
+            let outp: *mut u8 = outbuf.as_mut_ptr();
+
+            while i < len {
+                let b = *inp.add(i);
+                if is_member(&member, b) {
+                    if last_squeezed != b as u16 {
+                        *outp.add(wp) = b;
+                        wp += 1;
+                        last_squeezed = b as u16;
+                    }
+                    i += 1;
+                    while i < len && *inp.add(i) == b {
+                        i += 1;
+                    }
+                } else {
+                    last_squeezed = 256;
+                    *outp.add(wp) = b;
+                    wp += 1;
+                    i += 1;
+                }
+            }
+            outbuf.set_len(wp);
+        }
+        return writer.write_all(&outbuf);
+    }
+
+    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = vec![0u8; buf_size];
     let mut last_squeezed: u16 = 256;

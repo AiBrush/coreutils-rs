@@ -1224,6 +1224,7 @@ fn process_bytes_chunk(
 }
 
 /// Extract byte ranges from a line into the output buffer.
+/// Uses unsafe buf helpers for zero bounds-check overhead in hot loops.
 #[inline(always)]
 fn cut_bytes_to_buf(
     line: &[u8],
@@ -1235,6 +1236,9 @@ fn cut_bytes_to_buf(
     let len = line.len();
     let mut first_range = true;
 
+    // Reserve worst case: full line + delimiters between ranges
+    buf.reserve(len + output_delim.len() * ranges.len() + 1);
+
     if complement {
         let mut pos: usize = 1;
         for r in ranges {
@@ -1242,9 +1246,9 @@ fn cut_bytes_to_buf(
             let re = r.end.min(len);
             if pos < rs {
                 if !first_range && !output_delim.is_empty() {
-                    buf.extend_from_slice(output_delim);
+                    unsafe { buf_extend(buf, output_delim) };
                 }
-                buf.extend_from_slice(&line[pos - 1..rs - 1]);
+                unsafe { buf_extend(buf, &line[pos - 1..rs - 1]) };
                 first_range = false;
             }
             pos = re + 1;
@@ -1254,16 +1258,16 @@ fn cut_bytes_to_buf(
         }
         if pos <= len {
             if !first_range && !output_delim.is_empty() {
-                buf.extend_from_slice(output_delim);
+                unsafe { buf_extend(buf, output_delim) };
             }
-            buf.extend_from_slice(&line[pos - 1..len]);
+            unsafe { buf_extend(buf, &line[pos - 1..len]) };
         }
     } else if output_delim.is_empty() && ranges.len() == 1 {
         // Ultra-fast path: single range, no output delimiter
         let start = ranges[0].start.saturating_sub(1);
         let end = ranges[0].end.min(len);
         if start < len {
-            buf.extend_from_slice(&line[start..end]);
+            unsafe { buf_extend(buf, &line[start..end]) };
         }
     } else {
         for r in ranges {
@@ -1273,9 +1277,9 @@ fn cut_bytes_to_buf(
                 break;
             }
             if !first_range && !output_delim.is_empty() {
-                buf.extend_from_slice(output_delim);
+                unsafe { buf_extend(buf, output_delim) };
             }
-            buf.extend_from_slice(&line[start..end]);
+            unsafe { buf_extend(buf, &line[start..end]) };
             first_range = false;
         }
     }
