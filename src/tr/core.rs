@@ -1,10 +1,29 @@
 use std::io::{self, Read, Write};
 
+use rayon::prelude::*;
+
 /// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Stream buffer: 4MB (L3-cache-friendly).
 const STREAM_BUF: usize = 4 * 1024 * 1024;
+
+/// Minimum data size to engage rayon parallel processing for mmap paths.
+/// Below this, single-threaded is faster due to thread pool overhead.
+const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Allocate a Vec<u8> of given length without zero-initialization.
+/// SAFETY: Caller must write all bytes before reading them.
+#[inline]
+#[allow(clippy::uninit_vec)]
+fn alloc_uninit_vec(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    // SAFETY: u8 has no drop, no invalid bit patterns; caller will overwrite before reading
+    unsafe {
+        v.set_len(len);
+    }
+    v
+}
 
 /// Build a 256-byte lookup table mapping set1[i] -> set2[i].
 #[inline]
@@ -832,10 +851,11 @@ fn squeeze_single_stream(
 const SINGLE_WRITE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Translate bytes from an mmap'd byte slice.
-/// Detects single-range translations (e.g., a-z→A-Z) and uses SIMD vectorized
+/// Detects single-range translations (e.g., a-z to A-Z) and uses SIMD vectorized
 /// arithmetic (AVX2: 32 bytes/iter, SSE2: 16 bytes/iter) for those cases.
 /// Falls back to scalar 256-byte table lookup for general translations.
 ///
+/// For data >= 2MB: uses rayon parallel processing across multiple cores.
 /// For data <= 16MB: single allocation + single write_all (1 syscall).
 /// For data > 16MB: chunked approach to limit memory (N syscalls where N = data/4MB).
 pub fn translate_mmap(
@@ -854,32 +874,78 @@ pub fn translate_mmap(
 
     // Try SIMD fast path for single-range constant-offset translations
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {
-        // Single-alloc fast path: one buffer, one write
-        if data.len() <= SINGLE_WRITE_LIMIT {
-            let mut buf = vec![0u8; data.len()];
-            translate_range_simd(data, &mut buf, lo, hi, offset);
-            return writer.write_all(&buf);
-        }
-        // Chunked path for large data
-        let mut buf = vec![0u8; BUF_SIZE];
-        for chunk in data.chunks(BUF_SIZE) {
-            translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
-            writer.write_all(&buf[..chunk.len()])?;
-        }
-        return Ok(());
+        return translate_mmap_range(data, writer, lo, hi, offset);
     }
 
-    // General case: scalar table lookup
-    // Single-alloc fast path: one buffer, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = vec![0u8; data.len()];
-        translate_to(data, &mut buf, &table);
+    // General case: table lookup (with parallel processing for large data)
+    translate_mmap_table(data, writer, &table)
+}
+
+/// SIMD range translate for mmap data, with rayon parallel processing.
+fn translate_mmap_range(
+    data: &[u8],
+    writer: &mut impl Write,
+    lo: u8,
+    hi: u8,
+    offset: i8,
+) -> io::Result<()> {
+    // Parallel path: split data into chunks, translate each in parallel
+    if data.len() >= PARALLEL_THRESHOLD {
+        let mut buf = alloc_uninit_vec(data.len());
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        // Process chunks in parallel: each thread writes to its slice of buf
+        data.par_chunks(chunk_size)
+            .zip(buf.par_chunks_mut(chunk_size))
+            .for_each(|(src_chunk, dst_chunk)| {
+                translate_range_simd(src_chunk, &mut dst_chunk[..src_chunk.len()], lo, hi, offset);
+            });
+
         return writer.write_all(&buf);
     }
-    // Chunked path for large data
-    let mut buf = vec![0u8; BUF_SIZE];
+
+    // Small data: single-threaded SIMD
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut buf = alloc_uninit_vec(data.len());
+        translate_range_simd(data, &mut buf, lo, hi, offset);
+        return writer.write_all(&buf);
+    }
+    // Chunked path for large data (shouldn't happen since PARALLEL_THRESHOLD < SINGLE_WRITE_LIMIT)
+    let mut buf = alloc_uninit_vec(BUF_SIZE);
     for chunk in data.chunks(BUF_SIZE) {
-        translate_to(chunk, &mut buf[..chunk.len()], &table);
+        translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
+        writer.write_all(&buf[..chunk.len()])?;
+    }
+    Ok(())
+}
+
+/// General table-lookup translate for mmap data, with rayon parallel processing.
+fn translate_mmap_table(data: &[u8], writer: &mut impl Write, table: &[u8; 256]) -> io::Result<()> {
+    // Parallel path: split data into chunks, translate each in parallel
+    if data.len() >= PARALLEL_THRESHOLD {
+        let mut buf = alloc_uninit_vec(data.len());
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        data.par_chunks(chunk_size)
+            .zip(buf.par_chunks_mut(chunk_size))
+            .for_each(|(src_chunk, dst_chunk)| {
+                translate_to(src_chunk, &mut dst_chunk[..src_chunk.len()], table);
+            });
+
+        return writer.write_all(&buf);
+    }
+
+    // Small data: single-threaded
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut buf = alloc_uninit_vec(data.len());
+        translate_to(data, &mut buf, table);
+        return writer.write_all(&buf);
+    }
+    let mut buf = alloc_uninit_vec(BUF_SIZE);
+    for chunk in data.chunks(BUF_SIZE) {
+        translate_to(chunk, &mut buf[..chunk.len()], table);
         writer.write_all(&buf[..chunk.len()])?;
     }
     Ok(())
@@ -887,6 +953,7 @@ pub fn translate_mmap(
 
 /// Translate + squeeze from mmap'd byte slice.
 ///
+/// For data >= 2MB: two-phase approach: parallel translate, then sequential squeeze.
 /// For data <= 16MB: single-pass translate+squeeze into one buffer, one write syscall.
 /// For data > 16MB: chunked approach to limit memory.
 pub fn translate_squeeze_mmap(
@@ -897,6 +964,66 @@ pub fn translate_squeeze_mmap(
 ) -> io::Result<()> {
     let table = build_translate_table(set1, set2);
     let squeeze_set = build_member_set(set2);
+
+    // For large data: two-phase approach
+    // Phase 1: parallel translate into buffer
+    // Phase 2: sequential squeeze from translated buffer
+    if data.len() >= PARALLEL_THRESHOLD {
+        // Phase 1: parallel translate
+        let mut translated = alloc_uninit_vec(data.len());
+        let range_info = detect_range_offset(&table);
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        if let Some((lo, hi, offset)) = range_info {
+            data.par_chunks(chunk_size)
+                .zip(translated.par_chunks_mut(chunk_size))
+                .for_each(|(src_chunk, dst_chunk)| {
+                    translate_range_simd(
+                        src_chunk,
+                        &mut dst_chunk[..src_chunk.len()],
+                        lo,
+                        hi,
+                        offset,
+                    );
+                });
+        } else {
+            data.par_chunks(chunk_size)
+                .zip(translated.par_chunks_mut(chunk_size))
+                .for_each(|(src_chunk, dst_chunk)| {
+                    translate_to(src_chunk, &mut dst_chunk[..src_chunk.len()], &table);
+                });
+        }
+
+        // Phase 2: sequential squeeze
+        let mut outbuf: Vec<u8> = Vec::with_capacity(translated.len());
+        let mut last_squeezed: u16 = 256;
+        unsafe {
+            outbuf.set_len(translated.len());
+            let inp = translated.as_ptr();
+            let outp: *mut u8 = outbuf.as_mut_ptr();
+            let len = translated.len();
+            let mut wp = 0;
+            let mut i = 0;
+            while i < len {
+                let b = *inp.add(i);
+                if is_member(&squeeze_set, b) {
+                    if last_squeezed == b as u16 {
+                        i += 1;
+                        continue;
+                    }
+                    last_squeezed = b as u16;
+                } else {
+                    last_squeezed = 256;
+                }
+                *outp.add(wp) = b;
+                wp += 1;
+                i += 1;
+            }
+            outbuf.set_len(wp);
+        }
+        return writer.write_all(&outbuf);
+    }
 
     // Single-write fast path: translate+squeeze all data in one pass, one write
     if data.len() <= SINGLE_WRITE_LIMIT {
@@ -960,6 +1087,7 @@ pub fn translate_squeeze_mmap(
 
 /// Delete from mmap'd byte slice.
 ///
+/// For data >= 2MB: uses rayon parallel processing across multiple cores.
 /// For data <= 16MB: delete into one buffer, one write syscall.
 /// For data > 16MB: chunked approach to limit memory.
 pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
@@ -972,111 +1100,181 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 
     let member = build_member_set(delete_chars);
 
+    // Parallel path: split data, delete in parallel, collect and write
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        // Each thread produces a Vec<u8> of retained bytes
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len());
+                delete_chunk_bitset(chunk, &member, &mut out);
+                out
+            })
+            .collect();
+
+        // Write results in order
+        for result in &results {
+            if !result.is_empty() {
+                writer.write_all(result)?;
+            }
+        }
+        return Ok(());
+    }
+
     // Single-write fast path: delete into one buffer, one write
     if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = vec![0u8; data.len()];
-        let mut out_pos = 0;
-        let len = data.len();
-        let mut i = 0;
-
-        while i + 8 <= len {
-            unsafe {
-                let b0 = *data.get_unchecked(i);
-                let b1 = *data.get_unchecked(i + 1);
-                let b2 = *data.get_unchecked(i + 2);
-                let b3 = *data.get_unchecked(i + 3);
-                let b4 = *data.get_unchecked(i + 4);
-                let b5 = *data.get_unchecked(i + 5);
-                let b6 = *data.get_unchecked(i + 6);
-                let b7 = *data.get_unchecked(i + 7);
-
-                *outbuf.get_unchecked_mut(out_pos) = b0;
-                out_pos += !is_member(&member, b0) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b1;
-                out_pos += !is_member(&member, b1) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b2;
-                out_pos += !is_member(&member, b2) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b3;
-                out_pos += !is_member(&member, b3) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b4;
-                out_pos += !is_member(&member, b4) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b5;
-                out_pos += !is_member(&member, b5) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b6;
-                out_pos += !is_member(&member, b6) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b7;
-                out_pos += !is_member(&member, b7) as usize;
-            }
-            i += 8;
-        }
-
-        while i < len {
-            unsafe {
-                let b = *data.get_unchecked(i);
-                *outbuf.get_unchecked_mut(out_pos) = b;
-                out_pos += !is_member(&member, b) as usize;
-            }
-            i += 1;
-        }
-
+        let mut outbuf = alloc_uninit_vec(data.len());
+        let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
         return writer.write_all(&outbuf[..out_pos]);
     }
 
     // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
+    let mut outbuf = alloc_uninit_vec(buf_size);
 
     for chunk in data.chunks(buf_size) {
-        let mut out_pos = 0;
-        let len = chunk.len();
-        let mut i = 0;
-
-        while i + 8 <= len {
-            unsafe {
-                let b0 = *chunk.get_unchecked(i);
-                let b1 = *chunk.get_unchecked(i + 1);
-                let b2 = *chunk.get_unchecked(i + 2);
-                let b3 = *chunk.get_unchecked(i + 3);
-                let b4 = *chunk.get_unchecked(i + 4);
-                let b5 = *chunk.get_unchecked(i + 5);
-                let b6 = *chunk.get_unchecked(i + 6);
-                let b7 = *chunk.get_unchecked(i + 7);
-
-                *outbuf.get_unchecked_mut(out_pos) = b0;
-                out_pos += !is_member(&member, b0) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b1;
-                out_pos += !is_member(&member, b1) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b2;
-                out_pos += !is_member(&member, b2) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b3;
-                out_pos += !is_member(&member, b3) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b4;
-                out_pos += !is_member(&member, b4) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b5;
-                out_pos += !is_member(&member, b5) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b6;
-                out_pos += !is_member(&member, b6) as usize;
-                *outbuf.get_unchecked_mut(out_pos) = b7;
-                out_pos += !is_member(&member, b7) as usize;
-            }
-            i += 8;
-        }
-
-        while i < len {
-            unsafe {
-                let b = *chunk.get_unchecked(i);
-                *outbuf.get_unchecked_mut(out_pos) = b;
-                out_pos += !is_member(&member, b) as usize;
-            }
-            i += 1;
-        }
-
+        let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
         writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())
 }
 
+/// Delete bytes from chunk using bitset membership, appending retained bytes to `out`.
+#[inline]
+fn delete_chunk_bitset(chunk: &[u8], member: &[u8; 32], out: &mut Vec<u8>) {
+    let len = chunk.len();
+    let mut i = 0;
+    unsafe {
+        let inp = chunk.as_ptr();
+        // Reserve space to avoid repeated reallocation
+        out.reserve(len);
+        let outp = out.as_mut_ptr().add(out.len());
+        let mut wp = 0;
+
+        while i + 8 <= len {
+            let b0 = *inp.add(i);
+            let b1 = *inp.add(i + 1);
+            let b2 = *inp.add(i + 2);
+            let b3 = *inp.add(i + 3);
+            let b4 = *inp.add(i + 4);
+            let b5 = *inp.add(i + 5);
+            let b6 = *inp.add(i + 6);
+            let b7 = *inp.add(i + 7);
+
+            *outp.add(wp) = b0;
+            wp += !is_member(member, b0) as usize;
+            *outp.add(wp) = b1;
+            wp += !is_member(member, b1) as usize;
+            *outp.add(wp) = b2;
+            wp += !is_member(member, b2) as usize;
+            *outp.add(wp) = b3;
+            wp += !is_member(member, b3) as usize;
+            *outp.add(wp) = b4;
+            wp += !is_member(member, b4) as usize;
+            *outp.add(wp) = b5;
+            wp += !is_member(member, b5) as usize;
+            *outp.add(wp) = b6;
+            wp += !is_member(member, b6) as usize;
+            *outp.add(wp) = b7;
+            wp += !is_member(member, b7) as usize;
+            i += 8;
+        }
+        while i < len {
+            let b = *inp.add(i);
+            *outp.add(wp) = b;
+            wp += !is_member(member, b) as usize;
+            i += 1;
+        }
+        out.set_len(out.len() + wp);
+    }
+}
+
+/// Delete bytes from chunk using bitset, writing into pre-allocated buffer.
+/// Returns number of bytes written.
+#[inline]
+fn delete_chunk_bitset_into(chunk: &[u8], member: &[u8; 32], outbuf: &mut [u8]) -> usize {
+    let len = chunk.len();
+    let mut out_pos = 0;
+    let mut i = 0;
+
+    while i + 8 <= len {
+        unsafe {
+            let b0 = *chunk.get_unchecked(i);
+            let b1 = *chunk.get_unchecked(i + 1);
+            let b2 = *chunk.get_unchecked(i + 2);
+            let b3 = *chunk.get_unchecked(i + 3);
+            let b4 = *chunk.get_unchecked(i + 4);
+            let b5 = *chunk.get_unchecked(i + 5);
+            let b6 = *chunk.get_unchecked(i + 6);
+            let b7 = *chunk.get_unchecked(i + 7);
+
+            *outbuf.get_unchecked_mut(out_pos) = b0;
+            out_pos += !is_member(member, b0) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b1;
+            out_pos += !is_member(member, b1) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b2;
+            out_pos += !is_member(member, b2) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b3;
+            out_pos += !is_member(member, b3) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b4;
+            out_pos += !is_member(member, b4) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b5;
+            out_pos += !is_member(member, b5) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b6;
+            out_pos += !is_member(member, b6) as usize;
+            *outbuf.get_unchecked_mut(out_pos) = b7;
+            out_pos += !is_member(member, b7) as usize;
+        }
+        i += 8;
+    }
+
+    while i < len {
+        unsafe {
+            let b = *chunk.get_unchecked(i);
+            *outbuf.get_unchecked_mut(out_pos) = b;
+            out_pos += !is_member(member, b) as usize;
+        }
+        i += 1;
+    }
+
+    out_pos
+}
+
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    // Parallel path for large data: each thread deletes from its chunk
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len());
+                let mut last = 0;
+                for pos in memchr::memchr_iter(ch, chunk) {
+                    if pos > last {
+                        out.extend_from_slice(&chunk[last..pos]);
+                    }
+                    last = pos + 1;
+                }
+                if last < chunk.len() {
+                    out.extend_from_slice(&chunk[last..]);
+                }
+                out
+            })
+            .collect();
+
+        for result in &results {
+            if !result.is_empty() {
+                writer.write_all(result)?;
+            }
+        }
+        return Ok(());
+    }
+
     // Single-write fast path: collect all non-deleted spans into one buffer
     if data.len() <= SINGLE_WRITE_LIMIT {
         let mut outbuf = Vec::with_capacity(data.len());
@@ -1123,6 +1321,46 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
     let c1 = if chars.len() >= 2 { chars[1] } else { 0 };
     let c2 = if chars.len() >= 3 { chars[2] } else { 0 };
     let is_three = chars.len() >= 3;
+
+    // Parallel path for large data
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len());
+                let mut last = 0;
+                if is_three {
+                    for pos in memchr::memchr3_iter(c0, c1, c2, chunk) {
+                        if pos > last {
+                            out.extend_from_slice(&chunk[last..pos]);
+                        }
+                        last = pos + 1;
+                    }
+                } else {
+                    for pos in memchr::memchr2_iter(c0, c1, chunk) {
+                        if pos > last {
+                            out.extend_from_slice(&chunk[last..pos]);
+                        }
+                        last = pos + 1;
+                    }
+                }
+                if last < chunk.len() {
+                    out.extend_from_slice(&chunk[last..]);
+                }
+                out
+            })
+            .collect();
+
+        for result in &results {
+            if !result.is_empty() {
+                writer.write_all(result)?;
+            }
+        }
+        return Ok(());
+    }
 
     // Single-write fast path: collect all non-deleted spans into one buffer
     if data.len() <= SINGLE_WRITE_LIMIT {
@@ -1263,6 +1501,7 @@ pub fn delete_squeeze_mmap(
 
 /// Squeeze from mmap'd byte slice.
 ///
+/// For data >= 2MB: uses rayon parallel processing with boundary fixup.
 /// For data <= 16MB: squeeze into one buffer, one write syscall.
 /// For data > 16MB: chunked approach to limit memory.
 pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
@@ -1277,6 +1516,41 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
     }
 
     let member = build_member_set(squeeze_chars);
+
+    // Parallel path: squeeze each chunk independently, then fix boundaries
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| squeeze_chunk_bitset(chunk, &member))
+            .collect();
+
+        // Write results, fixing boundaries: if chunk N ends with byte B
+        // and chunk N+1 starts with same byte B, and B is in squeeze set,
+        // skip the first byte(s) of chunk N+1 that equal B.
+        for (idx, result) in results.iter().enumerate() {
+            if result.is_empty() {
+                continue;
+            }
+            if idx > 0 {
+                // Check boundary: does previous chunk end with same squeezable byte?
+                if let Some(&prev_last) = results[..idx].iter().rev().find_map(|r| r.last()) {
+                    if is_member(&member, prev_last) {
+                        // Skip leading bytes in this chunk that equal prev_last
+                        let skip = result.iter().take_while(|&&b| b == prev_last).count();
+                        if skip < result.len() {
+                            writer.write_all(&result[skip..])?;
+                        }
+                        continue;
+                    }
+                }
+            }
+            writer.write_all(result)?;
+        }
+        return Ok(());
+    }
 
     // Single-write fast path: squeeze all data into one buffer, one write
     if data.len() <= SINGLE_WRITE_LIMIT {
@@ -1352,6 +1626,43 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
         writer.write_all(&outbuf[..wp])?;
     }
     Ok(())
+}
+
+/// Squeeze a single chunk using bitset membership. Returns squeezed output.
+fn squeeze_chunk_bitset(chunk: &[u8], member: &[u8; 32]) -> Vec<u8> {
+    let len = chunk.len();
+    let mut out = Vec::with_capacity(len);
+    let mut last_squeezed: u16 = 256;
+    let mut i = 0;
+
+    unsafe {
+        out.set_len(len);
+        let inp = chunk.as_ptr();
+        let outp: *mut u8 = out.as_mut_ptr();
+        let mut wp = 0;
+
+        while i < len {
+            let b = *inp.add(i);
+            if is_member(member, b) {
+                if last_squeezed != b as u16 {
+                    *outp.add(wp) = b;
+                    wp += 1;
+                    last_squeezed = b as u16;
+                }
+                i += 1;
+                while i < len && *inp.add(i) == b {
+                    i += 1;
+                }
+            } else {
+                last_squeezed = 256;
+                *outp.add(wp) = b;
+                wp += 1;
+                i += 1;
+            }
+        }
+        out.set_len(wp);
+    }
+    out
 }
 
 fn squeeze_multi_mmap<const N: usize>(
@@ -1435,6 +1746,61 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
 
     if memchr::memmem::find(data, &[ch, ch]).is_none() {
         return writer.write_all(data);
+    }
+
+    // Parallel path: squeeze each chunk, fix boundaries
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len());
+                let mut cursor = 0;
+                while cursor < chunk.len() {
+                    match memchr::memchr(ch, &chunk[cursor..]) {
+                        Some(offset) => {
+                            let pos = cursor + offset;
+                            if pos > cursor {
+                                out.extend_from_slice(&chunk[cursor..pos]);
+                            }
+                            out.push(ch);
+                            cursor = pos + 1;
+                            while cursor < chunk.len() && chunk[cursor] == ch {
+                                cursor += 1;
+                            }
+                        }
+                        None => {
+                            out.extend_from_slice(&chunk[cursor..]);
+                            break;
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+
+        // Write results, fixing boundary squeezability
+        for (idx, result) in results.iter().enumerate() {
+            if result.is_empty() {
+                continue;
+            }
+            if idx > 0 {
+                if let Some(&prev_last) = results[..idx].iter().rev().find_map(|r| r.last()) {
+                    if prev_last == ch {
+                        // Skip leading ch bytes in this chunk result
+                        let skip = result.iter().take_while(|&&b| b == ch).count();
+                        if skip < result.len() {
+                            writer.write_all(&result[skip..])?;
+                        }
+                        continue;
+                    }
+                }
+            }
+            writer.write_all(result)?;
+        }
+        return Ok(());
     }
 
     let buf_size = data.len().min(BUF_SIZE);
