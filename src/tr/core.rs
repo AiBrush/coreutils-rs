@@ -516,7 +516,7 @@ fn squeeze_single_stream(
 // ============================================================================
 
 /// Translate bytes from an mmap'd byte slice.
-/// Single-pass: reads source and translates directly into output buffer.
+/// Uses table lookup with unchecked indexing for maximum throughput.
 pub fn translate_mmap(
     set1: &[u8],
     set2: &[u8],
@@ -535,7 +535,6 @@ pub fn translate_mmap(
     let mut buf = vec![0u8; buf_size];
     for chunk in data.chunks(buf_size) {
         let len = chunk.len();
-        // Copy + translate with unchecked indexing for tight inner loop
         buf[..len].copy_from_slice(chunk);
         translate_inplace(&mut buf[..len], &table);
         writer.write_all(&buf[..len])?;
