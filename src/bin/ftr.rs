@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -189,18 +189,17 @@ fn main() {
         return;
     }
 
-    // === Streaming paths (stdin pipe): use BufWriter for batching ===
+    // === Streaming paths (stdin pipe): bypass BufWriter entirely ===
+    // All streaming functions write 1MB+ chunks directly, so BufWriter
+    // just adds an extra memcpy without batching benefit.
     #[cfg(unix)]
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut *raw);
+    let result = run_streaming_mode(&cli, set1_str, &mut *raw);
     #[cfg(not(unix))]
-    let stdout = io::stdout();
-    #[cfg(not(unix))]
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
-
-    let result = run_streaming_mode(&cli, set1_str, &mut writer);
-
-    // Flush buffered output
-    let _ = writer.flush();
+    let result = {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        run_streaming_mode(&cli, set1_str, &mut lock)
+    };
 
     if let Err(e) = result
         && e.kind() != io::ErrorKind::BrokenPipe

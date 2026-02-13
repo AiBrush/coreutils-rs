@@ -9,8 +9,9 @@ const MAX_IOV: usize = 1024;
 /// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Stream buffer: 8MB — larger buffer = fewer read/write syscalls for streaming.
-const STREAM_BUF: usize = 8 * 1024 * 1024;
+/// Stream buffer: 1MB — fits in L2/L3 cache so data stays hot between read,
+/// process, and write phases. Larger buffers (4-8MB) cause cache thrashing.
+const STREAM_BUF: usize = 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// Below this, single-threaded is faster due to thread pool overhead.
@@ -406,6 +407,206 @@ fn translate_range_simd_inplace(data: &mut [u8], lo: u8, hi: u8, offset: i8) {
 }
 
 // ============================================================================
+// SIMD range deletion (x86_64)
+// ============================================================================
+
+/// Detect if ALL delete characters form a single contiguous byte range [lo..=hi].
+/// Returns Some((lo, hi)) if so. This is true for common classes:
+/// - `[:digit:]` = 0x30..=0x39
+/// - `a-z` = 0x61..=0x7A
+/// - `A-Z` = 0x41..=0x5A
+#[inline]
+fn detect_delete_range(chars: &[u8]) -> Option<(u8, u8)> {
+    if chars.is_empty() {
+        return None;
+    }
+    let mut lo = chars[0];
+    let mut hi = chars[0];
+    for &c in &chars[1..] {
+        if c < lo {
+            lo = c;
+        }
+        if c > hi {
+            hi = c;
+        }
+    }
+    // Check that the range size matches the number of chars (no gaps)
+    if (hi - lo + 1) as usize == chars.len() {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
+/// SIMD-accelerated delete for contiguous byte ranges.
+/// Uses the same bias+threshold trick as range translate to identify bytes in [lo..=hi],
+/// then compacts output by skipping matched bytes.
+#[cfg(target_arch = "x86_64")]
+fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
+    if is_x86_feature_detected!("avx2") {
+        unsafe { delete_range_avx2(src, dst, lo, hi) }
+    } else {
+        unsafe { delete_range_sse2(src, dst, lo, hi) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let range = hi - lo;
+        let bias_v = _mm256_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm256_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let zero = _mm256_setzero_si256();
+
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut ri = 0;
+        let mut wp = 0;
+
+        while ri + 32 <= len {
+            let input = _mm256_loadu_si256(sp.add(ri) as *const _);
+            let biased = _mm256_add_epi8(input, bias_v);
+            // gt = 0xFF where biased > threshold (OUT of range = KEEP)
+            let gt = _mm256_cmpgt_epi8(biased, threshold_v);
+            // in_range = 0xFF where IN range (to DELETE), 0 where to KEEP
+            let in_range = _mm256_cmpeq_epi8(gt, zero);
+            // keep_mask bits: 1 = keep (NOT in range)
+            let keep_mask = !(_mm256_movemask_epi8(in_range) as u32);
+
+            // Compact: copy kept bytes using the mask
+            let mut mask = keep_mask;
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                *dp.add(wp) = *sp.add(ri + bit);
+                wp += 1;
+                mask &= mask - 1; // clear lowest set bit
+            }
+            ri += 32;
+        }
+
+        // SSE2 tail for 16-byte remainder
+        if ri + 16 <= len {
+            let bias_v128 = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+            let threshold_v128 = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+            let zero128 = _mm_setzero_si128();
+
+            let input = _mm_loadu_si128(sp.add(ri) as *const _);
+            let biased = _mm_add_epi8(input, bias_v128);
+            let gt = _mm_cmpgt_epi8(biased, threshold_v128);
+            let in_range = _mm_cmpeq_epi8(gt, zero128);
+            let keep_mask = !(_mm_movemask_epi8(in_range) as u32) & 0xFFFF;
+
+            let mut mask = keep_mask;
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                *dp.add(wp) = *sp.add(ri + bit);
+                wp += 1;
+                mask &= mask - 1;
+            }
+            ri += 16;
+        }
+
+        // Scalar tail
+        while ri < len {
+            let b = *sp.add(ri);
+            if b < lo || b > hi {
+                *dp.add(wp) = b;
+                wp += 1;
+            }
+            ri += 1;
+        }
+
+        wp
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn delete_range_sse2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let range = hi - lo;
+        let bias_v = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let zero = _mm_setzero_si128();
+
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut ri = 0;
+        let mut wp = 0;
+
+        while ri + 16 <= len {
+            let input = _mm_loadu_si128(sp.add(ri) as *const _);
+            let biased = _mm_add_epi8(input, bias_v);
+            let gt = _mm_cmpgt_epi8(biased, threshold_v);
+            let in_range = _mm_cmpeq_epi8(gt, zero);
+            let keep_mask = !(_mm_movemask_epi8(in_range) as u32) & 0xFFFF;
+
+            let mut mask = keep_mask;
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                *dp.add(wp) = *sp.add(ri + bit);
+                wp += 1;
+                mask &= mask - 1;
+            }
+            ri += 16;
+        }
+
+        while ri < len {
+            let b = *sp.add(ri);
+            if b < lo || b > hi {
+                *dp.add(wp) = b;
+                wp += 1;
+            }
+            ri += 1;
+        }
+
+        wp
+    }
+}
+
+/// Scalar range delete fallback for non-x86_64.
+#[cfg(not(target_arch = "x86_64"))]
+fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
+    let mut wp = 0;
+    for &b in src {
+        if b < lo || b > hi {
+            dst[wp] = b;
+            wp += 1;
+        }
+    }
+    wp
+}
+
+/// Streaming delete for contiguous byte ranges using SIMD range detection.
+fn delete_range_streaming(
+    lo: u8,
+    hi: u8,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut src = vec![0u8; STREAM_BUF];
+    let mut dst = alloc_uninit_vec(STREAM_BUF);
+    loop {
+        let n = read_full(reader, &mut src)?;
+        if n == 0 {
+            break;
+        }
+        let wp = delete_range_chunk(&src[..n], &mut dst, lo, hi);
+        if wp > 0 {
+            writer.write_all(&dst[..wp])?;
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Streaming functions (Read + Write)
 // ============================================================================
 
@@ -538,6 +739,13 @@ pub fn delete(
     }
     if delete_chars.len() <= 3 {
         return delete_multi_streaming(delete_chars, reader, writer);
+    }
+
+    // SIMD fast path: if all delete chars form a contiguous range [lo..=hi],
+    // use vectorized range comparison instead of scalar bitset lookup.
+    // This covers [:digit:] (0x30-0x39), a-z, A-Z, etc.
+    if let Some((lo, hi)) = detect_delete_range(delete_chars) {
+        return delete_range_streaming(lo, hi, reader, writer);
     }
 
     let member = build_member_set(delete_chars);
@@ -1144,6 +1352,11 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         return delete_multi_memchr_mmap(delete_chars, data, writer);
     }
 
+    // SIMD fast path for contiguous ranges (digits, a-z, A-Z, etc.)
+    if let Some((lo, hi)) = detect_delete_range(delete_chars) {
+        return delete_range_mmap(data, writer, lo, hi);
+    }
+
     let member = build_member_set(delete_chars);
 
     // Parallel path: pre-allocate a single output buffer of data.len() and have each
@@ -1197,6 +1410,47 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
     for chunk in data.chunks(buf_size) {
         let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
         writer.write_all(&outbuf[..out_pos])?;
+    }
+    Ok(())
+}
+
+/// SIMD range delete for mmap data, with rayon parallel processing.
+fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io::Result<()> {
+    // Parallel path: each thread deletes from its chunk into a local Vec
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let results: Vec<Vec<u8>> = data
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut out = alloc_uninit_vec(chunk.len());
+                let wp = delete_range_chunk(chunk, &mut out, lo, hi);
+                unsafe { out.set_len(wp) };
+                out
+            })
+            .collect();
+
+        let slices: Vec<std::io::IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| std::io::IoSlice::new(r))
+            .collect();
+        return write_ioslices(writer, &slices);
+    }
+
+    // Single-write fast path
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf = alloc_uninit_vec(data.len());
+        let wp = delete_range_chunk(data, &mut outbuf, lo, hi);
+        return writer.write_all(&outbuf[..wp]);
+    }
+
+    // Chunked path
+    let mut outbuf = alloc_uninit_vec(BUF_SIZE);
+    for chunk in data.chunks(BUF_SIZE) {
+        let wp = delete_range_chunk(chunk, &mut outbuf, lo, hi);
+        writer.write_all(&outbuf[..wp])?;
     }
     Ok(())
 }
