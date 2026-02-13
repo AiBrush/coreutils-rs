@@ -82,18 +82,25 @@ fn escape_filename(name: &str) -> String {
 
 /// Check if parallel hashing is worthwhile based on total file size.
 /// For many small files, sequential with reused thread-local buffer is faster.
+/// Uses sampling to avoid N stat() syscalls for N-file workloads.
 fn use_parallel(files: &[String]) -> bool {
     const MIN_TOTAL: u64 = 10 * 1024 * 1024;
     if files.len() < 2 {
         return false;
     }
-    let total: u64 = files
+    let sample: u64 = files
         .iter()
+        .take(4)
         .filter_map(|f| std::fs::metadata(f).ok())
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum();
-    total >= MIN_TOTAL
+    let sampled = files.len().min(4) as u64;
+    if sampled == 0 {
+        return false;
+    }
+    let estimated_total = sample / sampled * files.len() as u64;
+    estimated_total >= MIN_TOTAL
 }
 
 fn main() {
@@ -320,39 +327,16 @@ fn main() {
     }
 }
 
-/// Write hash output using pre-built byte buffer for minimum overhead.
+/// Write hash output using single-write batched buffer for minimum overhead.
 #[inline]
 fn write_output(out: &mut impl Write, cli: &Cli, algo: HashAlgorithm, hash: &str, filename: &str) {
+    let binary = cli.binary || (!cli.text && cfg!(windows));
     if cli.tag {
-        let name = algo.name();
-        let term = if cli.zero { b'\0' } else { b'\n' };
-        let _ = out.write_all(name.as_bytes());
-        let _ = out.write_all(b" (");
-        let _ = out.write_all(filename.as_bytes());
-        let _ = out.write_all(b") = ");
-        let _ = out.write_all(hash.as_bytes());
-        let _ = out.write_all(&[term]);
+        let _ = hash::write_hash_tag_line(out, algo.name(), hash, filename, cli.zero);
+    } else if !cli.zero && needs_escape(filename) {
+        let escaped = escape_filename(filename);
+        let _ = hash::write_hash_line(out, hash, &escaped, binary, cli.zero, true);
     } else {
-        // GNU defaults to binary mode on Linux; only -t (text) uses space
-        let mode = if cli.binary || (!cli.text && cfg!(windows)) {
-            b'*'
-        } else {
-            b' '
-        };
-        let term = if cli.zero { b'\0' } else { b'\n' };
-
-        if !cli.zero && needs_escape(filename) {
-            let escaped = escape_filename(filename);
-            let _ = out.write_all(b"\\");
-            let _ = out.write_all(hash.as_bytes());
-            let _ = out.write_all(&[b' ', mode]);
-            let _ = out.write_all(escaped.as_bytes());
-            let _ = out.write_all(&[term]);
-        } else {
-            let _ = out.write_all(hash.as_bytes());
-            let _ = out.write_all(&[b' ', mode]);
-            let _ = out.write_all(filename.as_bytes());
-            let _ = out.write_all(&[term]);
-        }
+        let _ = hash::write_hash_line(out, hash, filename, binary, cli.zero, false);
     }
 }

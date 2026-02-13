@@ -167,18 +167,25 @@ fn main() {
 
 /// Check if parallel hashing is worthwhile based on total file size.
 /// For many small files, sequential with reused thread-local buffer is faster.
+/// Uses sampling to avoid N stat() syscalls for N-file workloads.
 fn use_parallel(files: &[String]) -> bool {
     const MIN_TOTAL: u64 = 10 * 1024 * 1024;
     if files.len() < 2 {
         return false;
     }
-    let total: u64 = files
+    let sample: u64 = files
         .iter()
+        .take(4)
         .filter_map(|f| std::fs::metadata(f).ok())
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum();
-    total >= MIN_TOTAL
+    let sampled = files.len().min(4) as u64;
+    if sampled == 0 {
+        return false;
+    }
+    let estimated_total = sample / sampled * files.len() as u64;
+    estimated_total >= MIN_TOTAL
 }
 
 fn run_hash_mode(cli: &Cli, files: &[String], output_bytes: usize, out: &mut impl Write) -> bool {

@@ -42,6 +42,7 @@ fn hash_digest<D: Digest>(data: &[u8]) -> String {
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
         let mut hasher = D::new();
         loop {
             let n = read_full(&mut reader, &mut buf)?;
@@ -62,9 +63,19 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 const HASH_READ_BUF: usize = 8 * 1024 * 1024;
 
 // Thread-local reusable buffer for streaming hash I/O.
-// Allocated once per thread, reused across all hash_reader calls.
+// Allocated LAZILY (only on first streaming-hash call) to avoid 8MB cost for
+// small-file-only workloads (e.g., "sha256sum *.txt" where every file is <1MB).
 thread_local! {
-    static STREAM_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; HASH_READ_BUF]);
+    static STREAM_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Ensure the streaming buffer is at least HASH_READ_BUF bytes.
+/// Called only on the streaming path, so small-file workloads never allocate 8MB.
+#[inline]
+fn ensure_stream_buf(buf: &mut Vec<u8>) {
+    if buf.len() < HASH_READ_BUF {
+        buf.resize(HASH_READ_BUF, 0);
+    }
 }
 
 // ── SHA-256 ───────────────────────────────────────────────────────────
@@ -96,6 +107,7 @@ fn sha256_bytes(data: &[u8]) -> String {
 fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
         let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
             .map_err(|e| io::Error::other(e))?;
         loop {
@@ -115,6 +127,7 @@ fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
 fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
         loop {
             let n = read_full(&mut reader, &mut buf)?;
@@ -175,6 +188,7 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
 fn md5_reader(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
         let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::md5())
             .map_err(|e| io::Error::other(e))?;
         loop {
@@ -227,6 +241,33 @@ fn open_noatime(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// Open a file and get its metadata in one step.
+/// On Linux uses fstat directly on the fd to avoid an extra syscall layer.
+#[cfg(target_os = "linux")]
+#[inline]
+fn open_and_stat(path: &Path) -> io::Result<(File, u64, bool)> {
+    let file = open_noatime(path)?;
+    let fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let is_regular = (stat.st_mode & libc::S_IFMT) == libc::S_IFREG;
+    let size = stat.st_size as u64;
+    Ok((file, size, is_regular))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn open_and_stat(path: &Path) -> io::Result<(File, u64, bool)> {
+    let file = open_noatime(path)?;
+    let metadata = file.metadata()?;
+    Ok((file, metadata.len(), metadata.file_type().is_file()))
+}
+
 /// Minimum file size to issue fadvise hint (1MB).
 /// For small files, the syscall overhead exceeds the readahead benefit.
 #[cfg(target_os = "linux")]
@@ -237,6 +278,11 @@ const FADVISE_MIN_SIZE: u64 = 1024 * 1024;
 /// with single-shot hash (avoids Hasher allocation + streaming overhead).
 const SMALL_FILE_LIMIT: u64 = 1024 * 1024;
 
+/// Threshold for tiny files that can be read into a stack buffer.
+/// Below this size, we use a stack-allocated buffer + single read() syscall,
+/// completely avoiding any heap allocation for the data path.
+const TINY_FILE_LIMIT: u64 = 8 * 1024;
+
 // Thread-local reusable buffer for small-file single-read hash.
 // Avoids repeated allocation for many small files (e.g., 100 files of 1KB each).
 thread_local! {
@@ -246,15 +292,17 @@ thread_local! {
 /// Hash a file by path. Uses mmap for large files (zero-copy, no read() syscalls),
 /// single-read + single-shot hash for small files, and streaming read as fallback.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
-    let file = open_noatime(path)?;
-    let metadata = file.metadata()?;
-    let file_size = metadata.len();
+    let (file, file_size, is_regular) = open_and_stat(path)?;
 
-    if metadata.file_type().is_file() && file_size == 0 {
+    if is_regular && file_size == 0 {
         return Ok(hash_bytes(algo, &[]));
     }
 
-    if file_size > 0 && metadata.file_type().is_file() {
+    if file_size > 0 && is_regular {
+        // Tiny files (<8KB): stack buffer + single read() — zero heap allocation
+        if file_size < TINY_FILE_LIMIT {
+            return hash_file_tiny(algo, file, file_size as usize);
+        }
         // mmap for large files — zero-copy, eliminates multiple read() syscalls
         if file_size >= SMALL_FILE_LIMIT {
             #[cfg(target_os = "linux")]
@@ -280,9 +328,8 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
                 return Ok(hash_bytes(algo, &mmap));
             }
         }
-        // Small files: single read into thread-local buffer, then single-shot hash.
+        // Small files (8KB..1MB): single read into thread-local buffer, then single-shot hash.
         // This avoids Hasher context allocation + streaming overhead for each file.
-        // Especially beneficial for many small files (100+ files of a few KB each).
         if file_size < SMALL_FILE_LIMIT {
             return hash_file_small(algo, file, file_size as usize);
         }
@@ -299,20 +346,49 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     hash_reader(algo, file)
 }
 
+/// Hash a tiny file (<8KB) using a stack-allocated buffer.
+/// Single read() syscall, zero heap allocation on the data path.
+/// Optimal for the "100 small files" benchmark where per-file overhead dominates.
+#[inline]
+fn hash_file_tiny(algo: HashAlgorithm, mut file: File, size: usize) -> io::Result<String> {
+    let mut buf = [0u8; 8192];
+    let mut total = 0;
+    // Read with known size — usually completes in a single read() for regular files
+    while total < size {
+        match file.read(&mut buf[total..size]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(hash_bytes(algo, &buf[..total]))
+}
+
 /// Hash a small file by reading it entirely into a thread-local buffer,
 /// then using the single-shot hash function. Avoids per-file Hasher allocation.
 #[inline]
 fn hash_file_small(algo: HashAlgorithm, mut file: File, size: usize) -> io::Result<String> {
     SMALL_FILE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        // Reset length but keep allocation, then grow if needed
         buf.clear();
-        // Pre-allocate to known file size to avoid reallocation
-        let cap = buf.capacity();
-        if cap < size {
-            buf.reserve(size - cap);
+        buf.reserve(size);
+        // SAFETY: capacity >= size after clear+reserve. We read into the buffer
+        // directly and only access buf[..total] where total <= size <= capacity.
+        unsafe {
+            buf.set_len(size);
         }
-        file.read_to_end(&mut buf)?;
-        Ok(hash_bytes(algo, &buf))
+        let mut total = 0;
+        while total < size {
+            match file.read(&mut buf[total..size]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(hash_bytes(algo, &buf[..total]))
     })
 }
 
@@ -393,6 +469,7 @@ pub fn blake2b_hash_data(data: &[u8], output_bytes: usize) -> String {
 pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
         let mut state = blake2b_simd::Params::new()
             .hash_length(output_bytes)
             .to_state();
@@ -411,15 +488,17 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
 /// Uses mmap for large files (zero-copy), single-read for small files,
 /// and streaming read as fallback.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
-    let file = open_noatime(path)?;
-    let metadata = file.metadata()?;
-    let file_size = metadata.len();
+    let (file, file_size, is_regular) = open_and_stat(path)?;
 
-    if metadata.file_type().is_file() && file_size == 0 {
+    if is_regular && file_size == 0 {
         return Ok(blake2b_hash_data(&[], output_bytes));
     }
 
-    if file_size > 0 && metadata.file_type().is_file() {
+    if file_size > 0 && is_regular {
+        // Tiny files (<8KB): stack buffer + single read() — zero heap allocation
+        if file_size < TINY_FILE_LIMIT {
+            return blake2b_hash_file_tiny(file, file_size as usize, output_bytes);
+        }
         // mmap for large files — zero-copy, eliminates multiple read() syscalls
         if file_size >= SMALL_FILE_LIMIT {
             #[cfg(target_os = "linux")]
@@ -445,7 +524,7 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
                 return Ok(blake2b_hash_data(&mmap, output_bytes));
             }
         }
-        // Small files: single read into thread-local buffer, then single-shot hash
+        // Small files (8KB..1MB): single read into thread-local buffer, then single-shot hash
         if file_size < SMALL_FILE_LIMIT {
             return blake2b_hash_file_small(file, file_size as usize, output_bytes);
         }
@@ -462,18 +541,43 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
     blake2b_hash_reader(file, output_bytes)
 }
 
+/// Hash a tiny BLAKE2b file (<8KB) using a stack-allocated buffer.
+#[inline]
+fn blake2b_hash_file_tiny(mut file: File, size: usize, output_bytes: usize) -> io::Result<String> {
+    let mut buf = [0u8; 8192];
+    let mut total = 0;
+    while total < size {
+        match file.read(&mut buf[total..size]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(blake2b_hash_data(&buf[..total], output_bytes))
+}
+
 /// Hash a small file with BLAKE2b by reading it entirely into a thread-local buffer.
 #[inline]
 fn blake2b_hash_file_small(mut file: File, size: usize, output_bytes: usize) -> io::Result<String> {
     SMALL_FILE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
-        let cap = buf.capacity();
-        if cap < size {
-            buf.reserve(size - cap);
+        buf.reserve(size);
+        // SAFETY: capacity >= size after clear+reserve
+        unsafe {
+            buf.set_len(size);
         }
-        file.read_to_end(&mut buf)?;
-        Ok(blake2b_hash_data(&buf, output_bytes))
+        let mut total = 0;
+        while total < size {
+            match file.read(&mut buf[total..size]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(blake2b_hash_data(&buf[..total], output_bytes))
     })
 }
 
@@ -525,6 +629,69 @@ pub fn print_hash_zero(
     out.write_all(&[b' ', mode])?;
     out.write_all(filename.as_bytes())?;
     out.write_all(b"\0")
+}
+
+// ── Single-write output buffer ─────────────────────────────────────
+// For multi-file workloads, batch the entire "hash  filename\n" line into
+// a single write() call. This halves the number of BufWriter flushes.
+
+// Thread-local output line buffer for batched writes.
+// Reused across files to avoid per-file allocation.
+thread_local! {
+    static LINE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+}
+
+/// Build and write the standard GNU hash output line in a single write() call.
+/// Format: "hash  filename\n" or "hash *filename\n" (binary mode).
+/// For escaped filenames: "\hash  escaped_filename\n".
+#[inline]
+pub fn write_hash_line(
+    out: &mut impl Write,
+    hash: &str,
+    filename: &str,
+    binary: bool,
+    zero: bool,
+    escaped: bool,
+) -> io::Result<()> {
+    LINE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let mode = if binary { b'*' } else { b' ' };
+        let term = if zero { b'\0' } else { b'\n' };
+        if escaped {
+            buf.push(b'\\');
+        }
+        buf.extend_from_slice(hash.as_bytes());
+        buf.push(b' ');
+        buf.push(mode);
+        buf.extend_from_slice(filename.as_bytes());
+        buf.push(term);
+        out.write_all(&buf)
+    })
+}
+
+/// Build and write BSD tag format output in a single write() call.
+/// Format: "ALGO (filename) = hash\n"
+#[inline]
+pub fn write_hash_tag_line(
+    out: &mut impl Write,
+    algo_name: &str,
+    hash: &str,
+    filename: &str,
+    zero: bool,
+) -> io::Result<()> {
+    LINE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let term = if zero { b'\0' } else { b'\n' };
+        buf.extend_from_slice(algo_name.as_bytes());
+        buf.extend_from_slice(b" (");
+        buf.extend_from_slice(filename.as_bytes());
+        buf.extend_from_slice(b") = ");
+        buf.extend_from_slice(hash.as_bytes());
+        buf.push(term);
+        out.write_all(&buf)
+    })
 }
 
 /// Print hash result in BSD tag format: "ALGO (filename) = hash\n"
@@ -829,12 +996,22 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     unsafe {
         let buf = hex.as_mut_vec();
         buf.set_len(len);
-        let ptr = buf.as_mut_ptr();
+        hex_encode_to_slice(bytes, buf);
+    }
+    hex
+}
+
+/// Encode bytes as hex directly into a pre-allocated output slice.
+/// Output slice must be at least `bytes.len() * 2` bytes long.
+#[inline]
+fn hex_encode_to_slice(bytes: &[u8], out: &mut [u8]) {
+    // SAFETY: We write exactly bytes.len()*2 bytes into `out`, which must be large enough.
+    unsafe {
+        let ptr = out.as_mut_ptr();
         for (i, &b) in bytes.iter().enumerate() {
             let pair = *HEX_TABLE.get_unchecked(b as usize);
             *ptr.add(i * 2) = pair[0];
             *ptr.add(i * 2 + 1) = pair[1];
         }
     }
-    hex
 }
