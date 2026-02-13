@@ -1003,6 +1003,11 @@ fn write_sorted_single_buf_entries(
     Ok(())
 }
 
+/// Threshold for switching to parallel sort. Below this, rayon thread pool
+/// overhead exceeds the sorting benefit. Empirically tuned: 50K lines is the
+/// break-even point for piped 10MB input (~200 bytes/line).
+const PARALLEL_SORT_THRESHOLD: usize = 50_000;
+
 /// Helper: perform a parallel or sequential sort on indices.
 fn do_sort(
     indices: &mut [usize],
@@ -1011,12 +1016,12 @@ fn do_sort(
 ) {
     let n = indices.len();
     if stable {
-        if n > 10_000 {
+        if n > PARALLEL_SORT_THRESHOLD {
             indices.par_sort_by(cmp);
         } else {
             indices.sort_by(cmp);
         }
-    } else if n > 10_000 {
+    } else if n > PARALLEL_SORT_THRESHOLD {
         indices.par_sort_unstable_by(cmp);
     } else {
         indices.sort_unstable_by(cmp);

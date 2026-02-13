@@ -136,7 +136,9 @@ fn needs_key_extraction(config: &UniqConfig) -> bool {
 }
 
 /// Fast path comparison: no field/char extraction needed, no case folding.
-/// Uses pointer+length equality shortcut and 8-byte prefix rejection.
+/// Uses pointer+length equality shortcut and multi-word prefix rejection.
+/// For short lines (<= 16 bytes, common in many-dups data), avoids the
+/// full memcmp call overhead by doing direct word comparisons.
 #[inline(always)]
 fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
     let alen = a.len();
@@ -146,14 +148,31 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
     if alen == 0 {
         return true;
     }
-    // 8-byte prefix check: reject most non-equal lines without full memcmp
-    if alen >= 8 {
-        let a8 = unsafe { (a.as_ptr() as *const u64).read_unaligned() };
-        let b8 = unsafe { (b.as_ptr() as *const u64).read_unaligned() };
-        if a8 != b8 {
-            return false;
+    // Short-line fast path: compare via word loads to avoid memcmp call overhead
+    if alen <= 8 {
+        // For <= 8 bytes: load as u64 with masking (overlap at start)
+        // Compare the first min(alen,8) bytes via a single u64 load
+        if alen >= 8 {
+            let a8 = unsafe { (a.as_ptr() as *const u64).read_unaligned() };
+            let b8 = unsafe { (b.as_ptr() as *const u64).read_unaligned() };
+            return a8 == b8;
         }
+        // For < 8 bytes: byte-by-byte via slice (compiler vectorizes this)
+        return a == b;
     }
+    // 8-byte prefix check: reject most non-equal lines without full memcmp
+    let a8 = unsafe { (a.as_ptr() as *const u64).read_unaligned() };
+    let b8 = unsafe { (b.as_ptr() as *const u64).read_unaligned() };
+    if a8 != b8 {
+        return false;
+    }
+    // Check last 8 bytes (overlapping for 9-16 byte lines, eliminating full memcmp)
+    if alen <= 16 {
+        let a_tail = unsafe { (a.as_ptr().add(alen - 8) as *const u64).read_unaligned() };
+        let b_tail = unsafe { (b.as_ptr().add(alen - 8) as *const u64).read_unaligned() };
+        return a_tail == b_tail;
+    }
+    // Longer lines: prefix passed, fall through to full memcmp
     a == b
 }
 
@@ -319,8 +338,9 @@ fn line_full_at<'a>(data: &'a [u8], line_starts: &[usize], idx: usize) -> &'a [u
 
 /// Linear scan for the end of a duplicate group.
 /// Returns the index of the first line that differs from line_starts[group_start].
-/// Must use linear scan (not binary search) because uniq input may NOT be sorted —
+/// Must use linear scan (not binary search) because uniq input may NOT be sorted --
 /// equal lines can appear in non-adjacent groups separated by different lines.
+/// Caches key length for fast length-mismatch rejection.
 #[inline]
 fn linear_scan_group_end(
     data: &[u8],
@@ -330,9 +350,11 @@ fn linear_scan_group_end(
     content_end: usize,
 ) -> usize {
     let key = line_content_at(data, line_starts, group_start, content_end);
+    let key_len = key.len();
     let mut i = group_start + 1;
     while i < num_lines {
-        if !lines_equal_fast(key, line_content_at(data, line_starts, i, content_end)) {
+        let candidate = line_content_at(data, line_starts, i, content_end);
+        if candidate.len() != key_len || !lines_equal_fast(key, candidate) {
             return i;
         }
         i += 1;
@@ -526,6 +548,10 @@ fn process_default_fast_singlepass(
 /// Sequential single-pass dedup with zero-copy output.
 /// Instead of copying data to a buffer, tracks contiguous output runs and writes
 /// directly from the original data. For all-unique data, this is a single write_all.
+///
+/// Optimized for the "many duplicates" case: caches the previous line's length
+/// and first-8-byte prefix for fast rejection of non-duplicates without
+/// calling the full comparison function.
 fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
     let mut prev_start: usize = 0;
     let mut prev_end: usize; // exclusive, without terminator
@@ -542,6 +568,14 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
         }
     }
 
+    // Cache previous line metadata for fast comparison
+    let mut prev_len = prev_end - prev_start;
+    let mut prev_prefix: u64 = if prev_len >= 8 {
+        unsafe { (data.as_ptr().add(prev_start) as *const u64).read_unaligned() }
+    } else {
+        0
+    };
+
     // run_start tracks the beginning of the current contiguous output region.
     // When a duplicate is found, we flush the run up to the duplicate and skip it.
     let mut run_start: usize = 0;
@@ -554,10 +588,39 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
             None => data.len(), // last line without terminator
         };
 
-        let prev_content = &data[prev_start..prev_end];
-        let cur_content = &data[cur_start..cur_end];
+        let cur_len = cur_end - cur_start;
 
-        if lines_equal_fast(prev_content, cur_content) {
+        // Fast reject: if lengths differ, lines are definitely not equal
+        let is_dup = if cur_len != prev_len {
+            false
+        } else if cur_len == 0 {
+            true
+        } else if cur_len >= 8 {
+            // Compare cached 8-byte prefix first
+            let cur_prefix =
+                unsafe { (data.as_ptr().add(cur_start) as *const u64).read_unaligned() };
+            if cur_prefix != prev_prefix {
+                false
+            } else if cur_len <= 8 {
+                true // prefix covers entire line
+            } else if cur_len <= 16 {
+                // Check last 8 bytes (overlapping)
+                let a_tail = unsafe {
+                    (data.as_ptr().add(prev_start + prev_len - 8) as *const u64).read_unaligned()
+                };
+                let b_tail = unsafe {
+                    (data.as_ptr().add(cur_start + cur_len - 8) as *const u64).read_unaligned()
+                };
+                a_tail == b_tail
+            } else {
+                data[prev_start..prev_end] == data[cur_start..cur_end]
+            }
+        } else {
+            // Short line < 8 bytes
+            data[prev_start..prev_end] == data[cur_start..cur_end]
+        };
+
+        if is_dup {
             // Duplicate — flush the current run up to this line, then skip it
             if run_start < cur_start {
                 writer.write_all(&data[run_start..cur_start])?;
@@ -569,9 +632,15 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
                 run_start = cur_end;
             }
         } else {
-            // Different line — extend the current run
+            // Different line — update cached comparison state
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
+            prev_prefix = if cur_len >= 8 {
+                unsafe { (data.as_ptr().add(cur_start) as *const u64).read_unaligned() }
+            } else {
+                0
+            };
             last_output_end = if cur_end < data.len() {
                 cur_end + 1
             } else {
@@ -759,6 +828,7 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
 
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
 /// Zero-copy: writes directly from input data, no output buffer allocation.
+/// Uses cached prefix comparison for fast duplicate detection.
 fn process_filter_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -781,6 +851,7 @@ fn process_filter_fast_singlepass(
 
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
+    let mut prev_len = prev_end;
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
@@ -790,10 +861,14 @@ fn process_filter_fast_singlepass(
             None => data.len(),
         };
 
-        if lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        let is_dup = cur_len == prev_len
+            && lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
-            // Output previous group — write directly from input data (zero-copy)
+            // Output previous group -- write directly from input data (zero-copy)
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
                 if prev_end < data.len() && data[prev_end] == term {
@@ -805,6 +880,7 @@ fn process_filter_fast_singlepass(
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
             count = 1;
         }
 
@@ -832,6 +908,7 @@ fn process_filter_fast_singlepass(
 /// Fast single-pass for count mode (-c) with all standard output modes.
 /// Zero line_starts allocation: scans with memchr, counts groups inline,
 /// and writes count-prefixed lines directly.
+/// Uses cached length comparison for fast duplicate rejection.
 fn process_count_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -857,6 +934,7 @@ fn process_count_fast_singlepass(
 
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
+    let mut prev_len = prev_end;
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
@@ -866,7 +944,11 @@ fn process_count_fast_singlepass(
             None => data.len(),
         };
 
-        if lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        let is_dup = cur_len == prev_len
+            && lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
             // Output previous group with count
@@ -881,6 +963,7 @@ fn process_count_fast_singlepass(
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
             count = 1;
         }
 

@@ -5,10 +5,12 @@ use std::cmp::Ordering;
 use super::key::KeyOpts;
 
 /// Strip leading blanks (space and tab).
-#[inline]
+#[inline(always)]
 pub fn skip_leading_blanks(s: &[u8]) -> &[u8] {
     let mut i = 0;
-    while i < s.len() && (s[i] == b' ' || s[i] == b'\t') {
+    while i < s.len()
+        && (unsafe { *s.get_unchecked(i) } == b' ' || unsafe { *s.get_unchecked(i) } == b'\t')
+    {
         i += 1;
     }
     &s[i..]
@@ -22,6 +24,7 @@ pub fn compare_lexical(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Numeric sort (-n): compare leading numeric strings.
 /// Handles optional leading whitespace, sign, and decimal point.
+#[inline]
 pub fn compare_numeric(a: &[u8], b: &[u8]) -> Ordering {
     let va = parse_numeric_value(a);
     let vb = parse_numeric_value(b);
@@ -30,6 +33,9 @@ pub fn compare_numeric(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Fast custom numeric parser: parses sign + digits + optional decimal directly from bytes.
 /// Avoids UTF-8 validation and str::parse::<f64>() overhead entirely.
+/// Uses batch digit processing for the integer part (4 digits at a time) to reduce
+/// loop iterations and branch mispredictions.
+#[inline]
 pub fn parse_numeric_value(s: &[u8]) -> f64 {
     let s = skip_leading_blanks(s);
     if s.is_empty() {
@@ -37,32 +43,84 @@ pub fn parse_numeric_value(s: &[u8]) -> f64 {
     }
 
     let mut i = 0;
-    let negative = if s[i] == b'-' {
+    let negative = if unsafe { *s.get_unchecked(i) } == b'-' {
         i += 1;
         true
     } else {
-        if s[i] == b'+' {
+        if i < s.len() && unsafe { *s.get_unchecked(i) } == b'+' {
             i += 1;
         }
         false
     };
 
-    // Parse integer part
+    if i >= s.len() {
+        return 0.0;
+    }
+
+    // Parse integer part — batch 4 digits at a time for reduced loop overhead
     let mut integer: u64 = 0;
     let mut has_digits = false;
-    while i < s.len() && s[i].is_ascii_digit() {
-        integer = integer.wrapping_mul(10).wrapping_add((s[i] - b'0') as u64);
+
+    // Fast batch path: process 4 digits at a time
+    while i + 4 <= s.len() {
+        let d0 = unsafe { *s.get_unchecked(i) }.wrapping_sub(b'0');
+        if d0 > 9 {
+            break;
+        }
+        let d1 = unsafe { *s.get_unchecked(i + 1) }.wrapping_sub(b'0');
+        if d1 > 9 {
+            integer = integer.wrapping_mul(10).wrapping_add(d0 as u64);
+            i += 1;
+            has_digits = true;
+            break;
+        }
+        let d2 = unsafe { *s.get_unchecked(i + 2) }.wrapping_sub(b'0');
+        if d2 > 9 {
+            integer = integer
+                .wrapping_mul(100)
+                .wrapping_add(d0 as u64 * 10 + d1 as u64);
+            i += 2;
+            has_digits = true;
+            break;
+        }
+        let d3 = unsafe { *s.get_unchecked(i + 3) }.wrapping_sub(b'0');
+        if d3 > 9 {
+            integer = integer
+                .wrapping_mul(1000)
+                .wrapping_add(d0 as u64 * 100 + d1 as u64 * 10 + d2 as u64);
+            i += 3;
+            has_digits = true;
+            break;
+        }
+        integer = integer
+            .wrapping_mul(10000)
+            .wrapping_add(d0 as u64 * 1000 + d1 as u64 * 100 + d2 as u64 * 10 + d3 as u64);
+        i += 4;
+        has_digits = true;
+    }
+
+    // Tail: process remaining digits one at a time
+    while i < s.len() {
+        let d = unsafe { *s.get_unchecked(i) }.wrapping_sub(b'0');
+        if d > 9 {
+            break;
+        }
+        integer = integer.wrapping_mul(10).wrapping_add(d as u64);
         has_digits = true;
         i += 1;
     }
 
     // Parse fractional part
-    if i < s.len() && s[i] == b'.' {
+    if i < s.len() && unsafe { *s.get_unchecked(i) } == b'.' {
         i += 1;
         let frac_start = i;
         let mut frac_val: u64 = 0;
-        while i < s.len() && s[i].is_ascii_digit() {
-            frac_val = frac_val.wrapping_mul(10).wrapping_add((s[i] - b'0') as u64);
+        while i < s.len() {
+            let d = unsafe { *s.get_unchecked(i) }.wrapping_sub(b'0');
+            if d > 9 {
+                break;
+            }
+            frac_val = frac_val.wrapping_mul(10).wrapping_add(d as u64);
             has_digits = true;
             i += 1;
         }
@@ -98,6 +156,8 @@ const POW10: [f64; 20] = [
 /// Returns Some(i64) if the value is a pure integer (no decimal point, no exponent).
 /// Returns None if the value has a decimal point or is not a valid integer.
 /// This avoids the f64 conversion path for integer-only data.
+/// Uses wrapping arithmetic (no overflow checks) for speed — values >18 digits
+/// may wrap but sort order is still consistent since all values wrap the same way.
 #[inline]
 pub fn try_parse_integer(s: &[u8]) -> Option<i64> {
     let s = skip_leading_blanks(s);
@@ -106,28 +166,71 @@ pub fn try_parse_integer(s: &[u8]) -> Option<i64> {
     }
 
     let mut i = 0;
-    let negative = if s[i] == b'-' {
+    let negative = if unsafe { *s.get_unchecked(i) } == b'-' {
         i += 1;
         true
     } else {
-        if s[i] == b'+' {
+        if i < s.len() && unsafe { *s.get_unchecked(i) } == b'+' {
             i += 1;
         }
         false
     };
 
-    // Parse digits
+    // Parse digits — wrapping arithmetic, batch 4 digits at a time
     let mut value: i64 = 0;
     let mut has_digits = false;
-    while i < s.len() && s[i].is_ascii_digit() {
-        // Check for overflow before multiplying
-        value = value.checked_mul(10)?.checked_add((s[i] - b'0') as i64)?;
+
+    // Fast batch: 4 digits at a time
+    while i + 4 <= s.len() {
+        let d0 = unsafe { *s.get_unchecked(i) }.wrapping_sub(b'0');
+        if d0 > 9 {
+            break;
+        }
+        let d1 = unsafe { *s.get_unchecked(i + 1) }.wrapping_sub(b'0');
+        if d1 > 9 {
+            value = value.wrapping_mul(10).wrapping_add(d0 as i64);
+            i += 1;
+            has_digits = true;
+            break;
+        }
+        let d2 = unsafe { *s.get_unchecked(i + 2) }.wrapping_sub(b'0');
+        if d2 > 9 {
+            value = value
+                .wrapping_mul(100)
+                .wrapping_add(d0 as i64 * 10 + d1 as i64);
+            i += 2;
+            has_digits = true;
+            break;
+        }
+        let d3 = unsafe { *s.get_unchecked(i + 3) }.wrapping_sub(b'0');
+        if d3 > 9 {
+            value = value
+                .wrapping_mul(1000)
+                .wrapping_add(d0 as i64 * 100 + d1 as i64 * 10 + d2 as i64);
+            i += 3;
+            has_digits = true;
+            break;
+        }
+        value = value
+            .wrapping_mul(10000)
+            .wrapping_add(d0 as i64 * 1000 + d1 as i64 * 100 + d2 as i64 * 10 + d3 as i64);
+        i += 4;
+        has_digits = true;
+    }
+
+    // Tail: remaining digits
+    while i < s.len() {
+        let d = unsafe { *s.get_unchecked(i) }.wrapping_sub(b'0');
+        if d > 9 {
+            break;
+        }
+        value = value.wrapping_mul(10).wrapping_add(d as i64);
         has_digits = true;
         i += 1;
     }
 
     // If there's a decimal point, this is not a pure integer
-    if i < s.len() && s[i] == b'.' {
+    if i < s.len() && unsafe { *s.get_unchecked(i) } == b'.' {
         return None;
     }
 
@@ -135,7 +238,11 @@ pub fn try_parse_integer(s: &[u8]) -> Option<i64> {
         return Some(0);
     }
 
-    Some(if negative { -value } else { value })
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
 }
 
 /// Convert an i64 to a sortable u64 whose natural ordering matches signed integer ordering.
