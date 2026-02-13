@@ -25,41 +25,30 @@ const CHUNKED_WRITE_THRESHOLD: usize = 16 * 1024 * 1024;
 const WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Write buf to out, using chunked writes for large buffers to avoid
-/// pipe backpressure stalls. After writing, hint the kernel to release
-/// the buffer pages immediately (MADV_DONTNEED) since we're done with them.
+/// pipe backpressure stalls.
 #[inline]
 fn write_maybe_chunked(out: &mut impl Write, buf: &[u8]) -> io::Result<()> {
-    let result = if buf.len() > CHUNKED_WRITE_THRESHOLD {
+    if buf.len() > CHUNKED_WRITE_THRESHOLD {
         for chunk in buf.chunks(WRITE_CHUNK_SIZE) {
             out.write_all(chunk)?;
         }
         Ok(())
     } else {
         out.write_all(buf)
-    };
-
-    // Hint kernel to release these pages immediately — we're done with the buffer.
-    // This reduces RSS for large files and avoids LRU pressure on the page cache.
-    #[cfg(target_os = "linux")]
-    if buf.len() >= 1024 * 1024 {
-        unsafe {
-            libc::madvise(
-                buf.as_ptr() as *mut libc::c_void,
-                buf.len(),
-                libc::MADV_DONTNEED,
-            );
-        }
     }
-
-    result
+    // Note: MADV_DONTNEED was removed here. On heap-allocated Vec<u8> buffers,
+    // madvise(MADV_DONTNEED) is counterproductive: it zeros the pages but doesn't
+    // release them back to the OS (the allocator still owns them). This just adds
+    // unnecessary page faults on next access without reducing RSS.
 }
 
 /// Copy records from data into buf at computed offsets.
 /// Uses rayon parallel copy for large data with many records, sequential otherwise.
-/// SAFETY: records must contain valid (start, len) pairs within data bounds.
-/// Offsets must be a prefix sum of record lengths, fitting within buf.
+/// Each record is (src_start, src_len, dst_offset) — a single Vec for better cache
+/// locality and halved allocations vs. separate records/offsets vectors.
+/// SAFETY: records must contain valid (start, len, offset) tuples within data/buf bounds.
 #[inline]
-fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize)], offsets: &[usize]) {
+fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize, usize)]) {
     if data.len() >= PARALLEL_TAC_THRESHOLD && records.len() >= 64 {
         let dst_base = buf.as_mut_ptr() as usize;
         let src_base = data.as_ptr() as usize;
@@ -67,8 +56,8 @@ fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize)], 
         // SAFETY: Each record writes to a non-overlapping region of buf.
         // We pass base addresses as usize (which is Send+Sync) and
         // reconstruct pointers inside the closure.
-        records.par_iter().zip(offsets.par_iter()).for_each(
-            |(&(src_start, src_len), &dst_off)| unsafe {
+        records.par_iter().for_each(
+            |&(src_start, src_len, dst_off)| unsafe {
                 std::ptr::copy_nonoverlapping(
                     (src_base + src_start) as *const u8,
                     (dst_base + dst_off) as *mut u8,
@@ -79,7 +68,7 @@ fn copy_records_to_buf(data: &[u8], buf: &mut [u8], records: &[(usize, usize)], 
     } else {
         let buf_ptr = buf.as_mut_ptr();
         let data_ptr = data.as_ptr();
-        for (&(src_start, src_len), &dst_off) in records.iter().zip(offsets.iter()) {
+        for &(src_start, src_len, dst_off) in records.iter() {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_ptr.add(src_start),
@@ -334,37 +323,35 @@ pub fn tac_string_separator(
 /// Two-phase approach: Phase 1 scans all separator positions (sequential, SIMD memrchr).
 /// Phase 2 copies records into output buffer in parallel using rayon.
 fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let Some(first_sep) = memchr::memrchr(sep, data) else {
+    let Some(_) = memchr::memchr(sep, data) else {
         return out.write_all(data);
     };
 
-    // Phase 1: Find ALL separator positions using backward SIMD scan.
-    // Collect into Vec in reverse order (last separator first).
-    let mut sep_positions: Vec<usize> = Vec::new();
-    let mut pos = first_sep;
-    sep_positions.push(pos);
-    while pos > 0 {
-        match memchr::memrchr(sep, &data[..pos]) {
-            Some(prev) => {
-                sep_positions.push(prev);
-                pos = prev;
-            }
-            None => break,
-        }
-    }
-    // sep_positions is in reverse order: [last_sep, ..., first_sep]
+    // Phase 1: Find ALL separator positions using a single forward SIMD pass
+    // with memchr_iter, then reverse. This replaces M backward memrchr passes
+    // with 1 forward pass — much more SIMD-friendly.
+    let mut sep_positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
+    // Reverse so sep_positions[0] = last separator (output order)
+    sep_positions.reverse();
 
-    // Build record descriptors: (src_start, src_len) in output order (reversed).
+    let last_sep = sep_positions[0]; // latest in data
+
+    // Build merged record descriptors: (src_start, src_len, dst_offset) in output order.
+    // Single Vec for better cache locality vs. separate records/offsets vectors.
     // Record layout (after-separator mode):
     //   - Trailing data after last separator (if any)
     //   - For each separator pair: data[prev+1..cur+1] (includes separator at cur)
     //   - First record: data[0..first_sep_in_data+1]
-    let num_records = sep_positions.len() + 1 + if first_sep + 1 < data.len() { 1 } else { 0 };
-    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
+    let num_records = sep_positions.len() + 1 + if last_sep + 1 < data.len() { 1 } else { 0 };
+    let mut records: Vec<(usize, usize, usize)> = Vec::with_capacity(num_records);
+
+    let mut off = 0usize;
 
     // Trailing content after last separator
-    if first_sep + 1 < data.len() {
-        records.push((first_sep + 1, data.len() - (first_sep + 1)));
+    if last_sep + 1 < data.len() {
+        let len = data.len() - (last_sep + 1);
+        records.push((last_sep + 1, len, off));
+        off += len;
     }
 
     // Records between separators (sep_positions is already in reverse = output order)
@@ -378,18 +365,13 @@ fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) ->
         let start = prev_end;
         let end = cur_sep + 1;
         if end > start {
-            records.push((start, end - start));
+            let len = end - start;
+            records.push((start, len, off));
+            off += len;
         }
     }
 
-    // Compute output offsets (prefix sum of record lengths)
-    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
-    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
-    let mut off = 0usize;
-    for &(_, len) in &records {
-        offsets.push(off);
-        off += len;
-    }
+    let total_len = off;
 
     // Allocate output buffer (uninit for speed -- every byte will be written)
     let mut buf: Vec<u8> = Vec::with_capacity(total_len);
@@ -399,7 +381,7 @@ fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) ->
     }
 
     // Phase 2: Copy records (parallel for large data, sequential for small).
-    copy_records_to_buf(data, &mut buf, &records, &offsets);
+    copy_records_to_buf(data, &mut buf, &records);
 
     write_maybe_chunked(out, &buf[..total_len])
 }
@@ -407,35 +389,25 @@ fn tac_bytes_backward_after_alloc(data: &[u8], sep: u8, out: &mut impl Write) ->
 /// Single-allocation reverse for before-separator mode (single byte).
 /// Two-phase: scan separators, then parallel copy records.
 fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let Some(last_sep) = memchr::memrchr(sep, data) else {
+    let Some(_) = memchr::memchr(sep, data) else {
         return out.write_all(data);
     };
 
-    // Phase 1: Find ALL separator positions using backward SIMD scan.
-    let mut sep_positions: Vec<usize> = Vec::new();
-    let mut pos = last_sep;
-    sep_positions.push(pos);
-    while pos > 0 {
-        match memchr::memrchr(sep, &data[..pos]) {
-            Some(prev) => {
-                sep_positions.push(prev);
-                pos = prev;
-            }
-            None => break,
-        }
-    }
+    // Phase 1: Find ALL separator positions using a single forward SIMD pass
+    // with memchr_iter, then reverse. Replaces M backward memrchr passes with 1 forward pass.
+    let mut sep_positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
+    sep_positions.reverse();
     // sep_positions is in reverse order: [last_sep, ..., first_sep]
 
-    // Build record descriptors: (src_start, src_len) in output order.
+    // Build merged record descriptors: (src_start, src_len, dst_offset) in output order.
     // Before-separator mode: each record starts with its separator byte.
     // Output order: last record first.
-    //   - Last record: data[last_sep..data.len()]
-    //   - Between separators (in reverse): data[sep_i..sep_{i-1 in original order}]
-    //   - Leading content before first separator (if any)
     let first_sep_in_data = *sep_positions.last().unwrap();
     let has_leading = first_sep_in_data > 0;
     let num_records = sep_positions.len() + if has_leading { 1 } else { 0 };
-    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
+    let mut records: Vec<(usize, usize, usize)> = Vec::with_capacity(num_records);
+
+    let mut off = 0usize;
 
     // sep_positions[0] = last_sep, sep_positions[last] = first_sep
     // Output: last_sep..end, then prev_sep..last_sep, etc.
@@ -447,23 +419,19 @@ fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -
             sep_positions[i - 1]
         };
         if end > start {
-            records.push((start, end - start));
+            let len = end - start;
+            records.push((start, len, off));
+            off += len;
         }
     }
 
     // Leading content before first separator
     if has_leading {
-        records.push((0, first_sep_in_data));
+        records.push((0, first_sep_in_data, off));
+        off += first_sep_in_data;
     }
 
-    // Compute output offsets (prefix sum)
-    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
-    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
-    let mut off = 0usize;
-    for &(_, len) in &records {
-        offsets.push(off);
-        off += len;
-    }
+    let total_len = off;
 
     // Allocate output buffer
     let mut buf: Vec<u8> = Vec::with_capacity(total_len);
@@ -473,7 +441,7 @@ fn tac_bytes_backward_before_alloc(data: &[u8], sep: u8, out: &mut impl Write) -
     }
 
     // Phase 2: Copy records (parallel for large data, sequential for small).
-    copy_records_to_buf(data, &mut buf, &records, &offsets);
+    copy_records_to_buf(data, &mut buf, &records);
 
     write_maybe_chunked(out, &buf[..total_len])
 }
@@ -506,12 +474,15 @@ fn tac_string_backward_after_alloc(
         }
     }
 
-    // Build record descriptors in output order (reversed)
-    let mut records: Vec<(usize, usize)> = Vec::with_capacity(sep_positions.len() + 2);
+    // Build merged record descriptors: (src_start, src_len, dst_offset) in output order
+    let mut records: Vec<(usize, usize, usize)> = Vec::with_capacity(sep_positions.len() + 2);
+    let mut off = 0usize;
 
     // Trailing content after last separator
     if first_sep + sep_len < data.len() {
-        records.push((first_sep + sep_len, data.len() - (first_sep + sep_len)));
+        let len = data.len() - (first_sep + sep_len);
+        records.push((first_sep + sep_len, len, off));
+        off += len;
     }
 
     // Records between separators
@@ -524,18 +495,13 @@ fn tac_string_backward_after_alloc(
         };
         let end = cur_sep + sep_len;
         if end > prev_end {
-            records.push((prev_end, end - prev_end));
+            let len = end - prev_end;
+            records.push((prev_end, len, off));
+            off += len;
         }
     }
 
-    // Compute output offsets and total
-    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
-    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
-    let mut off = 0usize;
-    for &(_, len) in &records {
-        offsets.push(off);
-        off += len;
-    }
+    let total_len = off;
 
     let mut buf: Vec<u8> = Vec::with_capacity(total_len);
     #[allow(clippy::uninit_vec)]
@@ -543,7 +509,7 @@ fn tac_string_backward_after_alloc(
         buf.set_len(total_len);
     }
 
-    copy_records_to_buf(data, &mut buf, &records, &offsets);
+    copy_records_to_buf(data, &mut buf, &records);
 
     write_maybe_chunked(out, &buf[..total_len])
 }
@@ -575,10 +541,11 @@ fn tac_string_backward_before_alloc(
         }
     }
 
-    // Build record descriptors in output order
+    // Build merged record descriptors: (src_start, src_len, dst_offset) in output order
     let first_sep_in_data = *sep_positions.last().unwrap();
     let has_leading = first_sep_in_data > 0;
-    let mut records: Vec<(usize, usize)> = Vec::with_capacity(sep_positions.len() + 1);
+    let mut records: Vec<(usize, usize, usize)> = Vec::with_capacity(sep_positions.len() + 1);
+    let mut off = 0usize;
 
     for i in 0..sep_positions.len() {
         let start = sep_positions[i];
@@ -588,22 +555,18 @@ fn tac_string_backward_before_alloc(
             sep_positions[i - 1]
         };
         if end > start {
-            records.push((start, end - start));
+            let len = end - start;
+            records.push((start, len, off));
+            off += len;
         }
     }
 
     if has_leading {
-        records.push((0, first_sep_in_data));
+        records.push((0, first_sep_in_data, off));
+        off += first_sep_in_data;
     }
 
-    // Compute output offsets and total
-    let total_len: usize = records.iter().map(|&(_, len)| len).sum();
-    let mut offsets: Vec<usize> = Vec::with_capacity(records.len());
-    let mut off = 0usize;
-    for &(_, len) in &records {
-        offsets.push(off);
-        off += len;
-    }
+    let total_len = off;
 
     let mut buf: Vec<u8> = Vec::with_capacity(total_len);
     #[allow(clippy::uninit_vec)]
@@ -611,7 +574,7 @@ fn tac_string_backward_before_alloc(
         buf.set_len(total_len);
     }
 
-    copy_records_to_buf(data, &mut buf, &records, &offsets);
+    copy_records_to_buf(data, &mut buf, &records);
 
     write_maybe_chunked(out, &buf[..total_len])
 }

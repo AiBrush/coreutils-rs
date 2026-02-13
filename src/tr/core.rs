@@ -1014,7 +1014,8 @@ pub fn translate_squeeze_mmap(
 
     // For large data: two-phase approach
     // Phase 1: parallel translate into buffer
-    // Phase 2: sequential squeeze from translated buffer
+    // Phase 2: sequential squeeze IN-PLACE on the translated buffer
+    //          (squeeze only removes bytes, never grows, so no second allocation needed)
     if data.len() >= PARALLEL_THRESHOLD {
         // Phase 1: parallel translate
         let mut translated = alloc_uninit_vec(data.len());
@@ -1042,18 +1043,17 @@ pub fn translate_squeeze_mmap(
                 });
         }
 
-        // Phase 2: sequential squeeze
-        let mut outbuf: Vec<u8> = Vec::with_capacity(translated.len());
+        // Phase 2: squeeze in-place on the translated buffer.
+        // Since squeeze only removes bytes (never grows), we can read ahead and
+        // compact into the same buffer, saving a full data.len() heap allocation.
         let mut last_squeezed: u16 = 256;
+        let len = translated.len();
+        let mut wp = 0;
         unsafe {
-            outbuf.set_len(translated.len());
-            let inp = translated.as_ptr();
-            let outp: *mut u8 = outbuf.as_mut_ptr();
-            let len = translated.len();
-            let mut wp = 0;
+            let ptr = translated.as_mut_ptr();
             let mut i = 0;
             while i < len {
-                let b = *inp.add(i);
+                let b = *ptr.add(i);
                 if is_member(&squeeze_set, b) {
                     if last_squeezed == b as u16 {
                         i += 1;
@@ -1063,13 +1063,12 @@ pub fn translate_squeeze_mmap(
                 } else {
                     last_squeezed = 256;
                 }
-                *outp.add(wp) = b;
+                *ptr.add(wp) = b;
                 wp += 1;
                 i += 1;
             }
-            outbuf.set_len(wp);
         }
-        return writer.write_all(&outbuf);
+        return writer.write_all(&translated[..wp]);
     }
 
     // Single-write fast path: translate+squeeze all data in one pass, one write
@@ -1147,28 +1146,43 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 
     let member = build_member_set(delete_chars);
 
-    // Parallel path: split data, delete in parallel, collect and write
+    // Parallel path: pre-allocate a single output buffer of data.len() and have each
+    // thread write to its non-overlapping slice, then do a single write_all.
+    // This avoids per-chunk Vec allocations that the old approach had.
     if data.len() >= PARALLEL_THRESHOLD {
         let n_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() / n_threads).max(32 * 1024);
 
-        // Each thread produces a Vec<u8> of retained bytes
-        let results: Vec<Vec<u8>> = data
+        // Each thread deletes into its slice of outbuf and returns bytes written.
+        let mut outbuf = alloc_uninit_vec(data.len());
+        let chunk_lens: Vec<usize> = data
             .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut out = Vec::with_capacity(chunk.len());
-                delete_chunk_bitset(chunk, &member, &mut out);
-                out
+            .zip(outbuf.par_chunks_mut(chunk_size))
+            .map(|(src_chunk, dst_chunk)| {
+                delete_chunk_bitset_into(src_chunk, &member, dst_chunk)
             })
             .collect();
 
-        // Use writev to batch all results into fewer syscalls
-        let slices: Vec<std::io::IoSlice> = results
-            .iter()
-            .filter(|r| !r.is_empty())
-            .map(|r| std::io::IoSlice::new(r))
-            .collect();
-        return write_ioslices(writer, &slices);
+        // Compact: move each chunk's output to be contiguous.
+        // chunk_lens[i] is how many bytes thread i wrote into its slice.
+        // We need to shift them together since each dst_chunk started at chunk_size offsets.
+        let mut write_pos = 0;
+        let mut src_offset = 0;
+        for &clen in &chunk_lens {
+            if clen > 0 && src_offset != write_pos {
+                unsafe {
+                    std::ptr::copy(
+                        outbuf.as_ptr().add(src_offset),
+                        outbuf.as_mut_ptr().add(write_pos),
+                        clen,
+                    );
+                }
+            }
+            write_pos += clen;
+            src_offset += chunk_size;
+        }
+
+        return writer.write_all(&outbuf[..write_pos]);
     }
 
     // Single-write fast path: delete into one buffer, one write
@@ -1187,56 +1201,6 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())
-}
-
-/// Delete bytes from chunk using bitset membership, appending retained bytes to `out`.
-#[inline]
-fn delete_chunk_bitset(chunk: &[u8], member: &[u8; 32], out: &mut Vec<u8>) {
-    let len = chunk.len();
-    let mut i = 0;
-    unsafe {
-        let inp = chunk.as_ptr();
-        // Reserve space to avoid repeated reallocation
-        out.reserve(len);
-        let outp = out.as_mut_ptr().add(out.len());
-        let mut wp = 0;
-
-        while i + 8 <= len {
-            let b0 = *inp.add(i);
-            let b1 = *inp.add(i + 1);
-            let b2 = *inp.add(i + 2);
-            let b3 = *inp.add(i + 3);
-            let b4 = *inp.add(i + 4);
-            let b5 = *inp.add(i + 5);
-            let b6 = *inp.add(i + 6);
-            let b7 = *inp.add(i + 7);
-
-            *outp.add(wp) = b0;
-            wp += !is_member(member, b0) as usize;
-            *outp.add(wp) = b1;
-            wp += !is_member(member, b1) as usize;
-            *outp.add(wp) = b2;
-            wp += !is_member(member, b2) as usize;
-            *outp.add(wp) = b3;
-            wp += !is_member(member, b3) as usize;
-            *outp.add(wp) = b4;
-            wp += !is_member(member, b4) as usize;
-            *outp.add(wp) = b5;
-            wp += !is_member(member, b5) as usize;
-            *outp.add(wp) = b6;
-            wp += !is_member(member, b6) as usize;
-            *outp.add(wp) = b7;
-            wp += !is_member(member, b7) as usize;
-            i += 8;
-        }
-        while i < len {
-            let b = *inp.add(i);
-            *outp.add(wp) = b;
-            wp += !is_member(member, b) as usize;
-            i += 1;
-        }
-        out.set_len(out.len() + wp);
-    }
 }
 
 /// Delete bytes from chunk using bitset, writing into pre-allocated buffer.
@@ -1445,21 +1409,26 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
         let mut wp = 0;
         let mut last = 0;
 
-        let iter_fn = |chunk: &[u8]| -> Vec<usize> {
-            if is_three {
-                memchr::memchr3_iter(c0, c1, c2, chunk).collect()
-            } else {
-                memchr::memchr2_iter(c0, c1, chunk).collect()
+        // Iterate directly over memchr iterator without collecting into Vec<usize>.
+        // Positions are used exactly once in order, so no intermediate allocation needed.
+        if is_three {
+            for pos in memchr::memchr3_iter(c0, c1, c2, chunk) {
+                if pos > last {
+                    let run = pos - last;
+                    outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
+                    wp += run;
+                }
+                last = pos + 1;
             }
-        };
-
-        for pos in iter_fn(chunk) {
-            if pos > last {
-                let run = pos - last;
-                outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
-                wp += run;
+        } else {
+            for pos in memchr::memchr2_iter(c0, c1, chunk) {
+                if pos > last {
+                    let run = pos - last;
+                    outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
+                    wp += run;
+                }
+                last = pos + 1;
             }
-            last = pos + 1;
         }
 
         if last < chunk.len() {
