@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 
 use base64_simd::AsOut;
+use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
@@ -10,6 +11,9 @@ const STREAM_ENCODE_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
 
 /// Chunk size for no-wrap encoding: 12MB aligned to 3 bytes.
 const NOWRAP_CHUNK: usize = 12 * 1024 * 1024 - (12 * 1024 * 1024 % 3);
+
+/// Threshold for parallel encoding: 4MB.
+const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with reusable buffers for maximum throughput.
@@ -26,7 +30,30 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
 }
 
 /// Encode without wrapping — sequential SIMD encoding in chunks.
+/// For large inputs (>4MB), uses rayon to encode chunks in parallel.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
+    // For large inputs, encode chunks in parallel
+    if data.len() >= PAR_THRESHOLD {
+        // Split into chunks aligned to 3 bytes (base64 encoding unit)
+        let chunk_size = NOWRAP_CHUNK - (NOWRAP_CHUNK % 3);
+        let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+        let encoded_chunks: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+                let mut buf = vec![0u8; enc_len];
+                let encoded = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
+                let len = encoded.len();
+                buf.truncate(len);
+                buf
+            })
+            .collect();
+        for chunk in &encoded_chunks {
+            out.write_all(chunk)?;
+        }
+        return Ok(());
+    }
+
     // Size buffer for actual data, not max chunk size.
     let actual_chunk = NOWRAP_CHUNK.min(data.len());
     let enc_max = BASE64_ENGINE.encoded_length(actual_chunk);
@@ -41,13 +68,41 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 }
 
 /// Encode with line wrapping.
-/// Encodes in 6MB input chunks aligned to line boundaries, then wraps
-/// and writes each chunk. 6MB input -> ~8MB encoded+wrapped output.
+/// For large inputs (>4MB), splits into line-aligned chunks and encodes+wraps
+/// each chunk in parallel using rayon.
+/// For small inputs, encodes sequentially in 6MB chunks.
 fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     // Calculate bytes_per_line: the input bytes that produce exactly wrap_col encoded chars.
     // wrap_col base64 chars = (wrap_col * 3 / 4) input bytes (when wrap_col is divisible by 4).
     // For the default wrap_col=76: 76*3/4 = 57 bytes per line.
     let bytes_per_line = wrap_col * 3 / 4;
+
+    // For large inputs, use rayon parallel encoding
+    if data.len() >= PAR_THRESHOLD && bytes_per_line > 0 {
+        // Split into chunks aligned to bytes_per_line so each produces complete lines
+        let lines_per_chunk = (4 * 1024 * 1024) / bytes_per_line;
+        let chunk_size = (lines_per_chunk * bytes_per_line).max(bytes_per_line);
+        let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+
+        let encoded_chunks: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+                let mut encode_buf = vec![0u8; enc_len];
+                let encoded = BASE64_ENGINE.encode(chunk, encode_buf[..enc_len].as_out());
+                let max_lines = enc_len / wrap_col + 2;
+                let mut wrap_buf = vec![0u8; enc_len + max_lines];
+                let wp = wrap_encoded(encoded, wrap_col, &mut wrap_buf);
+                wrap_buf.truncate(wp);
+                wrap_buf
+            })
+            .collect();
+
+        for chunk in &encoded_chunks {
+            out.write_all(chunk)?;
+        }
+        return Ok(());
+    }
 
     // Encode in 6MB chunks aligned to bytes_per_line so each chunk produces
     // complete lines, avoiding column tracking across chunks.
