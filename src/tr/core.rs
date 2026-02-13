@@ -99,9 +99,27 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
 }
 
 /// Translate bytes in-place using a 256-byte lookup table.
-/// Uses 8x unrolling for better instruction-level parallelism.
+/// On x86_64 with SSSE3+, uses SIMD pshufb-based nibble decomposition for
+/// ~32 bytes per iteration. Falls back to 8x-unrolled scalar on other platforms.
 #[inline(always)]
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { translate_inplace_avx2_table(data, table) };
+            return;
+        }
+        if is_x86_feature_detected!("ssse3") {
+            unsafe { translate_inplace_ssse3_table(data, table) };
+            return;
+        }
+    }
+    translate_inplace_scalar(data, table);
+}
+
+/// Scalar fallback: 8x-unrolled table lookup.
+#[inline(always)]
+fn translate_inplace_scalar(data: &mut [u8], table: &[u8; 256]) {
     let len = data.len();
     let ptr = data.as_mut_ptr();
     let mut i = 0;
@@ -124,10 +142,226 @@ fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
     }
 }
 
+// ============================================================================
+// SIMD arbitrary table lookup using pshufb nibble decomposition (x86_64)
+// ============================================================================
+//
+// For an arbitrary 256-byte lookup table, we decompose each byte into
+// high nibble (bits 7-4) and low nibble (bits 3-0). We pre-build 16
+// SIMD vectors, one for each high nibble value h (0..15), containing
+// the 16 table entries table[h*16+0..h*16+15]. Then for each input
+// vector we:
+//   1. Extract low nibble (AND 0x0F) -> used as pshufb index
+//   2. Extract high nibble (shift right 4) -> used to select which table
+//   3. For each of the 16 high nibble values, create a mask where
+//      the high nibble equals that value, pshufb the corresponding
+//      table, and accumulate results
+//
+// AVX2 processes 32 bytes/iteration; SSSE3 processes 16 bytes/iteration.
+// With instruction-level parallelism, this achieves much higher throughput
+// than scalar table lookups which have serial data dependencies.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn translate_inplace_avx2_table(data: &mut [u8], table: &[u8; 256]) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+
+        // Pre-build 16 lookup vectors, one per high nibble value.
+        // Each vector holds 32 bytes = 2x 128-bit lanes, each lane has the same
+        // 16 table entries for pshufb indexing by low nibble.
+        let mut lut = [_mm256_setzero_si256(); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            let row: [u8; 16] = std::array::from_fn(|i| *table.get_unchecked(base + i));
+            // Broadcast the 128-bit row to both lanes of the 256-bit vector
+            let row128 = _mm_loadu_si128(row.as_ptr() as *const _);
+            lut[h as usize] = _mm256_broadcastsi128_si256(row128);
+        }
+
+        let lo_mask = _mm256_set1_epi8(0x0F);
+
+        let mut i = 0;
+        while i + 32 <= len {
+            let input = _mm256_loadu_si256(ptr.add(i) as *const _);
+            let lo_nibble = _mm256_and_si256(input, lo_mask);
+            let hi_nibble = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_mask);
+
+            // Accumulate result: for each high nibble value h, select bytes where
+            // hi_nibble == h, look up in lut[h] using lo_nibble, blend into result.
+            let mut result = _mm256_setzero_si256();
+
+            // Unroll the 16 high-nibble iterations for best ILP
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = _mm256_set1_epi8($h as i8);
+                    let mask = _mm256_cmpeq_epi8(hi_nibble, h_val);
+                    let looked_up = _mm256_shuffle_epi8(lut[$h], lo_nibble);
+                    result = _mm256_or_si256(result, _mm256_and_si256(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            _mm256_storeu_si256(ptr.add(i) as *mut _, result);
+            i += 32;
+        }
+
+        // SSE/SSSE3 tail for remaining 16-byte chunk
+        if i + 16 <= len {
+            let lo_mask128 = _mm_set1_epi8(0x0F);
+
+            // Build 128-bit LUTs (just the lower lane of each 256-bit LUT)
+            let mut lut128 = [_mm_setzero_si128(); 16];
+            for h in 0u8..16 {
+                lut128[h as usize] = _mm256_castsi256_si128(lut[h as usize]);
+            }
+
+            let input = _mm_loadu_si128(ptr.add(i) as *const _);
+            let lo_nib = _mm_and_si128(input, lo_mask128);
+            let hi_nib = _mm_and_si128(_mm_srli_epi16(input, 4), lo_mask128);
+
+            let mut res = _mm_setzero_si128();
+            macro_rules! do_nibble128 {
+                ($h:expr) => {
+                    let h_val = _mm_set1_epi8($h as i8);
+                    let mask = _mm_cmpeq_epi8(hi_nib, h_val);
+                    let looked_up = _mm_shuffle_epi8(lut128[$h], lo_nib);
+                    res = _mm_or_si128(res, _mm_and_si128(mask, looked_up));
+                };
+            }
+            do_nibble128!(0);
+            do_nibble128!(1);
+            do_nibble128!(2);
+            do_nibble128!(3);
+            do_nibble128!(4);
+            do_nibble128!(5);
+            do_nibble128!(6);
+            do_nibble128!(7);
+            do_nibble128!(8);
+            do_nibble128!(9);
+            do_nibble128!(10);
+            do_nibble128!(11);
+            do_nibble128!(12);
+            do_nibble128!(13);
+            do_nibble128!(14);
+            do_nibble128!(15);
+
+            _mm_storeu_si128(ptr.add(i) as *mut _, res);
+            i += 16;
+        }
+
+        // Scalar tail
+        while i < len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn translate_inplace_ssse3_table(data: &mut [u8], table: &[u8; 256]) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+
+        // Pre-build 16 lookup vectors for pshufb
+        let mut lut = [_mm_setzero_si128(); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            let row: [u8; 16] = std::array::from_fn(|i| *table.get_unchecked(base + i));
+            lut[h as usize] = _mm_loadu_si128(row.as_ptr() as *const _);
+        }
+
+        let lo_mask = _mm_set1_epi8(0x0F);
+
+        let mut i = 0;
+        while i + 16 <= len {
+            let input = _mm_loadu_si128(ptr.add(i) as *const _);
+            let lo_nibble = _mm_and_si128(input, lo_mask);
+            let hi_nibble = _mm_and_si128(_mm_srli_epi16(input, 4), lo_mask);
+
+            let mut result = _mm_setzero_si128();
+
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = _mm_set1_epi8($h as i8);
+                    let mask = _mm_cmpeq_epi8(hi_nibble, h_val);
+                    let looked_up = _mm_shuffle_epi8(lut[$h], lo_nibble);
+                    result = _mm_or_si128(result, _mm_and_si128(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            _mm_storeu_si128(ptr.add(i) as *mut _, result);
+            i += 16;
+        }
+
+        // Scalar tail
+        while i < len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
 /// Translate bytes from source to destination using a 256-byte lookup table.
+/// On x86_64 with SSSE3+, uses SIMD pshufb-based nibble decomposition.
 #[inline(always)]
 fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
     debug_assert!(dst.len() >= src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { translate_to_avx2_table(src, dst, table) };
+            return;
+        }
+        if is_x86_feature_detected!("ssse3") {
+            unsafe { translate_to_ssse3_table(src, dst, table) };
+            return;
+        }
+    }
+    translate_to_scalar(src, dst, table);
+}
+
+/// Scalar fallback for translate_to.
+#[inline(always)]
+fn translate_to_scalar(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
     unsafe {
         let sp = src.as_ptr();
         let dp = dst.as_mut_ptr();
@@ -144,6 +378,178 @@ fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
             *dp.add(i + 7) = *table.get_unchecked(*sp.add(i + 7) as usize);
             i += 8;
         }
+        while i < len {
+            *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn translate_to_avx2_table(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+
+        // Pre-build 16 lookup vectors
+        let mut lut = [_mm256_setzero_si256(); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            let row: [u8; 16] = std::array::from_fn(|i| *table.get_unchecked(base + i));
+            let row128 = _mm_loadu_si128(row.as_ptr() as *const _);
+            lut[h as usize] = _mm256_broadcastsi128_si256(row128);
+        }
+
+        let lo_mask = _mm256_set1_epi8(0x0F);
+
+        let mut i = 0;
+        while i + 32 <= len {
+            let input = _mm256_loadu_si256(sp.add(i) as *const _);
+            let lo_nibble = _mm256_and_si256(input, lo_mask);
+            let hi_nibble = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_mask);
+
+            let mut result = _mm256_setzero_si256();
+
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = _mm256_set1_epi8($h as i8);
+                    let mask = _mm256_cmpeq_epi8(hi_nibble, h_val);
+                    let looked_up = _mm256_shuffle_epi8(lut[$h], lo_nibble);
+                    result = _mm256_or_si256(result, _mm256_and_si256(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            _mm256_storeu_si256(dp.add(i) as *mut _, result);
+            i += 32;
+        }
+
+        // SSSE3 tail for remaining 16-byte chunk
+        if i + 16 <= len {
+            let lo_mask128 = _mm_set1_epi8(0x0F);
+            let mut lut128 = [_mm_setzero_si128(); 16];
+            for h in 0u8..16 {
+                lut128[h as usize] = _mm256_castsi256_si128(lut[h as usize]);
+            }
+
+            let input = _mm_loadu_si128(sp.add(i) as *const _);
+            let lo_nib = _mm_and_si128(input, lo_mask128);
+            let hi_nib = _mm_and_si128(_mm_srli_epi16(input, 4), lo_mask128);
+
+            let mut res = _mm_setzero_si128();
+            macro_rules! do_nibble128 {
+                ($h:expr) => {
+                    let h_val = _mm_set1_epi8($h as i8);
+                    let mask = _mm_cmpeq_epi8(hi_nib, h_val);
+                    let looked_up = _mm_shuffle_epi8(lut128[$h], lo_nib);
+                    res = _mm_or_si128(res, _mm_and_si128(mask, looked_up));
+                };
+            }
+            do_nibble128!(0);
+            do_nibble128!(1);
+            do_nibble128!(2);
+            do_nibble128!(3);
+            do_nibble128!(4);
+            do_nibble128!(5);
+            do_nibble128!(6);
+            do_nibble128!(7);
+            do_nibble128!(8);
+            do_nibble128!(9);
+            do_nibble128!(10);
+            do_nibble128!(11);
+            do_nibble128!(12);
+            do_nibble128!(13);
+            do_nibble128!(14);
+            do_nibble128!(15);
+
+            _mm_storeu_si128(dp.add(i) as *mut _, res);
+            i += 16;
+        }
+
+        // Scalar tail
+        while i < len {
+            *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn translate_to_ssse3_table(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+
+        let mut lut = [_mm_setzero_si128(); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            let row: [u8; 16] = std::array::from_fn(|i| *table.get_unchecked(base + i));
+            lut[h as usize] = _mm_loadu_si128(row.as_ptr() as *const _);
+        }
+
+        let lo_mask = _mm_set1_epi8(0x0F);
+
+        let mut i = 0;
+        while i + 16 <= len {
+            let input = _mm_loadu_si128(sp.add(i) as *const _);
+            let lo_nibble = _mm_and_si128(input, lo_mask);
+            let hi_nibble = _mm_and_si128(_mm_srli_epi16(input, 4), lo_mask);
+
+            let mut result = _mm_setzero_si128();
+
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = _mm_set1_epi8($h as i8);
+                    let mask = _mm_cmpeq_epi8(hi_nibble, h_val);
+                    let looked_up = _mm_shuffle_epi8(lut[$h], lo_nibble);
+                    result = _mm_or_si128(result, _mm_and_si128(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            _mm_storeu_si128(dp.add(i) as *mut _, result);
+            i += 16;
+        }
+
+        // Scalar tail
         while i < len {
             *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
             i += 1;
