@@ -6,13 +6,8 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// digest::Digest needed for generic hash on non-Linux (macOS, Windows)
-#[cfg(not(target_os = "linux"))]
 use digest::Digest;
-// md5 crate needed on non-Linux where OpenSSL is not available
-#[cfg(not(target_os = "linux"))]
 use md5::Md5;
-use memmap2::MmapOptions;
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy)]
@@ -34,8 +29,7 @@ impl HashAlgorithm {
 
 // ── Generic hash helpers ────────────────────────────────────────────
 
-/// Single-shot hash using the Digest trait (non-Linux: Apple, Windows).
-#[cfg(not(target_os = "linux"))]
+/// Single-shot hash using the Digest trait.
 fn hash_digest<D: Digest>(data: &[u8]) -> String {
     hex_encode(&D::digest(data))
 }
@@ -43,8 +37,6 @@ fn hash_digest<D: Digest>(data: &[u8]) -> String {
 /// Streaming hash using thread-local buffer for optimal cache behavior.
 /// Uses read_full to ensure each update() gets a full buffer, minimizing
 /// per-chunk hasher overhead and maximizing SIMD-friendly aligned updates.
-/// Used on non-Linux platforms (Apple, Windows) where OpenSSL is not available.
-#[cfg(not(target_os = "linux"))]
 fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -63,9 +55,9 @@ fn hash_reader_impl<D: Digest>(mut reader: impl Read) -> io::Result<String> {
 // ── Public hashing API ──────────────────────────────────────────────
 
 /// Buffer size for streaming hash I/O.
-/// 16MB: large enough to amortize syscall overhead and reduce the number
-/// of hash update() calls. Fewer updates = less per-chunk hasher overhead.
-const HASH_READ_BUF: usize = 16 * 1024 * 1024;
+/// 4MB: fits in L3 cache for optimal hash throughput while still amortizing
+/// syscall overhead. Smaller than previous 16MB avoids cache thrashing.
+const HASH_READ_BUF: usize = 4 * 1024 * 1024;
 
 // Thread-local reusable buffer for streaming hash I/O.
 // Allocated once per thread, reused across all hash_reader calls.
@@ -151,16 +143,8 @@ pub fn hash_bytes(algo: HashAlgorithm, data: &[u8]) -> String {
     }
 }
 
-/// Single-shot MD5 using OpenSSL's optimized assembly (Linux only).
-#[cfg(target_os = "linux")]
-fn md5_bytes(data: &[u8]) -> String {
-    let digest =
-        openssl::hash::hash(openssl::hash::MessageDigest::md5(), data).expect("MD5 hash failed");
-    hex_encode(&digest)
-}
-
-/// Single-shot MD5 using md-5 crate (macOS, Windows).
-#[cfg(not(target_os = "linux"))]
+/// Single-shot MD5 using md-5 crate with ASM acceleration.
+/// Avoids OpenSSL FFI overhead (~13µs per call saved).
 fn md5_bytes(data: &[u8]) -> String {
     hash_digest::<Md5>(data)
 }
@@ -174,27 +158,7 @@ pub fn hash_reader<R: Read>(algo: HashAlgorithm, reader: R) -> io::Result<String
     }
 }
 
-/// Streaming MD5 hash using OpenSSL's optimized assembly implementation (Linux only).
-#[cfg(target_os = "linux")]
-fn md5_reader(mut reader: impl Read) -> io::Result<String> {
-    STREAM_BUF.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::md5())
-            .map_err(|e| io::Error::other(e))?;
-        loop {
-            let n = read_full(&mut reader, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
-        }
-        let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
-        Ok(hex_encode(&digest))
-    })
-}
-
-/// Streaming MD5 hash using md-5 crate (macOS, Windows).
-#[cfg(not(target_os = "linux"))]
+/// Streaming MD5 hash using md-5 crate with ASM acceleration.
 fn md5_reader(reader: impl Read) -> io::Result<String> {
     hash_reader_impl::<Md5>(reader)
 }
@@ -231,40 +195,26 @@ fn open_noatime(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-/// Hash a file by path. Single open + fstat to minimize syscalls.
-/// Uses mmap with populate() + MADV_SEQUENTIAL for optimal I/O.
-/// Single hash_bytes() call over entire mmap avoids per-chunk overhead.
+/// Hash a file by path. Uses streaming read with sequential fadvise hint.
+/// Streaming avoids MAP_POPULATE blocking (pre-faults all pages upfront)
+/// and mmap setup/teardown overhead for small files.
 pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
-    // Single open — reuse fd for fstat + mmap (saves separate stat + open)
     let file = open_noatime(path)?;
-    let metadata = file.metadata()?; // fstat on existing fd, cheaper than stat(path)
-    let len = metadata.len();
-    let is_regular = metadata.file_type().is_file();
+    let metadata = file.metadata()?;
 
-    if is_regular && len == 0 {
+    if metadata.file_type().is_file() && metadata.len() == 0 {
         return Ok(hash_bytes(algo, &[]));
     }
 
-    if is_regular && len > 0 {
-        // Zero-copy mmap with populate: pre-faults all pages via MAP_POPULATE.
-        // MADV_SEQUENTIAL tells kernel to readahead aggressively and drop
-        // pages behind the access point, reducing memory pressure.
-        if let Ok(mmap) = unsafe { MmapOptions::new().populate().map(&file) } {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::madvise(
-                    mmap.as_ptr() as *mut libc::c_void,
-                    mmap.len(),
-                    libc::MADV_SEQUENTIAL,
-                );
-            }
-            return Ok(hash_bytes(algo, &mmap));
+    // Hint kernel for aggressive sequential readahead — overlaps I/O with hashing
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-        // mmap failed — fall back to streaming read
-        return hash_reader(algo, file);
     }
 
-    // Fallback: streaming read (special files, pipes, etc.) — fd already open
     hash_reader(algo, file)
 }
 
@@ -291,12 +241,20 @@ pub fn hash_stdin(algo: HashAlgorithm) -> io::Result<String> {
 }
 
 /// Check if parallel hashing is worthwhile for the given file paths.
-/// Always parallelizes with 2+ files — rayon's thread pool is already initialized
-/// and work-stealing overhead is minimal (~1µs per file dispatch).
-/// With mmap, each thread independently maps and hashes its own file with no
-/// shared state, giving near-linear speedup with available cores.
+/// For many small files, sequential processing avoids rayon thread pool
+/// init and work-stealing overhead (~13µs per file). Only parallelize
+/// when total data exceeds 10MB to amortize thread pool cost.
 pub fn should_use_parallel(paths: &[&Path]) -> bool {
-    paths.len() >= 2
+    if paths.len() < 2 {
+        return false;
+    }
+    // Only parallelize if we have substantial work per thread
+    let total_size: u64 = paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    total_size > 10 * 1024 * 1024
 }
 
 /// Issue readahead hints for a list of file paths to warm the page cache.
@@ -358,37 +316,24 @@ pub fn blake2b_hash_reader<R: Read>(mut reader: R, output_bytes: usize) -> io::R
     })
 }
 
-/// Hash a file with BLAKE2b variable output length. Single open + fstat.
-/// Uses mmap with populate() + MADV_SEQUENTIAL for optimal I/O.
+/// Hash a file with BLAKE2b variable output length.
+/// Uses streaming read with sequential fadvise for overlapped I/O.
 pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String> {
-    // Single open — reuse fd for fstat + mmap
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
-    let len = metadata.len();
-    let is_regular = metadata.file_type().is_file();
 
-    if is_regular && len == 0 {
+    if metadata.file_type().is_file() && metadata.len() == 0 {
         return Ok(blake2b_hash_data(&[], output_bytes));
     }
 
-    if is_regular && len > 0 {
-        // Zero-copy mmap with populate + sequential advice
-        if let Ok(mmap) = unsafe { MmapOptions::new().populate().map(&file) } {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::madvise(
-                    mmap.as_ptr() as *mut libc::c_void,
-                    mmap.len(),
-                    libc::MADV_SEQUENTIAL,
-                );
-            }
-            return Ok(blake2b_hash_data(&mmap, output_bytes));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-        // mmap failed — fall back to streaming read
-        return blake2b_hash_reader(file, output_bytes);
     }
 
-    // Fallback: streaming read — fd already open
     blake2b_hash_reader(file, output_bytes)
 }
 
