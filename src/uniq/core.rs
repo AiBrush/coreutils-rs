@@ -566,22 +566,19 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     let data_len = data.len();
     let base = data.as_ptr();
     let mut prev_start: usize = 0;
-    let mut prev_end: usize; // exclusive, without terminator
 
     // Find end of first line
-    match memchr::memchr(term, data) {
-        Some(pos) => {
-            prev_end = pos;
-        }
+    let first_end: usize = match memchr::memchr(term, data) {
+        Some(pos) => pos,
         None => {
             // Single line, no terminator
             writer.write_all(data)?;
             return writer.write_all(&[term]);
         }
-    }
+    };
 
     // Cache previous line metadata for fast comparison
-    let mut prev_len = prev_end - prev_start;
+    let mut prev_len = first_end - prev_start;
     let mut prev_prefix: u64 = if prev_len >= 8 {
         unsafe { (base.add(prev_start) as *const u64).read_unaligned() }
     } else {
@@ -591,8 +588,8 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     // run_start tracks the beginning of the current contiguous output region.
     // When a duplicate is found, we flush the run up to the duplicate and skip it.
     let mut run_start: usize = 0;
-    let mut cur_start = prev_end + 1;
-    let mut last_output_end = prev_end + 1; // exclusive end including terminator
+    let mut cur_start = first_end + 1;
+    let mut last_output_end = first_end + 1; // exclusive end including terminator
 
     while cur_start < data_len {
         let cur_end = match memchr::memchr(term, unsafe {
@@ -666,7 +663,6 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
         } else {
             // Different line — update cached comparison state
             prev_start = cur_start;
-            prev_end = cur_end;
             prev_len = cur_len;
             prev_prefix = if cur_len >= 8 {
                 unsafe { (base.add(cur_start) as *const u64).read_unaligned() }

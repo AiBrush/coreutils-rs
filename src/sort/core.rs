@@ -436,16 +436,20 @@ pub fn check_sorted(inputs: &[String], config: &SortConfig) -> io::Result<bool> 
     let (buffer, offsets) = read_all_input(inputs, config.zero_terminated)?;
     let data = &*buffer;
 
+    let dp = data.as_ptr();
     for i in 1..offsets.len() {
         let (s1, e1) = offsets[i - 1];
         let (s2, e2) = offsets[i];
+        // Use raw pointer arithmetic to avoid bounds checking
+        let line1 = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+        let line2 = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
         // For -c -u: use dedup comparison (no last-resort) so that
         // key-equal lines are detected as duplicates.
         // For -c without -u: use full comparison (with last-resort).
         let cmp = if config.unique {
-            compare_lines_for_dedup(&data[s1..e1], &data[s2..e2], config)
+            compare_lines_for_dedup(line1, line2, config)
         } else {
-            compare_lines(&data[s1..e1], &data[s2..e2], config)
+            compare_lines(line1, line2, config)
         };
         let bad = if config.unique {
             cmp != Ordering::Less
@@ -657,8 +661,10 @@ fn radix_sort_entries(
 
     // Sort each non-trivial bucket independently with rayon.
     // Optimized comparison: u64 prefix comparison resolves most entries,
-    // only falls through to byte-by-byte for prefix collisions.
+    // only falls through to word-at-a-time for prefix collisions.
     // The skip=min(8,la,lb) optimization avoids re-comparing the prefix bytes.
+    // Word-at-a-time comparison uses u64 loads for the suffix, which is ~8x faster
+    // than byte-by-byte comparison on modern CPUs (single u64 cmp vs 8 byte cmps).
     {
         let sorted_ptr = sorted.as_mut_ptr();
         let sorted_len = sorted.len();
@@ -671,13 +677,29 @@ fn radix_sort_entries(
                     let sb = b.1 as usize;
                     let lb = b.2 as usize;
                     let skip = 8.min(la).min(lb);
-                    // Use raw pointer arithmetic to avoid bounds checking
-                    // in this hot comparison path. data_addr is a usize (Send+Sync).
+                    let rem_a = la - skip;
+                    let rem_b = lb - skip;
                     unsafe {
                         let dp = data_addr as *const u8;
-                        let slice_a = std::slice::from_raw_parts(dp.add(sa + skip), la - skip);
-                        let slice_b = std::slice::from_raw_parts(dp.add(sb + skip), lb - skip);
-                        slice_a.cmp(slice_b)
+                        let pa = dp.add(sa + skip);
+                        let pb = dp.add(sb + skip);
+                        // Word-at-a-time comparison: compare 8 bytes at a time
+                        // using big-endian u64 loads. This resolves most suffix
+                        // collisions in 1-2 iterations instead of 8-16 byte cmps.
+                        let min_rem = rem_a.min(rem_b);
+                        let mut i = 0usize;
+                        while i + 8 <= min_rem {
+                            let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
+                            let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
+                            if wa != wb {
+                                return wa.cmp(&wb);
+                            }
+                            i += 8;
+                        }
+                        // Compare remaining bytes (< 8)
+                        let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
+                        let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
+                        tail_a.cmp(tail_b)
                     }
                 }
                 ord => ord,
@@ -723,8 +745,11 @@ fn line_prefix(data: &[u8], start: usize, end: usize) -> u64 {
         // Unaligned u64 load + bswap: single instruction on x86_64
         u64::from_be_bytes(unsafe { *(data.as_ptr().add(start) as *const [u8; 8]) })
     } else {
+        // Use raw pointer copy for short lines to avoid bounds checking
         let mut bytes = [0u8; 8];
-        bytes[..len].copy_from_slice(&data[start..end]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(start), bytes.as_mut_ptr(), len);
+        }
         u64::from_be_bytes(bytes)
     }
 }
@@ -855,14 +880,16 @@ fn write_sorted_output(
     terminator: &[u8],
 ) -> io::Result<()> {
     if config.unique {
+        let dp = data.as_ptr();
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            let line = &data[s..e];
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
+                    let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -881,11 +908,13 @@ fn write_sorted_output(
         // Use write_vectored to batch line+terminator pairs into fewer syscalls.
         // Each entry produces 2 IoSlices (line data + terminator), batched in
         // groups of 512 entries (1024 IoSlices) to stay within typical writev limits.
+        let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            slices.push(io::IoSlice::new(&data[s..e]));
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            slices.push(io::IoSlice::new(line));
             slices.push(io::IoSlice::new(terminator));
             if slices.len() >= BATCH * 2 {
                 write_all_vectored(writer, &slices)?;
@@ -1040,14 +1069,16 @@ fn write_sorted_entries(
     terminator: &[u8],
 ) -> io::Result<()> {
     if config.unique {
+        let dp = data.as_ptr();
         let mut prev: Option<usize> = None;
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            let line = &data[s..e];
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
+                    let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -1350,12 +1381,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
     if num_lines > 1 {
         let is_sorted = if is_plain_lex_for_check {
-            // Fast path: direct byte comparison for plain lexicographic sort
+            // Fast path: direct byte comparison for plain lexicographic sort.
+            // Uses raw pointer arithmetic to avoid bounds checking in the hot loop.
+            let dp = data.as_ptr();
             let mut sorted = true;
             for i in 1..num_lines {
                 let (s1, e1) = offsets[i - 1];
                 let (s2, e2) = offsets[i];
-                if data[s1..e1] > data[s2..e2] {
+                let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+                let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
+                if a > b {
                     sorted = false;
                     break;
                 }
@@ -1497,6 +1532,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         // (within each bucket, entries are already in reverse order from the sort).
         // For forward, iterate linearly through the sorted array.
         if config.unique {
+            let dp = data.as_ptr();
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
             if reverse {
@@ -1504,14 +1540,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
                         let su = s as usize;
                         let lu = l as usize;
+                        let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
                         let emit = prev_start == u32::MAX || {
                             let ps = prev_start as usize;
                             let pl = prev_len as usize;
-                            compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
+                            let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
+                            compare_lines_for_dedup(prev_line, line, config)
                                 != Ordering::Equal
                         };
                         if emit {
-                            writer.write_all(&data[su..su + lu])?;
+                            writer.write_all(line)?;
                             writer.write_all(terminator)?;
                             prev_start = s;
                             prev_len = l;
@@ -1522,14 +1560,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 for &(_, s, l) in &sorted {
                     let su = s as usize;
                     let lu = l as usize;
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
                     let emit = prev_start == u32::MAX || {
                         let ps = prev_start as usize;
                         let pl = prev_len as usize;
-                        compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
+                        let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
+                        compare_lines_for_dedup(prev_line, line, config)
                             != Ordering::Equal
                     };
                     if emit {
-                        writer.write_all(&data[su..su + lu])?;
+                        writer.write_all(line)?;
                         writer.write_all(terminator)?;
                         prev_start = s;
                         prev_len = l;
