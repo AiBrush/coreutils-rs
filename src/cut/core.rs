@@ -290,31 +290,25 @@ fn multi_select_chunk(
 ) {
     buf.reserve(data.len());
 
-    // Pre-compute field selection mask for O(1) field lookup
-    let field_mask = compute_field_mask(ranges, false);
-
     let base = data.as_ptr();
     let mut start = 0;
 
     for end_pos in memchr_iter(line_delim, data) {
         let line = unsafe { std::slice::from_raw_parts(base.add(start), end_pos - start) };
-        multi_select_line(
-            line, delim, line_delim, ranges, max_field, field_mask, suppress, buf,
-        );
+        multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
         start = end_pos + 1;
     }
     // Handle last line without trailing line_delim
     if start < data.len() {
         let line = unsafe { std::slice::from_raw_parts(base.add(start), data.len() - start) };
-        multi_select_line(
-            line, delim, line_delim, ranges, max_field, field_mask, suppress, buf,
-        );
+        multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
     }
 }
 
 /// Extract selected fields from a single line using delimiter position scanning.
 /// Scans delimiters only up to max_field (early exit), then extracts selected fields
-/// by indexing into the collected positions.
+/// by indexing directly into the collected positions. Since ranges are pre-sorted and
+/// non-overlapping, every field within a range is selected — no is_selected check needed.
 #[inline(always)]
 fn multi_select_line(
     line: &[u8],
@@ -322,7 +316,6 @@ fn multi_select_line(
     line_delim: u8,
     ranges: &[Range],
     max_field: usize,
-    field_mask: u64,
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
@@ -341,20 +334,19 @@ fn multi_select_line(
     // Stack array for up to 64 delimiter positions.
     let mut delim_pos = [0usize; 64];
     let mut num_delims: usize = 0;
-    let max_delims = max_field.min(64); // need max_field-1 delimiters to identify max_field fields
+    let max_delims = max_field.min(64);
 
     for pos in memchr_iter(delim, line) {
         if num_delims < max_delims {
             delim_pos[num_delims] = pos;
             num_delims += 1;
             if num_delims >= max_delims {
-                break; // Early exit: found enough delimiters
+                break;
             }
         }
     }
 
     if num_delims == 0 {
-        // No delimiter in line
         if !suppress {
             unsafe {
                 buf_extend(buf, line);
@@ -365,7 +357,8 @@ fn multi_select_line(
     }
 
     // Extract selected fields using delimiter positions.
-    // Field N has content between delim_pos[N-2]+1 and delim_pos[N-1] (or line start/end).
+    // Ranges are pre-sorted and non-overlapping, so every field_num within a range
+    // is selected — skip the is_selected check entirely (saves 1 function call per field).
     let total_fields = num_delims + 1;
     let mut first_output = true;
 
@@ -373,17 +366,13 @@ fn multi_select_line(
         let range_start = r.start;
         let range_end = r.end.min(total_fields);
         if range_start > total_fields {
-            break; // No more fields available
+            break;
         }
         for field_num in range_start..=range_end {
             if field_num > total_fields {
                 break;
             }
-            if !is_selected(field_num, field_mask, ranges, false) {
-                continue;
-            }
 
-            // Get field boundaries
             let field_start = if field_num == 1 {
                 0
             } else if field_num - 2 < num_delims {
@@ -410,12 +399,7 @@ fn multi_select_line(
         }
     }
 
-    if first_output {
-        // No fields were output but line had delimiters — output empty line
-        unsafe { buf_push(buf, line_delim) };
-    } else {
-        unsafe { buf_push(buf, line_delim) };
-    }
+    unsafe { buf_push(buf, line_delim) };
 }
 
 // ── Fast path: field extraction with batched output ──────────────────────

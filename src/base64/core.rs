@@ -10,10 +10,11 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
 /// Minimum data size for parallel encoding (32MB).
-/// base64_simd SIMD encoding runs at ~8 GB/s per core. For the common
-/// 10MB benchmark input, rayon overhead (~100-200us for spawn+join)
-/// exceeds the benefit of parallel encoding (~0.2ms savings). Only use
-/// parallel for genuinely large files (32MB+) where the savings are 1ms+.
+/// The parallel path encodes per-line (57 bytes each), which has significant
+/// per-call overhead from base64_simd function setup. For 10MB benchmarks,
+/// bulk encode (one SIMD pass) + writev is faster than parallel per-line encode.
+/// Only use parallel for genuinely large files where the parallel throughput
+/// exceeds the per-call overhead.
 const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (32MB of base64 data).
@@ -107,12 +108,12 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
-    // Bulk-encode + fuse_wrap: encode the entire input in one SIMD pass (letting
-    // base64_simd use full vector widths), then insert newlines in a separate pass.
-    // For 10MB input this does 1 encode call vs ~175K per-line calls, eliminating
-    // massive per-call overhead (base64_simd can't vectorize 57-byte inputs).
+    // Bulk-encode + zero-copy writev: encode the entire input in one SIMD pass,
+    // then use write_vectored to interleave encoded segments with newlines.
+    // This avoids the fuse_wrap copy pass (saves 13.5MB allocation + copy for 10MB input).
+    // Phase 1: SIMD encode amortizes setup over the entire input.
+    // Phase 2: writev writes directly from the encode buffer with newline interleaving.
     if bytes_per_line.is_multiple_of(3) {
-        // Phase 1: Encode all data in one SIMD pass (no wrapping)
         let enc_len = BASE64_ENGINE.encoded_length(data.len());
         let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_len);
         #[allow(clippy::uninit_vec)]
@@ -120,30 +121,14 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             enc_buf.set_len(enc_len);
         }
         let encoded = BASE64_ENGINE.encode(data, enc_buf[..enc_len].as_out());
-
-        // Phase 2: Insert newlines every wrap_col chars using fuse_wrap
-        let line_out = wrap_col + 1;
-        let num_full_lines = encoded.len() / wrap_col;
-        let remainder = encoded.len() % wrap_col;
-        let total_output =
-            num_full_lines * line_out + if remainder > 0 { remainder + 1 } else { 0 };
-
-        let mut out_buf: Vec<u8> = Vec::with_capacity(total_output);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            out_buf.set_len(total_output);
-        }
-
-        let written = fuse_wrap(encoded, wrap_col, &mut out_buf);
-        return out.write_all(&out_buf[..written]);
+        return write_wrapped_iov(encoded, wrap_col, out);
     }
 
-    // Fallback for non-3-aligned bytes_per_line: use writev
+    // Fallback for non-3-aligned bytes_per_line: chunk + writev
     let lines_per_chunk = (32 * 1024 * 1024) / bytes_per_line;
     let max_input_chunk = (lines_per_chunk * bytes_per_line).max(bytes_per_line);
-    let input_chunk = max_input_chunk.min(data.len());
 
-    let enc_max = BASE64_ENGINE.encoded_length(input_chunk);
+    let enc_max = BASE64_ENGINE.encoded_length(max_input_chunk.min(data.len()));
     let mut encode_buf: Vec<u8> = Vec::with_capacity(enc_max);
     #[allow(clippy::uninit_vec)]
     unsafe {
@@ -419,6 +404,7 @@ fn encode_wrapped_parallel(
 /// Uses ptr::copy_nonoverlapping with 8-line unrolling for max throughput.
 /// Returns number of bytes written.
 #[inline]
+#[allow(dead_code)]
 fn fuse_wrap(encoded: &[u8], wrap_col: usize, out_buf: &mut [u8]) -> usize {
     let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline
     let mut rp = 0;
