@@ -252,11 +252,109 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
 
+/// Compare two equal-length lines starting from byte 8.
+/// Caller has already checked: lengths are equal, both >= 9 bytes, first 8 bytes match.
+/// This avoids redundant checks when the calling loop already did prefix rejection.
+#[inline(always)]
+fn lines_equal_after_prefix(a: &[u8], b: &[u8]) -> bool {
+    let alen = a.len();
+    debug_assert!(alen == b.len());
+    debug_assert!(alen > 8);
+    unsafe {
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        // Check last 8 bytes first (overlapping for 9-16 byte lines)
+        if alen <= 16 {
+            let a_tail = (ap.add(alen - 8) as *const u64).read_unaligned();
+            let b_tail = (bp.add(alen - 8) as *const u64).read_unaligned();
+            return a_tail == b_tail;
+        }
+        if alen <= 32 {
+            let a16 = (ap.add(8) as *const u64).read_unaligned();
+            let b16 = (bp.add(8) as *const u64).read_unaligned();
+            if a16 != b16 {
+                return false;
+            }
+            let a_tail = (ap.add(alen - 8) as *const u64).read_unaligned();
+            let b_tail = (bp.add(alen - 8) as *const u64).read_unaligned();
+            return a_tail == b_tail;
+        }
+        if alen <= 256 {
+            let mut off = 8usize;
+            while off + 32 <= alen {
+                let a0 = (ap.add(off) as *const u64).read_unaligned();
+                let b0 = (bp.add(off) as *const u64).read_unaligned();
+                let a1 = (ap.add(off + 8) as *const u64).read_unaligned();
+                let b1 = (bp.add(off + 8) as *const u64).read_unaligned();
+                let a2 = (ap.add(off + 16) as *const u64).read_unaligned();
+                let b2 = (bp.add(off + 16) as *const u64).read_unaligned();
+                let a3 = (ap.add(off + 24) as *const u64).read_unaligned();
+                let b3 = (bp.add(off + 24) as *const u64).read_unaligned();
+                if (a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3) != 0 {
+                    return false;
+                }
+                off += 32;
+            }
+            while off + 8 <= alen {
+                let aw = (ap.add(off) as *const u64).read_unaligned();
+                let bw = (bp.add(off) as *const u64).read_unaligned();
+                if aw != bw {
+                    return false;
+                }
+                off += 8;
+            }
+            if off < alen {
+                let a_tail = (ap.add(alen - 8) as *const u64).read_unaligned();
+                let b_tail = (bp.add(alen - 8) as *const u64).read_unaligned();
+                return a_tail == b_tail;
+            }
+            return true;
+        }
+    }
+    // >256 bytes: use memcmp via slice comparison (skipping the already-compared prefix)
+    a[8..] == b[8..]
+}
+
 /// Write a count-prefixed line in GNU uniq format.
 /// GNU format: "%7lu " — right-aligned in 7-char field, followed by space.
 /// Combines prefix + line + term into a single write for short lines (< 240 bytes).
+///
+/// Optimized with lookup table for counts 1-9 (most common case in many-dups data)
+/// and fast-path for counts < 10M (always fits in 7 chars, no copy_within needed).
 #[inline(always)]
 fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> io::Result<()> {
+    // Ultra-fast path for common small counts: pre-built prefix strings
+    // Avoids all the itoa/copy_within overhead for the most common case.
+    if count <= 9 {
+        // "      N " where N is 1-9 (7 chars + space = 8 bytes prefix)
+        let prefix: &[u8] = match count {
+            1 => b"      1 ",
+            2 => b"      2 ",
+            3 => b"      3 ",
+            4 => b"      4 ",
+            5 => b"      5 ",
+            6 => b"      6 ",
+            7 => b"      7 ",
+            8 => b"      8 ",
+            9 => b"      9 ",
+            _ => unreachable!(),
+        };
+        let total = 8 + line.len() + 1;
+        if total <= 256 {
+            let mut buf = [0u8; 256];
+            unsafe {
+                std::ptr::copy_nonoverlapping(prefix.as_ptr(), buf.as_mut_ptr(), 8);
+                std::ptr::copy_nonoverlapping(line.as_ptr(), buf.as_mut_ptr().add(8), line.len());
+                *buf.as_mut_ptr().add(8 + line.len()) = term;
+            }
+            return out.write_all(&buf[..total]);
+        } else {
+            out.write_all(prefix)?;
+            out.write_all(line)?;
+            return out.write_all(&[term]);
+        }
+    }
+
     // Build prefix "     N " in a stack buffer (max 21 bytes for u64 + spaces)
     let mut prefix = [b' '; 28]; // Enough for u64 max + padding + space
     let digits = itoa_right_aligned_into(&mut prefix, count);
@@ -276,6 +374,56 @@ fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> 
         out.write_all(&prefix[..prefix_len])?;
         out.write_all(line)?;
         out.write_all(&[term])
+    }
+}
+
+/// Write a count-prefixed line into a Vec<u8> buffer (avoids Writer overhead).
+/// Same format as write_count_line but appends to buf instead of calling write_all.
+#[inline(always)]
+fn write_count_line_buf(buf: &mut Vec<u8>, count: u64, line: &[u8], term: u8) {
+    // Ultra-fast path for common small counts: pre-built prefix strings
+    if count <= 9 {
+        let prefix: &[u8] = match count {
+            1 => b"      1 ",
+            2 => b"      2 ",
+            3 => b"      3 ",
+            4 => b"      4 ",
+            5 => b"      5 ",
+            6 => b"      6 ",
+            7 => b"      7 ",
+            8 => b"      8 ",
+            9 => b"      9 ",
+            _ => unreachable!(),
+        };
+        let total = 8 + line.len() + 1;
+        buf.reserve(total);
+        let old_len = buf.len();
+        unsafe {
+            let dst = buf.as_mut_ptr().add(old_len);
+            std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, 8);
+            std::ptr::copy_nonoverlapping(line.as_ptr(), dst.add(8), line.len());
+            *dst.add(8 + line.len()) = term;
+            buf.set_len(old_len + total);
+        }
+        return;
+    }
+
+    // Build prefix "     N " in a stack buffer
+    let mut prefix = [b' '; 28];
+    let digits = itoa_right_aligned_into(&mut prefix, count);
+    let width = digits.max(7);
+    let prefix_len = width + 1;
+    prefix[width] = b' ';
+
+    let total = prefix_len + line.len() + 1;
+    buf.reserve(total);
+    let old_len = buf.len();
+    unsafe {
+        let dst = buf.as_mut_ptr().add(old_len);
+        std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, prefix_len);
+        std::ptr::copy_nonoverlapping(line.as_ptr(), dst.add(prefix_len), line.len());
+        *dst.add(prefix_len + line.len()) = term;
+        buf.set_len(old_len + total);
     }
 }
 
@@ -898,13 +1046,19 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
             let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut run_start = chunk_start;
             let mut prev_start = 0usize;
-            let mut prev_end = first_term;
+            let mut _prev_end = first_term;
             let mut last_out_start = chunk_start;
             let mut last_out_end = first_line_end;
 
             let mut prev_len = first_term;
             let chunk_base = chunk.as_ptr();
             let chunk_len = chunk.len();
+            // Cache previous line's prefix for fast rejection
+            let mut prev_prefix: u64 = if prev_len >= 8 {
+                unsafe { (chunk_base as *const u64).read_unaligned() }
+            } else {
+                0
+            };
             let mut cur_start = first_term + 1;
             while cur_start < chunk_len {
                 // Speculative line-end: check if next line has same length
@@ -913,14 +1067,48 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
                     if spec < chunk_len && unsafe { *chunk_base.add(spec) } == term {
                         spec
                     } else {
-                        match memchr::memchr(term, &chunk[cur_start..]) {
+                        match memchr::memchr(term, unsafe {
+                            std::slice::from_raw_parts(
+                                chunk_base.add(cur_start),
+                                chunk_len - cur_start,
+                            )
+                        }) {
                             Some(offset) => cur_start + offset,
                             None => chunk_len,
                         }
                     }
                 };
 
-                if lines_equal_fast(&chunk[prev_start..prev_end], &chunk[cur_start..cur_end]) {
+                let cur_len = cur_end - cur_start;
+                // Fast reject: length + prefix + full comparison
+                let is_dup = if cur_len != prev_len {
+                    false
+                } else if cur_len == 0 {
+                    true
+                } else if cur_len >= 8 {
+                    let cur_prefix =
+                        unsafe { (chunk_base.add(cur_start) as *const u64).read_unaligned() };
+                    if cur_prefix != prev_prefix {
+                        false
+                    } else if cur_len <= 8 {
+                        true
+                    } else {
+                        unsafe {
+                            let a =
+                                std::slice::from_raw_parts(chunk_base.add(prev_start), prev_len);
+                            let b = std::slice::from_raw_parts(chunk_base.add(cur_start), cur_len);
+                            lines_equal_after_prefix(a, b)
+                        }
+                    }
+                } else {
+                    unsafe {
+                        let a = std::slice::from_raw_parts(chunk_base.add(prev_start), prev_len);
+                        let b = std::slice::from_raw_parts(chunk_base.add(cur_start), cur_len);
+                        a == b
+                    }
+                };
+
+                if is_dup {
                     // Duplicate — flush current run up to this line
                     let abs_cur = chunk_start + cur_start;
                     if run_start < abs_cur {
@@ -936,10 +1124,15 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
                 } else {
                     last_out_start = chunk_start + cur_start;
                     last_out_end = chunk_start + cur_end;
-                    prev_len = cur_end - cur_start;
+                    prev_len = cur_len;
+                    prev_prefix = if cur_len >= 8 {
+                        unsafe { (chunk_base.add(cur_start) as *const u64).read_unaligned() }
+                    } else {
+                        0
+                    };
                 }
                 prev_start = cur_start;
-                prev_end = cur_end;
+                _prev_end = cur_end;
 
                 if cur_end < chunk_len {
                     cur_start = cur_end + 1;
@@ -1008,10 +1201,9 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
 }
 
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
-/// Batched output: accumulates output lines in a 64KB buffer before flushing,
-/// reducing the number of write() syscalls.
-/// Uses cached prefix comparison for fast duplicate detection.
-/// Uses raw pointer arithmetic throughout to avoid bounds checking.
+/// Zero-copy: writes directly from mmap data through BufWriter.
+/// Uses speculative line-end detection and 8-byte prefix caching for fast
+/// duplicate detection without full memcmp.
 fn process_filter_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1034,42 +1226,89 @@ fn process_filter_fast_singlepass(
         }
     };
 
-    // Write directly to the BufWriter (already 16MB) — no batch_buf needed.
-    // This is zero-copy: we write slices from the original mmap data.
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut prev_len = prev_end;
+    let mut prev_prefix: u64 = if prev_len >= 8 {
+        unsafe { (base.add(prev_start) as *const u64).read_unaligned() }
+    } else {
+        0
+    };
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
+    // Batch output using IoSlice write_vectored to reduce syscall overhead.
+    // Each output line needs 2 slices: content + terminator.
+    const BATCH: usize = 512;
+    let term_slice: [u8; 1] = [term];
+    let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+
     while cur_start < data_len {
-        let cur_end = match memchr::memchr(term, unsafe {
-            std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
-        }) {
-            Some(offset) => cur_start + offset,
-            None => data_len,
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
         let cur_len = cur_end - cur_start;
-        let is_dup = cur_len == prev_len
-            && unsafe {
+
+        // Fast reject using length + 8-byte prefix.
+        // After prefix match, use lines_equal_after_prefix which skips
+        // the already-checked length/prefix/empty checks.
+        let is_dup = if cur_len != prev_len {
+            false
+        } else if cur_len == 0 {
+            true
+        } else if cur_len >= 8 {
+            let cur_prefix = unsafe { (base.add(cur_start) as *const u64).read_unaligned() };
+            if cur_prefix != prev_prefix {
+                false
+            } else if cur_len <= 8 {
+                true
+            } else {
+                unsafe {
+                    let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                    let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                    lines_equal_after_prefix(a, b)
+                }
+            }
+        } else {
+            unsafe {
                 let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
                 let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
-                lines_equal_fast(a, b)
-            };
+                a == b
+            }
+        };
 
         if is_dup {
             count += 1;
         } else {
-            // Output previous group directly from mmap data
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                writer.write_all(&data[prev_start..prev_end])?;
-                writer.write_all(&[term])?;
+                slices.push(io::IoSlice::new(&data[prev_start..prev_end]));
+                slices.push(io::IoSlice::new(&term_slice));
+                if slices.len() >= BATCH * 2 {
+                    write_all_vectored(writer, &slices)?;
+                    slices.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
             prev_len = cur_len;
+            prev_prefix = if cur_len >= 8 {
+                unsafe { (base.add(cur_start) as *const u64).read_unaligned() }
+            } else {
+                0
+            };
             count = 1;
         }
 
@@ -1083,8 +1322,11 @@ fn process_filter_fast_singlepass(
     // Output last group
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        writer.write_all(&data[prev_start..prev_end])?;
-        writer.write_all(&[term])?;
+        slices.push(io::IoSlice::new(&data[prev_start..prev_end]));
+        slices.push(io::IoSlice::new(&term_slice));
+    }
+    if !slices.is_empty() {
+        write_all_vectored(writer, &slices)?;
     }
 
     Ok(())
@@ -1096,9 +1338,12 @@ fn process_filter_fast_singlepass(
 /// Uses cached length comparison for fast duplicate rejection.
 /// Uses raw pointer arithmetic to avoid bounds checking.
 ///
-/// Batched output: accumulates count-prefixed lines in a 64KB buffer and
-/// flushes periodically, reducing the number of write() syscalls from
-/// one-per-group to one-per-64KB.
+/// Optimizations:
+/// - Speculative line-end detection: if all lines have the same length (common
+///   in repetitive data), we can skip the memchr SIMD scan entirely by checking
+///   if data[cur_start + prev_len] is the terminator.
+/// - Cached 8-byte prefix rejection: avoids full comparison for most non-equal lines.
+/// - Batched write_count_line: combines prefix + line + term into single writes.
 fn process_count_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1107,8 +1352,6 @@ fn process_count_fast_singlepass(
 ) -> io::Result<()> {
     let data_len = data.len();
     let base = data.as_ptr();
-    let is_default = matches!(config.mode, OutputMode::Default);
-
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
         None => {
@@ -1129,44 +1372,84 @@ fn process_count_fast_singlepass(
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut prev_len = prev_end;
+    let mut prev_prefix: u64 = if prev_len >= 8 {
+        unsafe { (base.add(prev_start) as *const u64).read_unaligned() }
+    } else {
+        0
+    };
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
+    // Batch output into a local buffer to reduce write_all calls.
+    // 256KB buffer reduces BufWriter call overhead by 4x vs 64KB.
+    const BATCH_BUF_SIZE: usize = 256 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
+
     while cur_start < data_len {
-        let cur_end = match memchr::memchr(term, unsafe {
-            std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
-        }) {
-            Some(offset) => cur_start + offset,
-            None => data_len,
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
         let cur_len = cur_end - cur_start;
-        let is_dup = cur_len == prev_len
-            && unsafe {
+
+        let is_dup = if cur_len != prev_len {
+            false
+        } else if cur_len == 0 {
+            true
+        } else if cur_len >= 8 {
+            let cur_prefix = unsafe { (base.add(cur_start) as *const u64).read_unaligned() };
+            if cur_prefix != prev_prefix {
+                false
+            } else if cur_len <= 8 {
+                true
+            } else {
+                unsafe {
+                    let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                    let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                    lines_equal_after_prefix(a, b)
+                }
+            }
+        } else {
+            unsafe {
                 let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
                 let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
-                lines_equal_fast(a, b)
-            };
+                a == b
+            }
+        };
 
         if is_dup {
             count += 1;
         } else {
-            // Output previous group with count — directly via BufWriter
-            let should_print = if is_default {
-                true
-            } else {
-                match config.mode {
-                    OutputMode::RepeatedOnly => count > 1,
-                    OutputMode::UniqueOnly => count == 1,
-                    _ => true,
-                }
+            let should_print = match config.mode {
+                OutputMode::RepeatedOnly => count > 1,
+                OutputMode::UniqueOnly => count == 1,
+                _ => true,
             };
             if should_print {
-                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+                write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+                if batch_buf.len() >= BATCH_BUF_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
             prev_len = cur_len;
+            prev_prefix = if cur_len >= 8 {
+                unsafe { (base.add(cur_start) as *const u64).read_unaligned() }
+            } else {
+                0
+            };
             count = 1;
         }
 
@@ -1178,69 +1461,104 @@ fn process_count_fast_singlepass(
     }
 
     // Output last group
-    let should_print = if is_default {
-        true
-    } else {
-        match config.mode {
-            OutputMode::RepeatedOnly => count > 1,
-            OutputMode::UniqueOnly => count == 1,
-            _ => true,
-        }
+    let should_print = match config.mode {
+        OutputMode::RepeatedOnly => count > 1,
+        OutputMode::UniqueOnly => count == 1,
+        _ => true,
     };
     if should_print {
-        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+        write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+    }
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())
 }
 
 /// Fast single-pass for case-insensitive (-i) default mode.
-/// Same logic as process_default_sequential but uses eq_ignore_ascii_case.
+/// Uses run-tracking zero-copy output and write_vectored batching.
+/// Includes speculative line-end detection and length-based early rejection.
 fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
-    let mut prev_start: usize = 0;
-    let mut prev_end: usize;
+    let data_len = data.len();
+    let base = data.as_ptr();
 
-    match memchr::memchr(term, data) {
-        Some(pos) => {
-            prev_end = pos;
-        }
+    let first_end = match memchr::memchr(term, data) {
+        Some(pos) => pos,
         None => {
             writer.write_all(data)?;
             return writer.write_all(&[term]);
         }
-    }
+    };
 
-    // Write first line
-    writer.write_all(&data[..prev_end + 1])?;
+    let mut prev_start: usize = 0;
+    let mut prev_len = first_end;
 
-    let mut cur_start = prev_end + 1;
+    // Run-tracking: flush contiguous regions from the original data.
+    let mut run_start: usize = 0;
+    let mut cur_start = first_end + 1;
+    let mut _last_output_end = first_end + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
-        let prev_content = &data[prev_start..prev_end];
-        let cur_content = &data[cur_start..cur_end];
+        let cur_len = cur_end - cur_start;
 
-        if !lines_equal_case_insensitive(prev_content, cur_content) {
-            // Different line — write it
-            if cur_end < data.len() {
-                writer.write_all(&data[cur_start..cur_end + 1])?;
-            } else {
-                writer.write_all(&data[cur_start..cur_end])?;
-                writer.write_all(&[term])?;
+        // Length-based early rejection before expensive case-insensitive compare
+        let is_dup = cur_len == prev_len
+            && unsafe {
+                let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                a.eq_ignore_ascii_case(b)
+            };
+
+        if is_dup {
+            // Duplicate — flush current run up to this line, skip it
+            if run_start < cur_start {
+                writer.write_all(&data[run_start..cur_start])?;
             }
+            run_start = if cur_end < data_len {
+                cur_end + 1
+            } else {
+                cur_end
+            };
+        } else {
             prev_start = cur_start;
-            prev_end = cur_end;
+            prev_len = cur_len;
+            _last_output_end = if cur_end < data_len {
+                cur_end + 1
+            } else {
+                cur_end
+            };
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
         }
+    }
+
+    // Flush remaining run
+    if run_start < data_len {
+        writer.write_all(&data[run_start..data_len])?;
+    }
+    // Ensure trailing terminator
+    if !data.is_empty() && data[data_len - 1] != term {
+        writer.write_all(&[term])?;
     }
 
     Ok(())
@@ -1248,6 +1566,7 @@ fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8)
 
 /// Fast single-pass for case-insensitive (-i) repeated/unique-only modes.
 /// Zero-copy: writes directly from mmap data through BufWriter.
+/// Uses speculative line-end detection and length-based early rejection.
 fn process_filter_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1255,6 +1574,8 @@ fn process_filter_ci_singlepass(
     term: u8,
 ) -> io::Result<()> {
     let repeated = matches!(config.mode, OutputMode::RepeatedOnly);
+    let data_len = data.len();
+    let base = data.as_ptr();
 
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
@@ -1269,29 +1590,55 @@ fn process_filter_ci_singlepass(
 
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
+    let mut prev_len = prev_end;
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    // Batch output using IoSlice write_vectored
+    const BATCH: usize = 512;
+    let term_slice: [u8; 1] = [term];
+    let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
-        if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        // Length check + case-insensitive comparison
+        let is_dup = cur_len == prev_len
+            && lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                writer.write_all(&data[prev_start..prev_end])?;
-                writer.write_all(&[term])?;
+                slices.push(io::IoSlice::new(&data[prev_start..prev_end]));
+                slices.push(io::IoSlice::new(&term_slice));
+                if slices.len() >= BATCH * 2 {
+                    write_all_vectored(writer, &slices)?;
+                    slices.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
@@ -1300,8 +1647,11 @@ fn process_filter_ci_singlepass(
 
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        writer.write_all(&data[prev_start..prev_end])?;
-        writer.write_all(&[term])?;
+        slices.push(io::IoSlice::new(&data[prev_start..prev_end]));
+        slices.push(io::IoSlice::new(&term_slice));
+    }
+    if !slices.is_empty() {
+        write_all_vectored(writer, &slices)?;
     }
 
     Ok(())
@@ -1338,13 +1688,36 @@ fn process_count_ci_singlepass(
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    // Batch output into a local buffer to reduce write_all calls.
+    const BATCH_BUF_SIZE: usize = 256 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
+
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let mut prev_len = prev_end - prev_start;
+
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
-        if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        // Length-based early rejection before expensive case-insensitive compare
+        let is_dup = cur_len == prev_len
+            && data[prev_start..prev_end].eq_ignore_ascii_case(&data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
             let should_print = if is_default {
@@ -1357,14 +1730,19 @@ fn process_count_ci_singlepass(
                 }
             };
             if should_print {
-                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+                write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+                if batch_buf.len() >= BATCH_BUF_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
@@ -1381,7 +1759,10 @@ fn process_count_ci_singlepass(
         }
     };
     if should_print {
-        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+        write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+    }
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())
