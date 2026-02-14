@@ -145,4 +145,4 @@ jobs:
             --head "$BRANCH")
 
           echo "Created PR: $PR_URL"
-          gh pr merge "$PR_URL" --auto --merge --delete-branch
+          gh pr merge "$PR_URL" --auto --merge
