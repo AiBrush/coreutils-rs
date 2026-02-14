@@ -968,33 +968,14 @@ fn complement_range_line(
     let mut prefix_end_pos: usize = usize::MAX; // byte position of (skip_start-1)th delim
     let mut suffix_start_pos: usize = usize::MAX; // byte position after skip_end-th delim
 
-    if len <= 256 {
-        let mut i = 0usize;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    delim_count += 1;
-                    if delim_count == need_prefix_delims {
-                        prefix_end_pos = i;
-                    }
-                    if delim_count == total_need {
-                        suffix_start_pos = i + 1;
-                        break;
-                    }
-                }
-                i += 1;
-            }
+    for pos in memchr_iter(delim, line) {
+        delim_count += 1;
+        if delim_count == need_prefix_delims {
+            prefix_end_pos = pos;
         }
-    } else {
-        for pos in memchr_iter(delim, line) {
-            delim_count += 1;
-            if delim_count == need_prefix_delims {
-                prefix_end_pos = pos;
-            }
-            if delim_count == total_need {
-                suffix_start_pos = pos + 1;
-                break;
-            }
+        if delim_count == total_need {
+            suffix_start_pos = pos + 1;
+            break;
         }
     }
 
@@ -1371,7 +1352,7 @@ fn fields_prefix_chunk(
 }
 
 /// Extract first N fields from one line (contiguous from-start range).
-/// Uses scalar byte scanning for short lines, memchr_iter for longer.
+/// Uses memchr SIMD for delimiter scanning on all line sizes.
 #[inline(always)]
 fn fields_prefix_line(
     line: &[u8],
@@ -1392,42 +1373,7 @@ fn fields_prefix_line(
     buf.reserve(len + 1);
     let base = line.as_ptr();
 
-    if len <= 256 {
-        // Scalar path for short lines
-        let mut field_count = 1usize;
-        let mut has_delim = false;
-        let mut i = 0usize;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    has_delim = true;
-                    if field_count >= last_field {
-                        buf_extend(buf, std::slice::from_raw_parts(base, i));
-                        buf_push(buf, line_delim);
-                        return;
-                    }
-                    field_count += 1;
-                }
-                i += 1;
-            }
-        }
-        if !has_delim {
-            if !suppress {
-                unsafe {
-                    buf_extend(buf, line);
-                    buf_push(buf, line_delim);
-                }
-            }
-            return;
-        }
-        unsafe {
-            buf_extend(buf, line);
-            buf_push(buf, line_delim);
-        }
-        return;
-    }
-
-    let mut field_count = 1;
+    let mut field_count = 1usize;
     let mut has_delim = false;
 
     for pos in memchr_iter(delim, line) {
@@ -2084,56 +2030,28 @@ fn extract_fields_to_buf(
     let mut first_output = true;
     let mut has_delim = false;
 
-    // For short lines (passwd-style, < 256 bytes), use direct scalar scanning
-    // to avoid memchr_iter setup overhead per line.
-    if len <= 256 {
-        let mut i = 0usize;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    has_delim = true;
-                    if is_selected(field_num, field_mask, ranges, complement) {
-                        if !first_output {
-                            buf_extend(buf, output_delim);
-                        }
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(field_start), i - field_start),
-                        );
-                        first_output = false;
-                    }
-                    field_num += 1;
-                    field_start = i + 1;
-                    if field_num > max_field {
-                        break;
-                    }
-                }
-                i += 1;
+    // Use memchr SIMD for all line sizes
+    for delim_pos in memchr_iter(delim, line) {
+        has_delim = true;
+
+        if is_selected(field_num, field_mask, ranges, complement) {
+            if !first_output {
+                unsafe { buf_extend(buf, output_delim) };
             }
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(field_start), delim_pos - field_start),
+                )
+            };
+            first_output = false;
         }
-    } else {
-        for delim_pos in memchr_iter(delim, line) {
-            has_delim = true;
 
-            if is_selected(field_num, field_mask, ranges, complement) {
-                if !first_output {
-                    unsafe { buf_extend(buf, output_delim) };
-                }
-                unsafe {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(field_start), delim_pos - field_start),
-                    )
-                };
-                first_output = false;
-            }
+        field_num += 1;
+        field_start = delim_pos + 1;
 
-            field_num += 1;
-            field_start = delim_pos + 1;
-
-            if field_num > max_field {
-                break;
-            }
+        if field_num > max_field {
+            break;
         }
     }
 
