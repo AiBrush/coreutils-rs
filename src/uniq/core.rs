@@ -1046,7 +1046,7 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
             let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut run_start = chunk_start;
             let mut prev_start = 0usize;
-            let mut prev_end = first_term;
+            let mut _prev_end = first_term;
             let mut last_out_start = chunk_start;
             let mut last_out_end = first_line_end;
 
@@ -1131,7 +1131,7 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
                     };
                 }
                 prev_start = cur_start;
-                prev_end = cur_end;
+                _prev_end = cur_end;
 
                 if cur_end < chunk_len {
                     cur_start = cur_end + 1;

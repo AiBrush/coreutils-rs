@@ -1171,7 +1171,7 @@ fn complement_single_field_line(
     // skip field is at positions skip_start_pos..skip_end_pos
     // Output prefix (before skip field) + suffix (after skip field)
     let has_prefix = skip_idx > 0 && skip_start_pos > 0;
-    let has_suffix = found_end && skip_end_pos + 1 <= len;
+    let has_suffix = found_end && skip_end_pos < len;
 
     if has_prefix && has_suffix {
         // prefix = line[0..skip_start_pos-1] (before the delimiter that starts skip field)
