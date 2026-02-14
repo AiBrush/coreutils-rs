@@ -236,6 +236,7 @@ unsafe fn translate_inplace_avx2_sparse(data: &mut [u8], table: &[u8; 256]) {
 }
 
 /// Scalar fallback: 8x-unrolled table lookup.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn translate_inplace_scalar(data: &mut [u8], table: &[u8; 256]) {
     let len = data.len();
@@ -253,6 +254,76 @@ fn translate_inplace_scalar(data: &mut [u8], table: &[u8; 256]) {
             *ptr.add(i + 7) = *table.get_unchecked(*ptr.add(i + 7) as usize);
             i += 8;
         }
+        while i < len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
+/// ARM64 NEON table lookup using nibble decomposition (same algorithm as x86 pshufb).
+/// Uses vqtbl1q_u8 for 16-byte table lookups, processes 16 bytes per iteration.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn translate_inplace_scalar(data: &mut [u8], table: &[u8; 256]) {
+    unsafe { translate_inplace_neon_table(data, table) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_inplace_neon_table(data: &mut [u8], table: &[u8; 256]) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+
+        // Pre-build 16 NEON lookup vectors (one per high nibble)
+        let mut lut: [uint8x16_t; 16] = [vdupq_n_u8(0); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            lut[h as usize] = vld1q_u8(table.as_ptr().add(base));
+        }
+
+        let lo_mask = vdupq_n_u8(0x0F);
+        let mut i = 0;
+
+        while i + 16 <= len {
+            let input = vld1q_u8(ptr.add(i));
+            let lo_nibble = vandq_u8(input, lo_mask);
+            let hi_nibble = vandq_u8(vshrq_n_u8(input, 4), lo_mask);
+
+            let mut result = vdupq_n_u8(0);
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = vdupq_n_u8($h);
+                    let mask = vceqq_u8(hi_nibble, h_val);
+                    let looked_up = vqtbl1q_u8(lut[$h as usize], lo_nibble);
+                    result = vorrq_u8(result, vandq_u8(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            vst1q_u8(ptr.add(i), result);
+            i += 16;
+        }
+
+        // Scalar tail
         while i < len {
             *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
             i += 1;
@@ -525,6 +596,7 @@ fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
 }
 
 /// Scalar fallback for translate_to.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn translate_to_scalar(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
     unsafe {
@@ -543,6 +615,73 @@ fn translate_to_scalar(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
             *dp.add(i + 7) = *table.get_unchecked(*sp.add(i + 7) as usize);
             i += 8;
         }
+        while i < len {
+            *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
+            i += 1;
+        }
+    }
+}
+
+/// ARM64 NEON table-lookup translate_to using nibble decomposition.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn translate_to_scalar(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
+    unsafe { translate_to_neon_table(src, dst, table) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_to_neon_table(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+
+        let mut lut: [uint8x16_t; 16] = [vdupq_n_u8(0); 16];
+        for h in 0u8..16 {
+            lut[h as usize] = vld1q_u8(table.as_ptr().add((h as usize) * 16));
+        }
+
+        let lo_mask = vdupq_n_u8(0x0F);
+        let mut i = 0;
+
+        while i + 16 <= len {
+            let input = vld1q_u8(sp.add(i));
+            let lo_nibble = vandq_u8(input, lo_mask);
+            let hi_nibble = vandq_u8(vshrq_n_u8(input, 4), lo_mask);
+
+            let mut result = vdupq_n_u8(0);
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = vdupq_n_u8($h);
+                    let mask = vceqq_u8(hi_nibble, h_val);
+                    let looked_up = vqtbl1q_u8(lut[$h as usize], lo_nibble);
+                    result = vorrq_u8(result, vandq_u8(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            vst1q_u8(dp.add(i), result);
+            i += 16;
+        }
+
         while i < len {
             *dp.add(i) = *table.get_unchecked(*sp.add(i) as usize);
             i += 1;
@@ -965,7 +1104,62 @@ unsafe fn translate_range_to_constant_sse2_inplace(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn translate_range_to_constant_simd_inplace(data: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+    unsafe { translate_range_to_constant_neon_inplace(data, lo, hi, replacement) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_range_to_constant_neon_inplace(
+    data: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+        let lo_v = vdupq_n_u8(lo);
+        let hi_v = vdupq_n_u8(hi);
+        let repl_v = vdupq_n_u8(replacement);
+        let mut i = 0;
+
+        while i + 32 <= len {
+            let in0 = vld1q_u8(ptr.add(i));
+            let in1 = vld1q_u8(ptr.add(i + 16));
+            let ge0 = vcgeq_u8(in0, lo_v);
+            let le0 = vcleq_u8(in0, hi_v);
+            let mask0 = vandq_u8(ge0, le0);
+            let ge1 = vcgeq_u8(in1, lo_v);
+            let le1 = vcleq_u8(in1, hi_v);
+            let mask1 = vandq_u8(ge1, le1);
+            // bsl: select repl where mask, keep input where not
+            vst1q_u8(ptr.add(i), vbslq_u8(mask0, repl_v, in0));
+            vst1q_u8(ptr.add(i + 16), vbslq_u8(mask1, repl_v, in1));
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let input = vld1q_u8(ptr.add(i));
+            let ge = vcgeq_u8(input, lo_v);
+            let le = vcleq_u8(input, hi_v);
+            let mask = vandq_u8(ge, le);
+            vst1q_u8(ptr.add(i), vbslq_u8(mask, repl_v, input));
+            i += 16;
+        }
+
+        while i < len {
+            let b = *ptr.add(i);
+            *ptr.add(i) = if b >= lo && b <= hi { replacement } else { b };
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn translate_range_to_constant_simd_inplace(data: &mut [u8], lo: u8, hi: u8, replacement: u8) {
     for b in data.iter_mut() {
         if *b >= lo && *b <= hi {
@@ -985,7 +1179,57 @@ fn translate_range_to_constant_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, 
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn translate_range_to_constant_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+    unsafe { translate_range_to_constant_neon(src, dst, lo, hi, replacement) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_range_to_constant_neon(
+    src: &[u8],
+    dst: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let lo_v = vdupq_n_u8(lo);
+        let hi_v = vdupq_n_u8(hi);
+        let repl_v = vdupq_n_u8(replacement);
+        let mut i = 0;
+
+        while i + 32 <= len {
+            let in0 = vld1q_u8(sp.add(i));
+            let in1 = vld1q_u8(sp.add(i + 16));
+            let mask0 = vandq_u8(vcgeq_u8(in0, lo_v), vcleq_u8(in0, hi_v));
+            let mask1 = vandq_u8(vcgeq_u8(in1, lo_v), vcleq_u8(in1, hi_v));
+            vst1q_u8(dp.add(i), vbslq_u8(mask0, repl_v, in0));
+            vst1q_u8(dp.add(i + 16), vbslq_u8(mask1, repl_v, in1));
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let input = vld1q_u8(sp.add(i));
+            let mask = vandq_u8(vcgeq_u8(input, lo_v), vcleq_u8(input, hi_v));
+            vst1q_u8(dp.add(i), vbslq_u8(mask, repl_v, input));
+            i += 16;
+        }
+
+        while i < len {
+            let b = *sp.add(i);
+            *dp.add(i) = if b >= lo && b <= hi { replacement } else { b };
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn translate_range_to_constant_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, replacement: u8) {
     for (i, &b) in src.iter().enumerate() {
         unsafe {
@@ -1219,15 +1463,112 @@ unsafe fn translate_range_sse2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offse
     }
 }
 
-/// Scalar range translation fallback for non-x86_64.
-#[cfg(not(target_arch = "x86_64"))]
+/// ARM64 NEON-accelerated range translation.
+/// Processes 16 bytes per iteration using vectorized range check + conditional add.
+#[cfg(target_arch = "aarch64")]
 fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
-    for (i, &b) in src.iter().enumerate() {
-        dst[i] = if b >= lo && b <= hi {
-            b.wrapping_add(offset as u8)
-        } else {
-            b
-        };
+    unsafe { translate_range_neon(src, dst, lo, hi, offset) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_range_neon(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let lo_v = vdupq_n_u8(lo);
+        let hi_v = vdupq_n_u8(hi);
+        let offset_v = vdupq_n_s8(offset);
+        let mut i = 0;
+
+        // 2x unrolled: process 32 bytes per iteration
+        while i + 32 <= len {
+            let in0 = vld1q_u8(sp.add(i));
+            let in1 = vld1q_u8(sp.add(i + 16));
+            // Range check: (b >= lo) & (b <= hi)
+            let ge0 = vcgeq_u8(in0, lo_v);
+            let le0 = vcleq_u8(in0, hi_v);
+            let mask0 = vandq_u8(ge0, le0);
+            let ge1 = vcgeq_u8(in1, lo_v);
+            let le1 = vcleq_u8(in1, hi_v);
+            let mask1 = vandq_u8(ge1, le1);
+            // Conditional add: in + (offset & mask)
+            let off0 = vandq_u8(mask0, vreinterpretq_u8_s8(offset_v));
+            let off1 = vandq_u8(mask1, vreinterpretq_u8_s8(offset_v));
+            let r0 = vaddq_u8(in0, off0);
+            let r1 = vaddq_u8(in1, off1);
+            vst1q_u8(dp.add(i), r0);
+            vst1q_u8(dp.add(i + 16), r1);
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let input = vld1q_u8(sp.add(i));
+            let ge = vcgeq_u8(input, lo_v);
+            let le = vcleq_u8(input, hi_v);
+            let mask = vandq_u8(ge, le);
+            let off = vandq_u8(mask, vreinterpretq_u8_s8(offset_v));
+            vst1q_u8(dp.add(i), vaddq_u8(input, off));
+            i += 16;
+        }
+
+        while i < len {
+            let b = *sp.add(i);
+            *dp.add(i) = if b >= lo && b <= hi {
+                b.wrapping_add(offset as u8)
+            } else {
+                b
+            };
+            i += 1;
+        }
+    }
+}
+
+/// Scalar range translation fallback for non-x86_64, non-aarch64 platforms.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    let offset_u8 = offset as u8;
+    let range = hi.wrapping_sub(lo);
+    unsafe {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let len = src.len();
+        let mut i = 0;
+        while i + 8 <= len {
+            macro_rules! do_byte {
+                ($off:expr) => {{
+                    let b = *sp.add(i + $off);
+                    let in_range = b.wrapping_sub(lo) <= range;
+                    *dp.add(i + $off) = if in_range {
+                        b.wrapping_add(offset_u8)
+                    } else {
+                        b
+                    };
+                }};
+            }
+            do_byte!(0);
+            do_byte!(1);
+            do_byte!(2);
+            do_byte!(3);
+            do_byte!(4);
+            do_byte!(5);
+            do_byte!(6);
+            do_byte!(7);
+            i += 8;
+        }
+        while i < len {
+            let b = *sp.add(i);
+            let in_range = b.wrapping_sub(lo) <= range;
+            *dp.add(i) = if in_range {
+                b.wrapping_add(offset_u8)
+            } else {
+                b
+            };
+            i += 1;
+        }
     }
 }
 
@@ -1361,11 +1702,67 @@ unsafe fn translate_range_sse2_inplace(data: &mut [u8], lo: u8, hi: u8, offset: 
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 fn translate_range_simd_inplace(data: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    unsafe { translate_range_neon_inplace(data, lo, hi, offset) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn translate_range_neon_inplace(data: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+        let lo_v = vdupq_n_u8(lo);
+        let hi_v = vdupq_n_u8(hi);
+        let offset_v = vdupq_n_s8(offset);
+        let mut i = 0;
+
+        while i + 32 <= len {
+            let in0 = vld1q_u8(ptr.add(i));
+            let in1 = vld1q_u8(ptr.add(i + 16));
+            let ge0 = vcgeq_u8(in0, lo_v);
+            let le0 = vcleq_u8(in0, hi_v);
+            let mask0 = vandq_u8(ge0, le0);
+            let ge1 = vcgeq_u8(in1, lo_v);
+            let le1 = vcleq_u8(in1, hi_v);
+            let mask1 = vandq_u8(ge1, le1);
+            let off0 = vandq_u8(mask0, vreinterpretq_u8_s8(offset_v));
+            let off1 = vandq_u8(mask1, vreinterpretq_u8_s8(offset_v));
+            vst1q_u8(ptr.add(i), vaddq_u8(in0, off0));
+            vst1q_u8(ptr.add(i + 16), vaddq_u8(in1, off1));
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            let input = vld1q_u8(ptr.add(i));
+            let ge = vcgeq_u8(input, lo_v);
+            let le = vcleq_u8(input, hi_v);
+            let mask = vandq_u8(ge, le);
+            let off = vandq_u8(mask, vreinterpretq_u8_s8(offset_v));
+            vst1q_u8(ptr.add(i), vaddq_u8(input, off));
+            i += 16;
+        }
+
+        while i < len {
+            let b = *ptr.add(i);
+            if b >= lo && b <= hi {
+                *ptr.add(i) = b.wrapping_add(offset as u8);
+            }
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn translate_range_simd_inplace(data: &mut [u8], lo: u8, hi: u8, offset: i8) {
+    let offset_u8 = offset as u8;
+    let range = hi.wrapping_sub(lo);
     for b in data.iter_mut() {
-        if *b >= lo && *b <= hi {
-            *b = b.wrapping_add(offset as u8);
+        if b.wrapping_sub(lo) <= range {
+            *b = b.wrapping_add(offset_u8);
         }
     }
 }
@@ -2753,21 +3150,26 @@ fn translate_to_separate_buf(
         return writer.write_all(&out_buf);
     }
 
-    // Single-allocation translate: full-size output buffer + single write_all.
-    // For 10MB data, the 10MB allocation is trivial and a single write() syscall
-    // is much faster than 40 x 256KB chunked writes (saves ~39 syscalls).
-    // SIMD translate runs at ~10 GB/s, so the translate itself is <1ms;
-    // syscall overhead dominates at this size.
-    let mut out_buf = alloc_uninit_vec(data.len());
+    // Chunked translate: 256KB buffer fits in L2 cache on both x86 and ARM.
+    // For 10MB data, this does 40 chunks. Each chunk's source + dest (512KB total)
+    // stays in L2, eliminating cache misses that hurt ARM64 scalar performance.
+    // The extra syscalls (~40 write() calls) add only ~40us overhead total.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut out_buf = alloc_uninit_vec(buf_size);
 
-    if let Some((lo, hi, offset)) = range_info {
-        translate_range_simd(data, &mut out_buf, lo, hi, offset);
-    } else if let Some((lo, hi, replacement)) = const_info {
-        translate_range_to_constant_simd(data, &mut out_buf, lo, hi, replacement);
-    } else {
-        translate_to(data, &mut out_buf, table);
+    for chunk in data.chunks(CHUNK) {
+        let clen = chunk.len();
+        if let Some((lo, hi, offset)) = range_info {
+            translate_range_simd(chunk, &mut out_buf[..clen], lo, hi, offset);
+        } else if let Some((lo, hi, replacement)) = const_info {
+            translate_range_to_constant_simd(chunk, &mut out_buf[..clen], lo, hi, replacement);
+        } else {
+            translate_to(chunk, &mut out_buf[..clen], table);
+        }
+        writer.write_all(&out_buf[..clen])?;
     }
-    writer.write_all(&out_buf)
+    Ok(())
 }
 
 /// Translate from a read-only mmap (or any byte slice) to a separate output buffer.

@@ -676,7 +676,9 @@ fn radix_sort_entries(
         }
         bk_starts[nbk] = s;
     }
-    // Scatter into sorted array
+    // Scatter into sorted array with software prefetching.
+    // Pre-fetching the target cache line 4 entries ahead hides memory latency
+    // for the random-access write pattern of radix scatter.
     let mut sorted: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
     #[allow(clippy::uninit_vec)]
     unsafe {
@@ -684,12 +686,37 @@ fn radix_sort_entries(
     }
     {
         let mut wpos = bk_starts.clone();
-        for &ent in &entries {
+        let sptr = sorted.as_mut_ptr();
+        let eptr = entries.as_ptr();
+        let prefetch_dist = 4usize;
+        for idx in 0..n {
+            let ent = unsafe { *eptr.add(idx) };
             let b = (ent.0 >> 48) as usize;
             unsafe {
-                *sorted.as_mut_ptr().add(wpos[b]) = ent;
+                *sptr.add(wpos[b]) = ent;
             }
             wpos[b] += 1;
+            // Prefetch destination for an entry a few iterations ahead
+            if idx + prefetch_dist < n {
+                let future_ent = unsafe { *eptr.add(idx + prefetch_dist) };
+                let future_b = (future_ent.0 >> 48) as usize;
+                let future_pos = wpos[future_b];
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        sptr.add(future_pos) as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    std::arch::aarch64::_prefetch(
+                        sptr.add(future_pos) as *const i8,
+                        std::arch::aarch64::_PREFETCH_WRITE,
+                        std::arch::aarch64::_PREFETCH_LOCALITY3,
+                    );
+                }
+            }
         }
     }
     drop(entries);
@@ -1165,7 +1192,7 @@ fn write_sorted_output(
             }
             let out_ptr = out_buf.as_mut_ptr() as usize;
             let dp_addr = dp as usize;
-            const CHUNK: usize = 8192;
+            const CHUNK: usize = 16384;
             let chunks: Vec<_> = (0..n).collect::<Vec<_>>();
             chunks.par_chunks(CHUNK).for_each(|idxs| {
                 let dst = out_ptr as *mut u8;
@@ -1302,7 +1329,7 @@ fn write_sorted_entries(
             }
             let out_ptr = out_buf.as_mut_ptr() as usize;
             let dp_addr = dp as usize;
-            const CHUNK: usize = 8192;
+            const CHUNK: usize = 16384;
             let chunks: Vec<_> = (0..n).collect::<Vec<_>>();
             chunks.par_chunks(CHUNK).for_each(|idxs| {
                 let dst = out_ptr as *mut u8;
@@ -1743,14 +1770,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let term_byte = terminator[0];
 
             if num_lines > 50_000 {
-                // Large output: parallel buffer construction for reversed output
-                // Single-pass prefix sum + rev_indices (no intermediate out_sizes)
-                let rev_indices: Vec<usize> = (0..num_lines).rev().collect();
+                // Large output: parallel buffer construction for reversed output.
+                // No rev_indices Vec needed — compute reversed index inline.
                 let mut out_offsets: Vec<usize> = Vec::with_capacity(num_lines + 1);
                 out_offsets.push(0);
                 let mut acc = 0usize;
-                for &ri in &rev_indices {
-                    let (s, e) = offsets[ri];
+                for i in (0..num_lines).rev() {
+                    let (s, e) = offsets[i];
                     acc += (e - s) + 1;
                     out_offsets.push(acc);
                 }
@@ -1762,13 +1788,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
                 let out_ptr = out_buf.as_mut_ptr() as usize;
                 let dp_addr = dp as usize;
-                const CHUNK: usize = 8192;
+                let nlines = num_lines; // capture for closure
+                const CHUNK: usize = 16384;
                 let chunks: Vec<_> = (0..num_lines).collect::<Vec<_>>();
                 chunks.par_chunks(CHUNK).for_each(|idxs| {
                     let dst = out_ptr as *mut u8;
                     let src = dp_addr as *const u8;
                     for &i in idxs {
-                        let orig_idx = rev_indices[i];
+                        let orig_idx = nlines - 1 - i;
                         let (s, e) = offsets[orig_idx];
                         let lu = e - s;
                         let off = out_offsets[i];
@@ -1948,25 +1975,22 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 write_all_vectored(&mut writer, &slices)?;
             }
         } else if reverse {
-            // Reverse: parallel output buffer construction for large data.
+            // Reverse: output buffer construction for large data.
+            // Single-pass prefix sum directly from reversed iteration (no intermediate Vecs).
             let dp = data.as_ptr();
             let n_sorted = sorted.len();
             let term_byte = terminator[0];
 
             if n_sorted > 50_000 {
-                let out_sizes: Vec<usize> = sorted
-                    .iter()
-                    .rev()
-                    .map(|&(_, _, l)| l as usize + 1)
-                    .collect();
-                let total_out: usize = out_sizes.iter().sum();
+                // Single-pass prefix sum over reversed entries (no out_sizes Vec needed).
                 let mut out_offsets: Vec<usize> = Vec::with_capacity(n_sorted + 1);
                 out_offsets.push(0);
                 let mut acc = 0usize;
-                for &sz in &out_sizes {
-                    acc += sz;
+                for i in (0..n_sorted).rev() {
+                    acc += sorted[i].2 as usize + 1;
                     out_offsets.push(acc);
                 }
+                let total_out = acc;
 
                 let mut out_buf: Vec<u8> = Vec::with_capacity(total_out);
                 #[allow(clippy::uninit_vec)]
@@ -1975,15 +1999,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
                 let out_ptr = out_buf.as_mut_ptr() as usize;
                 let dp_addr = dp as usize;
-                // Build reversed view of sorted entries
-                let rev_sorted: Vec<(u64, u32, u32)> = sorted.iter().rev().copied().collect();
-                const CHUNK: usize = 8192;
+                let sorted_len = n_sorted; // capture for closure
+                const CHUNK: usize = 16384;
                 let chunks: Vec<_> = (0..n_sorted).collect::<Vec<_>>();
                 chunks.par_chunks(CHUNK).for_each(|idxs| {
                     let dst = out_ptr as *mut u8;
                     let src = dp_addr as *const u8;
                     for &idx in idxs {
-                        let (_, s, l) = rev_sorted[idx];
+                        // Map output index to reversed sorted index
+                        let rev_idx = sorted_len - 1 - idx;
+                        let (_, s, l) = sorted[rev_idx];
                         let off = out_offsets[idx];
                         let lu = l as usize;
                         unsafe {
@@ -2019,19 +2044,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
             if n_sorted > 50_000 {
                 // Large output: build contiguous buffer with parallel memcpy.
-                // Step 1: compute output offsets (prefix sum of line lengths + 1)
-                let out_sizes: Vec<usize> = sorted
-                    .iter()
-                    .map(|&(_, _, l)| l as usize + 1) // line + terminator
-                    .collect();
-                let total_out: usize = out_sizes.iter().sum();
+                // Single-pass prefix sum (no intermediate out_sizes allocation).
                 let mut out_offsets: Vec<usize> = Vec::with_capacity(n_sorted + 1);
                 out_offsets.push(0);
                 let mut acc = 0usize;
-                for &sz in &out_sizes {
-                    acc += sz;
+                for &(_, _, l) in &sorted {
+                    acc += l as usize + 1;
                     out_offsets.push(acc);
                 }
+                let total_out = acc;
 
                 // Step 2: parallel memcpy into output buffer
                 let mut out_buf: Vec<u8> = Vec::with_capacity(total_out);
@@ -2041,7 +2062,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
                 let out_ptr = out_buf.as_mut_ptr() as usize;
                 let dp_addr = dp as usize;
-                const CHUNK: usize = 8192;
+                const CHUNK: usize = 16384;
                 let chunks: Vec<_> = (0..n_sorted).collect::<Vec<_>>();
                 chunks.par_chunks(CHUNK).for_each(|idxs| {
                     let dst = out_ptr as *mut u8;
@@ -2057,7 +2078,6 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 });
 
-                // Step 3: single write
                 writer.write_all(&out_buf)?;
             } else {
                 // Smaller output: write_vectored batching
