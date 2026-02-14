@@ -191,18 +191,51 @@ fn main() {
             tr::expand_set2(set2_str, set1.len())
         };
 
-        // Try MAP_PRIVATE mmap for in-place translate (eliminates output buffer alloc)
-        let result = if let Some(mut mm) = try_mmap_stdin_mut() {
-            // MAP_PRIVATE mmap: in-place translate eliminates output buffer allocation
-            #[cfg(unix)]
-            {
-                tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut *raw)
-            }
-            #[cfg(not(unix))]
-            {
-                let stdout = io::stdout();
-                let mut lock = stdout.lock();
-                tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut lock)
+        // For small-to-medium files, use read-only mmap + separate output buffer.
+        // This avoids MAP_PRIVATE COW page faults entirely. For large files (>= 32MB),
+        // MAP_PRIVATE is better because it avoids doubling memory usage.
+        let result = if let Some(mm) = try_mmap_stdin() {
+            if mm.len() < 32 * 1024 * 1024 {
+                // Read-only mmap: translate into separate buffer (no COW faults)
+                #[cfg(unix)]
+                {
+                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut *raw)
+                }
+                #[cfg(not(unix))]
+                {
+                    let stdout = io::stdout();
+                    let mut lock = stdout.lock();
+                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut lock)
+                }
+            } else {
+                // Large file: use MAP_PRIVATE for in-place translate
+                drop(mm);
+                if let Some(mut mm_mut) = try_mmap_stdin_mut() {
+                    #[cfg(unix)]
+                    {
+                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let stdout = io::stdout();
+                        let mut lock = stdout.lock();
+                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
+                    }
+                } else {
+                    // Fallback: streaming path
+                    let stdin = io::stdin();
+                    let mut reader = stdin.lock();
+                    #[cfg(unix)]
+                    {
+                        tr::translate(&set1, &set2, &mut reader, &mut *raw)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let stdout = io::stdout();
+                        let mut lock = stdout.lock();
+                        tr::translate(&set1, &set2, &mut reader, &mut lock)
+                    }
+                }
             }
         } else {
             // Piped stdin: use streaming path (16MB buffer, read+translate+write

@@ -623,19 +623,11 @@ fn process_single_field(
             // Since most lines have a delimiter, and field 1 is a prefix of each line,
             // we can write contiguous runs directly from the source data.
             single_field1_zerocopy(data, delim, line_delim, out)?;
-        } else if target_idx <= 7 && !suppress {
-            // Optimized path for small field indices (fields 2-8):
-            // Uses scalar byte scanning per line for short lines (passwd-style),
-            // and memchr for longer lines. Avoids memchr2_iter overhead.
-            let mut buf = Vec::with_capacity(data.len().min(4 * 1024 * 1024));
-            process_small_field_combined(data, delim, line_delim, target_idx, &mut buf);
-            if !buf.is_empty() {
-                out.write_all(&buf)?;
-            }
         } else {
-            // Write directly to BufWriter-backed output to avoid intermediate Vec.
-            // For larger inputs, process_nth_field_combined builds a buffer that
-            // we then write in a single call (reducing syscall count).
+            // Single-pass SIMD scan using memchr2_iter for both delimiter and
+            // line_delim simultaneously. For large files this is faster than the
+            // two-pass approach (outer newline scan + inner scalar field scan)
+            // because it processes the entire file in one SIMD sweep.
             let mut buf = Vec::with_capacity(data.len().min(4 * 1024 * 1024));
             process_nth_field_combined(data, delim, line_delim, target_idx, suppress, &mut buf);
             if !buf.is_empty() {
@@ -1607,173 +1599,6 @@ fn single_field1_zerocopy(
     Ok(())
 }
 
-/// Optimized path for extracting small field indices (2-4) without suppress.
-/// For short lines (< 256 bytes, typical in passwd-style files), uses direct
-/// scalar byte scanning which avoids memchr setup overhead per call.
-/// For longer lines, uses memchr for SIMD-accelerated delimiter finding.
-/// Uses raw pointer arithmetic to eliminate bounds checking.
-fn process_small_field_combined(
-    data: &[u8],
-    delim: u8,
-    line_delim: u8,
-    target_idx: usize,
-    buf: &mut Vec<u8>,
-) {
-    buf.reserve(data.len());
-    let base = data.as_ptr();
-    let data_len = data.len();
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line_len = end_pos - start;
-        extract_small_field_to_buf(
-            unsafe { std::slice::from_raw_parts(base.add(start), line_len) },
-            delim,
-            target_idx,
-            line_delim,
-            buf,
-        );
-        start = end_pos + 1;
-    }
-    // Handle last line without terminator
-    if start < data_len {
-        let line_len = data_len - start;
-        extract_small_field_to_buf(
-            unsafe { std::slice::from_raw_parts(base.add(start), line_len) },
-            delim,
-            target_idx,
-            line_delim,
-            buf,
-        );
-    }
-}
-
-/// Extract a small-index field from a single line using direct scalar scanning.
-/// For passwd-style data (lines ~50-100 bytes, delimiter ':'), this avoids
-/// the overhead of memchr function calls and directly scans bytes with a
-/// tight scalar loop. For lines > 256 bytes, falls back to memchr.
-#[inline(always)]
-fn extract_small_field_to_buf(
-    line: &[u8],
-    delim: u8,
-    target_idx: usize,
-    line_delim: u8,
-    buf: &mut Vec<u8>,
-) {
-    let len = line.len();
-    if len == 0 {
-        unsafe { buf_push(buf, line_delim) };
-        return;
-    }
-
-    buf.reserve(len + 1);
-    let base = line.as_ptr();
-
-    // For short lines, use direct scalar scanning (avoids memchr call overhead)
-    if len <= 256 {
-        let mut delim_count = 0usize;
-        let mut field_start = 0usize;
-        let mut i = 0usize;
-
-        // Find start of target field
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    delim_count += 1;
-                    if delim_count == target_idx {
-                        field_start = i + 1;
-                        break;
-                    }
-                }
-                i += 1;
-            }
-        }
-
-        if delim_count < target_idx {
-            // Line has fewer delimiters than needed - output line as-is
-            unsafe {
-                buf_extend(buf, line);
-                buf_push(buf, line_delim);
-            }
-            return;
-        }
-
-        if field_start >= len {
-            // Empty field at end of line
-            unsafe { buf_push(buf, line_delim) };
-            return;
-        }
-
-        // Find end of target field
-        i = field_start;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(field_start), i - field_start),
-                    );
-                    buf_push(buf, line_delim);
-                    return;
-                }
-                i += 1;
-            }
-        }
-
-        // Last field (no trailing delimiter)
-        unsafe {
-            buf_extend(
-                buf,
-                std::slice::from_raw_parts(base.add(field_start), len - field_start),
-            );
-            buf_push(buf, line_delim);
-        }
-        return;
-    }
-
-    // For longer lines, use memchr for SIMD-accelerated scanning
-    let mut field_start = 0;
-    let mut found_start = target_idx == 0;
-    let mut delim_count = 0;
-    if !found_start {
-        let mut search_start = 0;
-        while let Some(pos) = memchr::memchr(delim, unsafe {
-            std::slice::from_raw_parts(base.add(search_start), len - search_start)
-        }) {
-            delim_count += 1;
-            if delim_count == target_idx {
-                field_start = search_start + pos + 1;
-                found_start = true;
-                break;
-            }
-            search_start = search_start + pos + 1;
-        }
-    }
-    if !found_start {
-        unsafe {
-            buf_extend(buf, line);
-            buf_push(buf, line_delim);
-        }
-    } else if field_start >= len {
-        unsafe { buf_push(buf, line_delim) };
-    } else {
-        match memchr::memchr(delim, unsafe {
-            std::slice::from_raw_parts(base.add(field_start), len - field_start)
-        }) {
-            Some(pos) => unsafe {
-                buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos));
-                buf_push(buf, line_delim);
-            },
-            None => unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(field_start), len - field_start),
-                );
-                buf_push(buf, line_delim);
-            },
-        }
-    }
-}
-
 /// Process a chunk of data for single-field extraction.
 fn process_single_field_chunk(
     data: &[u8],
@@ -2072,7 +1897,13 @@ fn process_bytes_from_start(
         let results: Vec<Vec<u8>> = chunks
             .par_iter()
             .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
+                // Estimate output size without scanning: assume average line
+                // is at least (max_bytes+1) bytes (otherwise no truncation).
+                // For cut -b1-5 on 50-char lines: output ~ chunk.len() * 6/51 ~ chunk/8.
+                // Using chunk.len()/4 as initial capacity handles most cases
+                // without reallocation, while avoiding the extra memchr scan.
+                let est_out = (chunk.len() / 4).max(max_bytes + 2);
+                let mut buf = Vec::with_capacity(est_out.min(chunk.len()));
                 bytes_from_start_chunk(chunk, max_bytes, line_delim, &mut buf);
                 buf
             })
@@ -2085,10 +1916,25 @@ fn process_bytes_from_start(
             .collect();
         write_ioslices(out, &slices)?;
     } else {
-        // Zero-copy path: track contiguous output runs and write directly from source.
-        // For lines <= max_bytes, we include them as-is (no copy needed).
-        // For lines > max_bytes, we flush the run, write the truncated line, start new run.
-        bytes_from_start_zerocopy(data, max_bytes, line_delim, out)?;
+        // For small max_bytes, the buffer path is faster than writev zero-copy
+        // because every line gets truncated, creating 3 IoSlice entries per line.
+        // Copying max_bytes+1 bytes into a contiguous buffer is cheaper than
+        // managing millions of IoSlice entries through the kernel.
+        if max_bytes <= 64 {
+            // Estimate output size without scanning: output <= data.len(),
+            // typically ~data.len()/4 for short max_bytes on longer lines.
+            let est_out = (data.len() / 4).max(max_bytes + 2);
+            let mut buf = Vec::with_capacity(est_out.min(data.len()));
+            bytes_from_start_chunk(data, max_bytes, line_delim, &mut buf);
+            if !buf.is_empty() {
+                out.write_all(&buf)?;
+            }
+        } else {
+            // Zero-copy path: track contiguous output runs and write directly from source.
+            // For lines <= max_bytes, we include them as-is (no copy needed).
+            // For lines > max_bytes, we flush the run, write the truncated line, start new run.
+            bytes_from_start_zerocopy(data, max_bytes, line_delim, out)?;
+        }
     }
     Ok(())
 }
@@ -2157,18 +2003,31 @@ fn bytes_from_start_zerocopy(
 
 /// Process a chunk for from-start byte range extraction (parallel path).
 /// Uses unsafe appends to eliminate bounds checking in the hot loop.
+/// When max_bytes is small, the output per line is tiny so we fuse the
+/// data copy + delimiter into a single tight loop with minimal overhead.
 #[inline]
 fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
-    // Reserve enough capacity: output <= input size
-    buf.reserve(data.len());
+    // Pre-reserve enough capacity: output is at most data.len() bytes
+    // (when all lines are <= max_bytes, output equals input).
+    // This eliminates per-iteration capacity checks in the hot loop.
+    buf.reserve(data.len().min(buf.capacity().max(max_bytes + 2)));
 
     let mut start = 0;
+    let data_ptr = data.as_ptr();
+
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         let take = line_len.min(max_bytes);
+        // Check capacity only when we might exceed it (rare with good pre-reserve)
+        let needed = take + 1;
+        if buf.len() + needed > buf.capacity() {
+            buf.reserve(needed.max(data.len() - pos));
+        }
         unsafe {
-            buf_extend(buf, &data[start..start + take]);
-            buf_push(buf, line_delim);
+            let dst = buf.as_mut_ptr().add(buf.len());
+            std::ptr::copy_nonoverlapping(data_ptr.add(start), dst, take);
+            *dst.add(take) = line_delim;
+            buf.set_len(buf.len() + take + 1);
         }
         start = pos + 1;
     }
@@ -2176,9 +2035,15 @@ fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &m
     if start < data.len() {
         let line_len = data.len() - start;
         let take = line_len.min(max_bytes);
+        let needed = take + 1;
+        if buf.len() + needed > buf.capacity() {
+            buf.reserve(needed);
+        }
         unsafe {
-            buf_extend(buf, &data[start..start + take]);
-            buf_push(buf, line_delim);
+            let dst = buf.as_mut_ptr().add(buf.len());
+            std::ptr::copy_nonoverlapping(data_ptr.add(start), dst, take);
+            *dst.add(take) = line_delim;
+            buf.set_len(buf.len() + take + 1);
         }
     }
 }

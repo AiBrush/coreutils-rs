@@ -306,16 +306,63 @@ unsafe fn translate_inplace_avx2_table(data: &mut [u8], table: &[u8; 256]) {
         let lo_mask = _mm256_set1_epi8(0x0F);
 
         let mut i = 0;
-        while i + 32 <= len {
+
+        // 2x unrolled: process 64 bytes (2x32) per iteration for better ILP.
+        // The CPU can overlap load/compute of the second vector while the first
+        // is in the nibble decomposition pipeline.
+        while i + 64 <= len {
+            let input0 = _mm256_loadu_si256(ptr.add(i) as *const _);
+            let input1 = _mm256_loadu_si256(ptr.add(i + 32) as *const _);
+
+            let lo0 = _mm256_and_si256(input0, lo_mask);
+            let hi0 = _mm256_and_si256(_mm256_srli_epi16(input0, 4), lo_mask);
+            let lo1 = _mm256_and_si256(input1, lo_mask);
+            let hi1 = _mm256_and_si256(_mm256_srli_epi16(input1, 4), lo_mask);
+
+            let mut r0 = _mm256_setzero_si256();
+            let mut r1 = _mm256_setzero_si256();
+
+            macro_rules! do_nibble2 {
+                ($h:expr) => {
+                    let h_val = _mm256_set1_epi8($h as i8);
+                    let m0 = _mm256_cmpeq_epi8(hi0, h_val);
+                    let l0 = _mm256_shuffle_epi8(lut[$h], lo0);
+                    r0 = _mm256_or_si256(r0, _mm256_and_si256(m0, l0));
+                    let m1 = _mm256_cmpeq_epi8(hi1, h_val);
+                    let l1 = _mm256_shuffle_epi8(lut[$h], lo1);
+                    r1 = _mm256_or_si256(r1, _mm256_and_si256(m1, l1));
+                };
+            }
+            do_nibble2!(0);
+            do_nibble2!(1);
+            do_nibble2!(2);
+            do_nibble2!(3);
+            do_nibble2!(4);
+            do_nibble2!(5);
+            do_nibble2!(6);
+            do_nibble2!(7);
+            do_nibble2!(8);
+            do_nibble2!(9);
+            do_nibble2!(10);
+            do_nibble2!(11);
+            do_nibble2!(12);
+            do_nibble2!(13);
+            do_nibble2!(14);
+            do_nibble2!(15);
+
+            _mm256_storeu_si256(ptr.add(i) as *mut _, r0);
+            _mm256_storeu_si256(ptr.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+
+        // Remaining 32-byte chunk
+        if i + 32 <= len {
             let input = _mm256_loadu_si256(ptr.add(i) as *const _);
             let lo_nibble = _mm256_and_si256(input, lo_mask);
             let hi_nibble = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_mask);
 
-            // Accumulate result: for each high nibble value h, select bytes where
-            // hi_nibble == h, look up in lut[h] using lo_nibble, blend into result.
             let mut result = _mm256_setzero_si256();
 
-            // Unroll the 16 high-nibble iterations for best ILP
             macro_rules! do_nibble {
                 ($h:expr) => {
                     let h_val = _mm256_set1_epi8($h as i8);
@@ -349,7 +396,6 @@ unsafe fn translate_inplace_avx2_table(data: &mut [u8], table: &[u8; 256]) {
         if i + 16 <= len {
             let lo_mask128 = _mm_set1_epi8(0x0F);
 
-            // Build 128-bit LUTs (just the lower lane of each 256-bit LUT)
             let mut lut128 = [_mm_setzero_si128(); 16];
             for h in 0u8..16 {
                 lut128[h as usize] = _mm256_castsi256_si128(lut[h as usize]);
@@ -529,7 +575,55 @@ unsafe fn translate_to_avx2_table(src: &[u8], dst: &mut [u8], table: &[u8; 256])
         let lo_mask = _mm256_set1_epi8(0x0F);
 
         let mut i = 0;
-        while i + 32 <= len {
+
+        // 2x unrolled: process 64 bytes per iteration for better ILP
+        while i + 64 <= len {
+            let input0 = _mm256_loadu_si256(sp.add(i) as *const _);
+            let input1 = _mm256_loadu_si256(sp.add(i + 32) as *const _);
+
+            let lo0 = _mm256_and_si256(input0, lo_mask);
+            let hi0 = _mm256_and_si256(_mm256_srli_epi16(input0, 4), lo_mask);
+            let lo1 = _mm256_and_si256(input1, lo_mask);
+            let hi1 = _mm256_and_si256(_mm256_srli_epi16(input1, 4), lo_mask);
+
+            let mut r0 = _mm256_setzero_si256();
+            let mut r1 = _mm256_setzero_si256();
+
+            macro_rules! do_nibble2 {
+                ($h:expr) => {
+                    let h_val = _mm256_set1_epi8($h as i8);
+                    let m0 = _mm256_cmpeq_epi8(hi0, h_val);
+                    let l0 = _mm256_shuffle_epi8(lut[$h], lo0);
+                    r0 = _mm256_or_si256(r0, _mm256_and_si256(m0, l0));
+                    let m1 = _mm256_cmpeq_epi8(hi1, h_val);
+                    let l1 = _mm256_shuffle_epi8(lut[$h], lo1);
+                    r1 = _mm256_or_si256(r1, _mm256_and_si256(m1, l1));
+                };
+            }
+            do_nibble2!(0);
+            do_nibble2!(1);
+            do_nibble2!(2);
+            do_nibble2!(3);
+            do_nibble2!(4);
+            do_nibble2!(5);
+            do_nibble2!(6);
+            do_nibble2!(7);
+            do_nibble2!(8);
+            do_nibble2!(9);
+            do_nibble2!(10);
+            do_nibble2!(11);
+            do_nibble2!(12);
+            do_nibble2!(13);
+            do_nibble2!(14);
+            do_nibble2!(15);
+
+            _mm256_storeu_si256(dp.add(i) as *mut _, r0);
+            _mm256_storeu_si256(dp.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+
+        // Remaining 32-byte chunk
+        if i + 32 <= len {
             let input = _mm256_loadu_si256(sp.add(i) as *const _);
             let lo_nibble = _mm256_and_si256(input, lo_mask);
             let hi_nibble = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_mask);
@@ -779,13 +873,29 @@ unsafe fn translate_range_to_constant_avx2_inplace(
         let ptr = data.as_mut_ptr();
         let mut i = 0;
 
-        while i + 32 <= len {
+        // 2x unrolled: process 64 bytes per iteration for better ILP
+        while i + 64 <= len {
+            let in0 = _mm256_loadu_si256(ptr.add(i) as *const _);
+            let in1 = _mm256_loadu_si256(ptr.add(i + 32) as *const _);
+            let bi0 = _mm256_add_epi8(in0, bias_v);
+            let bi1 = _mm256_add_epi8(in1, bias_v);
+            let gt0 = _mm256_cmpgt_epi8(bi0, threshold_v);
+            let gt1 = _mm256_cmpgt_epi8(bi1, threshold_v);
+            let ir0 = _mm256_cmpeq_epi8(gt0, zero);
+            let ir1 = _mm256_cmpeq_epi8(gt1, zero);
+            let r0 = _mm256_blendv_epi8(in0, repl_v, ir0);
+            let r1 = _mm256_blendv_epi8(in1, repl_v, ir1);
+            _mm256_storeu_si256(ptr.add(i) as *mut _, r0);
+            _mm256_storeu_si256(ptr.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+
+        // Remaining 32-byte chunk
+        if i + 32 <= len {
             let input = _mm256_loadu_si256(ptr.add(i) as *const _);
             let biased = _mm256_add_epi8(input, bias_v);
             let gt = _mm256_cmpgt_epi8(biased, threshold_v);
-            // mask = 0xFF where IN range (to replace), 0 where to KEEP
             let in_range = _mm256_cmpeq_epi8(gt, zero);
-            // Use blendvb: for each byte, if in_range bit is set, use replacement, else use input
             let result = _mm256_blendv_epi8(input, repl_v, in_range);
             _mm256_storeu_si256(ptr.add(i) as *mut _, result);
             i += 32;
@@ -896,18 +1006,39 @@ unsafe fn translate_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offse
         let zero = _mm256_setzero_si256();
 
         let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
         let mut i = 0;
 
-        while i + 32 <= len {
-            let input = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
+        // 2x unrolled: process 64 bytes per iteration for better ILP.
+        // Load/compute on the second vector while the first is in-flight.
+        while i + 64 <= len {
+            let in0 = _mm256_loadu_si256(sp.add(i) as *const _);
+            let in1 = _mm256_loadu_si256(sp.add(i + 32) as *const _);
+            let bi0 = _mm256_add_epi8(in0, bias_v);
+            let bi1 = _mm256_add_epi8(in1, bias_v);
+            let gt0 = _mm256_cmpgt_epi8(bi0, threshold_v);
+            let gt1 = _mm256_cmpgt_epi8(bi1, threshold_v);
+            let m0 = _mm256_cmpeq_epi8(gt0, zero);
+            let m1 = _mm256_cmpeq_epi8(gt1, zero);
+            let om0 = _mm256_and_si256(m0, offset_v);
+            let om1 = _mm256_and_si256(m1, offset_v);
+            let r0 = _mm256_add_epi8(in0, om0);
+            let r1 = _mm256_add_epi8(in1, om1);
+            _mm256_storeu_si256(dp.add(i) as *mut _, r0);
+            _mm256_storeu_si256(dp.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+
+        // Remaining 32-byte chunk
+        if i + 32 <= len {
+            let input = _mm256_loadu_si256(sp.add(i) as *const _);
             let biased = _mm256_add_epi8(input, bias_v);
-            // gt = 0xFF where biased > threshold (OUT of range)
             let gt = _mm256_cmpgt_epi8(biased, threshold_v);
-            // mask = 0xFF where IN range (NOT gt)
             let mask = _mm256_cmpeq_epi8(gt, zero);
             let offset_masked = _mm256_and_si256(mask, offset_v);
             let result = _mm256_add_epi8(input, offset_masked);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut _, result);
+            _mm256_storeu_si256(dp.add(i) as *mut _, result);
             i += 32;
         }
 
@@ -918,20 +1049,20 @@ unsafe fn translate_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offse
             let offset_v128 = _mm_set1_epi8(offset);
             let zero128 = _mm_setzero_si128();
 
-            let input = _mm_loadu_si128(src.as_ptr().add(i) as *const _);
+            let input = _mm_loadu_si128(sp.add(i) as *const _);
             let biased = _mm_add_epi8(input, bias_v128);
             let gt = _mm_cmpgt_epi8(biased, threshold_v128);
             let mask = _mm_cmpeq_epi8(gt, zero128);
             let offset_masked = _mm_and_si128(mask, offset_v128);
             let result = _mm_add_epi8(input, offset_masked);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, result);
+            _mm_storeu_si128(dp.add(i) as *mut _, result);
             i += 16;
         }
 
         // Scalar tail
         while i < len {
-            let b = *src.get_unchecked(i);
-            *dst.get_unchecked_mut(i) = if b >= lo && b <= hi {
+            let b = *sp.add(i);
+            *dp.add(i) = if b >= lo && b <= hi {
                 b.wrapping_add(offset as u8)
             } else {
                 b
@@ -1023,7 +1154,27 @@ unsafe fn translate_range_avx2_inplace(data: &mut [u8], lo: u8, hi: u8, offset: 
         let ptr = data.as_mut_ptr();
         let mut i = 0;
 
-        while i + 32 <= len {
+        // 2x unrolled: process 64 bytes per iteration for better ILP
+        while i + 64 <= len {
+            let in0 = _mm256_loadu_si256(ptr.add(i) as *const _);
+            let in1 = _mm256_loadu_si256(ptr.add(i + 32) as *const _);
+            let bi0 = _mm256_add_epi8(in0, bias_v);
+            let bi1 = _mm256_add_epi8(in1, bias_v);
+            let gt0 = _mm256_cmpgt_epi8(bi0, threshold_v);
+            let gt1 = _mm256_cmpgt_epi8(bi1, threshold_v);
+            let m0 = _mm256_cmpeq_epi8(gt0, zero);
+            let m1 = _mm256_cmpeq_epi8(gt1, zero);
+            let om0 = _mm256_and_si256(m0, offset_v);
+            let om1 = _mm256_and_si256(m1, offset_v);
+            let r0 = _mm256_add_epi8(in0, om0);
+            let r1 = _mm256_add_epi8(in1, om1);
+            _mm256_storeu_si256(ptr.add(i) as *mut _, r0);
+            _mm256_storeu_si256(ptr.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+
+        // Remaining 32-byte chunk
+        if i + 32 <= len {
             let input = _mm256_loadu_si256(ptr.add(i) as *const _);
             let biased = _mm256_add_epi8(input, bias_v);
             let gt = _mm256_cmpgt_epi8(biased, threshold_v);
@@ -2406,6 +2557,18 @@ pub fn translate_mmap_inplace(
         return writer.write_all(data);
     }
 
+    // For data that's being translated in a MAP_PRIVATE mmap, every modified page
+    // triggers a COW fault. For small-to-medium files where most bytes change,
+    // reading from mmap (read-only) + writing to a separate heap buffer is faster
+    // because it avoids COW faults entirely. The output buffer is fresh memory
+    // (no COW), and the input mmap stays read-only (MADV_SEQUENTIAL).
+    // Threshold: 32MB. Above this, in-place is better to avoid doubling memory.
+    const SEPARATE_BUF_THRESHOLD: usize = 32 * 1024 * 1024;
+
+    if data.len() < SEPARATE_BUF_THRESHOLD {
+        return translate_to_separate_buf(data, &table, writer);
+    }
+
     // Try SIMD fast path for single-range constant-offset translations (e.g., a-z -> A-Z)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {
         if data.len() >= PARALLEL_THRESHOLD {
@@ -2443,6 +2606,101 @@ pub fn translate_mmap_inplace(
         translate_inplace(data, &table);
     }
     writer.write_all(data)
+}
+
+/// Translate from read-only source to a separate output buffer, avoiding COW faults.
+/// Uses the appropriate SIMD path (range offset, range-to-constant, or general nibble).
+///
+/// For data >= PARALLEL_THRESHOLD: parallel chunked translate into full-size buffer.
+/// For smaller data: chunked translate+write with a reusable 4MB buffer to keep
+/// output data in L3 cache during write_all (avoids main memory round-trip).
+fn translate_to_separate_buf(
+    data: &[u8],
+    table: &[u8; 256],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let range_info = detect_range_offset(table);
+    let const_info = if range_info.is_none() {
+        detect_range_to_constant(table)
+    } else {
+        None
+    };
+
+    if data.len() >= PARALLEL_THRESHOLD {
+        // Parallel path: full-size output buffer, parallel translate, single write.
+        let mut out_buf = alloc_uninit_vec(data.len());
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        if let Some((lo, hi, offset)) = range_info {
+            data.par_chunks(chunk_size)
+                .zip(out_buf.par_chunks_mut(chunk_size))
+                .for_each(|(src, dst)| {
+                    translate_range_simd(src, &mut dst[..src.len()], lo, hi, offset);
+                });
+        } else if let Some((lo, hi, replacement)) = const_info {
+            data.par_chunks(chunk_size)
+                .zip(out_buf.par_chunks_mut(chunk_size))
+                .for_each(|(src, dst)| {
+                    dst[..src.len()].copy_from_slice(src);
+                    translate_range_to_constant_simd_inplace(
+                        &mut dst[..src.len()],
+                        lo,
+                        hi,
+                        replacement,
+                    );
+                });
+        } else {
+            data.par_chunks(chunk_size)
+                .zip(out_buf.par_chunks_mut(chunk_size))
+                .for_each(|(src, dst)| {
+                    translate_to(src, &mut dst[..src.len()], table);
+                });
+        }
+        return writer.write_all(&out_buf);
+    }
+
+    // Sequential path: translate in L3-cache-sized chunks (4MB).
+    // This keeps the output buffer hot in L3 cache during write_all,
+    // avoiding a main memory round-trip that happens with a full-size buffer.
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut out_buf = alloc_uninit_vec(buf_size);
+
+    for src_chunk in data.chunks(CHUNK) {
+        let dst = &mut out_buf[..src_chunk.len()];
+        if let Some((lo, hi, offset)) = range_info {
+            translate_range_simd(src_chunk, dst, lo, hi, offset);
+        } else if let Some((lo, hi, replacement)) = const_info {
+            dst.copy_from_slice(src_chunk);
+            translate_range_to_constant_simd_inplace(dst, lo, hi, replacement);
+        } else {
+            translate_to(src_chunk, dst, table);
+        }
+        writer.write_all(dst)?;
+    }
+
+    Ok(())
+}
+
+/// Translate from a read-only mmap (or any byte slice) to a separate output buffer.
+/// Avoids MAP_PRIVATE COW page faults by reading from the original data and
+/// writing to a freshly allocated heap buffer.
+pub fn translate_mmap_readonly(
+    set1: &[u8],
+    set2: &[u8],
+    data: &[u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let table = build_translate_table(set1, set2);
+
+    // Check if table is identity — pure passthrough
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
+    translate_to_separate_buf(data, &table, writer)
 }
 
 /// Translate + squeeze from mmap'd byte slice.
@@ -3207,10 +3465,11 @@ fn squeeze_single_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Resu
     // Zero-copy writev approach: build IoSlice entries pointing directly into
     // the original mmap'd data, skipping duplicate bytes in runs.
     // For `tr -s ' '` on 10MB with ~5K squeeze points:
-    //   - Old: 10MB allocation + 10MB copy into output buffer
-    //   - New: ~5K * 16 = 80KB IoSlice entries, zero data copy
+    //   - ~10K IoSlice entries (one per gap + one per squeeze point)
+    //   - ~10 writev syscalls (at 1024 entries per batch)
+    //   - Zero data copy — kernel reads directly from mmap pages
     let finder = memchr::memmem::Finder::new(&pair);
-    let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(1024);
+    let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(2048);
     let mut cursor = 0;
 
     while cursor < data.len() {
