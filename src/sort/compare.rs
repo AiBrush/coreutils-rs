@@ -576,9 +576,26 @@ fn next_valid(iter: &mut impl Iterator<Item = u8>, dict: bool, no_print: bool) -
     }
 }
 
-// Public wrappers for backward compatibility with tests
+/// Case-insensitive lexicographic comparison.
+/// Tight loop specialized for fold-case only (no dict/nonprinting filtering),
+/// avoiding the overhead of the general compare_text_filtered path.
 pub fn compare_ignore_case(a: &[u8], b: &[u8]) -> Ordering {
-    compare_text_filtered(a, b, false, false, true)
+    let alen = a.len();
+    let blen = b.len();
+    let min_len = alen.min(blen);
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    // Compare uppercase bytes directly with raw pointers for zero bounds-check overhead
+    let mut i = 0usize;
+    while i < min_len {
+        let ca = unsafe { (*ap.add(i)).to_ascii_uppercase() };
+        let cb = unsafe { (*bp.add(i)).to_ascii_uppercase() };
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+        i += 1;
+    }
+    alen.cmp(&blen)
 }
 
 pub fn compare_dictionary(a: &[u8], b: &[u8], ignore_case: bool) -> Ordering {

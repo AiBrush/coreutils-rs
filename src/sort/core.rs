@@ -1125,23 +1125,69 @@ fn write_sorted_output(
             write_all_vectored(writer, &slices)?;
         }
     } else {
-        // Batch line+terminator pairs via write_vectored to reduce function call
-        // overhead (2N write_all calls -> N/BATCH write_vectored calls).
         let dp = data.as_ptr();
-        const BATCH: usize = 512;
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-        for &idx in sorted_indices {
-            let (s, e) = offsets[idx];
-            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-            slices.push(io::IoSlice::new(line));
-            slices.push(io::IoSlice::new(terminator));
-            if slices.len() >= BATCH * 2 {
-                write_all_vectored(writer, &slices)?;
-                slices.clear();
+        let n = sorted_indices.len();
+        let term_byte = terminator[0];
+
+        if n > 50_000 {
+            // Large output: parallel buffer construction
+            let out_sizes: Vec<usize> = sorted_indices
+                .iter()
+                .map(|&idx| {
+                    let (s, e) = offsets[idx];
+                    (e - s) + 1
+                })
+                .collect();
+            let total_out: usize = out_sizes.iter().sum();
+            let mut out_offsets: Vec<usize> = Vec::with_capacity(n + 1);
+            out_offsets.push(0);
+            let mut acc = 0usize;
+            for &sz in &out_sizes {
+                acc += sz;
+                out_offsets.push(acc);
             }
-        }
-        if !slices.is_empty() {
-            write_all_vectored(writer, &slices)?;
+
+            let mut out_buf: Vec<u8> = Vec::with_capacity(total_out);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                out_buf.set_len(total_out);
+            }
+            let out_ptr = out_buf.as_mut_ptr() as usize;
+            let dp_addr = dp as usize;
+            const CHUNK: usize = 8192;
+            let chunks: Vec<_> = (0..n).collect::<Vec<_>>();
+            chunks.par_chunks(CHUNK).for_each(|idxs| {
+                let dst = out_ptr as *mut u8;
+                let src = dp_addr as *const u8;
+                for &i in idxs {
+                    let idx = sorted_indices[i];
+                    let (s, e) = offsets[idx];
+                    let lu = e - s;
+                    let off = out_offsets[i];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.add(s), dst.add(off), lu);
+                        *dst.add(off + lu) = term_byte;
+                    }
+                }
+            });
+            writer.write_all(&out_buf)?;
+        } else {
+            // Smaller output: write_vectored batching
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+            for &idx in sorted_indices {
+                let (s, e) = offsets[idx];
+                let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                slices.push(io::IoSlice::new(line));
+                slices.push(io::IoSlice::new(terminator));
+                if slices.len() >= BATCH * 2 {
+                    write_all_vectored(writer, &slices)?;
+                    slices.clear();
+                }
+            }
+            if !slices.is_empty() {
+                write_all_vectored(writer, &slices)?;
+            }
         }
     }
     Ok(())
