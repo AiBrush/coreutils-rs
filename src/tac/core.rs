@@ -11,59 +11,48 @@ const MAX_IOV: usize = 1024;
 const CHUNK: usize = 4 * 1024 * 1024;
 
 /// Flush a batch of IoSlice entries using write_vectored.
-/// Falls back to individual write_all for each slice if write_vectored
-/// doesn't write everything (handles partial writes).
+/// Batches in chunks of MAX_IOV to respect Linux UIO_MAXIOV.
 #[inline]
 fn flush_iov(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
-    if slices.is_empty() {
-        return Ok(());
-    }
-    // Try write_vectored first for the whole batch
-    let total: usize = slices.iter().map(|s| s.len()).sum();
-
-    // Fast path: single writev call often writes everything
-    let written = match out.write_vectored(slices) {
-        Ok(n) if n >= total => return Ok(()),
-        Ok(n) => n,
-        Err(e) => return Err(e),
-    };
-
-    // Slow path: partial write — fall back to write_all per remaining slice
-    let mut skip = written;
-    for slice in slices {
-        let slen = slice.len();
-        if skip >= slen {
-            skip -= slen;
-            continue;
-        }
-        if skip > 0 {
-            out.write_all(&slice[skip..])?;
-            skip = 0;
-        } else {
-            out.write_all(slice)?;
+    for batch in slices.chunks(MAX_IOV) {
+        let total: usize = batch.iter().map(|s| s.len()).sum();
+        let written = match out.write_vectored(batch) {
+            Ok(n) if n >= total => continue,
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        // Slow path: partial write — fall back to write_all per remaining slice
+        let mut skip = written;
+        for slice in batch {
+            let slen = slice.len();
+            if skip >= slen {
+                skip -= slen;
+                continue;
+            }
+            if skip > 0 {
+                out.write_all(&slice[skip..])?;
+                skip = 0;
+            } else {
+                out.write_all(slice)?;
+            }
         }
     }
     Ok(())
 }
 
 /// Reverse records separated by a single byte.
-/// Uses chunk-based forward SIMD scan processed in reverse order for
-/// maximum throughput — eliminates per-line memrchr call overhead.
-/// Output uses write_vectored (writev) for zero-copy from mmap'd data.
+/// Uses single forward SIMD pass to find separators, then builds reversed output.
 ///
 /// For data up to CONTIG_LIMIT, builds a contiguous reversed output buffer
-/// and writes it in a single write() call. This is faster for pipe output
-/// because it eliminates the overhead of many writev() syscalls (a 10MB file
-/// with 50-byte lines would need ~200 writev calls of 1024 entries each;
-/// a single 10MB write() is much faster).
+/// and writes it in a single write_all(). This is much faster for pipe output
+/// than writev with many small slices (a 10MB file with 50-byte lines would
+/// need ~200 writev calls of 1024 entries each; a single 10MB write is faster).
 ///
-/// For larger data, uses the writev approach to avoid doubling memory usage.
+/// For larger data, uses batched writev to avoid doubling memory usage.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
-    // For data up to 128MB, zero-copy writev: collect all positions in one forward
-    // SIMD pass, build IoSlice entries in reverse, flush with batched writev.
     if data.len() <= CONTIG_LIMIT {
         if !before {
             tac_bytes_contig_after(data, separator, out)
@@ -77,73 +66,54 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 }
 
-/// Threshold for zero-copy writev strategy.
-/// Up to 128MB, collect all separator positions in one pass, then writev
-/// with IoSlice entries pointing into the original buffer. Memory overhead
-/// is ~24 bytes per line (8 for position + 16 for IoSlice), much less than
-/// the old contiguous-copy approach that needed a full output buffer.
+/// Threshold for contiguous-buffer strategy.
+/// Up to 128MB, build a single reversed output buffer and write_all in one call.
 /// For data > 128MB, falls back to chunked backward scan with batched writev.
 const CONTIG_LIMIT: usize = 128 * 1024 * 1024;
 
-/// Zero-copy after-separator mode for data <= CONTIG_LIMIT.
-/// Collects ALL separator positions in a single forward memchr pass, then builds
-/// IoSlice entries pointing to records in reverse order in the ORIGINAL input buffer.
-/// Writes all slices with batched writev — no output buffer allocation or memcpy.
-///
-/// For a 10MB file with 50-byte lines (~200K lines), this needs:
-///   - ~200K * 8 = 1.6MB for position indices
-///   - ~200K * 16 = 3.2MB for IoSlice entries
-/// vs the old approach which needed 10MB for the output buffer.
+/// Contiguous-buffer after-separator mode for data <= CONTIG_LIMIT.
+/// Collects ALL separator positions in a single forward SIMD memchr pass,
+/// then copies records in reverse order into a contiguous output buffer.
+/// One write_all() of the full buffer is vastly faster than writev with
+/// thousands of small IoSlice entries (eliminates per-syscall overhead).
 fn tac_bytes_contig_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Single forward pass: find ALL separator positions using SIMD memchr.
-    // memchr_iter uses AVX2 on x86_64, processing 32 bytes per iteration.
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
-    // Build IoSlice entries in reverse record order, pointing directly into `data`.
-    // Each record is data[prev_sep+1 .. cur_sep+1] (includes the separator at cur_sep).
-    let num_records = positions.len() + 1; // +1 for the first record (before first sep)
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
 
-    // Records from last to first: each record is (sep_pos+1 .. next_sep_pos+1)
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
-            iov.push(IoSlice::new(&data[rec_start..end]));
+            buf.extend_from_slice(&data[rec_start..end]);
         }
         end = rec_start;
     }
-    // First record: data[0..first_sep+1] or data[0..end] if no separators
     if end > 0 {
-        iov.push(IoSlice::new(&data[0..end]));
+        buf.extend_from_slice(&data[0..end]);
     }
 
-    // Flush all IoSlice entries in batched writev calls
-    flush_iov(out, &iov)
+    out.write_all(&buf)
 }
 
-/// Zero-copy before-separator mode for data <= CONTIG_LIMIT.
-/// Same strategy as tac_bytes_contig_after but records start AT the separator.
+/// Contiguous-buffer before-separator mode for data <= CONTIG_LIMIT.
 fn tac_bytes_contig_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
-    let num_records = positions.len() + 1;
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    let mut buf: Vec<u8> = Vec::with_capacity(data.len());
 
-    // Records from last to first: each record is [sep_pos .. next_sep_pos)
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
-            iov.push(IoSlice::new(&data[pos..end]));
+            buf.extend_from_slice(&data[pos..end]);
         }
         end = pos;
     }
-    // First record: data[0..first_sep] or data[0..end] if no separators
     if end > 0 {
-        iov.push(IoSlice::new(&data[0..end]));
+        buf.extend_from_slice(&data[0..end]);
     }
 
-    flush_iov(out, &iov)
+    out.write_all(&buf)
 }
 
 /// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.
