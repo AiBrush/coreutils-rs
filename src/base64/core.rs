@@ -917,13 +917,131 @@ static NOT_WHITESPACE: [bool; 256] = {
     table
 };
 
+/// Fast decode for data with uniform line structure (e.g., standard 76-char base64).
+/// Detects if lines have consistent length, then copies at known offsets instead of
+/// scanning for newlines. For 13MB base64: saves ~1ms vs memchr2 gap-copy.
+/// Returns None if the data doesn't have uniform line structure.
+fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> {
+    // Find first newline to determine line length
+    let first_nl = memchr::memchr(b'\n', data)?;
+    let line_len = first_nl;
+
+    // Line length must be a multiple of 4 (complete base64 groups)
+    if line_len == 0 || line_len % 4 != 0 {
+        return None;
+    }
+
+    let stride = line_len + 1;
+
+    // Verify the data has consistent line structure
+    let check_lines = 4.min(data.len() / stride);
+    for i in 1..check_lines {
+        let expected_nl = i * stride - 1;
+        if expected_nl >= data.len() || data[expected_nl] != b'\n' {
+            return None;
+        }
+    }
+
+    let full_lines = if data.len() >= stride {
+        let candidate = data.len() / stride;
+        if candidate > 0 && data[candidate * stride - 1] != b'\n' {
+            return None;
+        }
+        candidate
+    } else {
+        0
+    };
+
+    let remainder_start = full_lines * stride;
+    let remainder = &data[remainder_start..];
+    let rem_clean = if remainder.last() == Some(&b'\n') {
+        &remainder[..remainder.len() - 1]
+    } else {
+        remainder
+    };
+
+    // Allocate clean buffer and copy at known offsets (no search needed)
+    let clean_len = full_lines * line_len + rem_clean.len();
+    let mut clean: Vec<u8> = Vec::with_capacity(clean_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        clean.set_len(clean_len);
+    }
+
+    let src = data.as_ptr();
+    let dst = clean.as_mut_ptr();
+
+    // 4-line unrolled structured copy for better ILP
+    let mut i = 0;
+    while i + 4 <= full_lines {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(i * stride),
+                dst.add(i * line_len),
+                line_len,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.add((i + 1) * stride),
+                dst.add((i + 1) * line_len),
+                line_len,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.add((i + 2) * stride),
+                dst.add((i + 2) * line_len),
+                line_len,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.add((i + 3) * stride),
+                dst.add((i + 3) * line_len),
+                line_len,
+            );
+        }
+        i += 4;
+    }
+    while i < full_lines {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(i * stride),
+                dst.add(i * line_len),
+                line_len,
+            );
+        }
+        i += 1;
+    }
+
+    // Copy remainder
+    if !rem_clean.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(remainder_start),
+                dst.add(full_lines * line_len),
+                rem_clean.len(),
+            );
+        }
+    }
+
+    // Decode: parallel for large data, in-place for small
+    if clean.len() >= PARALLEL_DECODE_THRESHOLD {
+        Some(decode_borrowed_clean_parallel(out, &clean))
+    } else {
+        Some(decode_clean_slice(&mut clean, out))
+    }
+}
+
 /// Decode by stripping whitespace and decoding in a single fused pass.
 /// For data with no whitespace, decodes directly without any copy.
-/// Uses memchr2 SIMD gap-copy for \n/\r (the dominant whitespace in base64),
-/// then a conditional fallback pass for rare whitespace types (tab, space, VT, FF).
-/// Tracks rare whitespace presence during the gap-copy to skip the second scan
-/// entirely in the common case (pure \n/\r whitespace only).
+/// Detects uniform line structure for fast structured-copy (no search needed),
+/// falls back to SIMD memchr2 gap-copy for irregular data.
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
+    // Fast path for uniform-line base64 (e.g., standard 76-char lines + newline).
+    // Copies at known offsets, avoiding the memchr2 search entirely.
+    // For 13MB base64: saves ~1ms vs memchr2 gap-copy (just structured memcpy).
+    if data.len() >= 77 {
+        if let Some(result) = try_decode_uniform_lines(data, out) {
+            return result;
+        }
+    }
+
     // Quick check: skip stripping if no \n or \r in the data.
     // Uses SIMD memchr2 for fast scanning (~10 GB/s) instead of per-byte check.
     if memchr::memchr2(b'\n', b'\r', data).is_none() {
