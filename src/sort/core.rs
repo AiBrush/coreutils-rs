@@ -2877,27 +2877,38 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 // Pre-select comparator: eliminates per-comparison option branching
                 let mut indices: Vec<usize> = (0..num_lines).collect();
                 let (cmp_fn, needs_blank, needs_reverse) = select_comparator(opts, random_seed);
+                let dp_sk = data.as_ptr() as usize;
                 do_sort(&mut indices, stable, |&a, &b| {
+                    let dp = dp_sk as *const u8;
                     let (sa, ea) = key_offs[a];
                     let (sb, eb) = key_offs[b];
                     let ka = if sa == ea {
                         &[] as &[u8]
                     } else if needs_blank {
-                        skip_leading_blanks(&data[sa..ea])
+                        skip_leading_blanks(unsafe {
+                            std::slice::from_raw_parts(dp.add(sa), ea - sa)
+                        })
                     } else {
-                        &data[sa..ea]
+                        unsafe { std::slice::from_raw_parts(dp.add(sa), ea - sa) }
                     };
                     let kb = if sb == eb {
                         &[] as &[u8]
                     } else if needs_blank {
-                        skip_leading_blanks(&data[sb..eb])
+                        skip_leading_blanks(unsafe {
+                            std::slice::from_raw_parts(dp.add(sb), eb - sb)
+                        })
                     } else {
-                        &data[sb..eb]
+                        unsafe { std::slice::from_raw_parts(dp.add(sb), eb - sb) }
                     };
                     let ord = cmp_fn(ka, kb);
                     let ord = if needs_reverse { ord.reverse() } else { ord };
                     if ord == Ordering::Equal && !stable {
-                        data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
+                        let (la, ra) = offsets[a];
+                        let (lb, rb) = offsets[b];
+                        unsafe {
+                            std::slice::from_raw_parts(dp.add(la), ra - la)
+                                .cmp(std::slice::from_raw_parts(dp.add(lb), rb - lb))
+                        }
                     } else {
                         ord
                     }
@@ -2948,23 +2959,29 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             })
             .collect();
 
+        let dp_mk = data.as_ptr() as usize;
         do_sort(&mut indices, stable, |&a, &b| {
+            let dp = dp_mk as *const u8;
             for (ki, &(cmp_fn, needs_blank, needs_reverse)) in comparators.iter().enumerate() {
                 let (sa, ea) = all_key_offs[ki][a];
                 let (sb, eb) = all_key_offs[ki][b];
                 let ka = if sa == ea {
                     &[] as &[u8]
                 } else if needs_blank {
-                    skip_leading_blanks(&data[sa..ea])
+                    skip_leading_blanks(unsafe {
+                        std::slice::from_raw_parts(dp.add(sa), ea - sa)
+                    })
                 } else {
-                    &data[sa..ea]
+                    unsafe { std::slice::from_raw_parts(dp.add(sa), ea - sa) }
                 };
                 let kb = if sb == eb {
                     &[] as &[u8]
                 } else if needs_blank {
-                    skip_leading_blanks(&data[sb..eb])
+                    skip_leading_blanks(unsafe {
+                        std::slice::from_raw_parts(dp.add(sb), eb - sb)
+                    })
                 } else {
-                    &data[sb..eb]
+                    unsafe { std::slice::from_raw_parts(dp.add(sb), eb - sb) }
                 };
 
                 let result = cmp_fn(ka, kb);
@@ -2980,7 +2997,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
             // All keys equal: last-resort whole-line comparison unless stable
             if !stable {
-                data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
+                let (sa, ea) = offsets[a];
+                let (sb, eb) = offsets[b];
+                unsafe {
+                    std::slice::from_raw_parts(dp.add(sa), ea - sa)
+                        .cmp(std::slice::from_raw_parts(dp.add(sb), eb - sb))
+                }
             } else {
                 Ordering::Equal
             }
@@ -3044,10 +3066,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         let (cmp_fn, needs_blank, needs_reverse) =
             select_comparator(&config.global_opts, config.random_seed);
         let stable = config.stable;
+        let dp_addr = data.as_ptr() as usize;
 
         do_sort(&mut indices, stable, |&a, &b| {
-            let la = &data[offsets[a].0..offsets[a].1];
-            let lb = &data[offsets[b].0..offsets[b].1];
+            let (sa, ea) = offsets[a];
+            let (sb, eb) = offsets[b];
+            let dp = dp_addr as *const u8;
+            let la = unsafe { std::slice::from_raw_parts(dp.add(sa), ea - sa) };
+            let lb = unsafe { std::slice::from_raw_parts(dp.add(sb), eb - sb) };
             let la = if needs_blank {
                 skip_leading_blanks(la)
             } else {
@@ -3062,7 +3088,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let ord = if needs_reverse { ord.reverse() } else { ord };
             // Last-resort whole-line comparison for deterministic order (unless -s)
             if ord == Ordering::Equal && !stable {
-                data[offsets[a].0..offsets[a].1].cmp(&data[offsets[b].0..offsets[b].1])
+                unsafe {
+                    std::slice::from_raw_parts(dp.add(sa), ea - sa)
+                        .cmp(std::slice::from_raw_parts(dp.add(sb), eb - sb))
+                }
             } else {
                 ord
             }
