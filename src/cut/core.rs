@@ -2,8 +2,9 @@ use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::io::{self, BufRead, IoSlice, Write};
 
-/// Minimum file size for parallel processing (2MB).
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum file size for parallel processing (1MB).
+/// Lowered from 2MB to benefit from parallel chunk processing on smaller piped inputs.
+const PARALLEL_THRESHOLD: usize = 1024 * 1024;
 
 /// Max iovec entries per writev call (Linux default).
 const MAX_IOV: usize = 1024;
@@ -427,9 +428,12 @@ fn process_fields_chunk(
 
     // Single-pass path for complement or unbounded ranges: memchr2_iter for both
     // delimiter and line_delim in one SIMD scan.
+    // Uses raw pointer arithmetic to eliminate bounds checking in the hot loop.
     if delim != line_delim {
         buf.reserve(data.len());
 
+        let data_len = data.len();
+        let base = data.as_ptr();
         let mut line_start: usize = 0;
         let mut field_start: usize = 0;
         let mut field_num: usize = 1;
@@ -437,7 +441,7 @@ fn process_fields_chunk(
         let mut has_delim = false;
 
         for pos in memchr::memchr2_iter(delim, line_delim, data) {
-            let byte = unsafe { *data.get_unchecked(pos) };
+            let byte = unsafe { *base.add(pos) };
 
             if byte == line_delim {
                 // End of line: flush final field and emit line delimiter
@@ -448,7 +452,7 @@ fn process_fields_chunk(
                     if !first_output {
                         unsafe { buf_extend(buf, output_delim) };
                     }
-                    unsafe { buf_extend(buf, &data[field_start..pos]) };
+                    unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start)) };
                     first_output = false;
                 }
 
@@ -457,7 +461,7 @@ fn process_fields_chunk(
                 } else if !has_delim {
                     if !suppress {
                         unsafe {
-                            buf_extend(buf, &data[line_start..pos]);
+                            buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), pos - line_start));
                             buf_push(buf, line_delim);
                         }
                     }
@@ -479,7 +483,7 @@ fn process_fields_chunk(
                     if !first_output {
                         unsafe { buf_extend(buf, output_delim) };
                     }
-                    unsafe { buf_extend(buf, &data[field_start..pos]) };
+                    unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start)) };
                     first_output = false;
                 }
 
@@ -489,9 +493,8 @@ fn process_fields_chunk(
         }
 
         // Handle last line without trailing line_delim
-        if line_start < data.len() {
-            let line = &data[line_start..];
-            if !line.is_empty() {
+        if line_start < data_len {
+            if line_start < data_len {
                 if (field_num <= max_field || complement)
                     && has_delim
                     && is_selected(field_num, field_mask, ranges, complement)
@@ -499,7 +502,7 @@ fn process_fields_chunk(
                     if !first_output {
                         unsafe { buf_extend(buf, output_delim) };
                     }
-                    unsafe { buf_extend(buf, &data[field_start..data.len()]) };
+                    unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), data_len - field_start)) };
                     first_output = false;
                 }
 
@@ -508,7 +511,7 @@ fn process_fields_chunk(
                 } else if !has_delim {
                     if !suppress {
                         unsafe {
-                            buf_extend(buf, &data[line_start..data.len()]);
+                            buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), data_len - line_start));
                             buf_push(buf, line_delim);
                         }
                     }
@@ -1228,6 +1231,9 @@ fn fields_mid_range_line(
 /// Uses memchr2_iter(delim, line_delim) to scan for both bytes in a single SIMD pass.
 /// This is faster than the nested approach (outer: find newlines, inner: find delimiters)
 /// because it eliminates one full SIMD scan and improves cache locality.
+///
+/// For target_idx == 0 (field 1), after finding the target field we skip remaining
+/// delimiters on the line by scanning directly for line_delim.
 fn process_nth_field_combined(
     data: &[u8],
     delim: u8,
@@ -1238,6 +1244,8 @@ fn process_nth_field_combined(
 ) {
     buf.reserve(data.len());
 
+    let data_len = data.len();
+    let base = data.as_ptr();
     let mut line_start: usize = 0;
     let mut field_start: usize = 0;
     let mut field_idx: usize = 0;
@@ -1245,7 +1253,7 @@ fn process_nth_field_combined(
     let mut emitted = false;
 
     for pos in memchr::memchr2_iter(delim, line_delim, data) {
-        let byte = unsafe { *data.get_unchecked(pos) };
+        let byte = unsafe { *base.add(pos) };
 
         if byte == line_delim {
             // End of line
@@ -1253,7 +1261,7 @@ fn process_nth_field_combined(
                 if has_delim && field_idx == target_idx {
                     // Last field matches target
                     unsafe {
-                        buf_extend(buf, &data[field_start..pos]);
+                        buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start));
                         buf_push(buf, line_delim);
                     }
                 } else if has_delim {
@@ -1264,7 +1272,7 @@ fn process_nth_field_combined(
                 } else if !suppress {
                     // No delimiter in line — output unchanged
                     unsafe {
-                        buf_extend(buf, &data[line_start..pos]);
+                        buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), pos - line_start));
                         buf_push(buf, line_delim);
                     }
                 }
@@ -1280,7 +1288,7 @@ fn process_nth_field_combined(
             has_delim = true;
             if field_idx == target_idx {
                 unsafe {
-                    buf_extend(buf, &data[field_start..pos]);
+                    buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start));
                     buf_push(buf, line_delim);
                 }
                 emitted = true;
@@ -1291,10 +1299,10 @@ fn process_nth_field_combined(
     }
 
     // Handle last line without trailing newline
-    if line_start < data.len() && !emitted {
+    if line_start < data_len && !emitted {
         if has_delim && field_idx == target_idx {
             unsafe {
-                buf_extend(buf, &data[field_start..data.len()]);
+                buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), data_len - field_start));
                 buf_push(buf, line_delim);
             }
         } else if has_delim {
@@ -1303,7 +1311,7 @@ fn process_nth_field_combined(
             }
         } else if !suppress {
             unsafe {
-                buf_extend(buf, &data[line_start..data.len()]);
+                buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), data_len - line_start));
                 buf_push(buf, line_delim);
             }
         }
@@ -1489,6 +1497,7 @@ fn process_single_field_chunk(
 
 /// Extract a single field from one line.
 /// Uses unsafe buf helpers — caller must ensure buf has capacity reserved.
+/// Raw pointer arithmetic eliminates per-field bounds checking.
 #[inline(always)]
 fn extract_single_field_line(
     line: &[u8],
@@ -1498,7 +1507,8 @@ fn extract_single_field_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    if line.is_empty() {
+    let len = line.len();
+    if len == 0 {
         if !suppress {
             buf.push(line_delim);
         }
@@ -1506,13 +1516,15 @@ fn extract_single_field_line(
     }
 
     // Ensure capacity for worst case (full line + newline)
-    buf.reserve(line.len() + 1);
+    buf.reserve(len + 1);
+
+    let base = line.as_ptr();
 
     // Ultra-fast path for first field: single memchr
     if target_idx == 0 {
         match memchr::memchr(delim, line) {
             Some(pos) => unsafe {
-                buf_extend(buf, &line[..pos]);
+                buf_extend(buf, std::slice::from_raw_parts(base, pos));
                 buf_push(buf, line_delim);
             },
             None => {
@@ -1535,7 +1547,7 @@ fn extract_single_field_line(
         has_delim = true;
         if field_idx == target_idx {
             unsafe {
-                buf_extend(buf, &line[field_start..pos]);
+                buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start));
                 buf_push(buf, line_delim);
             }
             return;
@@ -1556,7 +1568,7 @@ fn extract_single_field_line(
 
     if field_idx == target_idx {
         unsafe {
-            buf_extend(buf, &line[field_start..]);
+            buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), len - field_start));
             buf_push(buf, line_delim);
         }
     } else {
@@ -1566,6 +1578,7 @@ fn extract_single_field_line(
 
 /// Extract fields from a single line into the output buffer.
 /// Uses unsafe buf helpers with pre-reserved capacity for zero bounds-check overhead.
+/// Raw pointer arithmetic eliminates per-field bounds checking.
 #[inline(always)]
 fn extract_fields_to_buf(
     line: &[u8],
@@ -1595,6 +1608,7 @@ fn extract_fields_to_buf(
         buf.reserve(needed);
     }
 
+    let base = line.as_ptr();
     let mut field_num: usize = 1;
     let mut field_start: usize = 0;
     let mut first_output = true;
@@ -1607,7 +1621,7 @@ fn extract_fields_to_buf(
             if !first_output {
                 unsafe { buf_extend(buf, output_delim) };
             }
-            unsafe { buf_extend(buf, &line[field_start..delim_pos]) };
+            unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), delim_pos - field_start)) };
             first_output = false;
         }
 
@@ -1627,7 +1641,7 @@ fn extract_fields_to_buf(
         if !first_output {
             unsafe { buf_extend(buf, output_delim) };
         }
-        unsafe { buf_extend(buf, &line[field_start..len]) };
+        unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), len - field_start)) };
         first_output = false;
     }
 
@@ -1921,6 +1935,7 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
 }
 
 /// Process a chunk of data for byte/char extraction.
+/// Uses raw pointer arithmetic for the newline scan.
 fn process_bytes_chunk(
     data: &[u8],
     ranges: &[Range],
@@ -1929,16 +1944,19 @@ fn process_bytes_chunk(
     line_delim: u8,
     buf: &mut Vec<u8>,
 ) {
+    buf.reserve(data.len());
+    let base = data.as_ptr();
     let mut start = 0;
     for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), end_pos - start) };
         cut_bytes_to_buf(line, ranges, complement, output_delim, buf);
-        buf.push(line_delim);
+        unsafe { buf_push(buf, line_delim) };
         start = end_pos + 1;
     }
     if start < data.len() {
-        cut_bytes_to_buf(&data[start..], ranges, complement, output_delim, buf);
-        buf.push(line_delim);
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), data.len() - start) };
+        cut_bytes_to_buf(line, ranges, complement, output_delim, buf);
+        unsafe { buf_push(buf, line_delim) };
     }
 }
 
