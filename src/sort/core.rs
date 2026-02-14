@@ -633,6 +633,22 @@ impl Ord for MergeEntryOrd {
 }
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
+/// Software prefetch a cache line for reading.
+/// Hides memory latency by loading data into L1 cache before it's needed.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{x}]", x = in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
 /// Big-endian byte order ensures u64 comparison matches lexicographic order.
 #[inline]
 fn line_prefix(data: &[u8], start: usize, end: usize) -> u64 {
@@ -816,17 +832,7 @@ fn write_sorted_output(
         for j in 0..n {
             if j + 8 < n {
                 let (ps, _) = offsets[sorted_indices[j + 8]];
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch(dp.add(ps) as *const i8, 0);
-                }
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    let addr = dp.add(ps) as *const u8;
-                    std::arch::asm!("prfm pldl1keep, [{x}]", x = in(reg) addr, options(nostack, preserves_flags));
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                let _ = ps;
+                prefetch_read(unsafe { dp.add(ps) });
             }
             let (s, e) = offsets[sorted_indices[j]];
             let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
@@ -923,22 +929,9 @@ fn write_sorted_entries(
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         let n = entries.len();
         for j in 0..n {
-            // Prefetch data for entries 8 ahead to hide memory latency.
-            // After sort, entries access data in random order — prefetching
-            // ensures cache lines are loaded before they're needed.
             if j + 8 < n {
                 let (ps, _) = offsets[entries[j + 8].1];
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch(dp.add(ps) as *const i8, 0);
-                }
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    let addr = dp.add(ps) as *const u8;
-                    std::arch::asm!("prfm pldl1keep, [{x}]", x = in(reg) addr, options(nostack, preserves_flags));
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                let _ = ps;
+                prefetch_read(unsafe { dp.add(ps) });
             }
             let (s, e) = offsets[entries[j].1];
             let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
@@ -1693,16 +1686,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     if idx + pfx_dist < n {
                         let future = unsafe { *sptr.add(idx + pfx_dist) };
                         let fb = (future.0 >> 56) as usize;
-                        let fp = wpos[fb];
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            std::arch::x86_64::_mm_prefetch(
-                                tptr.add(fp) as *const i8,
-                                std::arch::x86_64::_MM_HINT_T0,
-                            );
-                        }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let _ = fp;
+                        prefetch_read(unsafe { tptr.add(wpos[fb]) as *const u8 });
                     }
                 }
             }
@@ -1791,6 +1775,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             const BATCH: usize = 512;
             let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
             while idx < n_sorted {
+                if idx + 8 < n_sorted {
+                    let ahead = if reverse {
+                        n_sorted - 1 - (idx + 8)
+                    } else {
+                        idx + 8
+                    };
+                    prefetch_read(unsafe { dp.add(sorted[ahead].1 as usize) });
+                }
                 let actual_idx = if reverse { n_sorted - 1 - idx } else { idx };
                 let (pfx, s, l) = sorted[actual_idx];
                 let su = s as usize;
@@ -1824,11 +1816,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
         } else if reverse {
             // Reverse: zero-copy writev directly from mmap data in reverse order.
-            // Eliminates ~110MB allocation for 100MB files.
+            // Prefetch 8 entries ahead to hide memory latency.
             let dp = data.as_ptr();
             const BATCH: usize = 512;
             let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            for &(_, s, l) in sorted.iter().rev() {
+            let n = sorted.len();
+            for j in 0..n {
+                if j + 8 < n {
+                    prefetch_read(unsafe { dp.add(sorted[n - 1 - (j + 8)].1 as usize) });
+                }
+                let (_, s, l) = sorted[n - 1 - j];
                 let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
                 slices.push(io::IoSlice::new(line));
                 slices.push(io::IoSlice::new(terminator));
@@ -1842,12 +1839,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
         } else {
             // Forward: zero-copy writev directly from mmap data.
-            // Eliminates ~110MB allocation (out_offsets + out_buf) for 100MB files.
-            // BufWriter(16MB) handles batching; writev syscall count is minimal.
+            // Prefetch 8 entries ahead to hide memory latency for random data access.
             let dp = data.as_ptr();
             const BATCH: usize = 512;
             let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            for &(_, s, l) in &sorted {
+            let n = sorted.len();
+            for j in 0..n {
+                if j + 8 < n {
+                    prefetch_read(unsafe { dp.add(sorted[j + 8].1 as usize) });
+                }
+                let (_, s, l) = sorted[j];
                 let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
                 slices.push(io::IoSlice::new(line));
                 slices.push(io::IoSlice::new(terminator));
