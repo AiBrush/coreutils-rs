@@ -1095,7 +1095,7 @@ fn delete_range_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = vec![0u8; STREAM_BUF];
+    let mut src = alloc_uninit_vec(STREAM_BUF);
     let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut src)?;
@@ -1136,14 +1136,15 @@ pub fn translate(
         return translate_range_stream(lo, hi, offset, reader, writer);
     }
 
-    // General case: IN-PLACE translation on a SINGLE 4MB buffer.
+    // General case: IN-PLACE translation on a SINGLE 16MB buffer.
     // This halves memory bandwidth vs the old separate src/dst approach:
-    // - Old: read into src (4MB), translate from src→dst (read 4MB + write 4MB), write dst (4MB) = 12MB
-    // - New: read into buf (4MB), translate in-place (read+write 4MB), write buf (4MB) = 8MB
+    // - Old: read into src, translate from src→dst (read + write), write dst = 12MB bandwidth
+    // - New: read into buf, translate in-place (read+write), write buf = 8MB bandwidth
     // The 8x-unrolled in-place translate avoids store-to-load forwarding stalls
     // because consecutive reads are 8 bytes apart (sequential), not aliased.
-    // Using 4MB buffer (vs 1MB) reduces syscall count from 10 to 3 for 10MB.
-    let mut buf = vec![0u8; STREAM_BUF];
+    // Using 16MB buffer = 1 read for 10MB input, minimizing syscall count.
+    // SAFETY: all bytes are written by read_full before being translated.
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1156,7 +1157,7 @@ pub fn translate(
 }
 
 /// Streaming SIMD range translation — single buffer, in-place transform.
-/// Uses 4MB buffer for fewer syscalls (translate is compute-light).
+/// Uses 16MB uninit buffer for fewer syscalls (translate is compute-light).
 fn translate_range_stream(
     lo: u8,
     hi: u8,
@@ -1164,7 +1165,7 @@ fn translate_range_stream(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1177,9 +1178,9 @@ fn translate_range_stream(
 }
 
 /// Pure passthrough: copy stdin to stdout without transformation.
-/// Uses a single 4MB buffer with direct read/write, no processing overhead.
+/// Uses a single 16MB uninit buffer with direct read/write, no processing overhead.
 fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut buf)?;
         if n == 0 {
@@ -1228,7 +1229,7 @@ pub fn translate_squeeze(
     // that the total is still a net win.
     let range_info = detect_range_offset(&table);
 
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
 
     loop {
@@ -1285,7 +1286,7 @@ pub fn delete(
     }
 
     let member = build_member_set(delete_chars);
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
 
     loop {
         let n = read_full(reader, &mut buf)?;
@@ -1343,7 +1344,7 @@ fn delete_single_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = vec![0u8; STREAM_BUF];
+    let mut src = alloc_uninit_vec(STREAM_BUF);
     let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut src)?;
@@ -1401,7 +1402,7 @@ fn delete_multi_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = vec![0u8; STREAM_BUF];
+    let mut src = alloc_uninit_vec(STREAM_BUF);
     let mut dst = alloc_uninit_vec(STREAM_BUF);
     loop {
         let n = read_full(reader, &mut src)?;
@@ -1465,7 +1466,7 @@ pub fn delete_squeeze(
 ) -> io::Result<()> {
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
 
     loop {
@@ -1508,7 +1509,7 @@ pub fn squeeze(
     }
 
     let member = build_member_set(squeeze_chars);
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
 
     loop {
@@ -1549,7 +1550,7 @@ fn squeeze_single_stream(
     // run length and collapse it to one occurrence.
     let pair = [ch, ch];
     let finder = memchr::memmem::Finder::new(&pair);
-    let mut buf = vec![0u8; STREAM_BUF];
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut was_squeeze_char = false;
 
     loop {
