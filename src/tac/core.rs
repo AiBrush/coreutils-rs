@@ -146,32 +146,36 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
             let estimated = chunk.len() / 40 + 64;
             let mut positions = Vec::with_capacity(estimated);
             for p in memchr::memchr_iter(sep, chunk) {
-                positions.push(chunk_start + p);
+                positions.push(p); // relative to chunk start
             }
 
-            // Fill output at the correct offset.
+            // Forward-read optimization: iterate positions FORWARD (cache-friendly
+            // sequential reads from mmap) and write BACKWARD into the output region.
+            // This exploits hardware prefetching for the source reads, which is the
+            // bottleneck since mmap pages may not all be in L2/L3 cache.
+            let chunk_len = chunk_end - chunk_start;
             let out_base = unsafe { (optr_addr as *mut u8).add(chunk_out_off[chunk_idx]) };
-            let src = iptr_addr as *const u8;
-            let mut wpos = 0usize;
-            let mut end = chunk_end;
+            let src = unsafe { (iptr_addr as *const u8).add(chunk_start) };
+            let mut wp = chunk_len; // write pointer at end, working backward
 
-            for &pos in positions.iter().rev() {
-                let rec_start = pos + 1;
-                let len = end - rec_start;
-                if len > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src.add(rec_start), out_base.add(wpos), len);
-                    }
-                    wpos += len;
+            // First records (before and between separators), forward order.
+            let mut prev_end = 0usize;
+            for &pos in positions.iter() {
+                let rec_end = pos + 1; // include separator
+                let len = rec_end - prev_end;
+                wp -= len;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(prev_end), out_base.add(wp), len);
                 }
-                end = rec_start;
+                prev_end = rec_end;
             }
 
-            // Remaining prefix within chunk (before first separator).
-            if end > chunk_start {
-                let len = end - chunk_start;
+            // Last record (after last separator to end of chunk).
+            if prev_end < chunk_len {
+                let len = chunk_len - prev_end;
+                wp -= len;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.add(chunk_start), out_base.add(wpos), len);
+                    std::ptr::copy_nonoverlapping(src.add(prev_end), out_base.add(wp), len);
                 }
             }
         });
@@ -231,30 +235,38 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
             let estimated = chunk.len() / 40 + 64;
             let mut positions = Vec::with_capacity(estimated);
             for p in memchr::memchr_iter(sep, chunk) {
-                positions.push(chunk_start + p);
+                positions.push(p); // relative to chunk start
             }
 
+            // Forward-read optimization: iterate FORWARD, write BACKWARD.
+            // Before mode: separator is attached to the START of the next record.
+            // Records: data[0..pos[0]], data[pos[0]..pos[1]], ..., data[pos[N-1]..chunk_len]
+            let chunk_len = chunk_end - chunk_start;
             let out_base = unsafe { (optr_addr as *mut u8).add(chunk_out_off[chunk_idx]) };
-            let src = iptr_addr as *const u8;
-            let mut wpos = 0usize;
-            let mut end = chunk_end;
+            let src = unsafe { (iptr_addr as *const u8).add(chunk_start) };
+            let mut wp = chunk_len;
 
-            // Before mode: separator attached to the NEXT record.
-            for &pos in positions.iter().rev() {
-                if pos < end {
-                    let len = end - pos;
+            // Process records forward: each record starts at prev_start
+            // and ends at the next separator position.
+            let mut prev_start = 0usize;
+            for &pos in positions.iter() {
+                // Record = data[prev_start..pos]
+                let len = pos - prev_start;
+                if len > 0 {
+                    wp -= len;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.add(pos), out_base.add(wpos), len);
+                        std::ptr::copy_nonoverlapping(src.add(prev_start), out_base.add(wp), len);
                     }
-                    wpos += len;
                 }
-                end = pos;
+                prev_start = pos;
             }
 
-            if end > chunk_start {
-                let len = end - chunk_start;
+            // Last record (from last separator to end of chunk).
+            if prev_start < chunk_len {
+                let len = chunk_len - prev_start;
+                wp -= len;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.add(chunk_start), out_base.add(wpos), len);
+                    std::ptr::copy_nonoverlapping(src.add(prev_start), out_base.add(wp), len);
                 }
             }
         });
@@ -262,10 +274,9 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
     out.write_all(&output)
 }
 
-/// After-separator mode: contiguous output buffer + single write_all.
-/// Builds the reversed output into a pre-allocated buffer, then writes
-/// it in one syscall. Eliminates per-entry writev overhead for dense
-/// separator patterns (typical text files with ~40 byte lines).
+/// After-separator mode: forward-read + backward-write for cache-friendly access.
+/// Iterates source data forward (hardware prefetching) and writes to the output
+/// buffer from the end backward, producing reversed record order.
 fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions = collect_positions_byte(data, sep);
 
@@ -273,7 +284,6 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
         return out.write_all(data);
     }
 
-    // Build contiguous output buffer with records in reverse order.
     let mut output = Vec::with_capacity(data.len());
     #[allow(clippy::uninit_vec)]
     unsafe {
@@ -281,33 +291,33 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
     }
     let op: *mut u8 = output.as_mut_ptr();
     let sp = data.as_ptr();
-    let mut wp = 0;
-    let mut end = data.len();
+    let mut wp = data.len(); // start at end, work backward
 
-    for &pos in positions.iter().rev() {
-        let rec_start = pos + 1;
-        let len = end - rec_start;
-        if len > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(sp.add(rec_start), op.add(wp), len);
-            }
-            wp += len;
-        }
-        end = rec_start;
-    }
-
-    // Remaining prefix before the first separator
-    if end > 0 {
+    // Forward iteration: cache-friendly sequential reads from source.
+    let mut prev_end = 0usize;
+    for &pos in positions.iter() {
+        let rec_end = pos + 1; // include separator
+        let len = rec_end - prev_end;
+        wp -= len;
         unsafe {
-            std::ptr::copy_nonoverlapping(sp, op.add(wp), end);
+            std::ptr::copy_nonoverlapping(sp.add(prev_end), op.add(wp), len);
         }
-        wp += end;
+        prev_end = rec_end;
     }
 
-    out.write_all(&output[..wp])
+    // Last record (after last separator).
+    if prev_end < data.len() {
+        let len = data.len() - prev_end;
+        wp -= len;
+        unsafe {
+            std::ptr::copy_nonoverlapping(sp.add(prev_end), op.add(wp), len);
+        }
+    }
+
+    out.write_all(&output[wp..])
 }
 
-/// Before-separator mode: contiguous output buffer + single write_all.
+/// Before-separator mode: forward-read + backward-write for cache-friendly access.
 fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions = collect_positions_byte(data, sep);
 
@@ -322,28 +332,33 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
     }
     let op: *mut u8 = output.as_mut_ptr();
     let sp = data.as_ptr();
-    let mut wp = 0;
-    let mut end = data.len();
+    let mut wp = data.len(); // start at end, work backward
 
-    for &pos in positions.iter().rev() {
-        if pos < end {
-            let len = end - pos;
+    // Before mode: separator attached to START of next record.
+    // Records: data[0..pos[0]], data[pos[0]..pos[1]], ..., data[pos[N-1]..len]
+    // Forward iteration for cache-friendly reads.
+    let mut prev_start = 0usize;
+    for &pos in positions.iter() {
+        let len = pos - prev_start;
+        if len > 0 {
+            wp -= len;
             unsafe {
-                std::ptr::copy_nonoverlapping(sp.add(pos), op.add(wp), len);
+                std::ptr::copy_nonoverlapping(sp.add(prev_start), op.add(wp), len);
             }
-            wp += len;
         }
-        end = pos;
+        prev_start = pos;
     }
 
-    if end > 0 {
+    // Last record (from last separator to end).
+    if prev_start < data.len() {
+        let len = data.len() - prev_start;
+        wp -= len;
         unsafe {
-            std::ptr::copy_nonoverlapping(sp, op.add(wp), end);
+            std::ptr::copy_nonoverlapping(sp.add(prev_start), op.add(wp), len);
         }
-        wp += end;
     }
 
-    out.write_all(&output[..wp])
+    out.write_all(&output[wp..])
 }
 
 /// Reverse records using a multi-byte string separator.

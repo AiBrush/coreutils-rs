@@ -10,7 +10,7 @@ const MAX_IOV: usize = 1024;
 /// are compute-light (single table lookup or bitset check per byte), so the
 /// bottleneck is I/O syscalls, not cache pressure. 16MB buffer means only
 /// 1 read()/write() syscall pair for a 10MB input, minimizing syscall overhead.
-/// For piped input, read_full retries partial reads to fill the entire buffer.
+/// For piped input, read_once processes data immediately for pipelining.
 /// This applies to ALL streaming modes (delete, squeeze, translate).
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
@@ -2375,7 +2375,7 @@ fn delete_range_streaming(
     // and its ~4000 page faults. For 10MB piped input, saves ~1.2ms.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2471,12 +2471,62 @@ unsafe fn delete_range_inplace_avx2(buf: &mut [u8], n: usize, lo: u8, hi: u8) ->
                 }
                 wp += 32;
             } else if del_mask != 0xFFFFFFFF {
-                // Mixed: branchless scalar compaction for this block
-                for j in 0..32 {
-                    let b = *ptr.add(ri + j);
-                    *ptr.add(wp) = b;
-                    wp += (b < lo || b > hi) as usize;
+                // Mixed block: pshufb-based 8-byte compaction.
+                // Process 4 × 8-byte sub-chunks using COMPACT_LUT + pshufb.
+                // Each sub-chunk: load 8 bytes into register (safe for overlap),
+                // shuffle kept bytes to front, store. 4 SIMD ops vs 32 scalar.
+                let keep_mask = !del_mask;
+                let m0 = keep_mask as u8;
+                let m1 = (keep_mask >> 8) as u8;
+                let m2 = (keep_mask >> 16) as u8;
+                let m3 = (keep_mask >> 24) as u8;
+
+                let c0 = m0.count_ones() as usize;
+                let c1 = m1.count_ones() as usize;
+                let c2 = m2.count_ones() as usize;
+                let c3 = m3.count_ones() as usize;
+
+                // Sub-chunk 0: bytes 0-7
+                if m0 == 0xFF {
+                    std::ptr::copy(ptr.add(ri), ptr.add(wp), 8);
+                } else if m0 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m0 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp) as *mut _, out_v);
                 }
+
+                // Sub-chunk 1: bytes 8-15
+                if m1 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 8), ptr.add(wp + c0), 8);
+                } else if m1 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 8) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m1 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0) as *mut _, out_v);
+                }
+
+                // Sub-chunk 2: bytes 16-23
+                if m2 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 16), ptr.add(wp + c0 + c1), 8);
+                } else if m2 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 16) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m2 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0 + c1) as *mut _, out_v);
+                }
+
+                // Sub-chunk 3: bytes 24-31
+                if m3 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 24), ptr.add(wp + c0 + c1 + c2), 8);
+                } else if m3 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 24) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m3 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0 + c1 + c2) as *mut _, out_v);
+                }
+
+                wp += c0 + c1 + c2 + c3;
             }
             // del_mask == 0xFFFFFFFF: all deleted, skip entirely
             ri += 32;
@@ -2530,10 +2580,10 @@ pub fn translate(
     // The 8x-unrolled in-place translate avoids store-to-load forwarding stalls
     // because consecutive reads are 8 bytes apart (sequential), not aliased.
     // Using 16MB buffer = 1 read for 10MB input, minimizing syscall count.
-    // SAFETY: all bytes are written by read_full before being translated.
+    // SAFETY: all bytes are written by read_once before being translated.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2554,7 +2604,7 @@ fn translate_range_stream(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2575,7 +2625,7 @@ fn translate_range_to_constant_stream(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2590,7 +2640,7 @@ fn translate_range_to_constant_stream(
 fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2599,26 +2649,20 @@ fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Re
     Ok(())
 }
 
-/// Read as many bytes as possible into buf, retrying on partial reads.
-/// Fast path: first read() often fills the entire buffer for regular files.
+/// Single-read for pipelining: process data immediately after first read()
+/// instead of blocking to fill the entire buffer. This enables cat|ftr
+/// pipelining: while ftr processes the first chunk, cat continues writing
+/// to the pipe. For 10MB piped input with 8MB pipe buffer, this saves
+/// ~0.5-1ms by overlapping cat's final writes with ftr's processing.
 #[inline]
-fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    // Fast path: first read() usually fills the entire buffer for regular files
-    let n = reader.read(buf)?;
-    if n == buf.len() || n == 0 {
-        return Ok(n);
-    }
-    // Slow path: partial read — retry to fill buffer (pipes, slow devices)
-    let mut total = n;
-    while total < buf.len() {
-        match reader.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
+fn read_once(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    Ok(total)
 }
 
 pub fn translate_squeeze(
@@ -2651,7 +2695,7 @@ pub fn translate_squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2739,7 +2783,7 @@ fn translate_squeeze_single_ch(
     let mut was_squeeze_char = false;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2836,7 +2880,7 @@ pub fn delete(
     let mut buf = alloc_uninit_vec(STREAM_BUF);
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2895,7 +2939,7 @@ fn delete_single_streaming(
     // gap-copy backward in the same buffer. Saves 16MB dst allocation.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2952,7 +2996,7 @@ fn delete_multi_streaming(
     // gap-copy backward in the same buffer. Saves 16MB dst allocation.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3017,7 +3061,7 @@ pub fn delete_squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3100,7 +3144,7 @@ pub fn squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3148,7 +3192,7 @@ fn squeeze_multi_stream(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3237,7 +3281,7 @@ fn squeeze_single_stream(
     let mut was_squeeze_char = false;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }

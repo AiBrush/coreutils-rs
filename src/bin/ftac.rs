@@ -116,9 +116,20 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // read_file sets MADV_SEQUENTIAL which is correct for the forward
-        // SIMD scan phase. Pages stay cached for the reverse output phase.
-        // MADV_WILLNEED is already set by read_file to pre-fault pages.
+        // Override MADV_SEQUENTIAL from read_file: tac needs reverse access
+        // after the forward scan. SEQUENTIAL tells the kernel to drop pages
+        // behind the read pointer, which would evict pages needed during the
+        // reverse copy phase. MADV_RANDOM keeps all pages resident.
+        #[cfg(target_os = "linux")]
+        {
+            let ptr = data.as_ptr() as *mut libc::c_void;
+            let len = data.len();
+            if len > 0 {
+                unsafe {
+                    libc::madvise(ptr, len, libc::MADV_RANDOM);
+                }
+            }
+        }
 
         let result = if cli.regex {
             let bytes: &[u8] = &data;
