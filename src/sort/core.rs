@@ -1158,7 +1158,8 @@ fn radix_sort_numeric_entries(
                 }
                 if j - i > 1 {
                     sorted[i..j].sort_unstable_by(|a, b| {
-                        data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                        data[offsets[a.1].0..offsets[a.1].1]
+                            .cmp(&data[offsets[b.1].0..offsets[b.1].1])
                     });
                 }
                 i = j;
@@ -1813,7 +1814,9 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             };
             if is_sorted {
                 // Data is already sorted by numeric value
-                if !config.unique && !config.zero_terminated && memchr::memchr(b'\r', data).is_none()
+                if !config.unique
+                    && !config.zero_terminated
+                    && memchr::memchr(b'\r', data).is_none()
                 {
                     if data.last() == Some(&b'\n') {
                         writer.write_all(data)?;

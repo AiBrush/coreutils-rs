@@ -1,13 +1,12 @@
-use std::io::{self, BufWriter, Write};
+use std::io::{self, IoSlice, Write};
 
-/// Buffer size for the BufWriter wrapping. 16MB keeps within L3 cache
-/// while ensuring only a few write syscalls for even 100MB+ files.
-const BUF_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum number of IoSlice entries per write_vectored call.
+/// Linux IOV_MAX is 1024, so we batch at this limit.
+const IOV_BATCH: usize = 1024;
 
 /// Reverse records separated by a single byte.
-/// Zero-copy: writes directly from the input data in reverse record order
-/// through a BufWriter, eliminating the need for a separate output buffer.
-/// For 100MB input this avoids 100MB alloc + 100MB memcpy.
+/// Zero-copy: uses write_vectored (writev) to output slices from the original
+/// mmap data in reverse record order. No output buffer allocation, no memcpy.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -80,8 +79,9 @@ pub fn tac_bytes_owned(
 }
 
 /// After-separator mode: zero-copy write from mmap in reverse record order.
-/// Uses a BufWriter to coalesce the small writes into large kernel writes.
-/// No output buffer allocation, no memcpy — writes directly from input data.
+/// Builds IoSlice arrays pointing into the original data, then writes them
+/// in batches using write_vectored (writev syscall). No buffer allocation,
+/// no memcpy — the kernel reads directly from the mmap pages.
 fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     // Collect separator positions with forward SIMD memchr (single fast pass).
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
@@ -91,31 +91,30 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         return out.write_all(data);
     }
 
-    // Wrap in BufWriter to coalesce writes. This avoids one-syscall-per-record.
-    let mut bw = BufWriter::with_capacity(BUF_SIZE, out);
+    // Build IoSlice entries in reverse record order.
+    // Each record is data[prev_sep+1 .. cur_sep+1) for after-mode.
+    // We output: last record first, first record last.
+    let num_slices = positions.len() + 1; // +1 for the segment before first separator
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(num_slices);
 
-    // After mode: records split at separator positions. Iterate in reverse,
-    // writing the data between each pair of separator+1 boundaries.
-    // This is the same logic as the old contiguous buffer copy, but writes
-    // directly to BufWriter instead of copy_nonoverlapping to an output Vec.
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
-            bw.write_all(&data[rec_start..end])?;
+            slices.push(IoSlice::new(&data[rec_start..end]));
         }
         end = rec_start;
     }
     // Remaining prefix before the first separator
     if end > 0 {
-        bw.write_all(&data[..end])?;
+        slices.push(IoSlice::new(&data[..end]));
     }
 
-    bw.flush()
+    // Write IoSlice batches using write_vectored (writev)
+    write_ioslices(out, &slices)
 }
 
 /// Before-separator mode: zero-copy write from mmap in reverse record order.
-/// Uses a BufWriter to coalesce the small writes into large kernel writes.
 fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
@@ -123,28 +122,72 @@ fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         return out.write_all(data);
     }
 
-    let mut bw = BufWriter::with_capacity(BUF_SIZE, out);
+    let num_slices = positions.len() + 1;
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(num_slices);
 
-    // Before mode: separator belongs to the following record.
-    // Records are: [0..sep[0]), [sep[0]..sep[1]), ..., [sep[n-1]..data.len())
-    // Output in reverse: last record first.
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
-            bw.write_all(&data[pos..end])?;
+            slices.push(IoSlice::new(&data[pos..end]));
         }
         end = pos;
     }
-    // Remaining prefix before first separator
     if end > 0 {
-        bw.write_all(&data[..end])?;
+        slices.push(IoSlice::new(&data[..end]));
     }
 
-    bw.flush()
+    write_ioslices(out, &slices)
+}
+
+/// Write a slice array in batches of IOV_BATCH using write_vectored.
+/// Handles partial writes correctly by advancing past consumed slices.
+fn write_ioslices(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < slices.len() {
+        let end = (offset + IOV_BATCH).min(slices.len());
+        let batch = &slices[offset..end];
+        let expected: usize = batch.iter().map(|s| s.len()).sum();
+        if expected == 0 {
+            offset = end;
+            continue;
+        }
+
+        let n = out.write_vectored(batch)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_vectored returned 0",
+            ));
+        }
+
+        if n >= expected {
+            // All slices in this batch were consumed
+            offset = end;
+        } else {
+            // Partial write — advance past fully consumed slices,
+            // then fall back to write_all for the remainder.
+            let mut consumed = n;
+            for (i, slice) in batch.iter().enumerate() {
+                if consumed >= slice.len() {
+                    consumed -= slice.len();
+                } else {
+                    // Partial slice — write remaining
+                    out.write_all(&slice[consumed..])?;
+                    // Write remaining full slices
+                    for s in &batch[i + 1..] {
+                        out.write_all(s)?;
+                    }
+                    break;
+                }
+            }
+            offset = end;
+        }
+    }
+    Ok(())
 }
 
 /// Reverse records using a multi-byte string separator.
-/// Uses chunk-based forward SIMD-accelerated memmem + zero-copy output.
+/// Uses chunk-based forward SIMD-accelerated memmem + zero-copy writev output.
 ///
 /// For single-byte separators, delegates to tac_bytes which uses memchr (faster).
 pub fn tac_string_separator(
@@ -171,7 +214,7 @@ pub fn tac_string_separator(
 }
 
 /// Multi-byte string separator, after mode (separator at end of record).
-/// Zero-copy: writes directly from input data in reverse record order.
+/// Zero-copy writev from input data in reverse record order.
 fn tac_string_after(
     data: &[u8],
     separator: &[u8],
@@ -184,24 +227,24 @@ fn tac_string_after(
         return out.write_all(data);
     }
 
-    let mut bw = BufWriter::with_capacity(BUF_SIZE, out);
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 1);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + sep_len;
         if rec_start < end {
-            bw.write_all(&data[rec_start..end])?;
+            slices.push(IoSlice::new(&data[rec_start..end]));
         }
         end = rec_start;
     }
     if end > 0 {
-        bw.write_all(&data[..end])?;
+        slices.push(IoSlice::new(&data[..end]));
     }
 
-    bw.flush()
+    write_ioslices(out, &slices)
 }
 
 /// Multi-byte string separator, before mode (separator at start of record).
-/// Zero-copy: writes directly from input data in reverse record order.
+/// Zero-copy writev from input data in reverse record order.
 fn tac_string_before(
     data: &[u8],
     separator: &[u8],
@@ -214,19 +257,19 @@ fn tac_string_before(
         return out.write_all(data);
     }
 
-    let mut bw = BufWriter::with_capacity(BUF_SIZE, out);
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 1);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
-            bw.write_all(&data[pos..end])?;
+            slices.push(IoSlice::new(&data[pos..end]));
         }
         end = pos;
     }
     if end > 0 {
-        bw.write_all(&data[..end])?;
+        slices.push(IoSlice::new(&data[..end]));
     }
 
-    bw.flush()
+    write_ioslices(out, &slices)
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
@@ -261,7 +304,7 @@ fn find_regex_matches_backward(data: &[u8], re: &regex::bytes::Regex) -> Vec<(us
 }
 
 /// Reverse records using a regex separator.
-/// Zero-copy: writes directly from input data via BufWriter.
+/// Zero-copy writev from input data.
 pub fn tac_regex_separator(
     data: &[u8],
     pattern: &str,
@@ -323,13 +366,12 @@ pub fn tac_regex_separator(
         }
     }
 
-    // Zero-copy output via BufWriter
-    let mut bw = BufWriter::with_capacity(BUF_SIZE, out);
-    for &(start, len) in &records {
-        if len > 0 {
-            bw.write_all(&data[start..start + len])?;
-        }
-    }
+    // Build IoSlice array and write with writev
+    let slices: Vec<IoSlice<'_>> = records
+        .iter()
+        .filter(|&&(_, len)| len > 0)
+        .map(|&(start, len)| IoSlice::new(&data[start..start + len]))
+        .collect();
 
-    bw.flush()
+    write_ioslices(out, &slices)
 }
