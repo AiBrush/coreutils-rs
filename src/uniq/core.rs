@@ -1367,52 +1367,88 @@ fn process_count_fast_singlepass(
 }
 
 /// Fast single-pass for case-insensitive (-i) default mode.
-/// Same logic as process_default_sequential but uses eq_ignore_ascii_case.
+/// Uses run-tracking zero-copy output and write_vectored batching.
+/// Includes speculative line-end detection and length-based early rejection.
 fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
-    let mut prev_start: usize = 0;
-    let mut prev_end: usize;
+    let data_len = data.len();
+    let base = data.as_ptr();
 
-    match memchr::memchr(term, data) {
-        Some(pos) => {
-            prev_end = pos;
-        }
+    let first_end = match memchr::memchr(term, data) {
+        Some(pos) => pos,
         None => {
             writer.write_all(data)?;
             return writer.write_all(&[term]);
         }
-    }
+    };
 
-    // Write first line
-    writer.write_all(&data[..prev_end + 1])?;
+    let mut prev_start: usize = 0;
+    let mut prev_len = first_end;
 
-    let mut cur_start = prev_end + 1;
+    // Run-tracking: flush contiguous regions from the original data.
+    let mut run_start: usize = 0;
+    let mut cur_start = first_end + 1;
+    let mut _last_output_end = first_end + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
-        let prev_content = &data[prev_start..prev_end];
-        let cur_content = &data[cur_start..cur_end];
+        let cur_len = cur_end - cur_start;
 
-        if !lines_equal_case_insensitive(prev_content, cur_content) {
-            // Different line — write it
-            if cur_end < data.len() {
-                writer.write_all(&data[cur_start..cur_end + 1])?;
-            } else {
-                writer.write_all(&data[cur_start..cur_end])?;
-                writer.write_all(&[term])?;
+        // Length-based early rejection before expensive case-insensitive compare
+        let is_dup = cur_len == prev_len
+            && unsafe {
+                let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                a.eq_ignore_ascii_case(b)
+            };
+
+        if is_dup {
+            // Duplicate — flush current run up to this line, skip it
+            if run_start < cur_start {
+                writer.write_all(&data[run_start..cur_start])?;
             }
+            run_start = if cur_end < data_len {
+                cur_end + 1
+            } else {
+                cur_end
+            };
+        } else {
             prev_start = cur_start;
-            prev_end = cur_end;
+            prev_len = cur_len;
+            _last_output_end = if cur_end < data_len {
+                cur_end + 1
+            } else {
+                cur_end
+            };
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
         }
+    }
+
+    // Flush remaining run
+    if run_start < data_len {
+        writer.write_all(&data[run_start..data_len])?;
+    }
+    // Ensure trailing terminator
+    if !data.is_empty() && data[data_len - 1] != term {
+        writer.write_all(&[term])?;
     }
 
     Ok(())
@@ -1566,7 +1602,12 @@ fn process_count_ci_singlepass(
             }
         };
 
-        if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        // Length-based early rejection before expensive case-insensitive compare
+        let is_dup = cur_len == prev_len
+            && data[prev_start..prev_end].eq_ignore_ascii_case(&data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
             let should_print = if is_default {
@@ -1587,7 +1628,7 @@ fn process_count_ci_singlepass(
             }
             prev_start = cur_start;
             prev_end = cur_end;
-            prev_len = cur_end - cur_start;
+            prev_len = cur_len;
             count = 1;
         }
 
