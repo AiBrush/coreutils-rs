@@ -876,22 +876,34 @@ fn write_sorted_output(
     Ok(())
 }
 
-/// Write all IoSlices, handling partial writes.
+/// Write all IoSlices to the writer, handling partial writes correctly.
+/// Advances past fully-consumed slices on each iteration.
 fn write_all_vectored(writer: &mut impl Write, slices: &[io::IoSlice<'_>]) -> io::Result<()> {
-    let total: usize = slices.iter().map(|s| s.len()).sum();
-    let mut written = 0usize;
-    while written < total {
-        let n = writer.write_vectored(slices)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write_vectored returned 0",
-            ));
-        }
-        written += n;
-        // BufWriter will typically consume all in one call, so we break early
-        if written >= total {
-            break;
+    // Fast path: single write_vectored call usually consumes everything
+    // when backed by BufWriter with a large buffer.
+    let n = writer.write_vectored(slices)?;
+    let expected: usize = slices.iter().map(|s| s.len()).sum();
+    if n >= expected {
+        return Ok(());
+    }
+    if n == 0 && expected > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "write_vectored returned 0",
+        ));
+    }
+    // Slow path: partial write — fall back to write_all per remaining slice.
+    // Find which slices were fully consumed and where the partial one starts.
+    let mut consumed = n;
+    for slice in slices {
+        if consumed == 0 {
+            writer.write_all(slice)?;
+        } else if consumed >= slice.len() {
+            consumed -= slice.len();
+        } else {
+            // Partial slice: write remaining portion
+            writer.write_all(&slice[consumed..])?;
+            consumed = 0;
         }
     }
     Ok(())
