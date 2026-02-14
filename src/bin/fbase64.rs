@@ -167,13 +167,12 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
             return b64::decode_owned(&mut data, cli.ignore_garbage, out);
         }
 
-        // For piped stdin: read ALL input first with raw read_stdin (64MB pre-alloc,
-        // zero Vec growth overhead), then decode the entire buffer at once.
-        // This enables parallel decode for large inputs and eliminates the streaming
-        // carry-over/chunking overhead. For 10MB base64 input, this is:
-        // 1 batch read -> 1 whitespace strip -> 1 parallel decode -> 1 write.
-        let mut data = coreutils_rs::common::io::read_stdin()?;
-        return b64::decode_owned(&mut data, cli.ignore_garbage, out);
+        // For piped stdin: use streaming decode to avoid 64MB read_stdin pre-alloc.
+        // decode_stream reads 16MB chunks, strips whitespace with SIMD memchr2,
+        // and decodes in-place. For 10MB input this processes everything in 1 chunk.
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        return b64::decode_stream(&mut reader, cli.ignore_garbage, out);
     }
 
     // For encode: try mmap for zero-copy stdin when redirected from a file
