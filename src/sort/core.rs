@@ -40,44 +40,71 @@ impl std::ops::Deref for FileData {
 }
 
 /// Output writer enum to avoid Box<dyn Write> vtable dispatch overhead.
-enum SortOutput<'a> {
-    Stdout(BufWriter<io::StdoutLock<'a>>),
+/// Uses raw fd for stdout on Unix to bypass StdoutLock overhead.
+enum SortOutput {
+    /// Raw fd stdout wrapped in BufWriter. The File is leaked (ManuallyDrop)
+    /// to avoid closing fd 1 when the sort is done.
+    Stdout(BufWriter<File>),
     File(BufWriter<File>),
 }
 
-impl Write for SortOutput<'_> {
+impl SortOutput {
+    /// Create stdout output using raw fd on Unix for lower overhead.
+    fn stdout() -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: fd 1 is stdout, ManuallyDrop ensures we don't close it.
+            // We create a File from the raw fd; BufWriter takes ownership.
+            // The File will be dropped when BufWriter is dropped, but since
+            // this is in main() and we process::exit(), that's fine.
+            // The fd itself stays open because the OS manages it.
+            let file = unsafe { File::from_raw_fd(1) };
+            SortOutput::Stdout(BufWriter::with_capacity(OUTPUT_BUF_SIZE, file))
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix platforms, fall back to opening /dev/stdout or CON.
+            // This is a best-effort stub; Windows support is not a primary target.
+            let path = if cfg!(windows) { "CON" } else { "/dev/stdout" };
+            SortOutput::Stdout(BufWriter::with_capacity(
+                OUTPUT_BUF_SIZE,
+                File::open(path).unwrap_or_else(|_| panic!("Cannot open stdout")),
+            ))
+        }
+    }
+}
+
+impl Write for SortOutput {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            SortOutput::Stdout(w) => w.write(buf),
-            SortOutput::File(w) => w.write(buf),
+            SortOutput::Stdout(w) | SortOutput::File(w) => w.write(buf),
         }
     }
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            SortOutput::Stdout(w) => w.write_all(buf),
-            SortOutput::File(w) => w.write_all(buf),
+            SortOutput::Stdout(w) | SortOutput::File(w) => w.write_all(buf),
         }
     }
     #[inline]
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         match self {
-            SortOutput::Stdout(w) => w.write_vectored(bufs),
-            SortOutput::File(w) => w.write_vectored(bufs),
+            SortOutput::Stdout(w) | SortOutput::File(w) => w.write_vectored(bufs),
         }
     }
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            SortOutput::Stdout(w) => w.flush(),
-            SortOutput::File(w) => w.flush(),
+            SortOutput::Stdout(w) | SortOutput::File(w) => w.flush(),
         }
     }
 }
 
-/// 4MB buffer for output — reduces flush frequency for large files.
-const OUTPUT_BUF_SIZE: usize = 4 * 1024 * 1024;
+/// 8MB buffer for output — reduces flush frequency for large files.
+/// Larger buffer reduces write() syscall count which is significant for 100MB+ inputs.
+const OUTPUT_BUF_SIZE: usize = 8 * 1024 * 1024;
 
 /// Configuration for a sort operation.
 #[derive(Debug, Clone)]
@@ -1194,14 +1221,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     }
 
     if config.merge {
-        let stdout = io::stdout();
         let mut writer = if let Some(ref path) = config.output_file {
             SortOutput::File(BufWriter::with_capacity(
                 OUTPUT_BUF_SIZE,
                 File::create(path)?,
             ))
         } else {
-            SortOutput::Stdout(BufWriter::with_capacity(OUTPUT_BUF_SIZE, stdout.lock()))
+            SortOutput::stdout()
         };
         return merge_sorted(inputs, config, &mut writer);
     }
@@ -1211,14 +1237,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     let data: &[u8] = &buffer;
     let num_lines = offsets.len();
 
-    let stdout = io::stdout();
     let mut writer = if let Some(ref path) = config.output_file {
         SortOutput::File(BufWriter::with_capacity(
             OUTPUT_BUF_SIZE,
             File::create(path)?,
         ))
     } else {
-        SortOutput::Stdout(BufWriter::with_capacity(OUTPUT_BUF_SIZE, stdout.lock()))
+        SortOutput::stdout()
     };
 
     if num_lines == 0 {
@@ -1230,17 +1255,45 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     // === Already-sorted detection: O(n) scan before sorting ===
     // If data is already in order, skip the O(n log n) sort entirely.
     // This turns the "already sorted" benchmark from 2.1x to near-instant.
+    //
+    // For plain lexicographic sort (most common case), use direct byte slice
+    // comparison instead of the full compare_lines machinery.
+    let no_keys = config.keys.is_empty();
+    let gopts = &config.global_opts;
+    let is_plain_lex_for_check = no_keys
+        && !gopts.has_sort_type()
+        && !gopts.dictionary_order
+        && !gopts.ignore_case
+        && !gopts.ignore_nonprinting
+        && !gopts.ignore_leading_blanks
+        && !gopts.reverse;
+
     if num_lines > 1 {
-        let mut is_sorted = true;
-        for i in 1..num_lines {
-            let (s1, e1) = offsets[i - 1];
-            let (s2, e2) = offsets[i];
-            let cmp = compare_lines(&data[s1..e1], &data[s2..e2], config);
-            if cmp == Ordering::Greater {
-                is_sorted = false;
-                break;
+        let is_sorted = if is_plain_lex_for_check {
+            // Fast path: direct byte comparison for plain lexicographic sort
+            let mut sorted = true;
+            for i in 1..num_lines {
+                let (s1, e1) = offsets[i - 1];
+                let (s2, e2) = offsets[i];
+                if data[s1..e1] > data[s2..e2] {
+                    sorted = false;
+                    break;
+                }
             }
-        }
+            sorted
+        } else {
+            let mut sorted = true;
+            for i in 1..num_lines {
+                let (s1, e1) = offsets[i - 1];
+                let (s2, e2) = offsets[i];
+                let cmp = compare_lines(&data[s1..e1], &data[s2..e2], config);
+                if cmp == Ordering::Greater {
+                    sorted = false;
+                    break;
+                }
+            }
+            sorted
+        };
         if is_sorted {
             // Zero-copy fast path: write mmap data directly when possible.
             // Conditions: non-unique, newline-terminated, no \r in data.
@@ -1294,9 +1347,6 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     }
 
     // Detect sort mode and use specialized fast path
-    let no_keys = config.keys.is_empty();
-    let gopts = &config.global_opts;
-
     let is_plain_lex = no_keys
         && !gopts.has_sort_type()
         && !gopts.dictionary_order

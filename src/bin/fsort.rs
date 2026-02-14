@@ -204,10 +204,11 @@ fn main() {
     };
 
     if let Err(e) = sort_and_output(&inputs, &config) {
-        // SIGPIPE is reset to SIG_DFL, so broken pipe kills the process
-        // before we get here. This is a fallback for edge cases.
+        // SIGPIPE is reset to SIG_DFL, so broken pipe usually kills the process
+        // before we get here. This is a fallback for edge cases (e.g., BufWriter
+        // catches the error during flush). GNU sort silently exits on SIGPIPE.
         if e.kind() == std::io::ErrorKind::BrokenPipe {
-            process::exit(2);
+            process::exit(0);
         }
         eprintln!("sort: {}", io_error_msg(&e));
         process::exit(2);

@@ -29,28 +29,21 @@ pub struct WcCounts {
 // (NUL, control chars, invalid UTF-8) do NOT break words.
 // Example: "hello\x00world" is 1 word (NUL is transparent), not 2.
 
-/// 3-state byte classification for C/POSIX locale.
-/// In C locale, mbrtowc() fails for bytes >= 0x80, making them transparent.
-/// Only printable ASCII (0x21-0x7E) forms words.
+/// Byte classification for C/POSIX locale word counting.
+/// GNU wc in C locale uses a simple 2-state model:
+///   - Space bytes (\\t, \\n, \\v, \\f, \\r, space) break words
+///   - ALL other bytes (including controls, NUL, bytes >= 0x80) form words
+/// This matches GNU behavior where bytes >= 0x80 and control characters
+/// are treated as word content, not transparent.
 const fn make_byte_class_c() -> [u8; 256] {
-    let mut t = [2u8; 256]; // default: transparent
-    // Spaces: iswspace() returns true
+    let mut t = [0u8; 256]; // default: word content (printable)
+    // Spaces: break words
     t[0x09] = 1; // \t
     t[0x0A] = 1; // \n
     t[0x0B] = 1; // \v
     t[0x0C] = 1; // \f
     t[0x0D] = 1; // \r
     t[0x20] = 1; // space
-    // GNU compat: null byte is treated as printable (word content) in C locale.
-    // mbrtowc() returns L'\0' for the null byte, and GNU wc treats it as
-    // a non-space printable character that starts/continues words.
-    t[0x00] = 0;
-    // Printable ASCII (0x21-0x7E): word content
-    let mut i = 0x21u16;
-    while i <= 0x7E {
-        t[i as usize] = 0;
-        i += 1;
-    }
     t
 }
 
@@ -144,11 +137,11 @@ pub fn count_words_locale(data: &[u8], utf8: bool) -> u64 {
     }
 }
 
-/// Count words in C/POSIX locale using 3-state scalar logic.
-/// Only printable ASCII (0x21-0x7E) forms words.
-/// Bytes >= 0x80 and non-printable ASCII controls are transparent.
+/// Count words in C/POSIX locale using simple 2-state logic.
+/// GNU wc in C locale: space bytes break words, ALL other bytes form words.
+/// This includes control characters, NUL, bytes >= 0x80 — they all start/continue words.
 ///
-/// Optimized with ASCII run skipping for printable characters.
+/// Optimized with non-space run skipping.
 fn count_words_c(data: &[u8]) -> u64 {
     let mut words = 0u64;
     let mut in_word = false;
@@ -157,45 +150,38 @@ fn count_words_c(data: &[u8]) -> u64 {
 
     while i < len {
         let b = unsafe { *data.get_unchecked(i) };
-        if b >= 0x21 && b <= 0x7E {
-            // Printable ASCII — word content
+        let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
+        if class == 1 {
+            // Space — break word
+            in_word = false;
+            i += 1;
+        } else {
+            // Non-space — word content
             if !in_word {
                 in_word = true;
                 words += 1;
             }
             i += 1;
-            // Skip remaining printable ASCII
+            // Skip remaining non-space bytes
             while i < len {
                 let b = unsafe { *data.get_unchecked(i) };
-                if b >= 0x21 && b <= 0x7E {
+                let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
+                if class == 0 {
                     i += 1;
                 } else {
                     break;
                 }
             }
-        } else {
-            let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
-            if class == 1 {
-                in_word = false;
-            } else if class == 0 {
-                // NUL is printable in C locale — starts/continues word
-                if !in_word {
-                    in_word = true;
-                    words += 1;
-                }
-            }
-            // class == 2: transparent — in_word unchanged
-            i += 1;
         }
     }
     words
 }
 
 /// AVX2-accelerated fused line+word counter for C locale chunks.
-/// Processes 32 bytes per iteration: classifies word characters via signed
-/// comparison (byte > 0x20), counts word-start transitions via bitmask,
-/// counts newlines via SIMD accumulation with periodic horizontal sum.
-/// ~3x faster than scalar for word counting on ASCII text.
+/// Processes 32 bytes per iteration: classifies word characters as any
+/// non-space byte (space = 0x09-0x0D, 0x20), counts word-start transitions
+/// via bitmask, counts newlines via SIMD accumulation with periodic horizontal sum.
+/// GNU wc C locale: ALL non-space bytes are word content.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn count_lw_c_chunk_avx2(data: &[u8]) -> (u64, u64, bool, bool) {
@@ -209,19 +195,30 @@ unsafe fn count_lw_c_chunk_avx2(data: &[u8]) -> (u64, u64, bool, bool) {
     let mut prev_was_word = false;
 
     unsafe {
-        let space_thr = _mm256_set1_epi8(0x20i8);
         let nl_byte = _mm256_set1_epi8(b'\n' as i8);
         let zero = _mm256_setzero_si256();
         let ones = _mm256_set1_epi8(1);
+        // Space detection: space bytes are 0x09-0x0D and 0x20
+        let space_char = _mm256_set1_epi8(0x20i8);
+        let tab_lo = _mm256_set1_epi8(0x08i8); // 0x09 - 1
+        let tab_hi = _mm256_set1_epi8(0x0Ei8); // 0x0D + 1
 
         let mut line_acc = _mm256_setzero_si256();
         let mut batch = 0u32;
 
         while i + 32 <= len {
             let v = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-            let is_word = _mm256_cmpgt_epi8(v, space_thr);
             let is_nl = _mm256_cmpeq_epi8(v, nl_byte);
             line_acc = _mm256_add_epi8(line_acc, _mm256_and_si256(is_nl, ones));
+
+            // is_space = (v == 0x20) | (v > 0x08 && v < 0x0E)
+            let is_sp = _mm256_cmpeq_epi8(v, space_char);
+            let gt_08 = _mm256_cmpgt_epi8(v, tab_lo);
+            let lt_0e = _mm256_cmpgt_epi8(tab_hi, v);
+            let is_tab_range = _mm256_and_si256(gt_08, lt_0e);
+            let is_space = _mm256_or_si256(is_sp, is_tab_range);
+            // is_word = NOT is_space
+            let is_word = _mm256_andnot_si256(is_space, _mm256_set1_epi8(-1));
 
             let word_mask = _mm256_movemask_epi8(is_word) as u32;
             let prev_mask = (word_mask << 1) | (prev_was_word as u32);
@@ -253,31 +250,34 @@ unsafe fn count_lw_c_chunk_avx2(data: &[u8]) -> (u64, u64, bool, bool) {
             total_lines += _mm_cvtsi128_si64(t) as u64;
         }
 
-        // Scalar tail
+        // Scalar tail using lookup table
         while i < len {
             let b = *ptr.add(i);
             if b == b'\n' {
                 total_lines += 1;
                 prev_was_word = false;
-            } else if b > 0x20 {
+            } else if *BYTE_CLASS_C.get_unchecked(b as usize) == 1 {
+                // Other space byte
+                prev_was_word = false;
+            } else {
+                // Non-space: word content
                 if !prev_was_word {
                     total_words += 1;
                 }
                 prev_was_word = true;
-            } else {
-                prev_was_word = false;
             }
             i += 1;
         }
     }
 
-    let first_is_word = !data.is_empty() && data[0] > 0x20;
+    let first_is_word = !data.is_empty() && BYTE_CLASS_C[data[0] as usize] == 0;
     (total_lines, total_words, first_is_word, prev_was_word)
 }
 
 /// SSE2-accelerated fused line+word counter for C locale chunks.
 /// Same algorithm as AVX2 but processes 16 bytes per iteration.
 /// Available on all x86_64 CPUs (SSE2 is baseline for x86_64).
+/// GNU wc C locale: ALL non-space bytes are word content.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn count_lw_c_chunk_sse2(data: &[u8]) -> (u64, u64, bool, bool) {
@@ -291,19 +291,30 @@ unsafe fn count_lw_c_chunk_sse2(data: &[u8]) -> (u64, u64, bool, bool) {
     let mut prev_was_word = false;
 
     unsafe {
-        let space_thr = _mm_set1_epi8(0x20i8);
         let nl_byte = _mm_set1_epi8(b'\n' as i8);
         let zero = _mm_setzero_si128();
         let ones = _mm_set1_epi8(1);
+        // Space detection: space bytes are 0x09-0x0D and 0x20
+        let space_char = _mm_set1_epi8(0x20i8);
+        let tab_lo = _mm_set1_epi8(0x08i8);
+        let tab_hi = _mm_set1_epi8(0x0Ei8);
 
         let mut line_acc = _mm_setzero_si128();
         let mut batch = 0u32;
 
         while i + 16 <= len {
             let v = _mm_loadu_si128(ptr.add(i) as *const __m128i);
-            let is_word = _mm_cmpgt_epi8(v, space_thr);
             let is_nl = _mm_cmpeq_epi8(v, nl_byte);
             line_acc = _mm_add_epi8(line_acc, _mm_and_si128(is_nl, ones));
+
+            // is_space = (v == 0x20) | (v > 0x08 && v < 0x0E)
+            let is_sp = _mm_cmpeq_epi8(v, space_char);
+            let gt_08 = _mm_cmpgt_epi8(v, tab_lo);
+            let lt_0e = _mm_cmpgt_epi8(tab_hi, v);
+            let is_tab_range = _mm_and_si128(gt_08, lt_0e);
+            let is_space = _mm_or_si128(is_sp, is_tab_range);
+            // is_word = NOT is_space
+            let is_word = _mm_andnot_si128(is_space, _mm_set1_epi8(-1));
 
             let word_mask = _mm_movemask_epi8(is_word) as u32;
             let prev_mask = (word_mask << 1) | (prev_was_word as u32);
@@ -329,25 +340,25 @@ unsafe fn count_lw_c_chunk_sse2(data: &[u8]) -> (u64, u64, bool, bool) {
             total_lines += _mm_cvtsi128_si64(t) as u64;
         }
 
-        // Scalar tail
+        // Scalar tail using lookup table
         while i < len {
             let b = *ptr.add(i);
             if b == b'\n' {
                 total_lines += 1;
                 prev_was_word = false;
-            } else if b > 0x20 {
+            } else if *BYTE_CLASS_C.get_unchecked(b as usize) == 1 {
+                prev_was_word = false;
+            } else {
                 if !prev_was_word {
                     total_words += 1;
                 }
                 prev_was_word = true;
-            } else {
-                prev_was_word = false;
             }
             i += 1;
         }
     }
 
-    let first_is_word = !data.is_empty() && data[0] > 0x20;
+    let first_is_word = !data.is_empty() && BYTE_CLASS_C[data[0] as usize] == 0;
     (total_lines, total_words, first_is_word, prev_was_word)
 }
 
@@ -368,67 +379,55 @@ fn count_lw_c_chunk_fast(data: &[u8]) -> (u64, u64, bool, bool) {
 
 /// Count words + lines in a C locale chunk, returning counts plus boundary info.
 /// Used by parallel word counting.
-/// Returns (line_count, word_count, first_active_is_printable, ends_in_word).
+/// Returns (line_count, word_count, first_is_word, ends_in_word).
+/// GNU wc C locale: ALL non-space bytes are word content.
 fn count_lw_c_chunk(data: &[u8]) -> (u64, u64, bool, bool) {
     let mut lines = 0u64;
     let mut words = 0u64;
     let mut in_word = false;
-    let mut first_active_is_printable = false;
-    let mut seen_active = false;
+    let mut first_is_word = false;
+    let mut seen_first = false;
     let mut i = 0;
     let len = data.len();
 
     while i < len {
         let b = unsafe { *data.get_unchecked(i) };
-        if b >= 0x21 && b <= 0x7E {
-            // Printable ASCII
-            if !seen_active {
-                seen_active = true;
-                first_active_is_printable = true;
+        let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
+        if class == 1 {
+            // Space byte — break word
+            if !seen_first {
+                seen_first = true;
+                // first_is_word stays false (space is not word content)
+            }
+            if b == b'\n' {
+                lines += 1;
+            }
+            in_word = false;
+            i += 1;
+        } else {
+            // Non-space byte — word content
+            if !seen_first {
+                seen_first = true;
+                first_is_word = true;
             }
             if !in_word {
                 in_word = true;
                 words += 1;
             }
             i += 1;
-            // Skip remaining printable ASCII
+            // Skip remaining non-space bytes
             while i < len {
                 let b = unsafe { *data.get_unchecked(i) };
-                if b >= 0x21 && b <= 0x7E {
+                let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
+                if class == 0 {
                     i += 1;
                 } else {
                     break;
                 }
             }
-        } else if b == b'\n' {
-            lines += 1;
-            if !seen_active {
-                seen_active = true;
-            }
-            in_word = false;
-            i += 1;
-        } else {
-            let class = unsafe { *BYTE_CLASS_C.get_unchecked(b as usize) };
-            if class == 1 {
-                if !seen_active {
-                    seen_active = true;
-                }
-                in_word = false;
-            } else if class == 0 {
-                // NUL is printable in C locale — starts/continues word
-                if !seen_active {
-                    seen_active = true;
-                    first_active_is_printable = true;
-                }
-                if !in_word {
-                    in_word = true;
-                    words += 1;
-                }
-            }
-            i += 1;
         }
     }
-    (lines, words, first_active_is_printable, in_word)
+    (lines, words, first_is_word, in_word)
 }
 
 /// Count words in UTF-8 locale using a state machine with 3-state logic.
