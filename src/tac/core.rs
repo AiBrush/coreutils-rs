@@ -105,7 +105,9 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
     }
 
     // Allocate output buffer (same size as input: all bytes are output).
+    // SAFETY: parallel threads write non-overlapping regions covering all bytes.
     let mut output = Vec::with_capacity(data.len());
+    #[allow(clippy::uninit_vec)]
     unsafe {
         output.set_len(data.len());
     }

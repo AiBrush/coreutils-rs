@@ -2611,80 +2611,78 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 } else {
                     entries.sort_unstable_by(packed_cmp);
                 }
-                // Output sorted packed entries
+                // Output sorted packed entries using contiguous buffer.
                 {
                     let dp = data.as_ptr();
-                    const BATCH: usize = 512;
-                    let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+                    let n = entries.len();
+                    let term_byte = terminator[0];
                     if config.unique {
+                        let buf_cap = data.len() + n + 1;
+                        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+                        let bptr = buf.as_mut_ptr();
+                        let mut pos = 0usize;
                         let mut prev: Option<u32> = None;
-                        let n = entries.len();
                         for j in 0..n {
                             let idx = if reverse { n - 1 - j } else { j };
                             let ent = &entries[idx];
                             let li = ent.3 as usize;
                             let (s, e) = offsets[li];
-                            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                            let len = e - s;
                             let should_output = match prev {
                                 Some(p) => {
                                     let pi = p as usize;
                                     let (ps, pe) = offsets[pi];
                                     let prev_line =
                                         unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                                    let line =
+                                        unsafe { std::slice::from_raw_parts(dp.add(s), len) };
                                     compare_lines_for_dedup(prev_line, line, config)
                                         != Ordering::Equal
                                 }
                                 None => true,
                             };
                             if should_output {
-                                slices.push(io::IoSlice::new(line));
-                                slices.push(io::IoSlice::new(terminator));
-                                if slices.len() >= BATCH * 2 {
-                                    write_all_vectored(&mut writer, &slices)?;
-                                    slices.clear();
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                                    *bptr.add(pos + len) = term_byte;
                                 }
+                                pos += len + 1;
                                 prev = Some(ent.3);
                             }
                         }
-                    } else if reverse {
-                        let n = entries.len();
-                        for j in 0..n {
-                            if j + 8 < n {
-                                let ahead = entries[n - 1 - (j + 8)].3 as usize;
-                                let (ps, _) = offsets[ahead];
-                                prefetch_read(unsafe { dp.add(ps) });
-                            }
-                            let ent = &entries[n - 1 - j];
-                            let (s, e) = offsets[ent.3 as usize];
-                            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-                            slices.push(io::IoSlice::new(line));
-                            slices.push(io::IoSlice::new(terminator));
-                            if slices.len() >= BATCH * 2 {
-                                write_all_vectored(&mut writer, &slices)?;
-                                slices.clear();
-                            }
+                        unsafe {
+                            buf.set_len(pos);
                         }
+                        writer.write_all(&buf)?;
                     } else {
-                        let n = entries.len();
+                        let total_size = if data.last() == Some(&term_byte) {
+                            data.len()
+                        } else {
+                            data.len() + 1
+                        };
+                        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
+                        let bptr = buf.as_mut_ptr();
+                        let mut pos = 0usize;
                         for j in 0..n {
-                            if j + 8 < n {
-                                let ahead = entries[j + 8].3 as usize;
-                                let (ps, _) = offsets[ahead];
+                            let actual = if reverse { n - 1 - j } else { j };
+                            if j + 16 < n {
+                                let ahead_idx = if reverse { n - 1 - (j + 16) } else { j + 16 };
+                                let (ps, _) = offsets[entries[ahead_idx].3 as usize];
                                 prefetch_read(unsafe { dp.add(ps) });
                             }
-                            let ent = &entries[j];
+                            let ent = &entries[actual];
                             let (s, e) = offsets[ent.3 as usize];
-                            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-                            slices.push(io::IoSlice::new(line));
-                            slices.push(io::IoSlice::new(terminator));
-                            if slices.len() >= BATCH * 2 {
-                                write_all_vectored(&mut writer, &slices)?;
-                                slices.clear();
+                            let len = e - s;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                                *bptr.add(pos + len) = term_byte;
                             }
+                            pos += len + 1;
                         }
-                    }
-                    if !slices.is_empty() {
-                        write_all_vectored(&mut writer, &slices)?;
+                        unsafe {
+                            buf.set_len(pos);
+                        }
+                        writer.write_all(&buf)?;
                     }
                 }
             } else {
