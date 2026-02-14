@@ -51,83 +51,13 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
 }
 
-/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
-/// vmsplice transfers user-space pages to a pipe without memcpy — the kernel
-/// pins the pages and the pipe reader reads directly from them.
-/// Falls back to regular write() for non-pipe fds or on error.
+/// Raw fd stdout for zero-overhead writes on Linux.
+/// Uses regular write() — vmsplice is unsafe because the caller may free/reuse
+/// buffers before the pipe reader consumes the data.
 #[cfg(target_os = "linux")]
-struct VmspliceWriter {
-    raw: ManuallyDrop<std::fs::File>,
-    is_pipe: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl VmspliceWriter {
-    fn new() -> Self {
-        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        // Check if stdout is a pipe (vmsplice only works on pipes)
-        let is_pipe = unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
-        };
-        Self { raw, is_pipe }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Write for VmspliceWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write(buf);
-        }
-        let iov = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
-            }
-            // Fall back to regular write on error
-            self.is_pipe = false;
-            (&*self.raw).write(buf)
-        }
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write_all(buf);
-        }
-        while !buf.is_empty() {
-            let iov = libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n > 0 {
-                buf = &buf[n as usize..];
-            } else if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
-            } else {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                // Fall back to regular write
-                self.is_pipe = false;
-                return (&*self.raw).write_all(buf);
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(()) // Pipes don't need flushing
-    }
+#[inline]
+fn raw_stdout_linux() -> ManuallyDrop<std::fs::File> {
+    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
@@ -167,12 +97,12 @@ fn main() {
     // for 10MB+ output. Falls back to write() for non-pipe stdout.
     // On other Unix: use raw fd (no BufWriter since callers produce large chunks).
     #[cfg(target_os = "linux")]
-    let mut writer = VmspliceWriter::new();
+    let mut raw = raw_stdout_linux();
     #[cfg(target_os = "linux")]
     let result = if filename == "-" {
-        process_stdin(&cli, &mut writer)
+        process_stdin(&cli, &mut *raw)
     } else {
-        process_file(filename, &cli, &mut writer)
+        process_file(filename, &cli, &mut *raw)
     };
     #[cfg(all(unix, not(target_os = "linux")))]
     let mut raw = raw_stdout();
