@@ -748,28 +748,29 @@ fn radix_sort_entries(
             };
             let blen = bucket.len();
 
-            // For large buckets (>64): second-level MSD radix on bits 32-47
-            // (2 bytes). Uses 65536 buckets (256KB count array, fits in L2 cache).
-            // For very large buckets, the wider radix is worthwhile because it
-            // reduces per-bucket sizes by 65536x vs the first-level radix.
-            // For medium buckets (65-512), uses 8-bit radix (256 buckets, 1KB).
+            // For large buckets (>64): second-level MSD radix.
+            // Uses 16-bit radix (bits 32-47, 65536 buckets) for large buckets (>512).
+            // Uses 8-bit radix (bits 40-47, 256 buckets) for medium buckets (65-512).
             if blen > 64 {
-                // Check if second-level radix has variation in the next 2 bytes
-                let first_bits = ((bucket[0].0 >> 32) & 0xFFFF) as u16;
+                // Determine radix width based on bucket size
+                let use_wide = blen > 512;
+                let check_shift = if use_wide { 32u32 } else { 40u32 };
+                let check_mask: u64 = if use_wide { 0xFFFF } else { 0xFF };
+
+                // Check if the selected radix bits have variation
+                let first_bits = (bucket[0].0 >> check_shift) & check_mask;
                 let mut has_variation = false;
                 for e in &bucket[1..] {
-                    if ((e.0 >> 32) & 0xFFFF) as u16 != first_bits {
+                    if ((e.0 >> check_shift) & check_mask) != first_bits {
                         has_variation = true;
                         break;
                     }
                 }
 
                 if has_variation {
-                    // Use 16-bit radix for large buckets (>512), 8-bit for medium
-                    let use_wide = blen > 512;
                     let sub_nbk: usize = if use_wide { 65536 } else { 256 };
-                    let shift = if use_wide { 32u32 } else { 40u32 };
-                    let mask: u64 = if use_wide { 0xFFFF } else { 0xFF };
+                    let shift = check_shift;
+                    let mask = check_mask;
 
                     let mut sub_cnts = vec![0u32; sub_nbk];
                     for &(pfx, _, _) in bucket.iter() {
@@ -2045,6 +2046,109 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 || opts.has_sort_type();
 
             if !has_flags {
+                // Already-sorted check for single-key lexicographic path.
+                // Uses 8-byte prefix comparison on extracted keys for fast detection.
+                // This is valuable for pre-sorted CSV data (e.g., sort -t, -k2 on already-sorted).
+                if num_lines > 1 {
+                    let mut is_sorted = true;
+                    let mut prev_pfx = if key_offs[0].0 < key_offs[0].1 {
+                        line_prefix(data, key_offs[0].0, key_offs[0].1)
+                    } else {
+                        0u64
+                    };
+                    for i in 1..num_lines {
+                        let (ks, ke) = key_offs[i];
+                        let cur_pfx = if ks < ke { line_prefix(data, ks, ke) } else { 0u64 };
+                        if cur_pfx < prev_pfx {
+                            is_sorted = false;
+                            break;
+                        }
+                        if cur_pfx == prev_pfx {
+                            let (ps, pe) = key_offs[i - 1];
+                            let pk = &data[ps..pe];
+                            let ck = &data[ks..ke];
+                            if pk > ck {
+                                is_sorted = false;
+                                break;
+                            }
+                            // Last-resort whole-line comparison for equal keys
+                            if !config.stable && pk == ck {
+                                let (ls, le) = offsets[i - 1];
+                                let (cs, ce) = offsets[i];
+                                if data[ls..le] > data[cs..ce] {
+                                    is_sorted = false;
+                                    break;
+                                }
+                            }
+                        }
+                        prev_pfx = cur_pfx;
+                    }
+
+                    if is_sorted {
+                        // Already sorted: output directly
+                        if !config.unique
+                            && !config.zero_terminated
+                            && memchr::memchr(b'\r', data).is_none()
+                        {
+                            if data.last() == Some(&b'\n') {
+                                writer.write_all(data)?;
+                            } else if !data.is_empty() {
+                                writer.write_all(data)?;
+                                writer.write_all(b"\n")?;
+                            }
+                            writer.flush()?;
+                            return Ok(());
+                        }
+                        // Line-by-line output for unique/special cases
+                        let dp = data.as_ptr();
+                        if config.unique {
+                            let mut prev: Option<usize> = None;
+                            for i in 0..num_lines {
+                                let (s, e) = offsets[i];
+                                let line =
+                                    unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                                let emit = match prev {
+                                    Some(p) => {
+                                        let (ps, pe) = offsets[p];
+                                        let prev_line = unsafe {
+                                            std::slice::from_raw_parts(dp.add(ps), pe - ps)
+                                        };
+                                        compare_lines_for_dedup(prev_line, line, config)
+                                            != Ordering::Equal
+                                    }
+                                    None => true,
+                                };
+                                if emit {
+                                    writer.write_all(line)?;
+                                    writer.write_all(terminator)?;
+                                    prev = Some(i);
+                                }
+                            }
+                        } else {
+                            const BATCH: usize = 512;
+                            let mut slices: Vec<io::IoSlice<'_>> =
+                                Vec::with_capacity(BATCH * 2);
+                            for i in 0..num_lines {
+                                let (s, e) = offsets[i];
+                                let line = unsafe {
+                                    std::slice::from_raw_parts(dp.add(s), e - s)
+                                };
+                                slices.push(io::IoSlice::new(line));
+                                slices.push(io::IoSlice::new(terminator));
+                                if slices.len() >= BATCH * 2 {
+                                    write_all_vectored(&mut writer, &slices)?;
+                                    slices.clear();
+                                }
+                            }
+                            if !slices.is_empty() {
+                                write_all_vectored(&mut writer, &slices)?;
+                            }
+                        }
+                        writer.flush()?;
+                        return Ok(());
+                    }
+                }
+
                 // Radix + prefix sort for single-key lexicographic path.
                 // Uses radix distribution on (key_prefix, line_index) pairs.
                 // Resolves most ordering via the 8-byte prefix radix buckets.
