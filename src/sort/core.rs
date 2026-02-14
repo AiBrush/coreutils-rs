@@ -621,17 +621,37 @@ impl Ord for MergeEntryOrd {
     }
 }
 
-/// Radix-distribute entries into 65536 buckets by top 2 bytes of prefix,
-/// then sort each bucket independently using rayon. Returns sorted array
-/// and bucket boundary table. This reduces per-bucket sort size by ~60x
-/// for uniform ASCII data, greatly improving cache behavior.
+/// Hybrid MSD radix sort for lexicographic (u64, u32, u32) entries.
+///
+/// Two-level MSD (Most Significant Digit) radix:
+/// 1. First pass: distribute by top 16 bits (bits 48-63) → 65536 buckets
+/// 2. Second pass within each large bucket: distribute by next 16 bits (bits 32-47)
+/// 3. Remaining sub-buckets: comparison sort (typically 0-2 entries)
+///
+/// This is more cache-friendly than full LSD radix (which makes 4 full O(n)
+/// passes over all data with random scatter writes). MSD touches the data once
+/// for the first pass, then only touches the entries in each bucket for the
+/// second pass. Most buckets are small (≤30 entries for 2M lines), so the
+/// second pass has excellent cache locality.
+///
+/// Key advantage over comparison sort alone: the first radix pass eliminates
+/// the top 16 bits from ALL comparisons. The second radix pass eliminates
+/// another 16 bits for larger buckets. Only the bottom 32 bits (4 bytes of
+/// the prefix) need comparison sort, which resolves almost instantly.
 fn radix_sort_entries(
     entries: Vec<(u64, u32, u32)>,
     data: &[u8],
     stable: bool,
-    reverse: bool,
-) -> (Vec<(u64, u32, u32)>, Vec<usize>) {
+    _reverse: bool,
+) -> Vec<(u64, u32, u32)> {
+    let n = entries.len();
+    if n <= 1 {
+        return entries;
+    }
+
     let nbk: usize = 65536;
+
+    // === PASS 1: MSD radix on top 16 bits (bits 48-63) ===
     let mut cnts = vec![0u32; nbk];
     for &(pfx, _, _) in &entries {
         cnts[(pfx >> 48) as usize] += 1;
@@ -645,14 +665,11 @@ fn radix_sort_entries(
         }
         bk_starts[nbk] = s;
     }
-    // Allocate without zero-init: the scatter writes every position exactly once
-    // (each of the N entries maps to a unique position via the prefix sum).
-    // Avoids ~15ms of page faults for 40MB zero-fill on large inputs.
-    let mut sorted: Vec<(u64, u32, u32)> = Vec::with_capacity(entries.len());
-    // SAFETY: every position [0..entries.len()) is written exactly once by the scatter loop below.
+    // Scatter into sorted array
+    let mut sorted: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        sorted.set_len(entries.len());
+        sorted.set_len(n);
     }
     {
         let mut wpos = bk_starts.clone();
@@ -667,16 +684,16 @@ fn radix_sort_entries(
     drop(entries);
     drop(cnts);
 
-    // Sort each non-trivial bucket independently with rayon.
-    // Optimized comparison: u64 prefix comparison resolves most entries,
-    // only falls through to word-at-a-time for prefix collisions.
-    // The skip=min(8,la,lb) optimization avoids re-comparing the prefix bytes.
-    // Word-at-a-time comparison uses u64 loads for the suffix, which is ~8x faster
-    // than byte-by-byte comparison on modern CPUs (single u64 cmp vs 8 byte cmps).
+    // === PASS 2: Within each large bucket, MSD radix on bits 32-47 ===
+    // Then comparison sort within each sub-bucket.
+    // Threshold: only do second radix pass for buckets with >32 entries
+    // (smaller buckets: comparison sort is faster due to no scatter overhead).
     {
-        let sorted_ptr = sorted.as_mut_ptr();
-        let sorted_len = sorted.len();
+        let sorted_ptr = sorted.as_mut_ptr() as usize;
         let data_addr = data.as_ptr() as usize;
+
+        // Comparison function for tiebreaking within sub-buckets.
+        // Starts comparison after the prefix bytes (skip first 8 or min(8,len) bytes).
         let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
             match a.0.cmp(&b.0) {
                 Ordering::Equal => {
@@ -691,9 +708,6 @@ fn radix_sort_entries(
                         let dp = data_addr as *const u8;
                         let pa = dp.add(sa + skip);
                         let pb = dp.add(sb + skip);
-                        // Word-at-a-time comparison: compare 8 bytes at a time
-                        // using big-endian u64 loads. This resolves most suffix
-                        // collisions in 1-2 iterations instead of 8-16 byte cmps.
                         let min_rem = rem_a.min(rem_b);
                         let mut i = 0usize;
                         while i + 8 <= min_rem {
@@ -704,7 +718,6 @@ fn radix_sort_entries(
                             }
                             i += 8;
                         }
-                        // Compare remaining bytes (< 8)
                         let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
                         let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
                         tail_a.cmp(tail_b)
@@ -713,35 +726,154 @@ fn radix_sort_entries(
                 ord => ord,
             }
         };
-        let mut slices: Vec<&mut [(u64, u32, u32)]> = Vec::new();
+
+        // Collect non-trivial buckets for parallel processing
+        let mut slices: Vec<(usize, usize)> = Vec::new();
         for i in 0..nbk {
             let lo = bk_starts[i];
             let hi = bk_starts[i + 1];
             if hi - lo > 1 {
-                debug_assert!(hi <= sorted_len);
-                slices.push(unsafe { std::slice::from_raw_parts_mut(sorted_ptr.add(lo), hi - lo) });
+                slices.push((lo, hi));
             }
         }
-        if stable {
-            if !reverse {
-                slices.into_par_iter().for_each(|sl| sl.sort_by(cmp_fn));
-            } else {
-                slices
-                    .into_par_iter()
-                    .for_each(|sl| sl.sort_by(|a, b| cmp_fn(a, b).reverse()));
+
+        // Process buckets in parallel with rayon
+        // For each bucket, decide between 2nd-level radix or comparison sort
+        let chunk_fn = |(lo, hi): (usize, usize)| {
+            let bucket = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (sorted_ptr as *mut (u64, u32, u32)).add(lo),
+                    hi - lo,
+                )
+            };
+            let blen = bucket.len();
+
+            // For large buckets (>64): second-level MSD radix on byte 5
+            // (bits 40-47). Uses 256 buckets (1KB count array, fits in L1 cache)
+            // instead of 65536 (256KB, spills to L2/L3).
+            if blen > 64 {
+                // Check if second-level radix has variation in byte 5
+                let first_b5 = ((bucket[0].0 >> 40) & 0xFF) as u8;
+                let mut has_variation = false;
+                for e in &bucket[1..] {
+                    if ((e.0 >> 40) & 0xFF) as u8 != first_b5 {
+                        has_variation = true;
+                        break;
+                    }
+                }
+
+                if has_variation {
+                    let sub_nbk: usize = 256;
+                    let mut sub_cnts = [0u32; 256];
+                    for &(pfx, _, _) in bucket.iter() {
+                        sub_cnts[((pfx >> 40) & 0xFF) as usize] += 1;
+                    }
+                    let mut sub_starts = [0usize; 257];
+                    {
+                        let mut s = 0usize;
+                        for i in 0..sub_nbk {
+                            sub_starts[i] = s;
+                            s += sub_cnts[i] as usize;
+                        }
+                        sub_starts[sub_nbk] = s;
+                    }
+                    // Scatter within bucket using temp buffer
+                    let mut temp: Vec<(u64, u32, u32)> = Vec::with_capacity(blen);
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        temp.set_len(blen);
+                    }
+                    {
+                        let mut wpos = sub_starts;
+                        let temp_ptr = temp.as_mut_ptr();
+                        for &ent in bucket.iter() {
+                            let b = ((ent.0 >> 40) & 0xFF) as usize;
+                            unsafe {
+                                *temp_ptr.add(wpos[b]) = ent;
+                            }
+                            wpos[b] += 1;
+                        }
+                    }
+                    // Copy back and sort sub-buckets
+                    bucket.copy_from_slice(&temp);
+                    drop(temp);
+                    // Sort each non-trivial sub-bucket
+                    for sb in 0..sub_nbk {
+                        let slo = sub_starts[sb];
+                        let shi = sub_starts[sb + 1];
+                        if shi - slo > 1 {
+                            let sub_slice = &mut bucket[slo..shi];
+                            let sub_len = sub_slice.len();
+                            // Check for all-identical content (common in repetitive data)
+                            let ref_s = sub_slice[0].1 as usize;
+                            let ref_l = sub_slice[0].2 as usize;
+                            let last_s = sub_slice[sub_len - 1].1 as usize;
+                            let last_l = sub_slice[sub_len - 1].2 as usize;
+                            let all_same = ref_l == last_l
+                                && unsafe {
+                                    let ddp = data_addr as *const u8;
+                                    let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
+                                    let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
+                                    a == b
+                                };
+                            if !all_same {
+                                if stable {
+                                    sub_slice.sort_by(cmp_fn);
+                                } else {
+                                    sub_slice.sort_unstable_by(cmp_fn);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
             }
-        } else if !reverse {
+
+            // For small/medium buckets or no second-level variation:
+            // Check for all-identical content first
+            let ref_s = bucket[0].1 as usize;
+            let ref_l = bucket[0].2 as usize;
+            let last_s = bucket[blen - 1].1 as usize;
+            let last_l = bucket[blen - 1].2 as usize;
+            let all_same = ref_l == last_l
+                && unsafe {
+                    let ddp = data_addr as *const u8;
+                    let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
+                    let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
+                    a == b
+                };
+            if all_same {
+                return;
+            }
+
+            // Comparison sort (insertion sort for tiny buckets, pdqsort for larger)
+            if blen <= 16 {
+                for k in 1..blen {
+                    let mut pos = k;
+                    while pos > 0 && cmp_fn(&bucket[pos], &bucket[pos - 1]) == Ordering::Less {
+                        bucket.swap(pos, pos - 1);
+                        pos -= 1;
+                    }
+                }
+            } else if stable {
+                bucket.sort_by(cmp_fn);
+            } else {
+                bucket.sort_unstable_by(cmp_fn);
+            }
+        };
+
+        if slices.len() > 16 {
             slices
                 .into_par_iter()
-                .for_each(|sl| sl.sort_unstable_by(cmp_fn));
+                .for_each(|(lo, hi)| chunk_fn((lo, hi)));
         } else {
-            slices
-                .into_par_iter()
-                .for_each(|sl| sl.sort_unstable_by(|a, b| cmp_fn(a, b).reverse()));
+            for (lo, hi) in slices {
+                chunk_fn((lo, hi));
+            }
         }
     }
 
-    (sorted, bk_starts)
+    sorted
 }
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
@@ -1254,6 +1386,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     //
     // For plain lexicographic sort (most common case), use direct byte slice
     // comparison instead of the full compare_lines machinery.
+    // Also handles sort -r (reverse) by checking descending order.
     let no_keys = config.keys.is_empty();
     let gopts = &config.global_opts;
     let is_plain_lex_for_check = no_keys
@@ -1261,8 +1394,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         && !gopts.dictionary_order
         && !gopts.ignore_case
         && !gopts.ignore_nonprinting
-        && !gopts.ignore_leading_blanks
-        && !gopts.reverse;
+        && !gopts.ignore_leading_blanks;
 
     // Pre-detect numeric mode to skip the generic sorted check.
     // Numeric mode does its own sorted check after parsing u64 values.
@@ -1277,24 +1409,42 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // Fast path: 8-byte prefix comparison for plain lexicographic sort.
             // Most lines can be resolved with a single u64 comparison, avoiding
             // full memcmp. Only falls back to full comparison on prefix collision.
+            // For -r (reverse), check descending order instead of ascending.
             let dp = data.as_ptr();
+            let reverse = gopts.reverse;
             let mut sorted = true;
             let mut prev_prefix = line_prefix(data, offsets[0].0, offsets[0].1);
             for i in 1..num_lines {
                 let (s2, e2) = offsets[i];
                 let cur_prefix = line_prefix(data, s2, e2);
-                if prev_prefix > cur_prefix {
-                    sorted = false;
-                    break;
-                }
-                if prev_prefix == cur_prefix {
-                    // Prefix collision — full comparison needed
-                    let (s1, e1) = offsets[i - 1];
-                    let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
-                    let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
-                    if a > b {
+                if !reverse {
+                    if prev_prefix > cur_prefix {
                         sorted = false;
                         break;
+                    }
+                    if prev_prefix == cur_prefix {
+                        let (s1, e1) = offsets[i - 1];
+                        let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+                        let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
+                        if a > b {
+                            sorted = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // Reverse: check descending order
+                    if prev_prefix < cur_prefix {
+                        sorted = false;
+                        break;
+                    }
+                    if prev_prefix == cur_prefix {
+                        let (s1, e1) = offsets[i - 1];
+                        let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+                        let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
+                        if a < b {
+                            sorted = false;
+                            break;
+                        }
                     }
                 }
                 prev_prefix = cur_prefix;
@@ -1428,9 +1578,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 .collect()
         };
 
-        // Two-level radix distribution + per-bucket sort via helper function
-        let (sorted, bk_starts) = radix_sort_entries(entries, data, config.stable, reverse);
-        let nbk = bk_starts.len() - 1;
+        // Full LSD radix sort on 8-byte prefix + tiebreak for collisions
+        let sorted = radix_sort_entries(entries, data, config.stable, reverse);
 
         // Switch to sequential for output phase
         #[cfg(target_os = "linux")]
@@ -1442,65 +1591,48 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         // (within each bucket, entries are already in reverse order from the sort).
         // For forward, iterate linearly through the sorted array.
         if config.unique {
+            // After full LSD radix sort, entries are in ascending order.
+            // For reverse, iterate backwards; for forward, iterate forwards.
+            // Inline dedup loop avoids Box<dyn Iterator> vtable overhead.
             let dp = data.as_ptr();
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
-            if reverse {
-                for bi in (0..nbk).rev() {
-                    for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
-                        let su = s as usize;
-                        let lu = l as usize;
-                        let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
-                        let emit = prev_start == u32::MAX || {
-                            let ps = prev_start as usize;
-                            let pl = prev_len as usize;
-                            let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
-                            compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
-                        };
-                        if emit {
-                            writer.write_all(line)?;
-                            writer.write_all(terminator)?;
-                            prev_start = s;
-                            prev_len = l;
-                        }
-                    }
+            let n_sorted = sorted.len();
+            let mut idx: usize = 0;
+            while idx < n_sorted {
+                let actual_idx = if reverse { n_sorted - 1 - idx } else { idx };
+                let (_, s, l) = sorted[actual_idx];
+                let su = s as usize;
+                let lu = l as usize;
+                let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
+                let emit = prev_start == u32::MAX || {
+                    let ps = prev_start as usize;
+                    let pl = prev_len as usize;
+                    let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
+                    compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
+                };
+                if emit {
+                    writer.write_all(line)?;
+                    writer.write_all(terminator)?;
+                    prev_start = s;
+                    prev_len = l;
                 }
-            } else {
-                for &(_, s, l) in &sorted {
-                    let su = s as usize;
-                    let lu = l as usize;
-                    let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
-                    let emit = prev_start == u32::MAX || {
-                        let ps = prev_start as usize;
-                        let pl = prev_len as usize;
-                        let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
-                        compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
-                    };
-                    if emit {
-                        writer.write_all(line)?;
-                        writer.write_all(terminator)?;
-                        prev_start = s;
-                        prev_len = l;
-                    }
-                }
+                idx += 1;
             }
         } else if reverse {
-            // Reverse: write buckets from highest to lowest using write_vectored.
-            // Zero-copy: IoSlice entries point directly into mmap data.
-            // Avoids per-bucket Vec<u8> buffer allocations entirely.
+            // Reverse: iterate the fully-sorted array backwards.
+            // After LSD radix sort, entries are in ascending order,
+            // so reverse iteration produces descending output.
             let dp = data.as_ptr();
             const BATCH: usize = 512;
             let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            for bi in (0..nbk).rev() {
-                for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
-                    let line =
-                        unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
-                    slices.push(io::IoSlice::new(line));
-                    slices.push(io::IoSlice::new(terminator));
-                    if slices.len() >= BATCH * 2 {
-                        write_all_vectored(&mut writer, &slices)?;
-                        slices.clear();
-                    }
+            for &(_, s, l) in sorted.iter().rev() {
+                let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
+                slices.push(io::IoSlice::new(line));
+                slices.push(io::IoSlice::new(terminator));
+                if slices.len() >= BATCH * 2 {
+                    write_all_vectored(&mut writer, &slices)?;
+                    slices.clear();
                 }
             }
             if !slices.is_empty() {
