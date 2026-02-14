@@ -320,15 +320,23 @@ fn read_all_input(
         } else {
             FileData::Owned(Vec::new())
         }
+    } else if inputs.len() == 1 && inputs[0] == "-" {
+        // Single stdin: use read_stdin() directly without extra copy.
+        // read_stdin() returns a Vec that we can use directly, avoiding the
+        // extend_from_slice copy that would happen with the multi-file path.
+        let stdin_data = crate::common::io::read_stdin()?;
+        FileData::Owned(stdin_data)
     } else {
+        // Multi-file or mixed file+stdin: concatenate into a single buffer.
         let mut data = Vec::new();
         for input in inputs {
             if input == "-" {
-                // Use raw libc::read() via read_stdin() for high-throughput stdin reads.
-                // Bypasses BufReader/StdinLock overhead, pre-allocates 64MB, uses
-                // full spare capacity per read() call to minimize syscall count.
                 let stdin_data = crate::common::io::read_stdin()?;
-                data.extend_from_slice(&stdin_data);
+                if data.is_empty() {
+                    data = stdin_data;
+                } else {
+                    data.extend_from_slice(&stdin_data);
+                }
             } else {
                 let mut file = File::open(input).map_err(|e| {
                     io::Error::new(
