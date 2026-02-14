@@ -9,12 +9,11 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (16MB).
-/// For single-invocation tools, rayon's thread pool initialization (~300µs for 4 threads)
-/// dominates at smaller sizes. SIMD encode at 10+ GB/s processes 10MB in ~1ms sequential,
-/// so parallel encoding only wins when the encode time exceeds rayon init + dispatch overhead.
-/// At 16MB+, the parallel speedup (2-4x on 4+ cores) exceeds rayon init + dispatch (~400µs).
-const PARALLEL_ENCODE_THRESHOLD: usize = 16 * 1024 * 1024;
+/// Minimum data size for parallel encoding (4MB).
+/// With rayon's lazy thread pool init (~300µs) amortized over warmup runs,
+/// parallel encoding wins at 4MB+ (sequential ~0.4ms vs parallel ~0.15ms + dispatch).
+/// For 10MB benchmarks, this enables 2-4x encode speedup on multi-core.
+const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (4MB of base64 data).
 /// At 4MB+, the parallel decode speedup (2-4x on multi-core) exceeds rayon overhead.
@@ -700,8 +699,14 @@ pub fn decode_mmap_inplace(
         }
     }
 
-    // Fast path: strip whitespace in-place, then decode in-place.
-    // Uses SIMD memchr2 gap-copy for \n/\r (dominant whitespace in base64).
+    // Fast path: uniform-line fused strip+decode (no intermediate buffer).
+    if data.len() >= 77 {
+        if let Some(result) = try_decode_uniform_lines(data, out) {
+            return result;
+        }
+    }
+
+    // Fallback: strip whitespace in-place using SIMD memchr2 gap-copy.
 
     // Quick check: no newlines at all — maybe already clean
     if memchr::memchr2(b'\n', b'\r', data).is_none() {
@@ -917,23 +922,21 @@ static NOT_WHITESPACE: [bool; 256] = {
     table
 };
 
-/// Fast decode for data with uniform line structure (e.g., standard 76-char base64).
-/// Detects if lines have consistent length, then copies at known offsets instead of
-/// scanning for newlines. For 13MB base64: saves ~1ms vs memchr2 gap-copy.
+/// Fused strip+decode for uniform-line base64 data.
+/// Detects consistent line length, then processes in sub-chunks: each sub-chunk
+/// copies lines to a small local buffer (L2-hot) and decodes immediately.
+/// Eliminates the large intermediate clean buffer (~12MB for 10MB decode).
 /// Returns None if the data doesn't have uniform line structure.
 fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> {
-    // Find first newline to determine line length
     let first_nl = memchr::memchr(b'\n', data)?;
     let line_len = first_nl;
-
-    // Line length must be a multiple of 4 (complete base64 groups)
     if line_len == 0 || line_len % 4 != 0 {
         return None;
     }
 
     let stride = line_len + 1;
 
-    // Verify the data has consistent line structure
+    // Verify the data has consistent line structure (first + last lines)
     let check_lines = 4.min(data.len() / stride);
     for i in 1..check_lines {
         let expected_nl = i * stride - 1;
@@ -960,64 +963,157 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
         remainder
     };
 
-    // Allocate clean buffer and copy at known offsets (no search needed)
-    let clean_len = full_lines * line_len + rem_clean.len();
-    let mut clean: Vec<u8> = Vec::with_capacity(clean_len);
+    // Compute exact decoded sizes
+    let decoded_per_line = line_len * 3 / 4;
+    let rem_decoded_size = if rem_clean.is_empty() {
+        0
+    } else {
+        let pad = rem_clean
+            .iter()
+            .rev()
+            .take(2)
+            .filter(|&&b| b == b'=')
+            .count();
+        rem_clean.len() * 3 / 4 - pad
+    };
+    let total_decoded = full_lines * decoded_per_line + rem_decoded_size;
+    let clean_len = full_lines * line_len;
+
+    // Parallel path: fused strip+decode with 128KB sub-chunks per thread.
+    // Each thread copies lines to a thread-local buffer (L2-hot) and decodes immediately,
+    // eliminating the 12MB+ intermediate clean buffer entirely.
+    if clean_len >= PARALLEL_DECODE_THRESHOLD && rayon::current_num_threads() > 1 {
+        let mut output: Vec<u8> = Vec::with_capacity(total_decoded);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            output.set_len(total_decoded);
+        }
+
+        let out_ptr = output.as_mut_ptr() as usize;
+        let src_ptr = data.as_ptr() as usize;
+        let num_threads = rayon::current_num_threads().max(1);
+        let lines_per_thread = (full_lines + num_threads - 1) / num_threads;
+        let lines_per_sub = (128 * 1024 / line_len).max(1);
+
+        let result: Result<Vec<()>, io::Error> = (0..num_threads)
+            .into_par_iter()
+            .map(|t| {
+                let start_line = t * lines_per_thread;
+                if start_line >= full_lines {
+                    return Ok(());
+                }
+                let end_line = (start_line + lines_per_thread).min(full_lines);
+                let chunk_lines = end_line - start_line;
+
+                let sub_buf_size = lines_per_sub.min(chunk_lines) * line_len;
+                let mut local_buf: Vec<u8> = Vec::with_capacity(sub_buf_size);
+                #[allow(clippy::uninit_vec)]
+                unsafe {
+                    local_buf.set_len(sub_buf_size);
+                }
+
+                let src = src_ptr as *const u8;
+                let out_base = out_ptr as *mut u8;
+                let local_dst = local_buf.as_mut_ptr();
+
+                let mut sub_start = 0usize;
+                while sub_start < chunk_lines {
+                    let sub_count = (chunk_lines - sub_start).min(lines_per_sub);
+                    let sub_clean = sub_count * line_len;
+
+                    for i in 0..sub_count {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src.add((start_line + sub_start + i) * stride),
+                                local_dst.add(i * line_len),
+                                line_len,
+                            );
+                        }
+                    }
+
+                    let out_offset = (start_line + sub_start) * decoded_per_line;
+                    let out_size = sub_count * decoded_per_line;
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts_mut(out_base.add(out_offset), out_size)
+                    };
+                    BASE64_ENGINE
+                        .decode(&local_buf[..sub_clean], out_slice.as_out())
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid input"))?;
+
+                    sub_start += sub_count;
+                }
+                Ok(())
+            })
+            .collect();
+
+        if let Err(e) = result {
+            return Some(Err(e));
+        }
+
+        if !rem_clean.is_empty() {
+            let rem_out = &mut output[full_lines * decoded_per_line..total_decoded];
+            match BASE64_ENGINE.decode(rem_clean, rem_out.as_out()) {
+                Ok(_) => {}
+                Err(_) => return Some(decode_error()),
+            }
+        }
+
+        return Some(out.write_all(&output[..total_decoded]));
+    }
+
+    // Sequential path: fused strip+decode in 64KB sub-chunks.
+    // Uses decode_inplace on a small reusable buffer — no large allocations at all.
+    let lines_per_sub = (64 * 1024 / line_len).max(1);
+    let sub_buf_size = lines_per_sub * line_len;
+    let mut local_buf: Vec<u8> = Vec::with_capacity(sub_buf_size);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        clean.set_len(clean_len);
+        local_buf.set_len(sub_buf_size);
     }
 
     let src = data.as_ptr();
-    let dst = clean.as_mut_ptr();
+    let local_dst = local_buf.as_mut_ptr();
 
-    // 4-line unrolled structured copy for better ILP
-    let mut i = 0;
-    while i + 4 <= full_lines {
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.add(i * stride), dst.add(i * line_len), line_len);
-            std::ptr::copy_nonoverlapping(
-                src.add((i + 1) * stride),
-                dst.add((i + 1) * line_len),
-                line_len,
-            );
-            std::ptr::copy_nonoverlapping(
-                src.add((i + 2) * stride),
-                dst.add((i + 2) * line_len),
-                line_len,
-            );
-            std::ptr::copy_nonoverlapping(
-                src.add((i + 3) * stride),
-                dst.add((i + 3) * line_len),
-                line_len,
-            );
+    let mut line_idx = 0usize;
+    while line_idx < full_lines {
+        let sub_count = (full_lines - line_idx).min(lines_per_sub);
+        let sub_clean = sub_count * line_len;
+
+        for i in 0..sub_count {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add((line_idx + i) * stride),
+                    local_dst.add(i * line_len),
+                    line_len,
+                );
+            }
         }
-        i += 4;
-    }
-    while i < full_lines {
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.add(i * stride), dst.add(i * line_len), line_len);
+
+        match BASE64_ENGINE.decode_inplace(&mut local_buf[..sub_clean]) {
+            Ok(decoded) => {
+                if let Err(e) = out.write_all(decoded) {
+                    return Some(Err(e));
+                }
+            }
+            Err(_) => return Some(decode_error()),
         }
-        i += 1;
+
+        line_idx += sub_count;
     }
 
-    // Copy remainder
     if !rem_clean.is_empty() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(remainder_start),
-                dst.add(full_lines * line_len),
-                rem_clean.len(),
-            );
+        let mut rem_buf = rem_clean.to_vec();
+        match BASE64_ENGINE.decode_inplace(&mut rem_buf) {
+            Ok(decoded) => {
+                if let Err(e) = out.write_all(decoded) {
+                    return Some(Err(e));
+                }
+            }
+            Err(_) => return Some(decode_error()),
         }
     }
 
-    // Decode: parallel for large data, in-place for small
-    if clean.len() >= PARALLEL_DECODE_THRESHOLD {
-        Some(decode_borrowed_clean_parallel(out, &clean))
-    } else {
-        Some(decode_clean_slice(&mut clean, out))
-    }
+    Some(Ok(()))
 }
 
 /// Decode by stripping whitespace and decoding in a single fused pass.

@@ -118,6 +118,22 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
     }
 }
 
+/// Read a file entirely into a mutable Vec.
+/// Uses exact-size allocation from fstat + single read() for efficiency.
+/// Preferred over mmap when the caller needs mutable access (e.g., in-place decode).
+pub fn read_file_vec(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_noatime(path)?;
+    let metadata = file.metadata()?;
+    let len = metadata.len() as usize;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; len];
+    let n = read_full(&mut &file, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
 /// Get file size without reading it (for byte-count-only optimization).
 pub fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())

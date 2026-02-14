@@ -11,7 +11,7 @@ use clap::Parser;
 use memmap2::MmapOptions;
 
 use coreutils_rs::base64::core as b64;
-use coreutils_rs::common::io::read_file;
+use coreutils_rs::common::io::{read_file, read_file_vec};
 use coreutils_rs::common::io_error_msg;
 
 #[derive(Parser)]
@@ -273,14 +273,15 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
-    // Use read-only mmap for both encode and decode.
-    // For decode: read-only mmap avoids MAP_PRIVATE COW page faults (~3ms for 13MB).
-    // The bulk strip+decode path in decode_to_writer is faster than in-place decode
-    // for large files (SIMD gap-copy to clean buffer + single-shot decode).
-    let data = read_file(Path::new(filename))?;
     if cli.decode {
-        b64::decode_to_writer(&data, cli.ignore_garbage, out)
+        // Decode: read to Vec for in-place strip+decode.
+        // Avoids separate 12MB+ clean buffer — strip whitespace in-place on the Vec,
+        // then parallel decode from the cleaned slice. Saves one large allocation.
+        let mut data = read_file_vec(Path::new(filename))?;
+        b64::decode_mmap_inplace(&mut data, cli.ignore_garbage, out)
     } else {
+        // Encode: use read-only mmap (zero-copy, no modification needed).
+        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }
