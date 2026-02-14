@@ -748,26 +748,27 @@ fn radix_sort_entries(
             };
             let blen = bucket.len();
 
-            // For large buckets (>64): second-level MSD radix on bits 32-47
-            // This creates 65536 sub-buckets, most with 0-1 entries.
+            // For large buckets (>64): second-level MSD radix on byte 5
+            // (bits 40-47). Uses 256 buckets (1KB count array, fits in L1 cache)
+            // instead of 65536 (256KB, spills to L2/L3).
             if blen > 64 {
-                // Check if second-level radix has variation in bits 32-47
-                let first_mid = (bucket[0].0 >> 32) & 0xFFFF;
+                // Check if second-level radix has variation in byte 5
+                let first_b5 = ((bucket[0].0 >> 40) & 0xFF) as u8;
                 let mut has_variation = false;
                 for e in &bucket[1..] {
-                    if ((e.0 >> 32) & 0xFFFF) != first_mid {
+                    if ((e.0 >> 40) & 0xFF) as u8 != first_b5 {
                         has_variation = true;
                         break;
                     }
                 }
 
                 if has_variation {
-                    let sub_nbk: usize = 65536;
-                    let mut sub_cnts = vec![0u32; sub_nbk];
+                    let sub_nbk: usize = 256;
+                    let mut sub_cnts = [0u32; 256];
                     for &(pfx, _, _) in bucket.iter() {
-                        sub_cnts[((pfx >> 32) & 0xFFFF) as usize] += 1;
+                        sub_cnts[((pfx >> 40) & 0xFF) as usize] += 1;
                     }
-                    let mut sub_starts = vec![0usize; sub_nbk + 1];
+                    let mut sub_starts = [0usize; 257];
                     {
                         let mut s = 0usize;
                         for i in 0..sub_nbk {
@@ -783,10 +784,10 @@ fn radix_sort_entries(
                         temp.set_len(blen);
                     }
                     {
-                        let mut wpos = sub_starts.clone();
+                        let mut wpos = sub_starts;
                         let temp_ptr = temp.as_mut_ptr();
                         for &ent in bucket.iter() {
-                            let b = ((ent.0 >> 32) & 0xFFFF) as usize;
+                            let b = ((ent.0 >> 40) & 0xFF) as usize;
                             unsafe {
                                 *temp_ptr.add(wpos[b]) = ent;
                             }
