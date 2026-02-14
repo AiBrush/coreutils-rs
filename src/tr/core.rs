@@ -2661,21 +2661,33 @@ fn translate_to_separate_buf(
         return writer.write_all(&out_buf);
     }
 
-    // Sequential path: single full-size allocation + single write_all.
-    // For 10MB, allocating 10MB is ~0.01ms (mmap) and a single write() call
-    // is faster than 2-3 chunked writes. The data stays hot in cache because
-    // translate_to processes sequentially and the write follows immediately.
-    let mut out_buf = alloc_uninit_vec(data.len());
+    // Chunked translate: use a small reusable buffer that fits in L2 cache.
+    // This avoids the full-size (10MB+) allocation entirely and improves cache
+    // locality: each chunk is translated and written while still hot in cache.
+    // 256KB fits comfortably in L2 (typically 256KB-1MB) and produces only
+    // ceil(10MB/256KB) = 40 write() syscalls for a 10MB file.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut out_buf = alloc_uninit_vec(buf_size);
 
     if let Some((lo, hi, offset)) = range_info {
-        translate_range_simd(data, &mut out_buf, lo, hi, offset);
+        for chunk in data.chunks(CHUNK) {
+            translate_range_simd(chunk, &mut out_buf[..chunk.len()], lo, hi, offset);
+            writer.write_all(&out_buf[..chunk.len()])?;
+        }
     } else if let Some((lo, hi, replacement)) = const_info {
-        out_buf.copy_from_slice(data);
-        translate_range_to_constant_simd_inplace(&mut out_buf, lo, hi, replacement);
+        for chunk in data.chunks(CHUNK) {
+            out_buf[..chunk.len()].copy_from_slice(chunk);
+            translate_range_to_constant_simd_inplace(&mut out_buf[..chunk.len()], lo, hi, replacement);
+            writer.write_all(&out_buf[..chunk.len()])?;
+        }
     } else {
-        translate_to(data, &mut out_buf, table);
+        for chunk in data.chunks(CHUNK) {
+            translate_to(chunk, &mut out_buf[..chunk.len()], table);
+            writer.write_all(&out_buf[..chunk.len()])?;
+        }
     }
-    writer.write_all(&out_buf)
+    Ok(())
 }
 
 /// Translate from a read-only mmap (or any byte slice) to a separate output buffer.
