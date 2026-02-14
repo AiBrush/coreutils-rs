@@ -908,15 +908,23 @@ fn write_sorted_output(
             }
         }
     } else {
-        // Direct sequential writes through BufWriter (which already has 16MB buffer).
-        // Avoids the contiguous buffer allocation + parallel copy overhead.
-        // BufWriter coalesces the small writes into large kernel writes.
+        // Batch line+terminator pairs via write_vectored to reduce function call
+        // overhead (2N write_all calls -> N/BATCH write_vectored calls).
         let dp = data.as_ptr();
+        const BATCH: usize = 512;
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
             let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-            writer.write_all(line)?;
-            writer.write_all(terminator)?;
+            slices.push(io::IoSlice::new(line));
+            slices.push(io::IoSlice::new(terminator));
+            if slices.len() >= BATCH * 2 {
+                write_all_vectored(writer, &slices)?;
+                slices.clear();
+            }
+        }
+        if !slices.is_empty() {
+            write_all_vectored(writer, &slices)?;
         }
     }
     Ok(())
@@ -1083,15 +1091,23 @@ fn write_sorted_entries(
             }
         }
     } else {
-        // Direct sequential writes through BufWriter (which already has 16MB buffer).
-        // Avoids the contiguous buffer allocation + parallel copy overhead.
-        // BufWriter coalesces the small writes into large kernel writes.
+        // Batch line+terminator pairs via write_vectored to reduce function call
+        // overhead (2N write_all calls -> N/BATCH write_vectored calls).
         let dp = data.as_ptr();
+        const BATCH: usize = 512;
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
             let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-            writer.write_all(line)?;
-            writer.write_all(terminator)?;
+            slices.push(io::IoSlice::new(line));
+            slices.push(io::IoSlice::new(terminator));
+            if slices.len() >= BATCH * 2 {
+                write_all_vectored(writer, &slices)?;
+                slices.clear();
+            }
+        }
+        if !slices.is_empty() {
+            write_all_vectored(writer, &slices)?;
         }
     }
     Ok(())
