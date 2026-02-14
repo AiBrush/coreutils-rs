@@ -1,0 +1,131 @@
+name: Update README Performance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM UTC
+
+permissions:
+  contents: write
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch latest benchmark report
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the latest version directory in the independent test repo
+          LATEST=$(gh api repos/AiBrush/coreutils-rs-independent-test/contents/results/benchmarks \
+            --jq '[.[] | select(.type == "dir")] | sort_by(.name) | last | .name' 2>/dev/null || echo "")
+
+          if [ -z "$LATEST" ]; then
+            echo "No benchmark results found"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Latest version: $LATEST"
+
+          # Fetch the report.md
+          REPORT=$(gh api repos/AiBrush/coreutils-rs-independent-test/contents/results/benchmarks/${LATEST}/report.md \
+            --jq '.content' 2>/dev/null | base64 -d || echo "")
+
+          if [ -z "$REPORT" ]; then
+            echo "No report.md found for version $LATEST"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "$LATEST" > /tmp/bench_version.txt
+          echo "$REPORT" > /tmp/bench_report.md
+
+      - name: Extract performance table
+        if: steps.fetch.outputs.found == 'true'
+        run: |
+          VERSION=$(cat /tmp/bench_version.txt)
+          REPORT=$(cat /tmp/bench_report.md)
+
+          # Extract the performance highlights table from the report
+          # Look for a markdown table with tool names and speedup values
+          # Build a new performance section
+          cat > /tmp/perf_section.md << 'SECTION_EOF'
+          ## Performance (independent benchmarks VERSION, Linux x86_64, hyperfine)
+          SECTION_EOF
+
+          # Replace VERSION placeholder
+          sed -i "s/VERSION/${VERSION}/g" /tmp/perf_section.md
+
+          # Extract table lines from report (lines starting with |)
+          TABLE_LINES=$(echo "$REPORT" | grep -E '^\|' | head -20)
+
+          if [ -z "$TABLE_LINES" ]; then
+            echo "No table found in report, extracting summary..."
+            # Try to build table from individual benchmark results
+            # Look for lines like "Tool: Nx faster" or similar patterns
+            echo "" >> /tmp/perf_section.md
+            echo "| Tool | Speedup vs GNU | Benchmark |" >> /tmp/perf_section.md
+            echo "|------|---------------:|-----------|" >> /tmp/perf_section.md
+
+            # Extract speedup data from report
+            echo "$REPORT" | grep -oP '(\w+)\s*[:|]\s*\*?\*?(\d+\.?\d*)x\*?\*?' | while read -r line; do
+              TOOL=$(echo "$line" | grep -oP '^\w+')
+              SPEED=$(echo "$line" | grep -oP '\d+\.?\d*x')
+              echo "| $TOOL | **$SPEED** | - |" >> /tmp/perf_section.md
+            done
+          else
+            echo "" >> /tmp/perf_section.md
+            echo "$TABLE_LINES" >> /tmp/perf_section.md
+          fi
+
+      - name: Update README.md
+        if: steps.fetch.outputs.found == 'true'
+        run: |
+          PERF_SECTION=$(cat /tmp/perf_section.md)
+
+          # Use Python to safely replace the performance section in README.md
+          python3 << 'PYEOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              content = f.read()
+
+          with open('/tmp/perf_section.md', 'r') as f:
+              new_section = f.read().strip()
+
+          # Replace everything from "## Performance" to the next "##" heading
+          pattern = r'## Performance[^\n]*\n.*?(?=\n## |\Z)'
+          replacement = new_section
+
+          new_content = re.sub(pattern, replacement, content, count=1, flags=re.DOTALL)
+
+          if new_content != content:
+              with open('README.md', 'w') as f:
+                  f.write(new_content)
+              print("README.md updated")
+          else:
+              print("No changes needed")
+          PYEOF
+
+      - name: Commit and push
+        if: steps.fetch.outputs.found == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet README.md; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          VERSION=$(cat /tmp/bench_version.txt)
+          git add README.md
+          git commit -m "docs: update performance benchmarks to ${VERSION}"
+          git push

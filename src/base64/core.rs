@@ -107,22 +107,26 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
-    // Single-allocation direct-to-position encode+wrap: allocate the exact output size,
-    // encode all lines directly into position, then single write_all. For 10MB input
-    // (13.5MB output), this does 1 write() instead of ~53 chunked writes. The 13.5MB
-    // allocation is trivial. SIMD encode at ~8 GB/s finishes in ~1.2ms.
+    // Bulk-encode + fuse_wrap: encode the entire input in one SIMD pass (letting
+    // base64_simd use full vector widths), then insert newlines in a separate pass.
+    // For 10MB input this does 1 encode call vs ~175K per-line calls, eliminating
+    // massive per-call overhead (base64_simd can't vectorize 57-byte inputs).
     if bytes_per_line.is_multiple_of(3) {
-        let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline per line
-        let total_full_lines = data.len() / bytes_per_line;
-        let remainder_input = data.len() % bytes_per_line;
+        // Phase 1: Encode all data in one SIMD pass (no wrapping)
+        let enc_len = BASE64_ENGINE.encoded_length(data.len());
+        let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_len);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            enc_buf.set_len(enc_len);
+        }
+        let encoded = BASE64_ENGINE.encode(data, enc_buf[..enc_len].as_out());
 
-        // Calculate exact output size
-        let remainder_encoded = if remainder_input > 0 {
-            BASE64_ENGINE.encoded_length(remainder_input) + 1
-        } else {
-            0
-        };
-        let total_output = total_full_lines * line_out + remainder_encoded;
+        // Phase 2: Insert newlines every wrap_col chars using fuse_wrap
+        let line_out = wrap_col + 1;
+        let num_full_lines = encoded.len() / wrap_col;
+        let remainder = encoded.len() % wrap_col;
+        let total_output =
+            num_full_lines * line_out + if remainder > 0 { remainder + 1 } else { 0 };
 
         let mut out_buf: Vec<u8> = Vec::with_capacity(total_output);
         #[allow(clippy::uninit_vec)]
@@ -130,67 +134,8 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             out_buf.set_len(total_output);
         }
 
-        let dst = out_buf.as_mut_ptr();
-        let mut i = 0;
-
-        // 4-line unrolled encode loop
-        while i + 4 <= total_full_lines {
-            let in_base = i * bytes_per_line;
-            let out_base = i * line_out;
-            unsafe {
-                let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s0.as_out());
-                *dst.add(out_base + wrap_col) = b'\n';
-
-                let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
-                    s1.as_out(),
-                );
-                *dst.add(out_base + line_out + wrap_col) = b'\n';
-
-                let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
-                    s2.as_out(),
-                );
-                *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
-
-                let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
-                    s3.as_out(),
-                );
-                *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
-            }
-            i += 4;
-        }
-
-        // Remaining full lines
-        while i < total_full_lines {
-            let in_base = i * bytes_per_line;
-            let out_base = i * line_out;
-            unsafe {
-                let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s.as_out());
-                *dst.add(out_base + wrap_col) = b'\n';
-            }
-            i += 1;
-        }
-
-        // Handle remainder (last partial line)
-        if remainder_input > 0 {
-            let enc_len = BASE64_ENGINE.encoded_length(remainder_input);
-            let out_off = total_full_lines * line_out;
-            unsafe {
-                let s = std::slice::from_raw_parts_mut(dst.add(out_off), enc_len);
-                let _ =
-                    BASE64_ENGINE.encode(&data[total_full_lines * bytes_per_line..], s.as_out());
-                *dst.add(out_off + enc_len) = b'\n';
-            }
-        }
-
-        return out.write_all(&out_buf[..total_output]);
+        let written = fuse_wrap(encoded, wrap_col, &mut out_buf);
+        return out.write_all(&out_buf[..written]);
     }
 
     // Fallback for non-3-aligned bytes_per_line: use writev
@@ -473,7 +418,6 @@ fn encode_wrapped_parallel(
 /// Fuse encoded base64 data with newlines in a single pass.
 /// Uses ptr::copy_nonoverlapping with 8-line unrolling for max throughput.
 /// Returns number of bytes written.
-#[allow(dead_code)]
 #[inline]
 fn fuse_wrap(encoded: &[u8], wrap_col: usize, out_buf: &mut [u8]) -> usize {
     let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline

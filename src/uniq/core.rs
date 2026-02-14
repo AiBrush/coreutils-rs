@@ -377,56 +377,6 @@ fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> 
     }
 }
 
-/// Write a count-prefixed line into a Vec<u8> buffer (avoids Writer overhead).
-/// Same format as write_count_line but appends to buf instead of calling write_all.
-#[inline(always)]
-fn write_count_line_buf(buf: &mut Vec<u8>, count: u64, line: &[u8], term: u8) {
-    // Ultra-fast path for common small counts: pre-built prefix strings
-    if count <= 9 {
-        let prefix: &[u8] = match count {
-            1 => b"      1 ",
-            2 => b"      2 ",
-            3 => b"      3 ",
-            4 => b"      4 ",
-            5 => b"      5 ",
-            6 => b"      6 ",
-            7 => b"      7 ",
-            8 => b"      8 ",
-            9 => b"      9 ",
-            _ => unreachable!(),
-        };
-        let total = 8 + line.len() + 1;
-        buf.reserve(total);
-        let old_len = buf.len();
-        unsafe {
-            let dst = buf.as_mut_ptr().add(old_len);
-            std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, 8);
-            std::ptr::copy_nonoverlapping(line.as_ptr(), dst.add(8), line.len());
-            *dst.add(8 + line.len()) = term;
-            buf.set_len(old_len + total);
-        }
-        return;
-    }
-
-    // Build prefix "     N " in a stack buffer
-    let mut prefix = [b' '; 28];
-    let digits = itoa_right_aligned_into(&mut prefix, count);
-    let width = digits.max(7);
-    let prefix_len = width + 1;
-    prefix[width] = b' ';
-
-    let total = prefix_len + line.len() + 1;
-    buf.reserve(total);
-    let old_len = buf.len();
-    unsafe {
-        let dst = buf.as_mut_ptr().add(old_len);
-        std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, prefix_len);
-        std::ptr::copy_nonoverlapping(line.as_ptr(), dst.add(prefix_len), line.len());
-        *dst.add(prefix_len + line.len()) = term;
-        buf.set_len(old_len + total);
-    }
-}
-
 /// Write u64 decimal right-aligned into prefix buffer.
 /// Buffer is pre-filled with spaces. Returns number of digits written.
 #[inline(always)]
@@ -1338,12 +1288,16 @@ fn process_filter_fast_singlepass(
 /// Uses cached length comparison for fast duplicate rejection.
 /// Uses raw pointer arithmetic to avoid bounds checking.
 ///
+/// Zero-copy output: uses writev (IoSlice) to write count prefixes from a
+/// small arena + line content directly from mmap'd data + terminator bytes.
+/// This avoids copying line content into an intermediate buffer entirely.
+///
 /// Optimizations:
 /// - Speculative line-end detection: if all lines have the same length (common
 ///   in repetitive data), we can skip the memchr SIMD scan entirely by checking
 ///   if data[cur_start + prev_len] is the terminator.
 /// - Cached 8-byte prefix rejection: avoids full comparison for most non-equal lines.
-/// - Batched write_count_line: combines prefix + line + term into single writes.
+/// - IoSlice writev batching: eliminates memcpy of line content.
 fn process_count_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1380,10 +1334,16 @@ fn process_count_fast_singlepass(
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    // Batch output into a local buffer to reduce write_all calls.
-    // 256KB buffer reduces BufWriter call overhead by 4x vs 64KB.
-    const BATCH_BUF_SIZE: usize = 256 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
+    // Zero-copy writev batching: accumulate groups as (prefix_offset, prefix_len,
+    // line_start, line_end) tuples, with prefixes stored in a flat byte buffer.
+    // Build IoSlice arrays at flush time to avoid borrow conflicts.
+    // Line content points directly into mmap'd data — zero copy.
+    const BATCH: usize = 340;
+    const PREFIX_SLOT: usize = 28; // max prefix size per group
+    let term_slice: [u8; 1] = [term];
+    let mut prefix_buf = vec![b' '; BATCH * PREFIX_SLOT];
+    // Each group: (prefix_len, line_start_in_data, line_end_in_data)
+    let mut groups: Vec<(usize, usize, usize)> = Vec::with_capacity(BATCH);
 
     while cur_start < data_len {
         let cur_end = {
@@ -1436,10 +1396,19 @@ fn process_count_fast_singlepass(
                 _ => true,
             };
             if should_print {
-                write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
-                if batch_buf.len() >= BATCH_BUF_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
+                let idx = groups.len();
+                let prefix_off = idx * PREFIX_SLOT;
+                let prefix_len = format_count_prefix_into(
+                    count,
+                    &mut prefix_buf[prefix_off..prefix_off + PREFIX_SLOT],
+                );
+                groups.push((prefix_len, prev_start, prev_end));
+
+                if groups.len() >= BATCH {
+                    flush_count_groups(writer, &prefix_buf, &groups, &term_slice, data)?;
+                    groups.clear();
+                    // Re-fill prefix_buf with spaces for next batch
+                    prefix_buf.fill(b' ');
                 }
             }
             prev_start = cur_start;
@@ -1467,13 +1436,60 @@ fn process_count_fast_singlepass(
         _ => true,
     };
     if should_print {
-        write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+        let idx = groups.len();
+        let prefix_off = idx * PREFIX_SLOT;
+        let prefix_len =
+            format_count_prefix_into(count, &mut prefix_buf[prefix_off..prefix_off + PREFIX_SLOT]);
+        groups.push((prefix_len, prev_start, prev_end));
     }
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+    if !groups.is_empty() {
+        flush_count_groups(writer, &prefix_buf, &groups, &term_slice, data)?;
     }
 
     Ok(())
+}
+
+/// Flush batched count groups using write_vectored (writev).
+/// Builds IoSlice arrays from the prefix buffer and mmap'd data.
+#[inline]
+fn flush_count_groups(
+    writer: &mut impl Write,
+    prefix_buf: &[u8],
+    groups: &[(usize, usize, usize)],
+    term_slice: &[u8; 1],
+    data: &[u8],
+) -> io::Result<()> {
+    const PREFIX_SLOT: usize = 28;
+    let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(groups.len() * 3);
+    for (i, &(prefix_len, line_start, line_end)) in groups.iter().enumerate() {
+        let prefix_off = i * PREFIX_SLOT;
+        slices.push(io::IoSlice::new(
+            &prefix_buf[prefix_off..prefix_off + prefix_len],
+        ));
+        slices.push(io::IoSlice::new(&data[line_start..line_end]));
+        slices.push(io::IoSlice::new(term_slice));
+    }
+    write_all_vectored(writer, &slices)
+}
+
+/// Format a count prefix into a buffer slot, returning the prefix length.
+/// GNU format: "%7lu " — right-aligned count in 7-char field, followed by space.
+/// Buffer must be pre-filled with spaces and at least 28 bytes.
+#[inline(always)]
+fn format_count_prefix_into(count: u64, buf: &mut [u8]) -> usize {
+    if count <= 9 {
+        buf[6] = b'0' + count as u8;
+        buf[7] = b' ';
+        return 8;
+    }
+    // Use itoa on a temp array, then copy
+    let mut tmp = [b' '; 28];
+    let digits = itoa_right_aligned_into(&mut tmp, count);
+    let width = digits.max(7);
+    tmp[width] = b' ';
+    let len = width + 1;
+    buf[..len].copy_from_slice(&tmp[..len]);
+    len
 }
 
 /// Fast single-pass for case-insensitive (-i) default mode.
@@ -1688,9 +1704,12 @@ fn process_count_ci_singlepass(
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    // Batch output into a local buffer to reduce write_all calls.
-    const BATCH_BUF_SIZE: usize = 256 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
+    // Zero-copy writev batching: same approach as process_count_fast_singlepass
+    const BATCH: usize = 340;
+    const PREFIX_SLOT: usize = 28;
+    let term_slice: [u8; 1] = [term];
+    let mut prefix_buf = vec![b' '; BATCH * PREFIX_SLOT];
+    let mut groups: Vec<(usize, usize, usize)> = Vec::with_capacity(BATCH);
 
     let base = data.as_ptr();
     let data_len = data.len();
@@ -1730,10 +1749,18 @@ fn process_count_ci_singlepass(
                 }
             };
             if should_print {
-                write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
-                if batch_buf.len() >= BATCH_BUF_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
+                let idx = groups.len();
+                let prefix_off = idx * PREFIX_SLOT;
+                let prefix_len = format_count_prefix_into(
+                    count,
+                    &mut prefix_buf[prefix_off..prefix_off + PREFIX_SLOT],
+                );
+                groups.push((prefix_len, prev_start, prev_end));
+
+                if groups.len() >= BATCH {
+                    flush_count_groups(writer, &prefix_buf, &groups, &term_slice, data)?;
+                    groups.clear();
+                    prefix_buf.fill(b' ');
                 }
             }
             prev_start = cur_start;
@@ -1759,10 +1786,14 @@ fn process_count_ci_singlepass(
         }
     };
     if should_print {
-        write_count_line_buf(&mut batch_buf, count, &data[prev_start..prev_end], term);
+        let idx = groups.len();
+        let prefix_off = idx * PREFIX_SLOT;
+        let prefix_len =
+            format_count_prefix_into(count, &mut prefix_buf[prefix_off..prefix_off + PREFIX_SLOT]);
+        groups.push((prefix_len, prev_start, prev_end));
     }
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+    if !groups.is_empty() {
+        flush_count_groups(writer, &prefix_buf, &groups, &term_slice, data)?;
     }
 
     Ok(())
