@@ -2086,7 +2086,8 @@ fn detect_delete_range(chars: &[u8]) -> Option<(u8, u8)> {
         }
     }
     // Check that the range size matches the number of chars (no gaps)
-    if (hi - lo + 1) as usize == chars.len() {
+    // Cast to usize before +1 to avoid u8 overflow when hi=255, lo=0 (range=256)
+    if (hi as usize - lo as usize + 1) == chars.len() {
         Some((lo, hi))
     } else {
         None
