@@ -59,31 +59,45 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 
 /// Parallel no-wrap encoding: split at 3-byte boundaries, encode chunks in parallel.
 /// Each chunk except possibly the last is 3-byte aligned, so no padding in intermediate chunks.
-/// Uses write_vectored (writev) to send all encoded chunks in a single syscall.
+/// Uses a single shared output buffer with direct-to-position encoding (no per-thread allocs).
 fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     let num_threads = rayon::current_num_threads().max(1);
     let raw_chunk = data.len() / num_threads;
     // Align to 3 bytes so each chunk encodes without padding (except the last)
     let chunk_size = ((raw_chunk + 2) / 3) * 3;
 
-    let chunks: Vec<&[u8]> = data.chunks(chunk_size.max(3)).collect();
-    let encoded_chunks: Vec<Vec<u8>> = chunks
-        .par_iter()
-        .map(|chunk| {
-            let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-            let mut buf: Vec<u8> = Vec::with_capacity(enc_len);
-            #[allow(clippy::uninit_vec)]
-            unsafe {
-                buf.set_len(enc_len);
-            }
-            let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
-            buf
-        })
-        .collect();
+    // Pre-compute per-chunk metadata: (input_offset, output_offset, input_len)
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+    while in_off < data.len() {
+        let chunk_len = chunk_size.max(3).min(data.len() - in_off);
+        let enc_len = BASE64_ENGINE.encoded_length(chunk_len);
+        tasks.push((in_off, out_off, chunk_len));
+        in_off += chunk_len;
+        out_off += enc_len;
+    }
+    let total_output = out_off;
 
-    // Use write_vectored to send all chunks in a single syscall
-    let iov: Vec<io::IoSlice> = encoded_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
-    write_all_vectored(out, &iov)
+    // Single shared output buffer
+    let mut outbuf: Vec<u8> = Vec::with_capacity(total_output);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        outbuf.set_len(total_output);
+    }
+
+    // Parallel encode: each thread encodes directly into its position in the shared buffer.
+    // SAFETY: tasks have non-overlapping output regions.
+    let buf_addr = outbuf.as_mut_ptr() as usize;
+    tasks.par_iter().for_each(|&(in_off, out_off, chunk_len)| {
+        let enc_len = BASE64_ENGINE.encoded_length(chunk_len);
+        let out_slice = unsafe {
+            std::slice::from_raw_parts_mut((buf_addr as *mut u8).add(out_off), enc_len)
+        };
+        let _ = BASE64_ENGINE.encode(&data[in_off..in_off + chunk_len], out_slice.as_out());
+    });
+
+    out.write_all(&outbuf[..total_output])
 }
 
 /// Encode with line wrapping using in-place expansion.
