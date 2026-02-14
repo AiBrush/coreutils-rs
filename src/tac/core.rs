@@ -1,43 +1,26 @@
-use std::io::{self, IoSlice, Write};
+use std::io::{self, Write};
 
-/// Max IoSlice entries per write_vectored batch.
-/// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
-const MAX_IOV: usize = 1024;
+/// Threshold above which we use parallel copy for building the output buffer.
+/// Below this, the single-threaded memcpy is fast enough.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
-/// Chunk size for the forward-scan-within-backward-chunks strategy.
-/// 4MB gives better SIMD throughput per memchr_iter call (fewer calls needed,
-/// each processing a larger contiguous region with full AVX2 pipeline).
-/// For a 10MB file with 50-byte lines, 4MB chunks = 3 calls vs 5 at 2MB.
-const CHUNK: usize = 4 * 1024 * 1024;
-
-/// Flush a batch of IoSlice entries using write_vectored.
-/// Batches in chunks of MAX_IOV to respect Linux UIO_MAXIOV.
-#[inline]
-fn flush_iov(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
-    for batch in slices.chunks(MAX_IOV) {
-        let total: usize = batch.iter().map(|s| s.len()).sum();
-        let written = match out.write_vectored(batch) {
-            Ok(n) if n >= total => continue,
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-        // Slow path: partial write — fall back to write_all per remaining slice
-        let mut skip = written;
-        for slice in batch {
-            let slen = slice.len();
-            if skip >= slen {
-                skip -= slen;
-                continue;
-            }
-            if skip > 0 {
-                out.write_all(&slice[skip..])?;
-                skip = 0;
-            } else {
-                out.write_all(slice)?;
-            }
-        }
+/// Reverse records separated by a single byte.
+/// Uses single forward SIMD pass to find separators, then builds a contiguous
+/// output buffer with records in reverse order and writes via single write_all.
+///
+/// The contiguous-buffer approach is much faster than writev because:
+/// - writev with 200K IoSlice entries requires ~200 syscalls (1024 per batch)
+/// - Single write_all of contiguous buffer = 1-2 syscalls
+/// - The memcpy cost to build the buffer is much less than the syscall overhead
+pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    if !before {
+        tac_bytes_contiguous_after(data, separator, out)
+    } else {
+        tac_bytes_contiguous_before(data, separator, out)
+    }
 }
 
 /// Reverse records of an owned Vec in-place, then write.
@@ -56,7 +39,7 @@ pub fn tac_bytes_owned(
     if data.is_empty() {
         return Ok(());
     }
-    // For before-separator mode or complex cases, fall back to the copy approach
+    // For before-separator mode, fall back to the copy approach
     if before {
         return tac_bytes(data, separator, before, out);
     }
@@ -68,11 +51,6 @@ pub fn tac_bytes_owned(
 
     // Step 2: Reverse each record within the reversed buffer.
     // After step 1, records are in the right order but each record's bytes are reversed.
-    // We need to reverse each individual record.
-    //
-    // After global reverse, what were "\n" separators at the END of records
-    // are now at the START. So records are [sep][reversed_bytes]...[sep][reversed_bytes][maybe_no_sep]
-    //
     // Collect separator positions first (memchr SIMD pass), then reverse each segment.
     let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
     let mut start = 0;
@@ -90,209 +68,169 @@ pub fn tac_bytes_owned(
     out.write_all(data)
 }
 
-/// Reverse records separated by a single byte.
-/// Uses single forward SIMD pass to find separators, then builds zero-copy
-/// reversed output via IoSlice entries pointing directly at the source data.
+/// After-separator mode: Build contiguous output buffer with records in reverse order.
+/// Single forward SIMD memchr pass to find all separator positions, then copy
+/// records into output buffer in reverse order. Single write_all at the end.
 ///
-/// For data up to ZEROCOPY_LIMIT (256MB), builds IoSlice entries for all
-/// records and writes via batched write_vectored. For larger data, falls
-/// back to chunked backward scan to limit memory overhead.
-pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    if data.len() <= ZEROCOPY_LIMIT {
-        if !before {
-            tac_bytes_zerocopy_after(data, separator, out)
-        } else {
-            tac_bytes_zerocopy_before(data, separator, out)
-        }
-    } else if !before {
-        tac_bytes_backward_after(data, separator, out)
-    } else {
-        tac_bytes_backward_before(data, separator, out)
-    }
-}
-
-/// Threshold for zero-copy IoSlice strategy.
-/// Up to 256MB, the positions Vec (~50MB for 50-byte lines) + IoSlice Vec
-/// (~100MB) is acceptable. For larger data, use chunked backward scan.
-const ZEROCOPY_LIMIT: usize = 256 * 1024 * 1024;
-
-/// Zero-copy after-separator mode: builds IoSlice entries pointing directly
-/// at the source data in reverse record order. Uses forward SIMD memchr_iter
-/// to find all separator positions, then constructs IoSlice entries in reverse
-/// order and writes them via batched write_vectored.
-///
-/// Eliminates the 10MB output buffer allocation and data copy that the previous
-/// contiguous-buffer approach required. For /dev/null or pipe output, this is
-/// significantly faster since we avoid touching 10MB of output memory entirely.
-fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+/// For large files (>4MB), uses rayon parallel copy to fill the output buffer.
+fn tac_bytes_contiguous_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     // Collect separator positions with forward SIMD memchr (single fast pass).
-    // For 10MB with 50-byte lines, this produces ~200K positions.
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
-    // Build IoSlice entries in reverse order, pointing directly at source data.
-    // Each record is the slice between separators (after the separator byte).
-    let num_records = positions.len() + 1; // +1 for potential leading record
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    if positions.is_empty() {
+        // No separators found — output data as-is
+        return out.write_all(data);
+    }
 
+    // Build array of record (start, len) in reverse order.
+    // Records are the data between separators.
+    // For after-separator mode: record is [prev_sep+1 .. cur_sep+1) (includes the separator).
+    let num_records = positions.len() + 1; // +1 for potential leading record without separator
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
+
+    // Walk positions in reverse to build reversed record list
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
-            iov.push(IoSlice::new(&data[rec_start..end]));
+            records.push((rec_start, end - rec_start));
         }
         end = rec_start;
     }
     // First record (before the first separator)
     if end > 0 {
-        iov.push(IoSlice::new(&data[..end]));
+        records.push((0, end));
     }
 
-    flush_iov(out, &iov)
+    // Total output size equals input size (we're just reordering, not adding/removing bytes)
+    let total: usize = records.iter().map(|&(_, len)| len).sum();
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    // Allocate output buffer (no zero-init needed)
+    let mut output: Vec<u8> = Vec::with_capacity(total);
+    // SAFETY: every byte in [0..total) is written by the copy loop below.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total);
+    }
+
+    if total >= PARALLEL_THRESHOLD && records.len() > 100 {
+        // Parallel copy: compute prefix sums for write positions, then copy in parallel
+        parallel_copy_records(data, &records, &mut output);
+    } else {
+        // Sequential copy
+        let src = data.as_ptr();
+        let dst = output.as_mut_ptr();
+        let mut wp = 0usize;
+        for &(start, len) in &records {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start), dst.add(wp), len);
+            }
+            wp += len;
+        }
+    }
+
+    out.write_all(&output)
 }
 
-/// Zero-copy before-separator mode: builds IoSlice entries pointing directly
-/// at the source data in reverse record order.
-fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+/// Before-separator mode: Build contiguous output buffer with records in reverse order.
+fn tac_bytes_contiguous_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
+    if positions.is_empty() {
+        return out.write_all(data);
+    }
+
     let num_records = positions.len() + 1;
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(num_records);
 
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
-            iov.push(IoSlice::new(&data[pos..end]));
+            records.push((pos, end - pos));
         }
         end = pos;
     }
-    // First record (before the first separator)
     if end > 0 {
-        iov.push(IoSlice::new(&data[..end]));
+        records.push((0, end));
     }
 
-    flush_iov(out, &iov)
+    let total: usize = records.iter().map(|&(_, len)| len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut output: Vec<u8> = Vec::with_capacity(total);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total);
+    }
+
+    if total >= PARALLEL_THRESHOLD && records.len() > 100 {
+        parallel_copy_records(data, &records, &mut output);
+    } else {
+        let src = data.as_ptr();
+        let dst = output.as_mut_ptr();
+        let mut wp = 0usize;
+        for &(start, len) in &records {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start), dst.add(wp), len);
+            }
+            wp += len;
+        }
+    }
+
+    out.write_all(&output)
 }
 
-/// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.
-///
-/// Instead of calling memrchr once per line (high per-call overhead for short
-/// lines), we process the file backward in large chunks. Within each chunk a
-/// single memchr_iter forward pass finds ALL separator positions with full SIMD
-/// pipeline utilisation, then we emit the records (slices) in reverse order.
-///
-/// This converts ~200K memrchr calls (for a 10MB / 50-byte-line file) into
-/// ~20 memchr_iter calls, each scanning a contiguous 512KB region.
-///
-/// Optimization: Instead of collecting positions into a Vec, we store them
-/// in a stack-allocated array to avoid heap allocation per chunk.
-fn tac_bytes_backward_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
+/// Parallel copy of records into the output buffer using rayon.
+/// Computes prefix sums for write positions, then each thread copies
+/// its chunk of records independently.
+fn parallel_copy_records(data: &[u8], records: &[(usize, usize)], output: &mut [u8]) {
+    use rayon::prelude::*;
 
-    // `global_end` tracks where the current (rightmost unseen) record ends.
-    let mut global_end = data.len();
+    let n = records.len();
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (n + num_threads - 1) / num_threads;
 
-    // Stack-allocated positions buffer: avoid heap allocation per chunk.
-    // 512KB chunk / 1 byte per separator = 512K max positions.
-    // We use a heap-allocated buffer once but reuse across all chunks.
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
+    // Compute prefix sums for each chunk's starting write position
+    let chunk_sizes: Vec<usize> = records
+        .chunks(chunk_size)
+        .map(|chunk| chunk.iter().map(|&(_, len)| len).sum())
+        .collect();
 
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
-
-    loop {
-        let chunk_end = global_end.min(data.len());
-        if chunk_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
-            }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
-        }
-        let chunk = &data[chunk_start..chunk_end];
-
-        // Reuse positions buffer: clear and refill without reallocation.
-        positions_buf.clear();
-        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
-
-        // Emit records in reverse (rightmost first).
-        for &pos in positions_buf.iter().rev() {
-            if pos + 1 < global_end {
-                iov.push(IoSlice::new(&data[pos + 1..global_end]));
-            }
-            global_end = pos + 1;
-
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
+    let mut chunk_offsets: Vec<usize> = Vec::with_capacity(chunk_sizes.len() + 1);
+    chunk_offsets.push(0usize);
+    let mut total = 0usize;
+    for &sz in &chunk_sizes {
+        total += sz;
+        chunk_offsets.push(total);
     }
 
-    // First record
-    if global_end > 0 {
-        iov.push(IoSlice::new(&data[0..global_end]));
-    }
-    flush_iov(out, &iov)?;
-    Ok(())
-}
+    let output_addr = output.as_mut_ptr() as usize;
+    let data_addr = data.as_ptr() as usize;
 
-/// Before-separator mode: chunk-based forward SIMD scan, emitted in reverse.
-///
-/// Same chunked strategy as after-mode, but each record STARTS with its
-/// separator byte instead of ending with it.
-fn tac_bytes_backward_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
-
-    let mut global_end = data.len();
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
-
-    loop {
-        let chunk_end = global_end.min(data.len());
-        if chunk_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
+    records
+        .par_chunks(chunk_size)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let op = output_addr as *mut u8;
+            let dp = data_addr as *const u8;
+            let mut wp = chunk_offsets[ci];
+            for &(start, len) in chunk {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(dp.add(start), op.add(wp), len);
+                }
+                wp += len;
             }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
-        }
-        let chunk = &data[chunk_start..chunk_end];
-
-        positions_buf.clear();
-        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
-
-        for &pos in positions_buf.iter().rev() {
-            iov.push(IoSlice::new(&data[pos..global_end]));
-            global_end = pos;
-
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
-    }
-
-    if global_end > 0 {
-        iov.push(IoSlice::new(&data[0..global_end]));
-    }
-    flush_iov(out, &iov)?;
-    Ok(())
+        });
 }
 
 /// Reverse records using a multi-byte string separator.
-/// Uses chunk-based forward SIMD-accelerated memmem + IoSlice zero-copy output.
+/// Uses chunk-based forward SIMD-accelerated memmem + contiguous buffer output.
 ///
 /// For single-byte separators, delegates to tac_bytes which uses memchr (faster).
 pub fn tac_string_separator(
@@ -311,14 +249,6 @@ pub fn tac_string_separator(
 
     let sep_len = separator.len();
 
-    // For multi-byte separators we use the same chunk-based strategy but with
-    // memmem::find_iter instead of memchr_iter. We need FinderRev only for a
-    // quick "any separator exists?" check — the actual work uses forward Finder.
-    //
-    // We still need to handle the case where a separator straddles a chunk
-    // boundary. We do this by extending each chunk's left edge by (sep_len - 1)
-    // bytes and deduplicating matches that fall in the overlap zone.
-
     if !before {
         tac_string_after(data, separator, sep_len, out)
     } else {
@@ -327,114 +257,106 @@ pub fn tac_string_separator(
 }
 
 /// Multi-byte string separator, after mode (separator at end of record).
+/// Builds contiguous output buffer instead of using writev.
 fn tac_string_after(
     data: &[u8],
     separator: &[u8],
     sep_len: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
-    let mut global_end = data.len();
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK / 4);
+    // Collect all separator positions
+    let positions: Vec<usize> = memchr::memmem::find_iter(data, separator).collect();
 
-    loop {
-        let chunk_end = global_end.min(data.len());
-        let scan_start = chunk_start.saturating_sub(sep_len - 1);
-        if scan_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
-            }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
-        }
-        let scan_region = &data[scan_start..chunk_end];
-
-        positions_buf.clear();
-        positions_buf.extend(
-            memchr::memmem::find_iter(scan_region, separator)
-                .map(|p| p + scan_start)
-                .filter(|&p| p >= chunk_start || chunk_start == 0)
-                .filter(|&p| p + sep_len <= global_end),
-        );
-
-        for &pos in positions_buf.iter().rev() {
-            let rec_end_exclusive = pos + sep_len;
-            if rec_end_exclusive < global_end {
-                iov.push(IoSlice::new(&data[rec_end_exclusive..global_end]));
-            }
-            global_end = rec_end_exclusive;
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
+    if positions.is_empty() {
+        return out.write_all(data);
     }
 
-    if global_end > 0 {
-        iov.push(IoSlice::new(&data[0..global_end]));
+    // Build records in reverse order
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(positions.len() + 1);
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
+        let rec_start = pos + sep_len;
+        if rec_start < end {
+            records.push((rec_start, end - rec_start));
+        }
+        end = rec_start;
     }
-    flush_iov(out, &iov)?;
-    Ok(())
+    if end > 0 {
+        records.push((0, end));
+    }
+
+    let total: usize = records.iter().map(|&(_, len)| len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut output: Vec<u8> = Vec::with_capacity(total);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total);
+    }
+
+    let src = data.as_ptr();
+    let dst = output.as_mut_ptr();
+    let mut wp = 0usize;
+    for &(start, len) in &records {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(start), dst.add(wp), len);
+        }
+        wp += len;
+    }
+
+    out.write_all(&output)
 }
 
 /// Multi-byte string separator, before mode (separator at start of record).
+/// Builds contiguous output buffer instead of using writev.
 fn tac_string_before(
     data: &[u8],
     separator: &[u8],
-    sep_len: usize,
+    _sep_len: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
-    let mut global_end = data.len();
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK / 4);
+    let positions: Vec<usize> = memchr::memmem::find_iter(data, separator).collect();
 
-    loop {
-        let chunk_end = global_end.min(data.len());
-        let scan_start = chunk_start.saturating_sub(sep_len - 1);
-        if scan_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
-            }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
-        }
-        let scan_region = &data[scan_start..chunk_end];
-
-        positions_buf.clear();
-        positions_buf.extend(
-            memchr::memmem::find_iter(scan_region, separator)
-                .map(|p| p + scan_start)
-                .filter(|&p| p >= chunk_start || chunk_start == 0)
-                .filter(|&p| p < global_end),
-        );
-
-        for &pos in positions_buf.iter().rev() {
-            iov.push(IoSlice::new(&data[pos..global_end]));
-            global_end = pos;
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
+    if positions.is_empty() {
+        return out.write_all(data);
     }
 
-    if global_end > 0 {
-        iov.push(IoSlice::new(&data[0..global_end]));
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(positions.len() + 1);
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
+        if pos < end {
+            records.push((pos, end - pos));
+        }
+        end = pos;
     }
-    flush_iov(out, &iov)?;
-    Ok(())
+    if end > 0 {
+        records.push((0, end));
+    }
+
+    let total: usize = records.iter().map(|&(_, len)| len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut output: Vec<u8> = Vec::with_capacity(total);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total);
+    }
+
+    let src = data.as_ptr();
+    let dst = output.as_mut_ptr();
+    let mut wp = 0usize;
+    for &(start, len) in &records {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(start), dst.add(wp), len);
+        }
+        wp += len;
+    }
+
+    out.write_all(&output)
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
@@ -469,6 +391,7 @@ fn find_regex_matches_backward(data: &[u8], re: &regex::bytes::Regex) -> Vec<(us
 }
 
 /// Reverse records using a regex separator.
+/// Builds contiguous output buffer instead of using writev.
 pub fn tac_regex_separator(
     data: &[u8],
     pattern: &str,
@@ -496,24 +419,21 @@ pub fn tac_regex_separator(
         return Ok(());
     }
 
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(matches.len().min(MAX_IOV) + 2);
+    // Build records in reverse order
+    let mut records: Vec<(usize, usize)> = Vec::with_capacity(matches.len() + 2);
 
     if !before {
         let last_end = matches.last().unwrap().1;
 
         if last_end < data.len() {
-            iov.push(IoSlice::new(&data[last_end..]));
+            records.push((last_end, data.len() - last_end));
         }
 
         let mut i = matches.len();
         while i > 0 {
             i -= 1;
             let rec_start = if i == 0 { 0 } else { matches[i - 1].1 };
-            iov.push(IoSlice::new(&data[rec_start..matches[i].1]));
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
+            records.push((rec_start, matches[i].1 - rec_start));
         }
     } else {
         let mut i = matches.len();
@@ -525,18 +445,34 @@ pub fn tac_regex_separator(
             } else {
                 data.len()
             };
-            iov.push(IoSlice::new(&data[start..end]));
-            if iov.len() >= MAX_IOV {
-                flush_iov(out, &iov)?;
-                iov.clear();
-            }
+            records.push((start, end - start));
         }
 
         if matches[0].0 > 0 {
-            iov.push(IoSlice::new(&data[..matches[0].0]));
+            records.push((0, matches[0].0));
         }
     }
 
-    flush_iov(out, &iov)?;
-    Ok(())
+    let total: usize = records.iter().map(|&(_, len)| len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut output: Vec<u8> = Vec::with_capacity(total);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total);
+    }
+
+    let src = data.as_ptr();
+    let dst = output.as_mut_ptr();
+    let mut wp = 0usize;
+    for &(start, len) in &records {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(start), dst.add(wp), len);
+        }
+        wp += len;
+    }
+
+    out.write_all(&output)
 }
