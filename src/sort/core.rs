@@ -1795,10 +1795,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             sorted.sort_unstable_by(pfx_cmp);
         }
 
-        // Switch to sequential for output phase
+        // Switch to random-access hint for output phase:
+        // After sorting, entries access data in sorted (not file) order,
+        // which is random with respect to mmap page layout.
+        // MADV_RANDOM disables readahead that would waste I/O on unneeded pages.
         #[cfg(target_os = "linux")]
         if let FileData::Mmap(ref mmap) = buffer {
-            let _ = mmap.advise(memmap2::Advice::Sequential);
+            let _ = mmap.advise(memmap2::Advice::Random);
         }
 
         // Output sorted entries. For reverse, iterate buckets from high to low
