@@ -101,12 +101,13 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 
     let num_records = positions.len() + 1; // +1 for the segment before first separator
 
-    // For very many small records (>128K records), use buffered copy instead of writev.
-    // writev has per-IoSlice kernel overhead (~16 bytes per entry in kernel), but for
-    // moderate record counts (4K-128K), the cost of building IoSlice entries is much
-    // less than the cost of 100K+ copy_nonoverlapping calls in the buffered approach.
-    // At 128K records * 16 bytes/IoSlice = 2MB overhead vs saving 128K memcpy calls.
-    if num_records > 128 * 1024 {
+    // For many records, use buffered copy instead of writev.
+    // BufWriter::write_vectored iterates over IoSlice entries one-by-one,
+    // so for N records it does N calls to write(). The buffered approach
+    // pre-copies all records into a contiguous buffer and does one write_all,
+    // which is faster when records are small (< 256 bytes average).
+    // Threshold: 8K records balances IoSlice setup cost vs copy overhead.
+    if num_records > 8192 {
         return tac_bytes_buffered_after(data, &positions, out);
     }
 
@@ -242,8 +243,8 @@ fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
 
     let num_records = positions.len() + 1;
 
-    // For very many small records (>128K), use buffered copy instead of writev
-    if num_records > 128 * 1024 {
+    // For many records, use buffered copy instead of writev
+    if num_records > 8192 {
         return tac_bytes_buffered_before(data, &positions, out);
     }
 
