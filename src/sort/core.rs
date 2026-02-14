@@ -688,7 +688,7 @@ fn radix_sort_entries(
         let mut wpos = bk_starts.clone();
         let sptr = sorted.as_mut_ptr();
         let eptr = entries.as_ptr();
-        let prefetch_dist = 4usize;
+        let prefetch_dist = 8usize;
         for idx in 0..n {
             let ent = unsafe { *eptr.add(idx) };
             let b = (ent.0 >> 48) as usize;
