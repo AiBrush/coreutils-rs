@@ -242,9 +242,10 @@ fn itoa_right_aligned_into(buf: &mut [u8; 28], mut val: u64) -> usize {
 
 /// Process uniq from a byte slice (mmap'd file). Zero-copy, no per-line allocation.
 pub fn process_uniq_bytes(data: &[u8], output: impl Write, config: &UniqConfig) -> io::Result<()> {
-    // 32MB output buffer for fewer flush syscalls on large inputs.
-    // Larger buffer reduces write() syscall count for 100MB+ inputs.
-    let mut writer = BufWriter::with_capacity(32 * 1024 * 1024, output);
+    // 16MB output buffer — optimal for L3 cache utilization on modern CPUs.
+    // 32MB can cause cache thrashing; 16MB stays within L3 while still
+    // reducing write() syscall count significantly.
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, output);
     let term = if config.zero_terminated { b'\0' } else { b'\n' };
 
     match config.mode {
@@ -542,8 +543,10 @@ fn process_default_fast_singlepass(
     writer: &mut impl Write,
     term: u8,
 ) -> io::Result<()> {
-    // Parallel path for large files — kick in at 2MB for better CPU utilization
-    if data.len() >= 2 * 1024 * 1024 {
+    // Parallel path for large files — kick in at 4MB.
+    // Lower thresholds (e.g. 2MB) hurt performance on 10MB files because
+    // the parallel overhead dominates for smaller chunks.
+    if data.len() >= 4 * 1024 * 1024 {
         return process_default_parallel(data, writer, term);
     }
 

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -98,9 +98,10 @@ struct Cli {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
+/// 8MB matches other tools (ftac, fbase64, ftr, fcut) for consistent syscall reduction.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
     unsafe {
         libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
         libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout
@@ -271,29 +272,33 @@ fn run_uniq(cli: &Cli, config: &UniqConfig, output: impl Write) {
                 match try_mmap_stdin() {
                     Some(mmap) => process_uniq_bytes(&mmap, output, config),
                     None => {
-                        let mut buf = Vec::new();
-                        if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-                            if e.kind() != io::ErrorKind::BrokenPipe {
-                                eprintln!("uniq: {}", io_error_msg(&e));
-                                process::exit(1);
+                        // Use raw libc::read() via read_stdin() for piped stdin.
+                        // Bypasses StdinLock/BufReader overhead, pre-allocates 64MB.
+                        match coreutils_rs::common::io::read_stdin() {
+                            Ok(buf) => process_uniq_bytes(&buf, output, config),
+                            Err(e) => {
+                                if e.kind() != io::ErrorKind::BrokenPipe {
+                                    eprintln!("uniq: {}", io_error_msg(&e));
+                                    process::exit(1);
+                                }
+                                return;
                             }
-                            return;
                         }
-                        process_uniq_bytes(&buf, output, config)
                     }
                 }
             }
             #[cfg(not(unix))]
             {
-                let mut buf = Vec::new();
-                if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-                    if e.kind() != io::ErrorKind::BrokenPipe {
-                        eprintln!("uniq: {}", io_error_msg(&e));
-                        process::exit(1);
+                match coreutils_rs::common::io::read_stdin() {
+                    Ok(buf) => process_uniq_bytes(&buf, output, config),
+                    Err(e) => {
+                        if e.kind() != io::ErrorKind::BrokenPipe {
+                            eprintln!("uniq: {}", io_error_msg(&e));
+                            process::exit(1);
+                        }
+                        return;
                     }
-                    return;
                 }
-                process_uniq_bytes(&buf, output, config)
             }
         }
         Some(path) => {

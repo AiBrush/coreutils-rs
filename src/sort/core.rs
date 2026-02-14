@@ -323,10 +323,11 @@ fn read_all_input(
         let mut data = Vec::new();
         for input in inputs {
             if input == "-" {
-                // Use BufReader with 8MB buffer for high-throughput stdin reads.
-                // This reduces the number of read syscalls for piped input.
-                let mut reader = BufReader::with_capacity(8 * 1024 * 1024, io::stdin().lock());
-                reader.read_to_end(&mut data)?;
+                // Use raw libc::read() via read_stdin() for high-throughput stdin reads.
+                // Bypasses BufReader/StdinLock overhead, pre-allocates 64MB, uses
+                // full spare capacity per read() call to minimize syscall count.
+                let stdin_data = crate::common::io::read_stdin()?;
+                data.extend_from_slice(&stdin_data);
             } else {
                 let mut file = File::open(input).map_err(|e| {
                     io::Error::new(
@@ -854,10 +855,55 @@ fn write_sorted_output(
     } else if sorted_indices.len() > 50_000 {
         write_sorted_single_buf_idx(data, offsets, sorted_indices, terminator, writer)?;
     } else {
+        // Use write_vectored to batch line+terminator pairs into fewer syscalls.
+        // Each entry produces 2 IoSlices (line data + terminator), batched in
+        // groups of 512 entries (1024 IoSlices) to stay within typical writev limits.
+        const BATCH: usize = 512;
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            writer.write_all(&data[s..e])?;
-            writer.write_all(terminator)?;
+            slices.push(io::IoSlice::new(&data[s..e]));
+            slices.push(io::IoSlice::new(terminator));
+            if slices.len() >= BATCH * 2 {
+                write_all_vectored(writer, &slices)?;
+                slices.clear();
+            }
+        }
+        if !slices.is_empty() {
+            write_all_vectored(writer, &slices)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write all IoSlices to the writer, handling partial writes correctly.
+/// Advances past fully-consumed slices on each iteration.
+fn write_all_vectored(writer: &mut impl Write, slices: &[io::IoSlice<'_>]) -> io::Result<()> {
+    // Fast path: single write_vectored call usually consumes everything
+    // when backed by BufWriter with a large buffer.
+    let n = writer.write_vectored(slices)?;
+    let expected: usize = slices.iter().map(|s| s.len()).sum();
+    if n >= expected {
+        return Ok(());
+    }
+    if n == 0 && expected > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "write_vectored returned 0",
+        ));
+    }
+    // Slow path: partial write — fall back to write_all per remaining slice.
+    // Find which slices were fully consumed and where the partial one starts.
+    let mut consumed = n;
+    for slice in slices {
+        if consumed == 0 {
+            writer.write_all(slice)?;
+        } else if consumed >= slice.len() {
+            consumed -= slice.len();
+        } else {
+            // Partial slice: write remaining portion
+            writer.write_all(&slice[consumed..])?;
+            consumed = 0;
         }
     }
     Ok(())
@@ -991,10 +1037,20 @@ fn write_sorted_entries(
     } else if entries.len() > 50_000 {
         write_sorted_single_buf_entries(data, offsets, entries, terminator, writer)?;
     } else {
+        // Use write_vectored to batch line+terminator pairs.
+        const BATCH: usize = 512;
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            writer.write_all(&data[s..e])?;
-            writer.write_all(terminator)?;
+            slices.push(io::IoSlice::new(&data[s..e]));
+            slices.push(io::IoSlice::new(terminator));
+            if slices.len() >= BATCH * 2 {
+                write_all_vectored(writer, &slices)?;
+                slices.clear();
+            }
+        }
+        if !slices.is_empty() {
+            write_all_vectored(writer, &slices)?;
         }
     }
     Ok(())
@@ -1194,10 +1250,11 @@ fn do_sort(
 /// 3. Single-key sorts: pre-extracts key offsets + optional numeric pre-parse
 /// 4. General: index-based sort with full comparison function
 pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()> {
-    // Enlarge pipe buffers on Linux for higher throughput when reading from stdin
+    // Enlarge pipe buffers on Linux for higher throughput when reading from stdin.
+    // 8MB matches other tools (ftac, fbase64, ftr, fcut) for consistent syscall reduction.
     #[cfg(target_os = "linux")]
     {
-        const PIPE_SIZE: i32 = 4 * 1024 * 1024;
+        const PIPE_SIZE: i32 = 8 * 1024 * 1024;
         unsafe {
             libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE);
             libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE);
@@ -1329,10 +1386,20 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 }
             } else {
+                // Use write_vectored to batch line+terminator pairs.
+                const BATCH: usize = 512;
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
-                    writer.write_all(&data[s..e])?;
-                    writer.write_all(terminator)?;
+                    slices.push(io::IoSlice::new(&data[s..e]));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
+                }
+                if !slices.is_empty() {
+                    write_all_vectored(&mut writer, &slices)?;
                 }
             }
             writer.flush()?;
@@ -1540,9 +1607,19 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 // Phase 5: single write
                 writer.write_all(&output)?;
             } else {
+                // Use write_vectored to batch line+terminator pairs.
+                const BATCH: usize = 512;
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for &(_, s, l) in &sorted {
-                    writer.write_all(&data[s as usize..(s + l) as usize])?;
-                    writer.write_all(terminator)?;
+                    slices.push(io::IoSlice::new(&data[s as usize..(s + l) as usize]));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
+                }
+                if !slices.is_empty() {
+                    write_all_vectored(&mut writer, &slices)?;
                 }
             }
         }
