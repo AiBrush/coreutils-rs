@@ -2103,17 +2103,46 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                     drop(entries);
 
-                    // Sort each bucket with full key comparison
+                    // Sort each bucket with full key comparison.
+                    // Uses raw pointer arithmetic to eliminate bounds checking in the
+                    // comparison hot path. The 8-byte prefix is already resolved by
+                    // the radix pass, so we only compare bytes after the prefix.
                     {
                         let sorted_ptr = sorted.as_mut_ptr();
                         let sorted_len = sorted.len();
+                        let data_addr = data.as_ptr() as usize;
                         let bucket_cmp = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
                             let ord = match a.0.cmp(&b.0) {
                                 Ordering::Equal => {
                                     let (sa, ea) = key_offs[a.1];
                                     let (sb, eb) = key_offs[b.1];
-                                    let skip = 8.min(ea - sa).min(eb - sb);
-                                    data[sa + skip..ea].cmp(&data[sb + skip..eb])
+                                    let la = ea - sa;
+                                    let lb = eb - sb;
+                                    let skip = 8.min(la).min(lb);
+                                    let rem_a = la - skip;
+                                    let rem_b = lb - skip;
+                                    unsafe {
+                                        let dp = data_addr as *const u8;
+                                        let pa = dp.add(sa + skip);
+                                        let pb = dp.add(sb + skip);
+                                        let min_rem = rem_a.min(rem_b);
+                                        let mut i = 0usize;
+                                        while i + 8 <= min_rem {
+                                            let wa =
+                                                u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
+                                            let wb =
+                                                u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
+                                            if wa != wb {
+                                                return wa.cmp(&wb);
+                                            }
+                                            i += 8;
+                                        }
+                                        let tail_a =
+                                            std::slice::from_raw_parts(pa.add(i), rem_a - i);
+                                        let tail_b =
+                                            std::slice::from_raw_parts(pb.add(i), rem_b - i);
+                                        tail_a.cmp(tail_b)
+                                    }
                                 }
                                 ord => ord,
                             };

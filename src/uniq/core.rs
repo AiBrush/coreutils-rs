@@ -255,8 +255,43 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
 /// Write a count-prefixed line in GNU uniq format.
 /// GNU format: "%7lu " — right-aligned in 7-char field, followed by space.
 /// Combines prefix + line + term into a single write for short lines (< 240 bytes).
+///
+/// Optimized with lookup table for counts 1-9 (most common case in many-dups data)
+/// and fast-path for counts < 10M (always fits in 7 chars, no copy_within needed).
 #[inline(always)]
 fn write_count_line(out: &mut impl Write, count: u64, line: &[u8], term: u8) -> io::Result<()> {
+    // Ultra-fast path for common small counts: pre-built prefix strings
+    // Avoids all the itoa/copy_within overhead for the most common case.
+    if count <= 9 {
+        // "      N " where N is 1-9 (7 chars + space = 8 bytes prefix)
+        let prefix: &[u8] = match count {
+            1 => b"      1 ",
+            2 => b"      2 ",
+            3 => b"      3 ",
+            4 => b"      4 ",
+            5 => b"      5 ",
+            6 => b"      6 ",
+            7 => b"      7 ",
+            8 => b"      8 ",
+            9 => b"      9 ",
+            _ => unreachable!(),
+        };
+        let total = 8 + line.len() + 1;
+        if total <= 256 {
+            let mut buf = [0u8; 256];
+            unsafe {
+                std::ptr::copy_nonoverlapping(prefix.as_ptr(), buf.as_mut_ptr(), 8);
+                std::ptr::copy_nonoverlapping(line.as_ptr(), buf.as_mut_ptr().add(8), line.len());
+                *buf.as_mut_ptr().add(8 + line.len()) = term;
+            }
+            return out.write_all(&buf[..total]);
+        } else {
+            out.write_all(prefix)?;
+            out.write_all(line)?;
+            return out.write_all(&[term]);
+        }
+    }
+
     // Build prefix "     N " in a stack buffer (max 21 bytes for u64 + spaces)
     let mut prefix = [b' '; 28]; // Enough for u64 max + padding + space
     let digits = itoa_right_aligned_into(&mut prefix, count);
