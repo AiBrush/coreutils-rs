@@ -850,9 +850,18 @@ fn decode_borrowed_clean(out: &mut impl Write, data: &[u8]) -> io::Result<()> {
     if data.len() >= PARALLEL_DECODE_THRESHOLD {
         return decode_borrowed_clean_parallel(out, data);
     }
-    match BASE64_ENGINE.decode_to_vec(data) {
+    // Pre-allocate exact output size to avoid decode_to_vec's reallocation.
+    // Decoded size = data.len() * 3 / 4 minus padding.
+    let pad = data.iter().rev().take(2).filter(|&&b| b == b'=').count();
+    let decoded_size = data.len() * 3 / 4 - pad;
+    let mut buf: Vec<u8> = Vec::with_capacity(decoded_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(decoded_size);
+    }
+    match BASE64_ENGINE.decode(data, buf[..decoded_size].as_out()) {
         Ok(decoded) => {
-            out.write_all(&decoded)?;
+            out.write_all(decoded)?;
             Ok(())
         }
         Err(_) => decode_error(),
@@ -952,13 +961,12 @@ pub fn encode_stream(
 }
 
 /// Streaming encode with NO line wrapping — optimized fast path.
-/// Read size is 12MB (divisible by 3): encoded output = 12MB * 4/3 = 16MB.
-/// 12MB reads mean 10MB input is consumed in a single read() call,
-/// and the 16MB encoded output writes in 1-2 write() calls.
+/// Read size is 24MB (divisible by 3): encoded output = 24MB * 4/3 = 32MB.
+/// 24MB reads mean 10-18MB input is consumed in a single read() call,
+/// and the encoded output writes in 1-2 write() calls.
 fn encode_stream_nowrap(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    // 12MB aligned to 3 bytes: encoded output = 12MB * 4/3 = 16MB.
-    // For 10MB input: 1 read (10MB) instead of 2 reads.
-    const NOWRAP_READ: usize = 12 * 1024 * 1024; // exactly divisible by 3
+    // 24MB aligned to 3 bytes: 24MB reads handle up to 24MB input in one pass.
+    const NOWRAP_READ: usize = 24 * 1024 * 1024; // exactly divisible by 3
 
     // SAFETY: buf bytes are written by read_full before being processed.
     // encode_buf bytes are written by encode before being read.
@@ -1052,8 +1060,8 @@ fn encode_stream_wrapped_fused(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     // Align read size to bytes_per_line for complete output lines per chunk.
-    // ~210K lines * 57 bytes = ~12MB input, ~16MB output.
-    let lines_per_chunk = (12 * 1024 * 1024) / bytes_per_line;
+    // ~420K lines * 57 bytes = ~24MB input, ~32MB output.
+    let lines_per_chunk = (24 * 1024 * 1024) / bytes_per_line;
     let read_size = lines_per_chunk * bytes_per_line;
     let line_out = wrap_col + 1; // wrap_col encoded bytes + 1 newline
 
