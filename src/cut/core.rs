@@ -623,19 +623,11 @@ fn process_single_field(
             // Since most lines have a delimiter, and field 1 is a prefix of each line,
             // we can write contiguous runs directly from the source data.
             single_field1_zerocopy(data, delim, line_delim, out)?;
-        } else if target_idx <= 7 && !suppress {
-            // Optimized path for small field indices (fields 2-8):
-            // Uses scalar byte scanning per line for short lines (passwd-style),
-            // and memchr for longer lines. Avoids memchr2_iter overhead.
-            let mut buf = Vec::with_capacity(data.len().min(4 * 1024 * 1024));
-            process_small_field_combined(data, delim, line_delim, target_idx, &mut buf);
-            if !buf.is_empty() {
-                out.write_all(&buf)?;
-            }
         } else {
-            // Write directly to BufWriter-backed output to avoid intermediate Vec.
-            // For larger inputs, process_nth_field_combined builds a buffer that
-            // we then write in a single call (reducing syscall count).
+            // Single-pass SIMD scan using memchr2_iter for both delimiter and
+            // line_delim simultaneously. For large files this is faster than the
+            // two-pass approach (outer newline scan + inner scalar field scan)
+            // because it processes the entire file in one SIMD sweep.
             let mut buf = Vec::with_capacity(data.len().min(4 * 1024 * 1024));
             process_nth_field_combined(data, delim, line_delim, target_idx, suppress, &mut buf);
             if !buf.is_empty() {
