@@ -806,31 +806,99 @@ fn radix_sort_entries(
                     bucket.copy_from_slice(&temp);
                     drop(temp);
                     // Sort each non-trivial sub-bucket
+                    // For large sub-buckets (>64), do a 3rd-level radix on bits 16-31
                     for sb in 0..sub_nbk {
                         let slo = sub_starts[sb];
                         let shi = sub_starts[sb + 1];
-                        if shi - slo > 1 {
-                            let sub_slice = &mut bucket[slo..shi];
-                            let sub_len = sub_slice.len();
-                            // Check for all-identical content (common in repetitive data)
-                            let ref_s = sub_slice[0].1 as usize;
-                            let ref_l = sub_slice[0].2 as usize;
-                            let last_s = sub_slice[sub_len - 1].1 as usize;
-                            let last_l = sub_slice[sub_len - 1].2 as usize;
-                            let all_same = ref_l == last_l
-                                && unsafe {
-                                    let ddp = data_addr as *const u8;
-                                    let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
-                                    let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
-                                    a == b
-                                };
-                            if !all_same {
-                                if stable {
-                                    sub_slice.sort_by(cmp_fn);
-                                } else {
-                                    sub_slice.sort_unstable_by(cmp_fn);
+                        if shi - slo <= 1 {
+                            continue;
+                        }
+                        let sub_slice = &mut bucket[slo..shi];
+                        let sub_len = sub_slice.len();
+                        // Check for all-identical content (common in repetitive data)
+                        let ref_s = sub_slice[0].1 as usize;
+                        let ref_l = sub_slice[0].2 as usize;
+                        let last_s = sub_slice[sub_len - 1].1 as usize;
+                        let last_l = sub_slice[sub_len - 1].2 as usize;
+                        let all_same = ref_l == last_l
+                            && unsafe {
+                                let ddp = data_addr as *const u8;
+                                let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
+                                let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
+                                a == b
+                            };
+                        if all_same {
+                            continue;
+                        }
+
+                        // 3rd-level radix on bits 16-31 for large sub-buckets
+                        if sub_len > 64 {
+                            let r3_shift = 16u32;
+                            let r3_mask: u64 = 0xFFFF;
+                            let r3_first = (sub_slice[0].0 >> r3_shift) & r3_mask;
+                            let mut r3_has_var = false;
+                            for e in &sub_slice[1..] {
+                                if ((e.0 >> r3_shift) & r3_mask) != r3_first {
+                                    r3_has_var = true;
+                                    break;
                                 }
                             }
+                            if r3_has_var {
+                                let r3_nbk: usize = 256; // 8-bit radix to save memory
+                                let r3_s = 24u32; // bits 24-31
+                                let r3_m: u64 = 0xFF;
+                                let mut r3_cnts = vec![0u32; r3_nbk];
+                                for &(pfx, _, _) in sub_slice.iter() {
+                                    r3_cnts[((pfx >> r3_s) & r3_m) as usize] += 1;
+                                }
+                                let mut r3_starts = vec![0usize; r3_nbk + 1];
+                                {
+                                    let mut s = 0usize;
+                                    for i in 0..r3_nbk {
+                                        r3_starts[i] = s;
+                                        s += r3_cnts[i] as usize;
+                                    }
+                                    r3_starts[r3_nbk] = s;
+                                }
+                                let mut r3_temp: Vec<(u64, u32, u32)> =
+                                    Vec::with_capacity(sub_len);
+                                #[allow(clippy::uninit_vec)]
+                                unsafe {
+                                    r3_temp.set_len(sub_len);
+                                }
+                                {
+                                    let mut wpos = r3_starts.clone();
+                                    let tp = r3_temp.as_mut_ptr();
+                                    for &ent in sub_slice.iter() {
+                                        let b = ((ent.0 >> r3_s) & r3_m) as usize;
+                                        unsafe {
+                                            *tp.add(wpos[b]) = ent;
+                                        }
+                                        wpos[b] += 1;
+                                    }
+                                }
+                                sub_slice.copy_from_slice(&r3_temp);
+                                drop(r3_temp);
+                                for rb in 0..r3_nbk {
+                                    let rlo = r3_starts[rb];
+                                    let rhi = r3_starts[rb + 1];
+                                    if rhi - rlo > 1 {
+                                        let rs = &mut sub_slice[rlo..rhi];
+                                        if stable {
+                                            rs.sort_by(cmp_fn);
+                                        } else {
+                                            rs.sort_unstable_by(cmp_fn);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        if stable {
+                            sub_slice.sort_by(cmp_fn);
+                        } else {
+                            sub_slice.sort_unstable_by(cmp_fn);
                         }
                     }
                     return;
