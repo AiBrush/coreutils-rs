@@ -715,6 +715,7 @@ fn complement_single_field_chunk(
 }
 
 /// Extract all fields except skip_idx from one line.
+/// Uses raw pointer arithmetic to eliminate bounds checking.
 #[inline(always)]
 fn complement_single_field_line(
     line: &[u8],
@@ -724,14 +725,16 @@ fn complement_single_field_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    if line.is_empty() {
+    let len = line.len();
+    if len == 0 {
         if !suppress {
             buf.push(line_delim);
         }
         return;
     }
 
-    buf.reserve(line.len() + 1);
+    buf.reserve(len + 1);
+    let base = line.as_ptr();
 
     let mut field_idx = 0;
     let mut field_start = 0;
@@ -744,7 +747,7 @@ fn complement_single_field_line(
             if !first_output {
                 unsafe { buf_push(buf, delim) };
             }
-            unsafe { buf_extend(buf, &line[field_start..pos]) };
+            unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), pos - field_start)) };
             first_output = false;
         }
         field_idx += 1;
@@ -766,7 +769,7 @@ fn complement_single_field_line(
         if !first_output {
             unsafe { buf_push(buf, delim) };
         }
-        unsafe { buf_extend(buf, &line[field_start..]) };
+        unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(field_start), len - field_start)) };
     }
 
     unsafe { buf_push(buf, line_delim) };
@@ -907,6 +910,7 @@ fn fields_prefix_chunk(
 }
 
 /// Extract first N fields from one line (contiguous from-start range).
+/// Uses raw pointer arithmetic.
 #[inline(always)]
 fn fields_prefix_line(
     line: &[u8],
@@ -916,14 +920,16 @@ fn fields_prefix_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    if line.is_empty() {
+    let len = line.len();
+    if len == 0 {
         if !suppress {
             buf.push(line_delim);
         }
         return;
     }
 
-    buf.reserve(line.len() + 1);
+    buf.reserve(len + 1);
+    let base = line.as_ptr();
 
     let mut field_count = 1;
     let mut has_delim = false;
@@ -932,7 +938,7 @@ fn fields_prefix_line(
         has_delim = true;
         if field_count >= last_field {
             unsafe {
-                buf_extend(buf, &line[..pos]);
+                buf_extend(buf, std::slice::from_raw_parts(base, pos));
                 buf_push(buf, line_delim);
             }
             return;
@@ -1020,6 +1026,7 @@ fn fields_suffix_chunk(
 }
 
 /// Extract fields from start_field to end from one line.
+/// Uses raw pointer arithmetic.
 #[inline(always)]
 fn fields_suffix_line(
     line: &[u8],
@@ -1029,14 +1036,16 @@ fn fields_suffix_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    if line.is_empty() {
+    let len = line.len();
+    if len == 0 {
         if !suppress {
             buf.push(line_delim);
         }
         return;
     }
 
-    buf.reserve(line.len() + 1);
+    buf.reserve(len + 1);
+    let base = line.as_ptr();
 
     let skip_delims = start_field - 1;
     let mut delim_count = 0;
@@ -1047,7 +1056,7 @@ fn fields_suffix_line(
         delim_count += 1;
         if delim_count >= skip_delims {
             unsafe {
-                buf_extend(buf, &line[pos + 1..]);
+                buf_extend(buf, std::slice::from_raw_parts(base.add(pos + 1), len - pos - 1));
                 buf_push(buf, line_delim);
             }
             return;
@@ -1160,6 +1169,7 @@ fn fields_mid_range_chunk(
 
 /// Extract fields start_field..=end_field from one line.
 /// Uses memchr_iter to skip to start_field, then counts delimiters to end_field.
+/// Raw pointer arithmetic to eliminate bounds checking.
 #[inline(always)]
 fn fields_mid_range_line(
     line: &[u8],
@@ -1170,14 +1180,16 @@ fn fields_mid_range_line(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    if line.is_empty() {
+    let len = line.len();
+    if len == 0 {
         if !suppress {
             buf.push(line_delim);
         }
         return;
     }
 
-    buf.reserve(line.len() + 1);
+    buf.reserve(len + 1);
+    let base = line.as_ptr();
 
     // Count delimiters to find start_field and end_field boundaries
     let skip_before = start_field - 1; // delimiters to skip before start_field
@@ -1198,7 +1210,7 @@ fn fields_mid_range_line(
                 range_start = 0;
             }
             unsafe {
-                buf_extend(buf, &line[range_start..pos]);
+                buf_extend(buf, std::slice::from_raw_parts(base.add(range_start), pos - range_start));
                 buf_push(buf, line_delim);
             }
             return;
@@ -1222,7 +1234,7 @@ fn fields_mid_range_line(
             range_start = 0;
         }
         unsafe {
-            buf_extend(buf, &line[range_start..]);
+            buf_extend(buf, std::slice::from_raw_parts(base.add(range_start), len - range_start));
             buf_push(buf, line_delim);
         }
     } else {
