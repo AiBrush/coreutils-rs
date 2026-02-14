@@ -1239,29 +1239,65 @@ fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
 }
 
 /// Streaming delete for contiguous byte ranges using SIMD range detection.
-/// Uses 4MB buffer to reduce syscalls (delete is compute-light, I/O bound).
-/// When no bytes are deleted from a chunk (common for data with few matches),
-/// writes directly from the source buffer to avoid the copy overhead.
+/// Uses a single 16MB buffer with in-place compaction to halve memory bandwidth
+/// compared to the src+dst two-buffer approach (avoids 16MB extra allocation
+/// and the src->dst copy). For 10MB input with 10-20% deletion, this touches
+/// ~10MB once vs ~20MB with two buffers.
 fn delete_range_streaming(
     lo: u8,
     hi: u8,
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = alloc_uninit_vec(STREAM_BUF);
-    let mut dst = alloc_uninit_vec(STREAM_BUF);
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut src)?;
+        let n = read_full(reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        let wp = delete_range_chunk(&src[..n], &mut dst, lo, hi);
-        if wp == n {
-            // No bytes deleted — write source directly (avoids copy overhead)
-            writer.write_all(&src[..n])?;
-        } else if wp > 0 {
-            writer.write_all(&dst[..wp])?;
+        // In-place compaction: read bytes, skip those in [lo..=hi], shift rest down.
+        // Uses branchless write-then-conditionally-advance pattern to avoid
+        // branch mispredictions when most bytes are kept.
+        let mut wp = 0;
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            let mut i = 0;
+            while i + 8 <= n {
+                let b0 = *ptr.add(i);
+                let b1 = *ptr.add(i + 1);
+                let b2 = *ptr.add(i + 2);
+                let b3 = *ptr.add(i + 3);
+                let b4 = *ptr.add(i + 4);
+                let b5 = *ptr.add(i + 5);
+                let b6 = *ptr.add(i + 6);
+                let b7 = *ptr.add(i + 7);
+
+                *ptr.add(wp) = b0;
+                wp += (b0 < lo || b0 > hi) as usize;
+                *ptr.add(wp) = b1;
+                wp += (b1 < lo || b1 > hi) as usize;
+                *ptr.add(wp) = b2;
+                wp += (b2 < lo || b2 > hi) as usize;
+                *ptr.add(wp) = b3;
+                wp += (b3 < lo || b3 > hi) as usize;
+                *ptr.add(wp) = b4;
+                wp += (b4 < lo || b4 > hi) as usize;
+                *ptr.add(wp) = b5;
+                wp += (b5 < lo || b5 > hi) as usize;
+                *ptr.add(wp) = b6;
+                wp += (b6 < lo || b6 > hi) as usize;
+                *ptr.add(wp) = b7;
+                wp += (b7 < lo || b7 > hi) as usize;
+                i += 8;
+            }
+            while i < n {
+                let b = *ptr.add(i);
+                *ptr.add(wp) = b;
+                wp += (b < lo || b > hi) as usize;
+                i += 1;
+            }
         }
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }
@@ -1531,28 +1567,29 @@ fn delete_single_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = alloc_uninit_vec(STREAM_BUF);
-    let mut dst = alloc_uninit_vec(STREAM_BUF);
+    // Single byte delete: use memchr to find positions, then gap-copy in-place
+    // using ptr::copy (memmove) since src and dst overlap. memchr SIMD scanning
+    // at ~10 GB/s is much faster than per-byte branchless for single-char delete.
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut src)?;
+        let n = read_full(reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        // Use memchr to find byte positions, gap-copy to separate dst buffer.
-        // Separate src/dst allows copy_nonoverlapping (faster than memmove)
-        // and avoids aliasing concerns in the hot loop.
         let mut wp = 0;
         let mut i = 0;
         while i < n {
-            match memchr::memchr(ch, &src[i..n]) {
+            match memchr::memchr(ch, &buf[i..n]) {
                 Some(offset) => {
                     if offset > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr().add(i),
-                                dst.as_mut_ptr().add(wp),
-                                offset,
-                            );
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    offset,
+                                );
+                            }
                         }
                         wp += offset;
                     }
@@ -1561,12 +1598,14 @@ fn delete_single_streaming(
                 None => {
                     let run_len = n - i;
                     if run_len > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr().add(i),
-                                dst.as_mut_ptr().add(wp),
-                                run_len,
-                            );
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
                         }
                         wp += run_len;
                     }
@@ -1574,12 +1613,7 @@ fn delete_single_streaming(
                 }
             }
         }
-        // If nothing was deleted, write from src directly (avoids extra copy)
-        if wp == n {
-            writer.write_all(&src[..n])?;
-        } else if wp > 0 {
-            writer.write_all(&dst[..wp])?;
-        }
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }
@@ -1589,32 +1623,33 @@ fn delete_multi_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    let mut src = alloc_uninit_vec(STREAM_BUF);
-    let mut dst = alloc_uninit_vec(STREAM_BUF);
+    // Multi-byte delete (2-3 chars): use memchr2/memchr3 SIMD scanning,
+    // gap-copy in-place to avoid the second 16MB buffer allocation.
+    let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut src)?;
+        let n = read_full(reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        // Use memchr2/memchr3 to find byte positions, gap-copy to separate dst buffer.
-        // Separate src/dst allows copy_nonoverlapping (faster than memmove).
         let mut wp = 0;
         let mut i = 0;
         while i < n {
             let found = if chars.len() == 2 {
-                memchr::memchr2(chars[0], chars[1], &src[i..n])
+                memchr::memchr2(chars[0], chars[1], &buf[i..n])
             } else {
-                memchr::memchr3(chars[0], chars[1], chars[2], &src[i..n])
+                memchr::memchr3(chars[0], chars[1], chars[2], &buf[i..n])
             };
             match found {
                 Some(offset) => {
                     if offset > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr().add(i),
-                                dst.as_mut_ptr().add(wp),
-                                offset,
-                            );
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    offset,
+                                );
+                            }
                         }
                         wp += offset;
                     }
@@ -1623,12 +1658,14 @@ fn delete_multi_streaming(
                 None => {
                     let run_len = n - i;
                     if run_len > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr().add(i),
-                                dst.as_mut_ptr().add(wp),
-                                run_len,
-                            );
+                        if wp != i {
+                            unsafe {
+                                std::ptr::copy(
+                                    buf.as_ptr().add(i),
+                                    buf.as_mut_ptr().add(wp),
+                                    run_len,
+                                );
+                            }
                         }
                         wp += run_len;
                     }
@@ -1636,11 +1673,7 @@ fn delete_multi_streaming(
                 }
             }
         }
-        if wp == n {
-            writer.write_all(&src[..n])?;
-        } else if wp > 0 {
-            writer.write_all(&dst[..wp])?;
-        }
+        writer.write_all(&buf[..wp])?;
     }
     Ok(())
 }
