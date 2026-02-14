@@ -162,11 +162,7 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
             if rec_start < end {
                 let len = end - rec_start;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(rec_start),
-                        dst.add(wp),
-                        len,
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(rec_start), dst.add(wp), len);
                 }
                 wp += len;
             }
@@ -175,11 +171,7 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         if end > chunk_start {
             let len = end - chunk_start;
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(chunk_start),
-                    dst.0.add(wp),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(chunk_start), dst.add(wp), len);
             }
         }
     });
@@ -232,11 +224,7 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
             if pos < end {
                 let len = end - pos;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(pos),
-                        dst.add(wp),
-                        len,
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), dst.add(wp), len);
                 }
                 wp += len;
             }
@@ -245,11 +233,7 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         if end > chunk_start {
             let len = end - chunk_start;
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(chunk_start),
-                    dst.0.add(wp),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(chunk_start), dst.add(wp), len);
             }
         }
     });
