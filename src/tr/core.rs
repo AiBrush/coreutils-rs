@@ -6,9 +6,6 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
-const BUF_SIZE: usize = 4 * 1024 * 1024;
-
 /// Stream buffer: 16MB — tr streaming operations (translate, delete, squeeze)
 /// are compute-light (single table lookup or bitset check per byte), so the
 /// bottleneck is I/O syscalls, not cache pressure. 16MB buffer means only
@@ -2382,10 +2379,6 @@ pub fn translate_owned(
 // ============================================================================
 
 /// Maximum data size for single-allocation translate approach.
-/// Below this limit, translate ALL data into one buffer and do a single write_all.
-/// Above this, use chunked approach to limit memory usage.
-const SINGLE_WRITE_LIMIT: usize = 16 * 1024 * 1024;
-
 /// Translate bytes from an mmap'd byte slice.
 /// Detects single-range translations (e.g., a-z to A-Z) and uses SIMD vectorized
 /// arithmetic (AVX2: 32 bytes/iter, SSE2: 16 bytes/iter) for those cases.
@@ -2446,15 +2439,11 @@ fn translate_mmap_range(
         return writer.write_all(&buf);
     }
 
-    // Small data: single-threaded SIMD
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = alloc_uninit_vec(data.len());
-        translate_range_simd(data, &mut buf, lo, hi, offset);
-        return writer.write_all(&buf);
-    }
-    // Chunked path for large data (shouldn't happen since PARALLEL_THRESHOLD < SINGLE_WRITE_LIMIT)
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked SIMD translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
         writer.write_all(&buf[..chunk.len()])?;
     }
@@ -2492,13 +2481,11 @@ fn translate_mmap_range_to_constant(
         return writer.write_all(&buf);
     }
 
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = data.to_vec();
-        translate_range_to_constant_simd_inplace(&mut buf, lo, hi, replacement);
-        return writer.write_all(&buf);
-    }
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         buf[..chunk.len()].copy_from_slice(chunk);
         translate_range_to_constant_simd_inplace(&mut buf[..chunk.len()], lo, hi, replacement);
         writer.write_all(&buf[..chunk.len()])?;
@@ -2523,14 +2510,11 @@ fn translate_mmap_table(data: &[u8], writer: &mut impl Write, table: &[u8; 256])
         return writer.write_all(&buf);
     }
 
-    // Small data: single-threaded
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = alloc_uninit_vec(data.len());
-        translate_to(data, &mut buf, table);
-        return writer.write_all(&buf);
-    }
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         translate_to(chunk, &mut buf[..chunk.len()], table);
         writer.write_all(&buf[..chunk.len()])?;
     }
@@ -2783,40 +2767,10 @@ pub fn translate_squeeze_mmap(
         return writer.write_all(&translated[..wp]);
     }
 
-    // Single-write fast path: translate+squeeze all data in one pass, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        unsafe {
-            buf.set_len(data.len());
-            let outp: *mut u8 = buf.as_mut_ptr();
-            let inp = data.as_ptr();
-            let len = data.len();
-            let mut wp = 0;
-            let mut i = 0;
-            while i < len {
-                let translated = *table.get_unchecked(*inp.add(i) as usize);
-                if is_member(&squeeze_set, translated) {
-                    if last_squeezed == translated as u16 {
-                        i += 1;
-                        continue;
-                    }
-                    last_squeezed = translated as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *outp.add(wp) = translated;
-                wp += 1;
-                i += 1;
-            }
-            buf.set_len(wp);
-        }
-        return writer.write_all(&buf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut buf = vec![0u8; buf_size];
+    // Chunked translate+squeeze: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
     let mut last_squeezed: u16 = 256;
 
     for chunk in data.chunks(buf_size) {
@@ -2910,17 +2864,15 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         return writer.write_all(&outbuf[..write_pos]);
     }
 
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = alloc_uninit_vec(data.len());
-        let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
-        return writer.write_all(&outbuf[..out_pos]);
-    }
-
-    let buf_size = data.len().min(BUF_SIZE);
+    // Chunked delete: process in 256KB chunks to avoid full-size allocation.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
     let mut outbuf = alloc_uninit_vec(buf_size);
-    for chunk in data.chunks(buf_size) {
+    for chunk in data.chunks(CHUNK) {
         let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
-        writer.write_all(&outbuf[..out_pos])?;
+        if out_pos > 0 {
+            writer.write_all(&outbuf[..out_pos])?;
+        }
     }
     Ok(())
 }
@@ -2950,10 +2902,18 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
         return write_ioslices(writer, &slices);
     }
 
-    // Single-write fast path: SIMD range delete into single buffer, one write_all
-    let mut outbuf = alloc_uninit_vec(data.len());
-    let wp = delete_range_chunk(data, &mut outbuf, lo, hi);
-    writer.write_all(&outbuf[..wp])
+    // Chunked delete: use a reusable 256KB buffer to avoid full-size allocation.
+    // Delete compacts data, so each 256KB input chunk produces <= 256KB output.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut outbuf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
+        let wp = delete_range_chunk(chunk, &mut outbuf, lo, hi);
+        if wp > 0 {
+            writer.write_all(&outbuf[..wp])?;
+        }
+    }
+    Ok(())
 }
 
 /// Delete bytes from chunk using bitset, writing into pre-allocated buffer.
@@ -3116,44 +3076,10 @@ pub fn delete_squeeze_mmap(
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
 
-    // Single-write fast path: delete+squeeze all data in one pass, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        unsafe {
-            outbuf.set_len(data.len());
-            let outp: *mut u8 = outbuf.as_mut_ptr();
-            let inp = data.as_ptr();
-            let len = data.len();
-            let mut out_pos = 0;
-            let mut i = 0;
-            while i < len {
-                let b = *inp.add(i);
-                if is_member(&delete_set, b) {
-                    i += 1;
-                    continue;
-                }
-                if is_member(&squeeze_set, b) {
-                    if last_squeezed == b as u16 {
-                        i += 1;
-                        continue;
-                    }
-                    last_squeezed = b as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *outp.add(out_pos) = b;
-                out_pos += 1;
-                i += 1;
-            }
-            outbuf.set_len(out_pos);
-        }
-        return writer.write_all(&outbuf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
+    // Chunked delete+squeeze: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut outbuf = alloc_uninit_vec(buf_size);
     let mut last_squeezed: u16 = 256;
 
     for chunk in data.chunks(buf_size) {
@@ -3235,46 +3161,10 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
         return write_ioslices(writer, &slices);
     }
 
-    // Single-write fast path: squeeze all data into one buffer, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        let len = data.len();
-        let mut wp = 0;
-        let mut i = 0;
-
-        unsafe {
-            outbuf.set_len(data.len());
-            let inp = data.as_ptr();
-            let outp: *mut u8 = outbuf.as_mut_ptr();
-
-            while i < len {
-                let b = *inp.add(i);
-                if is_member(&member, b) {
-                    if last_squeezed != b as u16 {
-                        *outp.add(wp) = b;
-                        wp += 1;
-                        last_squeezed = b as u16;
-                    }
-                    i += 1;
-                    while i < len && *inp.add(i) == b {
-                        i += 1;
-                    }
-                } else {
-                    last_squeezed = 256;
-                    *outp.add(wp) = b;
-                    wp += 1;
-                    i += 1;
-                }
-            }
-            outbuf.set_len(wp);
-        }
-        return writer.write_all(&outbuf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
+    // Chunked squeeze: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut outbuf = alloc_uninit_vec(buf_size);
     let mut last_squeezed: u16 = 256;
 
     for chunk in data.chunks(buf_size) {
