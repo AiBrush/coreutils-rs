@@ -871,8 +871,7 @@ fn radix_sort_entries(
                                     }
                                     r3_starts[r3_nbk] = s;
                                 }
-                                let mut r3_temp: Vec<(u64, u32, u32)> =
-                                    Vec::with_capacity(sub_len);
+                                let mut r3_temp: Vec<(u64, u32, u32)> = Vec::with_capacity(sub_len);
                                 #[allow(clippy::uninit_vec)]
                                 unsafe {
                                     r3_temp.set_len(sub_len);
@@ -994,11 +993,7 @@ fn line_prefix_upper(data: &[u8], start: usize, end: usize) -> u64 {
     let mut i = 0usize;
     while i < take {
         let b = unsafe { *p.add(start + i) };
-        bytes[i] = if b >= b'a' && b <= b'z' {
-            b - 32
-        } else {
-            b
-        };
+        bytes[i] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
         i += 1;
     }
     u64::from_be_bytes(bytes)
@@ -1652,11 +1647,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 prev_prefix = cur_prefix;
             }
             // For -r (reverse), swap: ascending input needs reversal, descending is "sorted"
-            if reverse {
-                (desc, asc)
-            } else {
-                (asc, desc)
-            }
+            if reverse { (desc, asc) } else { (asc, desc) }
         } else {
             let mut asc = true;
             let mut desc = true;
@@ -1822,8 +1813,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let emit = match prev {
                     Some(p) => {
                         let (ps, pe) = offsets[p];
-                        let prev_line =
-                            unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                        let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
                         compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                     }
                     None => true,
@@ -1997,11 +1987,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         let off = out_offsets[idx];
                         let lu = l as usize;
                         unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.add(s as usize),
-                                dst.add(off),
-                                lu,
-                            );
+                            std::ptr::copy_nonoverlapping(src.add(s as usize), dst.add(off), lu);
                             *dst.add(off + lu) = term_byte;
                         }
                     }
@@ -2168,8 +2154,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         // This distributes entries by their 8-byte uppercase prefix, then
         // sorts within each bucket using the full case-insensitive comparator.
         if n > 256 {
-            let mut entries =
-                radix_sort_numeric_entries(entries, data, &offsets, stable, false);
+            let mut entries = radix_sort_numeric_entries(entries, data, &offsets, stable, false);
             // The numeric radix sort treats u64 as opaque keys, which works for
             // our uppercase prefix since it preserves lexicographic order.
             // But we need to tiebreak within equal-prefix runs with the full
@@ -2462,7 +2447,11 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     };
                     for i in 1..num_lines {
                         let (ks, ke) = key_offs[i];
-                        let cur_pfx = if ks < ke { line_prefix(data, ks, ke) } else { 0u64 };
+                        let cur_pfx = if ks < ke {
+                            line_prefix(data, ks, ke)
+                        } else {
+                            0u64
+                        };
                         if cur_pfx < prev_pfx {
                             is_sorted = false;
                             break;
@@ -2508,12 +2497,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         if config.unique {
                             let mut prev: Option<usize> = None;
                             const BATCH: usize = 512;
-                            let mut slices: Vec<io::IoSlice<'_>> =
-                                Vec::with_capacity(BATCH * 2);
+                            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                             for i in 0..num_lines {
                                 let (s, e) = offsets[i];
-                                let line =
-                                    unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                                let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
                                 let emit = match prev {
                                     Some(p) => {
                                         let (ps, pe) = offsets[p];
@@ -2540,13 +2527,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                             }
                         } else {
                             const BATCH: usize = 512;
-                            let mut slices: Vec<io::IoSlice<'_>> =
-                                Vec::with_capacity(BATCH * 2);
+                            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                             for i in 0..num_lines {
                                 let (s, e) = offsets[i];
-                                let line = unsafe {
-                                    std::slice::from_raw_parts(dp.add(s), e - s)
-                                };
+                                let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
                                 slices.push(io::IoSlice::new(line));
                                 slices.push(io::IoSlice::new(terminator));
                                 if slices.len() >= BATCH * 2 {
@@ -2732,13 +2716,17 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                                     }
                                     let mut temp: Vec<(u64, usize)> = Vec::with_capacity(blen);
                                     #[allow(clippy::uninit_vec)]
-                                    unsafe { temp.set_len(blen); }
+                                    unsafe {
+                                        temp.set_len(blen);
+                                    }
                                     {
                                         let mut wpos = sub_starts.clone();
                                         let temp_ptr = temp.as_mut_ptr();
                                         for &ent in bucket.iter() {
                                             let b = ((ent.0 >> shift) & mask) as usize;
-                                            unsafe { *temp_ptr.add(wpos[b]) = ent; }
+                                            unsafe {
+                                                *temp_ptr.add(wpos[b]) = ent;
+                                            }
                                             wpos[b] += 1;
                                         }
                                     }
@@ -2781,15 +2769,20 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                                                     }
                                                     r3_starts[r3_nbk] = s;
                                                 }
-                                                let mut r3_temp: Vec<(u64, usize)> = Vec::with_capacity(sub_len);
+                                                let mut r3_temp: Vec<(u64, usize)> =
+                                                    Vec::with_capacity(sub_len);
                                                 #[allow(clippy::uninit_vec)]
-                                                unsafe { r3_temp.set_len(sub_len); }
+                                                unsafe {
+                                                    r3_temp.set_len(sub_len);
+                                                }
                                                 {
                                                     let mut wpos = r3_starts.clone();
                                                     let tp = r3_temp.as_mut_ptr();
                                                     for &ent in sub.iter() {
                                                         let b = ((ent.0 >> r3_s) & r3_m) as usize;
-                                                        unsafe { *tp.add(wpos[b]) = ent; }
+                                                        unsafe {
+                                                            *tp.add(wpos[b]) = ent;
+                                                        }
                                                         wpos[b] += 1;
                                                     }
                                                 }
@@ -2824,7 +2817,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                             if blen <= 16 {
                                 for k in 1..blen {
                                     let mut pos = k;
-                                    while pos > 0 && bucket_cmp(&bucket[pos], &bucket[pos - 1]) == Ordering::Less {
+                                    while pos > 0
+                                        && bucket_cmp(&bucket[pos], &bucket[pos - 1])
+                                            == Ordering::Less
+                                    {
                                         bucket.swap(pos, pos - 1);
                                         pos -= 1;
                                     }
@@ -2861,8 +2857,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                                 let (sb, eb) = key_offs[b.1];
                                 let skip = 8.min(ea - sa).min(eb - sb);
                                 unsafe {
-                                    std::slice::from_raw_parts(dp_small.add(sa + skip), ea - sa - skip)
-                                        .cmp(std::slice::from_raw_parts(dp_small.add(sb + skip), eb - sb - skip))
+                                    std::slice::from_raw_parts(
+                                        dp_small.add(sa + skip),
+                                        ea - sa - skip,
+                                    )
+                                    .cmp(
+                                        std::slice::from_raw_parts(
+                                            dp_small.add(sb + skip),
+                                            eb - sb - skip,
+                                        ),
+                                    )
                                 }
                             }
                             ord => ord,
@@ -2990,18 +2994,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let ka = if sa == ea {
                     &[] as &[u8]
                 } else if needs_blank {
-                    skip_leading_blanks(unsafe {
-                        std::slice::from_raw_parts(dp.add(sa), ea - sa)
-                    })
+                    skip_leading_blanks(unsafe { std::slice::from_raw_parts(dp.add(sa), ea - sa) })
                 } else {
                     unsafe { std::slice::from_raw_parts(dp.add(sa), ea - sa) }
                 };
                 let kb = if sb == eb {
                     &[] as &[u8]
                 } else if needs_blank {
-                    skip_leading_blanks(unsafe {
-                        std::slice::from_raw_parts(dp.add(sb), eb - sb)
-                    })
+                    skip_leading_blanks(unsafe { std::slice::from_raw_parts(dp.add(sb), eb - sb) })
                 } else {
                     unsafe { std::slice::from_raw_parts(dp.add(sb), eb - sb) }
                 };

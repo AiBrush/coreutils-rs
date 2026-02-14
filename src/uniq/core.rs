@@ -1094,7 +1094,8 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
                         true
                     } else {
                         unsafe {
-                            let a = std::slice::from_raw_parts(chunk_base.add(prev_start), prev_len);
+                            let a =
+                                std::slice::from_raw_parts(chunk_base.add(prev_start), prev_len);
                             let b = std::slice::from_raw_parts(chunk_base.add(cur_start), cur_len);
                             lines_equal_after_prefix(a, b)
                         }

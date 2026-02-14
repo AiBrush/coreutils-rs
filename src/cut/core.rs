@@ -249,7 +249,9 @@ fn process_fields_multi_select(
             .par_iter()
             .map(|chunk| {
                 let mut buf = Vec::with_capacity(chunk.len());
-                multi_select_chunk(chunk, delim, line_delim, ranges, max_field, suppress, &mut buf);
+                multi_select_chunk(
+                    chunk, delim, line_delim, ranges, max_field, suppress, &mut buf,
+                );
                 buf
             })
             .collect();
@@ -261,7 +263,9 @@ fn process_fields_multi_select(
         write_ioslices(out, &slices)?;
     } else {
         let mut buf = Vec::with_capacity(data.len());
-        multi_select_chunk(data, delim, line_delim, ranges, max_field, suppress, &mut buf);
+        multi_select_chunk(
+            data, delim, line_delim, ranges, max_field, suppress, &mut buf,
+        );
         if !buf.is_empty() {
             out.write_all(&buf)?;
         }
@@ -1128,12 +1132,12 @@ fn complement_single_field_line(
     // - We need one more delimiter to find where it ends
     // For skip_idx == 0 (skip field 1): skip field starts at 0, ends at first delimiter
     // For skip_idx == 1 (skip field 2): skip field starts after 1st delim, ends at 2nd delim
-    let need_before = skip_idx;       // delimiters before skip field
-    let need_total = skip_idx + 1;    // delimiters to find end of skip field
+    let need_before = skip_idx; // delimiters before skip field
+    let need_total = skip_idx + 1; // delimiters to find end of skip field
 
     let mut delim_count: usize = 0;
-    let mut skip_start_pos: usize = 0;  // byte start of skip field
-    let mut skip_end_pos: usize = len;   // byte position of delimiter after skip field (or EOL)
+    let mut skip_start_pos: usize = 0; // byte start of skip field
+    let mut skip_end_pos: usize = len; // byte position of delimiter after skip field (or EOL)
     let mut found_end = false;
 
     for pos in memchr_iter(delim, line) {
