@@ -975,11 +975,7 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
     let mut i = 0;
     while i + 4 <= full_lines {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.add(i * stride),
-                dst.add(i * line_len),
-                line_len,
-            );
+            std::ptr::copy_nonoverlapping(src.add(i * stride), dst.add(i * line_len), line_len);
             std::ptr::copy_nonoverlapping(
                 src.add((i + 1) * stride),
                 dst.add((i + 1) * line_len),
@@ -1000,11 +996,7 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
     }
     while i < full_lines {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.add(i * stride),
-                dst.add(i * line_len),
-                line_len,
-            );
+            std::ptr::copy_nonoverlapping(src.add(i * stride), dst.add(i * line_len), line_len);
         }
         i += 1;
     }
