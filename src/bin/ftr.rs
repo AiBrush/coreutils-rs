@@ -96,6 +96,55 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     None
 }
 
+/// Try to create a MAP_PRIVATE (copy-on-write) mmap of stdin for in-place translate.
+/// MAP_PRIVATE means writes only affect our process's copy — the underlying file
+/// is unmodified. The kernel uses COW: only pages we actually modify get physically
+/// copied, so for sparse translations (e.g., `tr 'aeiou' 'AEIOU'` where only ~40%
+/// of bytes change), this is significantly cheaper than allocating a full copy.
+#[cfg(unix)]
+fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
+    use std::os::unix::io::AsRawFd;
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    use std::os::unix::io::FromRawFd;
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // map_copy creates MAP_PRIVATE mapping — writes are COW, file untouched
+    let mmap = unsafe { memmap2::MmapOptions::new().populate().map_copy(&file) }.ok();
+    std::mem::forget(file); // Don't close stdin
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED,
+            );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
+        }
+    }
+    mmap
+}
+
+#[cfg(not(unix))]
+fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
+    None
+}
+
 /// Enlarge pipe buffers on Linux for higher throughput.
 /// Default pipe buffer is 64KB; increasing to 8MB reduces syscalls
 /// when reading/writing through pipes (e.g., `cat file | ftr`).
@@ -119,14 +168,13 @@ fn main() {
 
     let set1_str = &cli.sets[0];
 
-    // Try mmap for file-redirected stdin (< file). Falls back to streaming/batch
-    // for piped input.
-    let mmap = try_mmap_stdin();
-
     #[cfg(unix)]
     let mut raw = raw_stdout();
 
     // Pure translate mode: bypass BufWriter entirely.
+    // For mmap path, use MAP_PRIVATE (COW) mmap and translate in-place to
+    // eliminate the full output buffer allocation. The kernel only copies
+    // pages that are actually modified.
     let is_pure_translate = !cli.delete && !cli.squeeze && cli.sets.len() >= 2;
 
     if is_pure_translate {
@@ -143,17 +191,18 @@ fn main() {
             tr::expand_set2(set2_str, set1.len())
         };
 
-        let result = if let Some(ref m) = mmap {
-            // File-redirected stdin: use mmap batch path (zero-copy + parallel)
+        // Try MAP_PRIVATE mmap for in-place translate (eliminates output buffer alloc)
+        let result = if let Some(mut mm) = try_mmap_stdin_mut() {
+            // MAP_PRIVATE mmap: in-place translate eliminates output buffer allocation
             #[cfg(unix)]
             {
-                tr::translate_mmap(&set1, &set2, m.as_ref(), &mut *raw)
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut *raw)
             }
             #[cfg(not(unix))]
             {
                 let stdout = io::stdout();
                 let mut lock = stdout.lock();
-                tr::translate_mmap(&set1, &set2, m.as_ref(), &mut lock)
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut lock)
             }
         } else {
             // Piped stdin: use streaming path (16MB buffer, read+translate+write
@@ -180,6 +229,9 @@ fn main() {
         }
         return;
     }
+
+    // Try read-only mmap for non-translate modes (delete, squeeze, etc.)
+    let mmap = try_mmap_stdin();
 
     if let Some(m) = mmap {
         // File-redirected stdin: use batch path with mmap data

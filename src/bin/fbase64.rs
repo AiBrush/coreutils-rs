@@ -120,7 +120,7 @@ fn main() {
     }
 }
 
-/// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
+/// Try to mmap stdin as read-only if it's a regular file (e.g., shell redirect `< file`).
 #[cfg(unix)]
 fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -158,12 +158,53 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     mmap
 }
 
+/// Try to create a MAP_PRIVATE (copy-on-write) mmap of stdin for in-place decode.
+/// MAP_PRIVATE means writes only affect our process's copy. For base64 decode,
+/// the whitespace stripping only modifies ~1.3% of pages (newline positions),
+/// and decode_inplace writes shorter data back, so total COW is minimal.
+#[cfg(unix)]
+fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
+        return None;
+    }
+
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mmap = unsafe { MmapOptions::new().populate().map_copy(&file) }.ok();
+    std::mem::forget(file);
+    #[cfg(target_os = "linux")]
+    if let Some(ref m) = mmap {
+        unsafe {
+            libc::madvise(
+                m.as_ptr() as *mut libc::c_void,
+                m.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+            if m.len() >= 2 * 1024 * 1024 {
+                libc::madvise(
+                    m.as_ptr() as *mut libc::c_void,
+                    m.len(),
+                    libc::MADV_HUGEPAGE,
+                );
+            }
+        }
+    }
+    mmap
+}
+
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Try mmap first for file-redirected stdin (zero-copy decode)
+        // Try MAP_PRIVATE mmap for in-place strip+decode (zero allocation)
         #[cfg(unix)]
-        if let Some(mmap) = try_mmap_stdin() {
-            return b64::decode_to_writer(&mmap, cli.ignore_garbage, out);
+        if let Some(mut mmap) = try_mmap_stdin_mut() {
+            return b64::decode_mmap_inplace(&mut mmap, cli.ignore_garbage, out);
         }
 
         // For piped stdin: use streaming decode to avoid 64MB read_stdin pre-alloc.
@@ -190,13 +231,33 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
-    // Use mmap for zero-copy file access (both encode and decode).
-    // For decode: mmap avoids the 13.7MB std::fs::read() allocation+copy,
-    // using borrowed decode_to_writer (memchr2 strip into clean buffer + decode).
-    let data = read_file(Path::new(filename))?;
     if cli.decode {
+        // For decode: try MAP_PRIVATE mmap for in-place strip+decode (zero alloc).
+        // Falls back to read_file + decode_to_writer for small files or non-mmap platforms.
+        #[cfg(unix)]
+        {
+            let file = std::fs::File::open(Path::new(filename))?;
+            let metadata = file.metadata()?;
+            if metadata.len() > 0
+                && metadata.file_type().is_file()
+                && let Ok(mut mmap) = unsafe { MmapOptions::new().populate().map_copy(&file) }
+            {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_SEQUENTIAL,
+                    );
+                }
+                return b64::decode_mmap_inplace(&mut mmap, cli.ignore_garbage, out);
+            }
+        }
+        let data = read_file(Path::new(filename))?;
         b64::decode_to_writer(&data, cli.ignore_garbage, out)
     } else {
+        // For encode: use read-only mmap (no modification needed)
+        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }

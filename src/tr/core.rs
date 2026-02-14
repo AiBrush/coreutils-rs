@@ -18,11 +18,11 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
-/// AVX2 translation runs at ~10 GB/s per core, processing 10MB in ~1ms.
-/// Rayon thread pool creation + sync costs ~100-500us, which nearly
-/// negates the parallelism benefit for data under 16MB. Single-threaded
-/// AVX2 is faster for typical benchmark workloads (10MB).
-const PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024;
+/// AVX2 translation runs at ~10 GB/s per core. At 4MB, parallel
+/// processing with 2 cores provides ~1.5x speedup (2MB/core in ~0.2ms)
+/// while rayon overhead is ~100us (thread pool is pre-warmed after first use).
+/// Lowered from 16MB to benefit 4-10MB inputs common in benchmarks.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Write multiple IoSlice buffers using write_vectored, batching into MAX_IOV-sized groups.
 /// Falls back to write_all per slice for partial writes.
@@ -123,15 +123,37 @@ fn get_simd_level() -> u8 {
     detected
 }
 
+/// Count how many entries in the translate table are non-identity.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn count_non_identity(table: &[u8; 256]) -> usize {
+    table
+        .iter()
+        .enumerate()
+        .filter(|&(i, &v)| v != i as u8)
+        .count()
+}
+
 /// Translate bytes in-place using a 256-byte lookup table.
-/// On x86_64 with SSSE3+, uses SIMD pshufb-based nibble decomposition for
-/// ~32 bytes per iteration. Falls back to 8x-unrolled scalar on other platforms.
+/// For sparse translations (few bytes change), uses SIMD skip-ahead:
+/// compare 32 bytes at a time against identity, skip unchanged chunks.
+/// For dense translations, uses full SIMD nibble decomposition.
+/// Falls back to 8x-unrolled scalar on non-x86_64 platforms.
 #[inline(always)]
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
     #[cfg(target_arch = "x86_64")]
     {
         let level = get_simd_level();
         if level >= 3 {
+            // For sparse translations (<=16 non-identity entries), the skip-ahead
+            // approach is faster: load 32 bytes, do a full nibble lookup, compare
+            // against input, skip store if identical. This avoids writing to pages
+            // that don't change (important for MAP_PRIVATE COW mmap).
+            let non_id = count_non_identity(table);
+            if non_id > 0 && non_id <= 16 {
+                unsafe { translate_inplace_avx2_sparse(data, table) };
+                return;
+            }
             unsafe { translate_inplace_avx2_table(data, table) };
             return;
         }
@@ -141,6 +163,79 @@ fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
         }
     }
     translate_inplace_scalar(data, table);
+}
+
+/// Sparse AVX2 translate: skip unchanged 32-byte chunks.
+/// For each chunk: perform full nibble lookup, compare result vs input.
+/// If identical (no bytes changed), skip the store entirely.
+/// This reduces memory bandwidth and avoids COW page faults for
+/// MAP_PRIVATE mmaps when most bytes are unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn translate_inplace_avx2_sparse(data: &mut [u8], table: &[u8; 256]) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = data.len();
+        let ptr = data.as_mut_ptr();
+
+        // Pre-build 16 lookup vectors (same as full nibble decomposition)
+        let mut lut = [_mm256_setzero_si256(); 16];
+        for h in 0u8..16 {
+            let base = (h as usize) * 16;
+            let row: [u8; 16] = std::array::from_fn(|i| *table.get_unchecked(base + i));
+            let row128 = _mm_loadu_si128(row.as_ptr() as *const _);
+            lut[h as usize] = _mm256_broadcastsi128_si256(row128);
+        }
+
+        let lo_mask = _mm256_set1_epi8(0x0F);
+
+        let mut i = 0;
+        while i + 32 <= len {
+            let input = _mm256_loadu_si256(ptr.add(i) as *const _);
+            let lo_nibble = _mm256_and_si256(input, lo_mask);
+            let hi_nibble = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_mask);
+
+            let mut result = _mm256_setzero_si256();
+            macro_rules! do_nibble {
+                ($h:expr) => {
+                    let h_val = _mm256_set1_epi8($h as i8);
+                    let mask = _mm256_cmpeq_epi8(hi_nibble, h_val);
+                    let looked_up = _mm256_shuffle_epi8(lut[$h], lo_nibble);
+                    result = _mm256_or_si256(result, _mm256_and_si256(mask, looked_up));
+                };
+            }
+            do_nibble!(0);
+            do_nibble!(1);
+            do_nibble!(2);
+            do_nibble!(3);
+            do_nibble!(4);
+            do_nibble!(5);
+            do_nibble!(6);
+            do_nibble!(7);
+            do_nibble!(8);
+            do_nibble!(9);
+            do_nibble!(10);
+            do_nibble!(11);
+            do_nibble!(12);
+            do_nibble!(13);
+            do_nibble!(14);
+            do_nibble!(15);
+
+            // Only store if result differs from input (skip unchanged chunks)
+            let diff = _mm256_xor_si256(input, result);
+            if _mm256_testz_si256(diff, diff) == 0 {
+                _mm256_storeu_si256(ptr.add(i) as *mut _, result);
+            }
+            i += 32;
+        }
+
+        // Scalar tail
+        while i < len {
+            *ptr.add(i) = *table.get_unchecked(*ptr.add(i) as usize);
+            i += 1;
+        }
+    }
 }
 
 /// Scalar fallback: 8x-unrolled table lookup.
@@ -2291,6 +2386,65 @@ fn translate_mmap_table(data: &[u8], writer: &mut impl Write, table: &[u8; 256])
     Ok(())
 }
 
+/// Translate bytes in-place on a mutable buffer (e.g., MAP_PRIVATE mmap).
+/// Eliminates the output buffer allocation entirely — the kernel's COW
+/// semantics mean only modified pages are physically copied.
+///
+/// For data >= PARALLEL_THRESHOLD: rayon parallel in-place translate.
+/// Otherwise: single-threaded in-place translate.
+pub fn translate_mmap_inplace(
+    set1: &[u8],
+    set2: &[u8],
+    data: &mut [u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let table = build_translate_table(set1, set2);
+
+    // Check if table is identity — pure passthrough
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
+    // Try SIMD fast path for single-range constant-offset translations (e.g., a-z -> A-Z)
+    if let Some((lo, hi, offset)) = detect_range_offset(&table) {
+        if data.len() >= PARALLEL_THRESHOLD {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (data.len() / n_threads).max(32 * 1024);
+            data.par_chunks_mut(chunk_size)
+                .for_each(|chunk| translate_range_simd_inplace(chunk, lo, hi, offset));
+        } else {
+            translate_range_simd_inplace(data, lo, hi, offset);
+        }
+        return writer.write_all(data);
+    }
+
+    // Try SIMD fast path for range-to-constant translations
+    if let Some((lo, hi, replacement)) = detect_range_to_constant(&table) {
+        if data.len() >= PARALLEL_THRESHOLD {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (data.len() / n_threads).max(32 * 1024);
+            data.par_chunks_mut(chunk_size).for_each(|chunk| {
+                translate_range_to_constant_simd_inplace(chunk, lo, hi, replacement)
+            });
+        } else {
+            translate_range_to_constant_simd_inplace(data, lo, hi, replacement);
+        }
+        return writer.write_all(data);
+    }
+
+    // General case: in-place table lookup
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+        data.par_chunks_mut(chunk_size)
+            .for_each(|chunk| translate_inplace(chunk, &table));
+    } else {
+        translate_inplace(data, &table);
+    }
+    writer.write_all(data)
+}
+
 /// Translate + squeeze from mmap'd byte slice.
 ///
 /// For data >= 2MB: two-phase approach: parallel translate, then sequential squeeze.
@@ -2444,14 +2598,27 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 
     let member = build_member_set(delete_chars);
 
-    // Parallel path: pre-allocate a single output buffer of data.len() and have each
-    // thread write to its non-overlapping slice, then do a single write_all.
-    // This avoids per-chunk Vec allocations that the old approach had.
+    // Heuristic: sample first 1024 bytes to estimate delete frequency.
+    // If < 10% of bytes are deleted, zero-copy writev is efficient
+    // (long runs between deletes = few IoSlice entries).
+    // For dense deletes (>= 10%), copy-based approach with parallel processing
+    // produces fewer, larger writes.
+    let sample_size = data.len().min(1024);
+    let sample_deletes = data[..sample_size]
+        .iter()
+        .filter(|&&b| is_member(&member, b))
+        .count();
+    let delete_pct = sample_deletes * 100 / sample_size.max(1);
+
+    if delete_pct < 10 {
+        return delete_bitset_zerocopy(data, &member, writer);
+    }
+
+    // Dense delete: copy-based approach with parallel processing
     if data.len() >= PARALLEL_THRESHOLD {
         let n_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() / n_threads).max(32 * 1024);
 
-        // Each thread deletes into its slice of outbuf and returns bytes written.
         let mut outbuf = alloc_uninit_vec(data.len());
         let chunk_lens: Vec<usize> = data
             .par_chunks(chunk_size)
@@ -2459,9 +2626,6 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
             .map(|(src_chunk, dst_chunk)| delete_chunk_bitset_into(src_chunk, &member, dst_chunk))
             .collect();
 
-        // Compact: move each chunk's output to be contiguous.
-        // chunk_lens[i] is how many bytes thread i wrote into its slice.
-        // We need to shift them together since each dst_chunk started at chunk_size offsets.
         let mut write_pos = 0;
         let mut src_offset = 0;
         for &clen in &chunk_lens {
@@ -2481,17 +2645,14 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         return writer.write_all(&outbuf[..write_pos]);
     }
 
-    // Single-write fast path: delete into one buffer, one write
     if data.len() <= SINGLE_WRITE_LIMIT {
         let mut outbuf = alloc_uninit_vec(data.len());
         let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
         return writer.write_all(&outbuf[..out_pos]);
     }
 
-    // Chunked path for large data
     let buf_size = data.len().min(BUF_SIZE);
     let mut outbuf = alloc_uninit_vec(buf_size);
-
     for chunk in data.chunks(buf_size) {
         let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
         writer.write_all(&outbuf[..out_pos])?;
@@ -2589,6 +2750,50 @@ fn delete_chunk_bitset_into(chunk: &[u8], member: &[u8; 32], outbuf: &mut [u8]) 
     }
 
     out_pos
+}
+
+/// Zero-copy delete for general bitset: scan for runs of kept bytes,
+/// build IoSlice entries pointing directly into the source data.
+/// No allocation for output data — just ~16 bytes per IoSlice entry.
+/// Flushes in MAX_IOV-sized batches for efficient writev.
+fn delete_bitset_zerocopy(
+    data: &[u8],
+    member: &[u8; 32],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(MAX_IOV);
+    let len = data.len();
+    let mut i = 0;
+    let mut run_start: Option<usize> = None;
+
+    while i < len {
+        let b = unsafe { *data.get_unchecked(i) };
+        if is_member(member, b) {
+            // This byte should be deleted
+            if let Some(rs) = run_start {
+                iov.push(std::io::IoSlice::new(&data[rs..i]));
+                run_start = None;
+                if iov.len() >= MAX_IOV {
+                    write_ioslices(writer, &iov)?;
+                    iov.clear();
+                }
+            }
+        } else {
+            // This byte should be kept
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        }
+        i += 1;
+    }
+    // Flush final run
+    if let Some(rs) = run_start {
+        iov.push(std::io::IoSlice::new(&data[rs..]));
+    }
+    if !iov.is_empty() {
+        write_ioslices(writer, &iov)?;
+    }
+    Ok(())
 }
 
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {

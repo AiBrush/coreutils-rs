@@ -874,9 +874,10 @@ fn process_fields_prefix(
     Ok(())
 }
 
-/// Zero-copy field-prefix extraction: writes contiguous runs directly from source data.
+/// Zero-copy field-prefix extraction using writev: builds IoSlice entries pointing
+/// directly into the source data, flushing in MAX_IOV-sized batches.
 /// For lines where the Nth delimiter exists, we truncate at that point.
-/// For lines with fewer fields, we output them unchanged.
+/// For lines with fewer fields, we output them unchanged (contiguous run).
 /// Lines without any delimiter are output unchanged (suppress=false assumed).
 #[inline]
 fn fields_prefix_zerocopy(
@@ -886,12 +887,13 @@ fn fields_prefix_zerocopy(
     last_field: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    let newline_buf: [u8; 1] = [line_delim];
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut start = 0;
     let mut run_start: usize = 0;
 
     for end_pos in memchr_iter(line_delim, data) {
         let line = &data[start..end_pos];
-        // Find the position of the Nth delimiter to truncate at
         let mut field_count = 1;
         let mut truncate_at: Option<usize> = None;
         for dpos in memchr_iter(delim, line) {
@@ -903,15 +905,18 @@ fn fields_prefix_zerocopy(
         }
 
         if let Some(trunc_pos) = truncate_at {
-            // This line has more fields than needed. Flush run, write truncated.
             if run_start < start {
-                out.write_all(&data[run_start..start])?;
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            out.write_all(&data[start..trunc_pos])?;
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&data[start..trunc_pos]));
+            iov.push(IoSlice::new(&newline_buf));
             run_start = end_pos + 1;
+
+            if iov.len() >= MAX_IOV - 2 {
+                write_ioslices(out, &iov)?;
+                iov.clear();
+            }
         }
-        // else: line has <= last_field fields, keep it in the run
         start = end_pos + 1;
     }
     // Handle last line without terminator
@@ -928,19 +933,25 @@ fn fields_prefix_zerocopy(
         }
         if let Some(trunc_pos) = truncate_at {
             if run_start < start {
-                out.write_all(&data[run_start..start])?;
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            out.write_all(&data[start..trunc_pos])?;
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&data[start..trunc_pos]));
+            iov.push(IoSlice::new(&newline_buf));
+            if !iov.is_empty() {
+                write_ioslices(out, &iov)?;
+            }
             return Ok(());
         }
     }
-    // Flush remaining run
+    // Flush remaining contiguous run
     if run_start < data.len() {
-        out.write_all(&data[run_start..])?;
+        iov.push(IoSlice::new(&data[run_start..]));
         if !data.is_empty() && *data.last().unwrap() != line_delim {
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&newline_buf));
         }
+    }
+    if !iov.is_empty() {
+        write_ioslices(out, &iov)?;
     }
     Ok(())
 }
@@ -1513,9 +1524,14 @@ fn process_nth_field_combined(
     }
 }
 
-/// Zero-copy field-1 extraction: writes contiguous runs directly from source data.
-/// For each line: if delimiter exists, truncate at first delimiter; otherwise pass through.
+/// Zero-copy field-1 extraction using writev: builds IoSlice entries pointing
+/// directly into the source data, flushing in MAX_IOV-sized batches.
+/// For each line: if delimiter exists, output field1 + newline; otherwise pass through.
 /// Uses memchr2 to scan for both delimiter and line terminator in a single SIMD pass.
+///
+/// For lines without delimiter: the entire line (including its newline) is a single
+/// contiguous IoSlice. For lines with delimiter: two IoSlices (field1 data + newline byte).
+/// Contiguous runs of unmodified lines are coalesced into a single IoSlice.
 #[inline]
 fn single_field1_zerocopy(
     data: &[u8],
@@ -1523,6 +1539,10 @@ fn single_field1_zerocopy(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    // Static newline byte for IoSlice references
+    let newline_buf: [u8; 1] = [line_delim];
+
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut line_start: usize = 0;
     let mut run_start: usize = 0;
     let mut first_delim: Option<usize> = None;
@@ -1534,13 +1554,19 @@ fn single_field1_zerocopy(
             // End of line
             if let Some(dp) = first_delim {
                 // Line has delimiter — truncate at first delimiter.
-                // Flush current run up to line_start, write truncated line.
+                // Flush current contiguous run, then add truncated line + newline.
                 if run_start < line_start {
-                    out.write_all(&data[run_start..line_start])?;
+                    iov.push(IoSlice::new(&data[run_start..line_start]));
                 }
-                out.write_all(&data[line_start..dp])?;
-                out.write_all(&[line_delim])?;
+                iov.push(IoSlice::new(&data[line_start..dp]));
+                iov.push(IoSlice::new(&newline_buf));
                 run_start = pos + 1;
+
+                // Flush when we're near the iovec limit
+                if iov.len() >= MAX_IOV - 2 {
+                    write_ioslices(out, &iov)?;
+                    iov.clear();
+                }
             }
             // else: no delimiter in line, output unchanged (stays in run)
             line_start = pos + 1;
@@ -1557,20 +1583,26 @@ fn single_field1_zerocopy(
     if line_start < data.len() {
         if let Some(dp) = first_delim {
             if run_start < line_start {
-                out.write_all(&data[run_start..line_start])?;
+                iov.push(IoSlice::new(&data[run_start..line_start]));
             }
-            out.write_all(&data[line_start..dp])?;
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&data[line_start..dp]));
+            iov.push(IoSlice::new(&newline_buf));
+            if !iov.is_empty() {
+                write_ioslices(out, &iov)?;
+            }
             return Ok(());
         }
     }
 
-    // Flush remaining run
+    // Flush remaining contiguous run
     if run_start < data.len() {
-        out.write_all(&data[run_start..])?;
+        iov.push(IoSlice::new(&data[run_start..]));
         if !data.is_empty() && *data.last().unwrap() != line_delim {
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&newline_buf));
         }
+    }
+    if !iov.is_empty() {
+        write_ioslices(out, &iov)?;
     }
     Ok(())
 }
@@ -2061,8 +2093,10 @@ fn process_bytes_from_start(
     Ok(())
 }
 
-/// Zero-copy byte-prefix extraction: writes contiguous runs directly from the source data.
-/// Only copies when a line needs truncation (line > max_bytes).
+/// Zero-copy byte-prefix extraction using writev: builds IoSlice entries pointing
+/// directly into the source data, flushing in MAX_IOV-sized batches.
+/// Lines shorter than max_bytes stay in contiguous runs. Lines needing truncation
+/// produce two IoSlices (truncated data + newline).
 #[inline]
 fn bytes_from_start_zerocopy(
     data: &[u8],
@@ -2070,21 +2104,27 @@ fn bytes_from_start_zerocopy(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    let newline_buf: [u8; 1] = [line_delim];
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut start = 0;
     let mut run_start: usize = 0;
 
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         if line_len > max_bytes {
-            // This line needs truncation. Flush current run, write truncated line.
+            // This line needs truncation
             if run_start < start {
-                out.write_all(&data[run_start..start])?;
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            out.write_all(&data[start..start + max_bytes])?;
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&data[start..start + max_bytes]));
+            iov.push(IoSlice::new(&newline_buf));
             run_start = pos + 1;
+
+            if iov.len() >= MAX_IOV - 2 {
+                write_ioslices(out, &iov)?;
+                iov.clear();
+            }
         }
-        // else: line fits, keep it in the current contiguous run
         start = pos + 1;
     }
     // Handle last line without terminator
@@ -2092,20 +2132,25 @@ fn bytes_from_start_zerocopy(
         let line_len = data.len() - start;
         if line_len > max_bytes {
             if run_start < start {
-                out.write_all(&data[run_start..start])?;
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            out.write_all(&data[start..start + max_bytes])?;
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&data[start..start + max_bytes]));
+            iov.push(IoSlice::new(&newline_buf));
+            if !iov.is_empty() {
+                write_ioslices(out, &iov)?;
+            }
             return Ok(());
         }
     }
-    // Flush remaining run (includes all short lines + the last line)
+    // Flush remaining contiguous run
     if run_start < data.len() {
-        out.write_all(&data[run_start..])?;
-        // Add terminator if last byte isn't one
+        iov.push(IoSlice::new(&data[run_start..]));
         if !data.is_empty() && *data.last().unwrap() != line_delim {
-            out.write_all(&[line_delim])?;
+            iov.push(IoSlice::new(&newline_buf));
         }
+    }
+    if !iov.is_empty() {
+        write_ioslices(out, &iov)?;
     }
     Ok(())
 }
