@@ -416,19 +416,31 @@ fn encode_wrapped_parallel(
                 let out_base = line_idx * line_out;
                 unsafe {
                     let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                    let _ = BASE64_ENGINE.encode(&input[in_base..in_base + bytes_per_line], s0.as_out());
+                    let _ = BASE64_ENGINE
+                        .encode(&input[in_base..in_base + bytes_per_line], s0.as_out());
                     *dst.add(out_base + wrap_col) = b'\n';
 
                     let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
-                    let _ = BASE64_ENGINE.encode(&input[in_base + bytes_per_line..in_base + 2 * bytes_per_line], s1.as_out());
+                    let _ = BASE64_ENGINE.encode(
+                        &input[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
+                        s1.as_out(),
+                    );
                     *dst.add(out_base + line_out + wrap_col) = b'\n';
 
-                    let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
-                    let _ = BASE64_ENGINE.encode(&input[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line], s2.as_out());
+                    let s2 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &input[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
+                        s2.as_out(),
+                    );
                     *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
 
-                    let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
-                    let _ = BASE64_ENGINE.encode(&input[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line], s3.as_out());
+                    let s3 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &input[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
+                        s3.as_out(),
+                    );
                     *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
                 }
                 line_idx += 4;
@@ -440,7 +452,8 @@ fn encode_wrapped_parallel(
                 let out_base = line_idx * line_out;
                 unsafe {
                     let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                    let _ = BASE64_ENGINE.encode(&input[in_base..in_base + bytes_per_line], s.as_out());
+                    let _ =
+                        BASE64_ENGINE.encode(&input[in_base..in_base + bytes_per_line], s.as_out());
                     *dst.add(out_base + wrap_col) = b'\n';
                 }
                 line_idx += 1;
@@ -625,7 +638,10 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
     // For typical base64 (76-char lines), we'll find \n immediately and skip this.
     if memchr::memchr2(b'\n', b'\r', data).is_none() {
         // No newlines/CR — check for rare whitespace only
-        if data.iter().any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c) {
+        if data
+            .iter()
+            .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c)
+        {
             data.retain(|&b| NOT_WHITESPACE[b as usize]);
         }
         return;
@@ -1082,15 +1098,24 @@ fn encode_stream_wrapped_fused(
                 *dst.add(out_base + wrap_col) = b'\n';
 
                 let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(&buf[in_base + bytes_per_line..in_base + 2 * bytes_per_line], s1.as_out());
+                let _ = BASE64_ENGINE.encode(
+                    &buf[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
+                    s1.as_out(),
+                );
                 *dst.add(out_base + line_out + wrap_col) = b'\n';
 
                 let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(&buf[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line], s2.as_out());
+                let _ = BASE64_ENGINE.encode(
+                    &buf[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
+                    s2.as_out(),
+                );
                 *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
 
                 let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(&buf[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line], s3.as_out());
+                let _ = BASE64_ENGINE.encode(
+                    &buf[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
+                    s3.as_out(),
+                );
                 *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
             }
             line_idx += 4;

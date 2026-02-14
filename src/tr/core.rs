@@ -665,7 +665,12 @@ fn translate_range_to_constant_simd_inplace(data: &mut [u8], lo: u8, hi: u8, rep
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn translate_range_to_constant_avx2_inplace(data: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+unsafe fn translate_range_to_constant_avx2_inplace(
+    data: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -716,7 +721,12 @@ unsafe fn translate_range_to_constant_avx2_inplace(data: &mut [u8], lo: u8, hi: 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn translate_range_to_constant_sse2_inplace(data: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+unsafe fn translate_range_to_constant_sse2_inplace(
+    data: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -1963,7 +1973,12 @@ fn translate_mmap_range_to_constant(
             .zip(buf.par_chunks_mut(chunk_size))
             .for_each(|(src_chunk, dst_chunk)| {
                 dst_chunk[..src_chunk.len()].copy_from_slice(src_chunk);
-                translate_range_to_constant_simd_inplace(&mut dst_chunk[..src_chunk.len()], lo, hi, replacement);
+                translate_range_to_constant_simd_inplace(
+                    &mut dst_chunk[..src_chunk.len()],
+                    lo,
+                    hi,
+                    replacement,
+                );
             });
 
         return writer.write_all(&buf);
