@@ -1384,6 +1384,7 @@ fn single_field1_zerocopy(
 /// Uses per-line memchr calls to find the target field boundaries.
 /// For field 2: finds the 1st delimiter (start of field 2), then the 2nd (end).
 /// More efficient than memchr2_iter for small field indices since we stop early.
+/// Uses raw pointer arithmetic to eliminate bounds checking.
 fn process_small_field_combined(
     data: &[u8],
     delim: u8,
@@ -1392,16 +1393,22 @@ fn process_small_field_combined(
     buf: &mut Vec<u8>,
 ) {
     buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
     let mut start = 0;
     for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
+        let line_len = end_pos - start;
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), line_len) };
+        let line_base = line.as_ptr();
         // Find the start of the target field (skip target_idx delimiters)
         let mut field_start = 0;
         let mut found_start = target_idx == 0;
         let mut delim_count = 0;
         if !found_start {
             let mut search_start = 0;
-            while let Some(pos) = memchr::memchr(delim, &line[search_start..]) {
+            while let Some(pos) = memchr::memchr(delim, unsafe {
+                std::slice::from_raw_parts(line_base.add(search_start), line_len - search_start)
+            }) {
                 delim_count += 1;
                 if delim_count == target_idx {
                     field_start = search_start + pos + 1;
@@ -1417,18 +1424,20 @@ fn process_small_field_combined(
                 buf_extend(buf, line);
                 buf_push(buf, line_delim);
             }
-        } else if field_start >= line.len() {
+        } else if field_start >= line_len {
             // Empty field at end
             unsafe { buf_push(buf, line_delim) };
         } else {
             // Find the end of the target field
-            match memchr::memchr(delim, &line[field_start..]) {
+            match memchr::memchr(delim, unsafe {
+                std::slice::from_raw_parts(line_base.add(field_start), line_len - field_start)
+            }) {
                 Some(pos) => unsafe {
-                    buf_extend(buf, &line[field_start..field_start + pos]);
+                    buf_extend(buf, std::slice::from_raw_parts(line_base.add(field_start), pos));
                     buf_push(buf, line_delim);
                 },
                 None => unsafe {
-                    buf_extend(buf, &line[field_start..]);
+                    buf_extend(buf, std::slice::from_raw_parts(line_base.add(field_start), line_len - field_start));
                     buf_push(buf, line_delim);
                 },
             }
@@ -1436,14 +1445,18 @@ fn process_small_field_combined(
         start = end_pos + 1;
     }
     // Handle last line without terminator
-    if start < data.len() {
-        let line = &data[start..];
+    if start < data_len {
+        let line_len = data_len - start;
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), line_len) };
+        let line_base = line.as_ptr();
         let mut field_start = 0;
         let mut found_start = target_idx == 0;
         let mut delim_count = 0;
         if !found_start {
             let mut search_start = 0;
-            while let Some(pos) = memchr::memchr(delim, &line[search_start..]) {
+            while let Some(pos) = memchr::memchr(delim, unsafe {
+                std::slice::from_raw_parts(line_base.add(search_start), line_len - search_start)
+            }) {
                 delim_count += 1;
                 if delim_count == target_idx {
                     field_start = search_start + pos + 1;
@@ -1458,16 +1471,18 @@ fn process_small_field_combined(
                 buf_extend(buf, line);
                 buf_push(buf, line_delim);
             }
-        } else if field_start >= line.len() {
+        } else if field_start >= line_len {
             unsafe { buf_push(buf, line_delim) };
         } else {
-            match memchr::memchr(delim, &line[field_start..]) {
+            match memchr::memchr(delim, unsafe {
+                std::slice::from_raw_parts(line_base.add(field_start), line_len - field_start)
+            }) {
                 Some(pos) => unsafe {
-                    buf_extend(buf, &line[field_start..field_start + pos]);
+                    buf_extend(buf, std::slice::from_raw_parts(line_base.add(field_start), pos));
                     buf_push(buf, line_delim);
                 },
                 None => unsafe {
-                    buf_extend(buf, &line[field_start..]);
+                    buf_extend(buf, std::slice::from_raw_parts(line_base.add(field_start), line_len - field_start));
                     buf_push(buf, line_delim);
                 },
             }
@@ -1962,6 +1977,7 @@ fn process_bytes_chunk(
 
 /// Extract byte ranges from a line into the output buffer.
 /// Uses unsafe buf helpers for zero bounds-check overhead in hot loops.
+/// Raw pointer arithmetic eliminates per-range bounds checking.
 #[inline(always)]
 fn cut_bytes_to_buf(
     line: &[u8],
@@ -1971,10 +1987,14 @@ fn cut_bytes_to_buf(
     buf: &mut Vec<u8>,
 ) {
     let len = line.len();
+    let base = line.as_ptr();
     let mut first_range = true;
 
     // Reserve worst case: full line + delimiters between ranges
-    buf.reserve(len + output_delim.len() * ranges.len() + 1);
+    let needed = len + output_delim.len() * ranges.len() + 1;
+    if buf.capacity() - buf.len() < needed {
+        buf.reserve(needed);
+    }
 
     if complement {
         let mut pos: usize = 1;
@@ -1985,7 +2005,7 @@ fn cut_bytes_to_buf(
                 if !first_range && !output_delim.is_empty() {
                     unsafe { buf_extend(buf, output_delim) };
                 }
-                unsafe { buf_extend(buf, &line[pos - 1..rs - 1]) };
+                unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(pos - 1), rs - pos)) };
                 first_range = false;
             }
             pos = re + 1;
@@ -1997,14 +2017,14 @@ fn cut_bytes_to_buf(
             if !first_range && !output_delim.is_empty() {
                 unsafe { buf_extend(buf, output_delim) };
             }
-            unsafe { buf_extend(buf, &line[pos - 1..len]) };
+            unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(pos - 1), len - pos + 1)) };
         }
     } else if output_delim.is_empty() && ranges.len() == 1 {
         // Ultra-fast path: single range, no output delimiter
         let start = ranges[0].start.saturating_sub(1);
         let end = ranges[0].end.min(len);
         if start < len {
-            unsafe { buf_extend(buf, &line[start..end]) };
+            unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(start), end - start)) };
         }
     } else {
         for r in ranges {
@@ -2016,7 +2036,7 @@ fn cut_bytes_to_buf(
             if !first_range && !output_delim.is_empty() {
                 unsafe { buf_extend(buf, output_delim) };
             }
-            unsafe { buf_extend(buf, &line[start..end]) };
+            unsafe { buf_extend(buf, std::slice::from_raw_parts(base.add(start), end - start)) };
             first_range = false;
         }
     }
