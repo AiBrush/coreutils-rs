@@ -62,8 +62,8 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     if data.is_empty() {
         return Ok(());
     }
-    // For data up to 32MB, build contiguous output buffer for single write().
-    // This trades one memcpy (fast, sequential) for N writev syscalls.
+    // For data up to 128MB, zero-copy writev: collect all positions in one forward
+    // SIMD pass, build IoSlice entries in reverse, flush with batched writev.
     if data.len() <= CONTIG_LIMIT {
         if !before {
             tac_bytes_contig_after(data, separator, out)
@@ -77,121 +77,73 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 }
 
-/// Threshold for contiguous output buffer strategy.
-/// Up to 32MB, the extra memcpy is cheaper than hundreds of writev() syscalls.
-const CONTIG_LIMIT: usize = 32 * 1024 * 1024;
+/// Threshold for zero-copy writev strategy.
+/// Up to 128MB, collect all separator positions in one pass, then writev
+/// with IoSlice entries pointing into the original buffer. Memory overhead
+/// is ~24 bytes per line (8 for position + 16 for IoSlice), much less than
+/// the old contiguous-copy approach that needed a full output buffer.
+/// For data > 128MB, falls back to chunked backward scan with batched writev.
+const CONTIG_LIMIT: usize = 128 * 1024 * 1024;
 
-/// Contiguous-output after-separator mode: build reversed output in one buffer,
-/// then write it all at once. For pipe output, a single large write() is
-/// significantly faster than many writev() calls.
+/// Zero-copy after-separator mode for data <= CONTIG_LIMIT.
+/// Collects ALL separator positions in a single forward memchr pass, then builds
+/// IoSlice entries pointing to records in reverse order in the ORIGINAL input buffer.
+/// Writes all slices with batched writev — no output buffer allocation or memcpy.
+///
+/// For a 10MB file with 50-byte lines (~200K lines), this needs:
+///   - ~200K * 8 = 1.6MB for position indices
+///   - ~200K * 16 = 3.2MB for IoSlice entries
+/// vs the old approach which needed 10MB for the output buffer.
 fn tac_bytes_contig_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Pre-allocate output buffer (same size as input since tac preserves all bytes)
-    let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-    let dst = outbuf.as_mut_ptr();
-    let mut wp = 0usize;
+    // Single forward pass: find ALL separator positions using SIMD memchr.
+    // memchr_iter uses AVX2 on x86_64, processing 32 bytes per iteration.
+    let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
-    let mut global_end = data.len();
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
+    // Build IoSlice entries in reverse record order, pointing directly into `data`.
+    // Each record is data[prev_sep+1 .. cur_sep+1] (includes the separator at cur_sep).
+    let num_records = positions.len() + 1; // +1 for the first record (before first sep)
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
 
-    loop {
-        let chunk_end = global_end.min(data.len());
-        if chunk_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
-            }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
+    // Records from last to first: each record is (sep_pos+1 .. next_sep_pos+1)
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
+        let rec_start = pos + 1;
+        if rec_start < end {
+            iov.push(IoSlice::new(&data[rec_start..end]));
         }
-        let chunk = &data[chunk_start..chunk_end];
-
-        positions_buf.clear();
-        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
-
-        for &pos in positions_buf.iter().rev() {
-            let rec_start = pos + 1;
-            let rec_len = global_end - rec_start;
-            if rec_len > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(rec_start),
-                        dst.add(wp),
-                        rec_len,
-                    );
-                }
-                wp += rec_len;
-            }
-            global_end = pos + 1;
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
+        end = rec_start;
+    }
+    // First record: data[0..first_sep+1] or data[0..end] if no separators
+    if end > 0 {
+        iov.push(IoSlice::new(&data[0..end]));
     }
 
-    // First record
-    if global_end > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(wp), global_end);
-        }
-        wp += global_end;
-    }
-
-    unsafe { outbuf.set_len(wp) };
-    out.write_all(&outbuf)
+    // Flush all IoSlice entries in batched writev calls
+    flush_iov(out, &iov)
 }
 
-/// Contiguous-output before-separator mode.
+/// Zero-copy before-separator mode for data <= CONTIG_LIMIT.
+/// Same strategy as tac_bytes_contig_after but records start AT the separator.
 fn tac_bytes_contig_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-    let dst = outbuf.as_mut_ptr();
-    let mut wp = 0usize;
+    let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
-    let mut global_end = data.len();
-    let mut positions_buf: Vec<usize> = Vec::with_capacity(CHUNK);
-    let mut chunk_start = data.len().saturating_sub(CHUNK);
+    let num_records = positions.len() + 1;
+    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
 
-    loop {
-        let chunk_end = global_end.min(data.len());
-        if chunk_start >= chunk_end {
-            if chunk_start == 0 {
-                break;
-            }
-            chunk_start = chunk_start.saturating_sub(CHUNK);
-            continue;
+    // Records from last to first: each record is [sep_pos .. next_sep_pos)
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
+        if pos < end {
+            iov.push(IoSlice::new(&data[pos..end]));
         }
-        let chunk = &data[chunk_start..chunk_end];
-
-        positions_buf.clear();
-        positions_buf.extend(memchr::memchr_iter(sep, chunk).map(|p| p + chunk_start));
-
-        for &pos in positions_buf.iter().rev() {
-            let rec_len = global_end - pos;
-            if rec_len > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr().add(pos), dst.add(wp), rec_len);
-                }
-                wp += rec_len;
-            }
-            global_end = pos;
-        }
-
-        if chunk_start == 0 {
-            break;
-        }
-        chunk_start = chunk_start.saturating_sub(CHUNK);
+        end = pos;
+    }
+    // First record: data[0..first_sep] or data[0..end] if no separators
+    if end > 0 {
+        iov.push(IoSlice::new(&data[0..end]));
     }
 
-    if global_end > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(wp), global_end);
-        }
-        wp += global_end;
-    }
-
-    unsafe { outbuf.set_len(wp) };
-    out.write_all(&outbuf)
+    flush_iov(out, &iov)
 }
 
 /// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.
