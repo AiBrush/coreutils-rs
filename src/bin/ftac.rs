@@ -327,10 +327,15 @@ fn main() {
     let had_error = {
         let stdout = io::stdout();
         let lock = stdout.lock();
-        let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, lock);
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        if is_byte_sep {
+            let mut writer = lock;
+            run(&cli, &files, &mut writer)
+        } else {
+            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, lock);
+            let err = run(&cli, &files, &mut writer);
+            let _ = writer.flush();
+            err
+        }
     };
 
     if had_error {
