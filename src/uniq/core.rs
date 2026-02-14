@@ -1271,8 +1271,8 @@ fn process_count_fast_singlepass(
     let mut cur_start = first_term + 1;
 
     // Batch output into a local buffer to reduce write_all calls.
-    // 64KB buffer amortizes BufWriter overhead (~50ns per write_all) across many lines.
-    const BATCH_BUF_SIZE: usize = 64 * 1024;
+    // 256KB buffer reduces BufWriter call overhead by 4x vs 64KB.
+    const BATCH_BUF_SIZE: usize = 256 * 1024;
     let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
 
     while cur_start < data_len {
@@ -1543,13 +1543,27 @@ fn process_count_ci_singlepass(
     let mut cur_start = first_term + 1;
 
     // Batch output into a local buffer to reduce write_all calls.
-    const BATCH_BUF_SIZE: usize = 64 * 1024;
+    const BATCH_BUF_SIZE: usize = 256 * 1024;
     let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_BUF_SIZE);
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let mut prev_len = prev_end - prev_start;
+
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
         if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
@@ -1573,10 +1587,11 @@ fn process_count_ci_singlepass(
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_end - cur_start;
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
