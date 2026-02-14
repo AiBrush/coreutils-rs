@@ -3778,10 +3778,10 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
     // The extra write_all calls (~40 for 10MB) are negligible cost.
     const COMPACT_BUF: usize = 256 * 1024;
     let mut outbuf = alloc_uninit_vec(COMPACT_BUF);
-    let mut wp = 0;
 
     #[cfg(target_arch = "x86_64")]
     {
+        let mut wp = 0;
         let level = get_simd_level();
         let len = data.len();
         let sp = data.as_ptr();
@@ -3871,6 +3871,11 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
             wp += (b < lo || b > hi) as usize;
             ri += 1;
         }
+
+        if wp > 0 {
+            writer.write_all(&outbuf[..wp])?;
+        }
+        return Ok(());
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -3885,9 +3890,7 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
         return Ok(());
     }
 
-    if wp > 0 {
-        writer.write_all(&outbuf[..wp])?;
-    }
+    #[allow(unreachable_code)]
     Ok(())
 }
 
