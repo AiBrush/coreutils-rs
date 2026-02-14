@@ -87,15 +87,22 @@ fn split_into_chunks(data: &[u8], sep: u8) -> Vec<usize> {
 }
 
 /// Thread-safe wrapper for sending a mutable pointer across rayon threads.
+/// Stores the pointer as a usize to avoid *mut u8's lack of Send/Sync.
 /// Each parallel chunk writes to its own non-overlapping region of the
 /// output buffer, so concurrent access is safe.
-struct SendMutPtr(*mut u8);
-unsafe impl Send for SendMutPtr {}
-unsafe impl Sync for SendMutPtr {}
-impl Copy for SendMutPtr {}
-impl Clone for SendMutPtr {
-    fn clone(&self) -> Self {
-        *self
+#[derive(Copy, Clone)]
+struct SendPtr(usize);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+impl SendPtr {
+    fn new(ptr: *mut u8) -> Self {
+        Self(ptr as usize)
+    }
+
+    #[inline]
+    unsafe fn add(self, offset: usize) -> *mut u8 {
+        (self.0 + offset) as *mut u8
     }
 }
 
@@ -141,7 +148,7 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
     // Phase 3: Allocate contiguous output buffer, then copy records in
     // parallel. Each chunk writes to its own non-overlapping region.
     let mut output = vec![0u8; data.len()];
-    let dst = SendMutPtr(output.as_mut_ptr());
+    let dst = SendPtr::new(output.as_mut_ptr());
 
     (0..n_chunks).into_par_iter().for_each(move |ci| {
         let chunk_start = boundaries[ci];
@@ -157,7 +164,7 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         data.as_ptr().add(rec_start),
-                        dst.0.add(wp),
+                        dst.add(wp),
                         len,
                     );
                 }
@@ -212,7 +219,7 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
     }
 
     let mut output = vec![0u8; data.len()];
-    let dst = SendMutPtr(output.as_mut_ptr());
+    let dst = SendPtr::new(output.as_mut_ptr());
 
     (0..n_chunks).into_par_iter().for_each(move |ci| {
         let chunk_start = boundaries[ci];
@@ -227,7 +234,7 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         data.as_ptr().add(pos),
-                        dst.0.add(wp),
+                        dst.add(wp),
                         len,
                     );
                 }

@@ -134,6 +134,7 @@ fn parse_args() -> Cli {
     };
 
     let mut args = std::env::args_os().skip(1);
+    #[allow(clippy::while_let_on_iterator)]
     while let Some(arg) = args.next() {
         let bytes = arg.as_encoded_bytes();
         if bytes == b"--" {
