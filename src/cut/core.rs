@@ -2007,17 +2007,20 @@ fn bytes_from_start_zerocopy(
 /// data copy + delimiter into a single tight loop with minimal overhead.
 #[inline]
 fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
+    // Pre-reserve enough capacity: output is at most data.len() bytes
+    // (when all lines are <= max_bytes, output equals input).
+    // This eliminates per-iteration capacity checks in the hot loop.
+    buf.reserve(data.len().min(buf.capacity().max(max_bytes + 2)));
+
     let mut start = 0;
-    // Use raw pointer for the inner copy to eliminate slice bounds checks
     let data_ptr = data.as_ptr();
 
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         let take = line_len.min(max_bytes);
-        // Ensure capacity for data + delimiter
+        // Check capacity only when we might exceed it (rare with good pre-reserve)
         let needed = take + 1;
-        let remaining = buf.capacity() - buf.len();
-        if remaining < needed {
+        if buf.len() + needed > buf.capacity() {
             buf.reserve(needed.max(data.len() - pos));
         }
         unsafe {
@@ -2033,8 +2036,7 @@ fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &m
         let line_len = data.len() - start;
         let take = line_len.min(max_bytes);
         let needed = take + 1;
-        let remaining = buf.capacity() - buf.len();
-        if remaining < needed {
+        if buf.len() + needed > buf.capacity() {
             buf.reserve(needed);
         }
         unsafe {
