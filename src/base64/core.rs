@@ -828,88 +828,134 @@ fn detect_regular_newline_stride(data: &[u8]) -> Option<usize> {
     Some(stride)
 }
 
-/// Fast fixed-stride whitespace strip + decode for regular base64 output.
-/// Copies line-length chunks at stride intervals, skipping the \n at the end
-/// of each line. No SIMD scanning needed — just arithmetic + memcpy.
+/// Fast fixed-stride decode for regular base64 output.
+/// Bulk-strips newlines from chunks of 256 lines (19456 bytes) into an L1-resident
+/// temp buffer, then decodes each chunk in a single SIMD call. This reduces the
+/// number of decode() calls by ~256x (from ~175K to ~684 for a 10MB decode) and
+/// avoids allocating a 13.3MB intermediate clean buffer.
+///
+/// Instead of: alloc 13.3MB clean buffer + 175K memcpy + 1 decode call
+/// We do: reuse 20KB temp buffer + 684 bulk memcpy + 684 decode calls
+///
+/// The 20KB temp buffer stays hot in L1 cache, and each decode call processes
+/// enough data (19456 bytes) for efficient SIMD utilization.
 fn decode_fixed_stride(data: &[u8], stride: usize, out: &mut impl Write) -> io::Result<()> {
     let line_len = stride - 1; // data bytes per line (e.g. 76 for stride 77)
     let num_full_lines = data.len() / stride;
     let remainder = data.len() % stride;
+
+    // Calculate exact decoded output size
     let clean_len = num_full_lines * line_len
         + if remainder > 0 {
-            remainder.min(line_len)
+            let tail = if data[data.len() - 1] == b'\n' {
+                remainder - 1
+            } else {
+                remainder.min(line_len)
+            };
+            tail
         } else {
             0
         };
+    // Each 4 base64 chars decode to 3 bytes, plus padding adjustment
+    let decoded_size = clean_len * 3 / 4 + 3; // +3 for rounding
 
-    let mut clean: Vec<u8> = Vec::with_capacity(clean_len);
-    let dst = clean.as_mut_ptr();
+    // Pre-allocate output buffer for all decoded data
+    let mut out_buf: Vec<u8> = Vec::with_capacity(decoded_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out_buf.set_len(decoded_size);
+    }
+    let out_ptr = out_buf.as_mut_ptr();
+    let mut out_wp = 0usize;
+
+    // Temp buffer for bulk newline stripping: 256 lines * 76 bytes = 19456 bytes.
+    // Stays hot in L1 cache (typically 32-48 KB).
+    const LINES_PER_CHUNK: usize = 256;
+    let chunk_clean = LINES_PER_CHUNK * line_len;
+    let mut temp: Vec<u8> = Vec::with_capacity(chunk_clean + line_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        temp.set_len(chunk_clean + line_len);
+    }
+
     let src = data.as_ptr();
-    let mut wp = 0;
+    let tmp = temp.as_mut_ptr();
+    let mut line = 0usize;
 
-    // Copy full lines: skip \n at end of each stride
-    // 4-line unrolled for ILP
-    let mut line = 0;
-    while line + 4 <= num_full_lines {
+    // Process full chunks of LINES_PER_CHUNK lines
+    while line + LINES_PER_CHUNK <= num_full_lines {
+        // Bulk copy 256 lines into temp buffer, skipping newlines
         unsafe {
-            std::ptr::copy_nonoverlapping(src.add(line * stride), dst.add(wp), line_len);
-            std::ptr::copy_nonoverlapping(
-                src.add((line + 1) * stride),
-                dst.add(wp + line_len),
-                line_len,
-            );
-            std::ptr::copy_nonoverlapping(
-                src.add((line + 2) * stride),
-                dst.add(wp + 2 * line_len),
-                line_len,
-            );
-            std::ptr::copy_nonoverlapping(
-                src.add((line + 3) * stride),
-                dst.add(wp + 3 * line_len),
-                line_len,
-            );
-        }
-        wp += 4 * line_len;
-        line += 4;
-    }
-    while line < num_full_lines {
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.add(line * stride), dst.add(wp), line_len);
-        }
-        wp += line_len;
-        line += 1;
-    }
-
-    // Handle remainder (last partial line, no trailing \n needed)
-    if remainder > 0 {
-        let tail = remainder.min(line_len);
-        // Strip trailing \n from remainder if present
-        let actual_tail = if remainder > 0 && data[data.len() - 1] == b'\n' {
-            remainder - 1
-        } else {
-            tail
-        };
-        if actual_tail > 0 {
-            unsafe {
+            for li in 0..LINES_PER_CHUNK {
                 std::ptr::copy_nonoverlapping(
-                    src.add(num_full_lines * stride),
-                    dst.add(wp),
-                    actual_tail,
+                    src.add((line + li) * stride),
+                    tmp.add(li * line_len),
+                    line_len,
                 );
             }
-            wp += actual_tail;
+        }
+        // Decode the chunk directly into the output buffer
+        let dec_len = match BASE64_ENGINE.decode(
+            &temp[..chunk_clean],
+            unsafe { std::slice::from_raw_parts_mut(out_ptr.add(out_wp), decoded_size - out_wp) }
+                .as_out(),
+        ) {
+            Ok(decoded) => decoded.len(),
+            Err(_) => return decode_error(),
+        };
+        out_wp += dec_len;
+        line += LINES_PER_CHUNK;
+    }
+
+    // Remaining full lines (< LINES_PER_CHUNK)
+    let remaining_lines = num_full_lines - line;
+    if remaining_lines > 0 {
+        unsafe {
+            for li in 0..remaining_lines {
+                std::ptr::copy_nonoverlapping(
+                    src.add((line + li) * stride),
+                    tmp.add(li * line_len),
+                    line_len,
+                );
+            }
+        }
+        let rem_clean = remaining_lines * line_len;
+        // If there's no remainder, this is the last chunk — decode including any padding
+        let dec_len = match BASE64_ENGINE.decode(
+            &temp[..rem_clean],
+            unsafe { std::slice::from_raw_parts_mut(out_ptr.add(out_wp), decoded_size - out_wp) }
+                .as_out(),
+        ) {
+            Ok(decoded) => decoded.len(),
+            Err(_) => return decode_error(),
+        };
+        out_wp += dec_len;
+    }
+
+    // Handle remainder (last partial line)
+    if remainder > 0 {
+        let actual_tail = if data[data.len() - 1] == b'\n' {
+            remainder - 1
+        } else {
+            remainder.min(line_len)
+        };
+        if actual_tail > 0 {
+            let tail_start = num_full_lines * stride;
+            let dec_len = match BASE64_ENGINE.decode(
+                &data[tail_start..tail_start + actual_tail],
+                unsafe {
+                    std::slice::from_raw_parts_mut(out_ptr.add(out_wp), decoded_size - out_wp)
+                }
+                .as_out(),
+            ) {
+                Ok(decoded) => decoded.len(),
+                Err(_) => return decode_error(),
+            };
+            out_wp += dec_len;
         }
     }
 
-    unsafe {
-        clean.set_len(wp);
-    }
-
-    if clean.len() >= PARALLEL_DECODE_THRESHOLD {
-        decode_borrowed_clean_parallel(out, &clean)
-    } else {
-        decode_clean_slice(&mut clean, out)
-    }
+    out.write_all(&out_buf[..out_wp])
 }
 
 /// SIMD memchr2 gap-copy whitespace strip for irregular newline patterns.
