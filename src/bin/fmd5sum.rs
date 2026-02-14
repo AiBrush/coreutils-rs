@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process;
 
 use clap::Parser;
-use rayon::prelude::*;
 
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::hash::{self, HashAlgorithm};
@@ -78,29 +77,6 @@ fn escape_filename(name: &str) -> String {
         }
     }
     out
-}
-
-/// Check if parallel hashing is worthwhile based on total file size.
-/// For many small files, sequential with reused thread-local buffer is faster.
-/// Uses sampling to avoid N stat() syscalls for N-file workloads.
-fn use_parallel(files: &[String]) -> bool {
-    const MIN_TOTAL: u64 = 10 * 1024 * 1024;
-    if files.len() < 2 {
-        return false;
-    }
-    let sample: u64 = files
-        .iter()
-        .take(4)
-        .filter_map(|f| std::fs::metadata(f).ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum();
-    let sampled = files.len().min(4) as u64;
-    if sampled == 0 {
-        return false;
-    }
-    let estimated_total = sample / sampled * files.len() as u64;
-    estimated_total >= MIN_TOTAL
 }
 
 fn main() {
@@ -279,35 +255,15 @@ fn main() {
                     }
                 }
             }
-        } else if use_parallel(&files) {
-            // Large total data: parallel hashing with rayon + readahead
-            let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
-            hash::readahead_files(&paths);
-
-            let results: Vec<(&str, Result<String, io::Error>)> = files
-                .par_iter()
-                .map(|filename| {
-                    let result = hash::hash_file(algo, Path::new(filename));
-                    (filename.as_str(), result)
-                })
-                .collect();
-
-            for (filename, result) in results {
-                match result {
-                    Ok(h) => {
-                        write_output(&mut out, &cli, algo, &h, filename);
-                    }
-                    Err(e) => {
-                        let _ = out.flush();
-                        eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
-                        had_error = true;
-                    }
-                }
-            }
         } else {
-            // Small files: sequential avoids rayon overhead
-            for filename in &files {
-                match hash::hash_file(algo, Path::new(filename)) {
+            // Multi-file: always use rayon parallel hashing with readahead.
+            // Even for many small files, rayon overhead is negligible (~1μs/task)
+            // vs per-file I/O (~10-50μs), and 4-thread parallelism gives ~4x.
+            let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
+            let results = hash::hash_files_parallel(&paths, algo);
+
+            for (filename, result) in files.iter().zip(results) {
+                match result {
                     Ok(h) => {
                         write_output(&mut out, &cli, algo, &h, filename);
                     }

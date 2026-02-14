@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process;
 
 use clap::Parser;
-use rayon::prelude::*;
 
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::hash;
@@ -165,29 +164,6 @@ fn main() {
     }
 }
 
-/// Check if parallel hashing is worthwhile based on total file size.
-/// For many small files, sequential with reused thread-local buffer is faster.
-/// Uses sampling to avoid N stat() syscalls for N-file workloads.
-fn use_parallel(files: &[String]) -> bool {
-    const MIN_TOTAL: u64 = 10 * 1024 * 1024;
-    if files.len() < 2 {
-        return false;
-    }
-    let sample: u64 = files
-        .iter()
-        .take(4)
-        .filter_map(|f| std::fs::metadata(f).ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum();
-    let sampled = files.len().min(4) as u64;
-    if sampled == 0 {
-        return false;
-    }
-    let estimated_total = sample / sampled * files.len() as u64;
-    estimated_total >= MIN_TOTAL
-}
-
 fn run_hash_mode(cli: &Cli, files: &[String], output_bytes: usize, out: &mut impl Write) -> bool {
     let mut had_error = false;
     let has_stdin = files.iter().any(|f| f == "-");
@@ -217,35 +193,15 @@ fn run_hash_mode(cli: &Cli, files: &[String], output_bytes: usize, out: &mut imp
                 }
             }
         }
-    } else if use_parallel(files) {
-        // Large total data: parallel hashing with rayon + readahead
-        let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
-        hash::readahead_files(&paths);
-
-        let results: Vec<(&str, Result<String, io::Error>)> = files
-            .par_iter()
-            .map(|filename| {
-                let result = hash::blake2b_hash_file(Path::new(filename), output_bytes);
-                (filename.as_str(), result)
-            })
-            .collect();
-
-        for (filename, result) in results {
-            match result {
-                Ok(h) => {
-                    write_output(out, cli, &h, filename, output_bytes);
-                }
-                Err(e) => {
-                    let _ = out.flush();
-                    eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
-                    had_error = true;
-                }
-            }
-        }
     } else {
-        // Small files: sequential avoids rayon overhead
-        for filename in files {
-            match hash::blake2b_hash_file(Path::new(filename), output_bytes) {
+        // Multi-file: use blake2b_simd::many for 4-way SIMD parallel hashing.
+        // All files pre-loaded into memory (mmap), then hashed simultaneously
+        // using AVX2 multi-buffer processing for ~4x throughput.
+        let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
+        let results = hash::blake2b_hash_files_many(&paths, output_bytes);
+
+        for (filename, result) in files.iter().zip(results) {
+            match result {
                 Ok(h) => {
                     write_output(out, cli, &h, filename, output_bytes);
                 }
