@@ -64,18 +64,12 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
         unsafe {
-            // tac now scans forward with memchr_iter — sequential readahead helps
-            libc::madvise(
-                m.as_ptr() as *mut libc::c_void,
-                m.len(),
-                libc::MADV_SEQUENTIAL,
-            );
-            if m.len() >= 2 * 1024 * 1024 {
-                libc::madvise(
-                    m.as_ptr() as *mut libc::c_void,
-                    m.len(),
-                    libc::MADV_HUGEPAGE,
-                );
+            let ptr = m.as_ptr() as *mut libc::c_void;
+            let len = m.len();
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+            if len >= 2 * 1024 * 1024 {
+                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
         }
     }
@@ -121,26 +115,21 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // tac uses backward SIMD scan (memrchr) for single-byte separator,
-        // so MADV_RANDOM is optimal — disables sequential readahead which
-        // would prefetch the wrong (forward) pages during backward scan.
-        // WILLNEED still helps pre-fault all pages, HUGEPAGE reduces TLB misses.
+        // tac scans forward with memchr_iter to collect separator positions,
+        // then builds IoSlice arrays for writev output. MADV_SEQUENTIAL optimizes
+        // the forward scan; HUGEPAGE reduces TLB misses for large files.
         #[cfg(target_os = "linux")]
         {
             if let FileData::Mmap(ref mmap) = data {
                 unsafe {
-                    // tac now scans forward with memchr_iter — sequential readahead helps
-                    libc::madvise(
-                        mmap.as_ptr() as *mut libc::c_void,
-                        mmap.len(),
-                        libc::MADV_SEQUENTIAL,
-                    );
-                    if mmap.len() >= 2 * 1024 * 1024 {
-                        libc::madvise(
-                            mmap.as_ptr() as *mut libc::c_void,
-                            mmap.len(),
-                            libc::MADV_HUGEPAGE,
-                        );
+                    let ptr = mmap.as_ptr() as *mut libc::c_void;
+                    let len = mmap.len();
+                    // Sequential readahead: optimizes the forward memchr_iter scan
+                    libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+                    // Pre-fault pages: avoids page fault stalls during the scan
+                    libc::madvise(ptr, len, libc::MADV_WILLNEED);
+                    if len >= 2 * 1024 * 1024 {
+                        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
                     }
                 }
             }
