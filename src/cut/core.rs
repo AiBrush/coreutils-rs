@@ -2384,49 +2384,40 @@ fn bytes_from_start_zerocopy(
 
 /// Process a chunk for from-start byte range extraction (parallel path).
 /// Uses unsafe appends to eliminate bounds checking in the hot loop.
-/// When max_bytes is small, the output per line is tiny so we fuse the
-/// data copy + delimiter into a single tight loop with minimal overhead.
+/// Pre-reserves data.len() (output never exceeds input), then uses a single
+/// write pointer with deferred set_len — no per-line capacity checks.
 #[inline]
 fn bytes_from_start_chunk(data: &[u8], max_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
-    // Pre-reserve enough capacity: output is at most data.len() bytes
-    // (when all lines are <= max_bytes, output equals input).
-    // This eliminates per-iteration capacity checks in the hot loop.
-    buf.reserve(data.len().min(buf.capacity().max(max_bytes + 2)));
+    // Output is always <= input size (we only truncate, never expand).
+    // Single reserve eliminates ALL per-line capacity checks.
+    buf.reserve(data.len());
 
+    let src = data.as_ptr();
+    let dst_base = buf.as_mut_ptr();
+    let mut wp = buf.len();
     let mut start = 0;
-    let data_ptr = data.as_ptr();
 
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         let take = line_len.min(max_bytes);
-        // Check capacity only when we might exceed it (rare with good pre-reserve)
-        let needed = take + 1;
-        if buf.len() + needed > buf.capacity() {
-            buf.reserve(needed.max(data.len() - pos));
-        }
         unsafe {
-            let dst = buf.as_mut_ptr().add(buf.len());
-            std::ptr::copy_nonoverlapping(data_ptr.add(start), dst, take);
-            *dst.add(take) = line_delim;
-            buf.set_len(buf.len() + take + 1);
+            std::ptr::copy_nonoverlapping(src.add(start), dst_base.add(wp), take);
+            *dst_base.add(wp + take) = line_delim;
         }
+        wp += take + 1;
         start = pos + 1;
     }
     // Handle last line without terminator
     if start < data.len() {
         let line_len = data.len() - start;
         let take = line_len.min(max_bytes);
-        let needed = take + 1;
-        if buf.len() + needed > buf.capacity() {
-            buf.reserve(needed);
-        }
         unsafe {
-            let dst = buf.as_mut_ptr().add(buf.len());
-            std::ptr::copy_nonoverlapping(data_ptr.add(start), dst, take);
-            *dst.add(take) = line_delim;
-            buf.set_len(buf.len() + take + 1);
+            std::ptr::copy_nonoverlapping(src.add(start), dst_base.add(wp), take);
+            *dst_base.add(wp + take) = line_delim;
         }
+        wp += take + 1;
     }
+    unsafe { buf.set_len(wp) };
 }
 
 /// Fast path for `cut -bN-`: skip first N-1 bytes per line.
@@ -2501,35 +2492,242 @@ fn bytes_from_offset_zerocopy(
 }
 
 /// Process a chunk for from-offset byte range extraction.
-/// Uses unsafe appends to eliminate bounds checking in the hot loop.
+/// Single reserve + deferred set_len for zero per-line overhead.
 #[inline]
 fn bytes_from_offset_chunk(data: &[u8], skip_bytes: usize, line_delim: u8, buf: &mut Vec<u8>) {
     buf.reserve(data.len());
 
+    let src = data.as_ptr();
+    let dst_base = buf.as_mut_ptr();
+    let mut wp = buf.len();
     let mut start = 0;
+
     for pos in memchr_iter(line_delim, data) {
         let line_len = pos - start;
         if line_len > skip_bytes {
+            let take = line_len - skip_bytes;
             unsafe {
-                buf_extend(buf, &data[start + skip_bytes..pos]);
+                std::ptr::copy_nonoverlapping(src.add(start + skip_bytes), dst_base.add(wp), take);
             }
+            wp += take;
         }
         unsafe {
-            buf_push(buf, line_delim);
+            *dst_base.add(wp) = line_delim;
         }
+        wp += 1;
         start = pos + 1;
     }
     if start < data.len() {
         let line_len = data.len() - start;
         if line_len > skip_bytes {
+            let take = line_len - skip_bytes;
             unsafe {
-                buf_extend(buf, &data[start + skip_bytes..data.len()]);
+                std::ptr::copy_nonoverlapping(src.add(start + skip_bytes), dst_base.add(wp), take);
             }
+            wp += take;
         }
         unsafe {
-            buf_push(buf, line_delim);
+            *dst_base.add(wp) = line_delim;
+        }
+        wp += 1;
+    }
+    unsafe { buf.set_len(wp) };
+}
+
+/// Fast path for `cut -bN-M` where N > 1 and M < MAX: extract bytes N through M per line.
+fn process_bytes_mid_range(
+    data: &[u8],
+    start_byte: usize,
+    end_byte: usize,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let skip = start_byte.saturating_sub(1);
+
+    if data.len() >= PARALLEL_THRESHOLD {
+        let chunks = split_into_chunks(data, line_delim);
+        let results: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut buf = Vec::with_capacity(chunk.len());
+                bytes_mid_range_chunk(chunk, skip, end_byte, line_delim, &mut buf);
+                buf
+            })
+            .collect();
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
+    } else {
+        let mut buf = Vec::with_capacity(data.len());
+        bytes_mid_range_chunk(data, skip, end_byte, line_delim, &mut buf);
+        if !buf.is_empty() {
+            out.write_all(&buf)?;
         }
     }
+    Ok(())
+}
+
+/// Process a chunk for mid-range byte extraction.
+/// For each line, output bytes skip..min(line_len, end_byte).
+/// Single reserve + deferred set_len.
+#[inline]
+fn bytes_mid_range_chunk(
+    data: &[u8],
+    skip: usize,
+    end_byte: usize,
+    line_delim: u8,
+    buf: &mut Vec<u8>,
+) {
+    buf.reserve(data.len());
+
+    let src = data.as_ptr();
+    let dst_base = buf.as_mut_ptr();
+    let mut wp = buf.len();
+    let mut start = 0;
+
+    for pos in memchr_iter(line_delim, data) {
+        let line_len = pos - start;
+        if line_len > skip {
+            let take_end = line_len.min(end_byte);
+            let take = take_end - skip;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start + skip), dst_base.add(wp), take);
+            }
+            wp += take;
+        }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
+        wp += 1;
+        start = pos + 1;
+    }
+    if start < data.len() {
+        let line_len = data.len() - start;
+        if line_len > skip {
+            let take_end = line_len.min(end_byte);
+            let take = take_end - skip;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start + skip), dst_base.add(wp), take);
+            }
+            wp += take;
+        }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
+        wp += 1;
+    }
+    unsafe { buf.set_len(wp) };
+}
+
+/// Fast path for `--complement -bN-M`: output bytes 1..N-1 and M+1..end per line.
+fn process_bytes_complement_mid(
+    data: &[u8],
+    skip_start: usize,
+    skip_end: usize,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let prefix_bytes = skip_start - 1; // bytes before the skip region
+    if data.len() >= PARALLEL_THRESHOLD {
+        let chunks = split_into_chunks(data, line_delim);
+        let results: Vec<Vec<u8>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut buf = Vec::with_capacity(chunk.len());
+                bytes_complement_mid_chunk(chunk, prefix_bytes, skip_end, line_delim, &mut buf);
+                buf
+            })
+            .collect();
+        let slices: Vec<IoSlice> = results
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| IoSlice::new(r))
+            .collect();
+        write_ioslices(out, &slices)?;
+    } else {
+        let mut buf = Vec::with_capacity(data.len());
+        bytes_complement_mid_chunk(data, prefix_bytes, skip_end, line_delim, &mut buf);
+        if !buf.is_empty() {
+            out.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Process a chunk for complement mid-range byte extraction.
+/// For each line: output bytes 0..prefix_bytes, then bytes skip_end..line_len.
+#[inline]
+fn bytes_complement_mid_chunk(
+    data: &[u8],
+    prefix_bytes: usize,
+    skip_end: usize,
+    line_delim: u8,
+    buf: &mut Vec<u8>,
+) {
+    buf.reserve(data.len());
+
+    let src = data.as_ptr();
+    let dst_base = buf.as_mut_ptr();
+    let mut wp = buf.len();
+    let mut start = 0;
+
+    for pos in memchr_iter(line_delim, data) {
+        let line_len = pos - start;
+        // Copy prefix (bytes before skip region)
+        let take_prefix = prefix_bytes.min(line_len);
+        if take_prefix > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start), dst_base.add(wp), take_prefix);
+            }
+            wp += take_prefix;
+        }
+        // Copy suffix (bytes after skip region)
+        if line_len > skip_end {
+            let suffix_len = line_len - skip_end;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(start + skip_end),
+                    dst_base.add(wp),
+                    suffix_len,
+                );
+            }
+            wp += suffix_len;
+        }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
+        wp += 1;
+        start = pos + 1;
+    }
+    if start < data.len() {
+        let line_len = data.len() - start;
+        let take_prefix = prefix_bytes.min(line_len);
+        if take_prefix > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start), dst_base.add(wp), take_prefix);
+            }
+            wp += take_prefix;
+        }
+        if line_len > skip_end {
+            let suffix_len = line_len - skip_end;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(start + skip_end),
+                    dst_base.add(wp),
+                    suffix_len,
+                );
+            }
+            wp += suffix_len;
+        }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
+        wp += 1;
+    }
+    unsafe { buf.set_len(wp) };
 }
 
 /// Optimized byte/char extraction with batched output and parallel processing.
@@ -2553,6 +2751,47 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
         if skip_bytes > 0 {
             return process_bytes_from_offset(data, skip_bytes, line_delim, out);
         }
+    }
+
+    // Fast path: single mid-range (e.g., cut -b5-100)
+    if !complement
+        && ranges.len() == 1
+        && ranges[0].start > 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
+        return process_bytes_mid_range(data, ranges[0].start, ranges[0].end, line_delim, out);
+    }
+
+    // Fast path: complement of single from-start range (e.g., --complement -b1-100 = output bytes 101+)
+    if complement
+        && ranges.len() == 1
+        && ranges[0].start == 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
+        return process_bytes_from_offset(data, ranges[0].end, line_delim, out);
+    }
+
+    // Fast path: complement of single from-offset range (e.g., --complement -b5- = output bytes 1-4)
+    if complement
+        && ranges.len() == 1
+        && ranges[0].end == usize::MAX
+        && ranges[0].start > 1
+        && output_delim.is_empty()
+    {
+        let max_bytes = ranges[0].start - 1;
+        return process_bytes_from_start(data, max_bytes, line_delim, out);
+    }
+
+    // Fast path: complement of single mid-range (e.g., --complement -b5-100 = bytes 1-4,101+)
+    if complement
+        && ranges.len() == 1
+        && ranges[0].start > 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
+        return process_bytes_complement_mid(data, ranges[0].start, ranges[0].end, line_delim, out);
     }
 
     if data.len() >= PARALLEL_THRESHOLD {
@@ -2591,6 +2830,8 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
 
 /// Process a chunk of data for byte/char extraction.
 /// Uses raw pointer arithmetic for the newline scan.
+/// Complement single-range fast path: compute complement ranges once, then use
+/// the non-complement multi-range path which is more cache-friendly.
 fn process_bytes_chunk(
     data: &[u8],
     ranges: &[Range],
