@@ -560,7 +560,11 @@ fn process_default_fast_singlepass(
 /// Optimized for the "many duplicates" case: caches the previous line's length
 /// and first-8-byte prefix for fast rejection of non-duplicates without
 /// calling the full comparison function.
+///
+/// Uses raw pointer arithmetic throughout to avoid bounds checking in the hot loop.
 fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) -> io::Result<()> {
+    let data_len = data.len();
+    let base = data.as_ptr();
     let mut prev_start: usize = 0;
     let mut prev_end: usize; // exclusive, without terminator
 
@@ -579,7 +583,7 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     // Cache previous line metadata for fast comparison
     let mut prev_len = prev_end - prev_start;
     let mut prev_prefix: u64 = if prev_len >= 8 {
-        unsafe { (data.as_ptr().add(prev_start) as *const u64).read_unaligned() }
+        unsafe { (base.add(prev_start) as *const u64).read_unaligned() }
     } else {
         0
     };
@@ -590,15 +594,19 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     let mut cur_start = prev_end + 1;
     let mut last_output_end = prev_end + 1; // exclusive end including terminator
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
+    while cur_start < data_len {
+        let cur_end = match memchr::memchr(term, unsafe {
+            std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+        }) {
             Some(offset) => cur_start + offset,
-            None => data.len(), // last line without terminator
+            None => data_len, // last line without terminator
         };
 
         let cur_len = cur_end - cur_start;
 
-        // Fast reject: if lengths differ, lines are definitely not equal
+        // Fast reject: if lengths differ, lines are definitely not equal.
+        // This branch structure is ordered by frequency: length mismatch is
+        // most common for unique data, prefix mismatch next, full compare last.
         let is_dup = if cur_len != prev_len {
             false
         } else if cur_len == 0 {
@@ -606,44 +614,46 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
         } else if cur_len >= 8 {
             // Compare cached 8-byte prefix first
             let cur_prefix =
-                unsafe { (data.as_ptr().add(cur_start) as *const u64).read_unaligned() };
+                unsafe { (base.add(cur_start) as *const u64).read_unaligned() };
             if cur_prefix != prev_prefix {
                 false
             } else if cur_len <= 8 {
                 true // prefix covers entire line
             } else if cur_len <= 16 {
                 // Check last 8 bytes (overlapping)
-                let a_tail = unsafe {
-                    (data.as_ptr().add(prev_start + prev_len - 8) as *const u64).read_unaligned()
-                };
-                let b_tail = unsafe {
-                    (data.as_ptr().add(cur_start + cur_len - 8) as *const u64).read_unaligned()
-                };
-                a_tail == b_tail
-            } else if cur_len <= 32 {
-                // Check bytes 8-16 and last 8 bytes
-                let a16 =
-                    unsafe { (data.as_ptr().add(prev_start + 8) as *const u64).read_unaligned() };
-                let b16 =
-                    unsafe { (data.as_ptr().add(cur_start + 8) as *const u64).read_unaligned() };
-                if a16 != b16 {
-                    false
-                } else {
-                    let a_tail = unsafe {
-                        (data.as_ptr().add(prev_start + prev_len - 8) as *const u64)
-                            .read_unaligned()
-                    };
-                    let b_tail = unsafe {
-                        (data.as_ptr().add(cur_start + cur_len - 8) as *const u64).read_unaligned()
-                    };
+                unsafe {
+                    let a_tail = (base.add(prev_start + prev_len - 8) as *const u64).read_unaligned();
+                    let b_tail = (base.add(cur_start + cur_len - 8) as *const u64).read_unaligned();
                     a_tail == b_tail
                 }
+            } else if cur_len <= 32 {
+                // Check bytes 8-16 and last 8 bytes
+                unsafe {
+                    let a16 = (base.add(prev_start + 8) as *const u64).read_unaligned();
+                    let b16 = (base.add(cur_start + 8) as *const u64).read_unaligned();
+                    if a16 != b16 {
+                        false
+                    } else {
+                        let a_tail = (base.add(prev_start + prev_len - 8) as *const u64).read_unaligned();
+                        let b_tail = (base.add(cur_start + cur_len - 8) as *const u64).read_unaligned();
+                        a_tail == b_tail
+                    }
+                }
             } else {
-                data[prev_start..prev_end] == data[cur_start..cur_end]
+                // For longer lines, use unsafe slice comparison to skip bounds checks
+                unsafe {
+                    let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                    let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                    a == b
+                }
             }
         } else {
-            // Short line < 8 bytes
-            data[prev_start..prev_end] == data[cur_start..cur_end]
+            // Short line < 8 bytes — direct byte comparison
+            unsafe {
+                let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+                let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+                a == b
+            }
         };
 
         if is_dup {
@@ -652,29 +662,21 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
                 writer.write_all(&data[run_start..cur_start])?;
             }
             // Start new run after this duplicate
-            if cur_end < data.len() {
-                run_start = cur_end + 1;
-            } else {
-                run_start = cur_end;
-            }
+            run_start = if cur_end < data_len { cur_end + 1 } else { cur_end };
         } else {
             // Different line — update cached comparison state
             prev_start = cur_start;
             prev_end = cur_end;
             prev_len = cur_len;
             prev_prefix = if cur_len >= 8 {
-                unsafe { (data.as_ptr().add(cur_start) as *const u64).read_unaligned() }
+                unsafe { (base.add(cur_start) as *const u64).read_unaligned() }
             } else {
                 0
             };
-            last_output_end = if cur_end < data.len() {
-                cur_end + 1
-            } else {
-                cur_end
-            };
+            last_output_end = if cur_end < data_len { cur_end + 1 } else { cur_end };
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
@@ -682,12 +684,12 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     }
 
     // Flush remaining run
-    if run_start < data.len() {
+    if run_start < data_len {
         writer.write_all(&data[run_start..last_output_end.max(run_start)])?;
     }
 
     // Ensure trailing terminator
-    if !data.is_empty() && *data.last().unwrap() != term {
+    if data_len > 0 && unsafe { *base.add(data_len - 1) } != term {
         writer.write_all(&[term])?;
     }
 
@@ -855,6 +857,7 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
 /// Zero-copy: writes directly from input data, no output buffer allocation.
 /// Uses cached prefix comparison for fast duplicate detection.
+/// Uses raw pointer arithmetic throughout to avoid bounds checking.
 fn process_filter_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -862,6 +865,8 @@ fn process_filter_fast_singlepass(
     term: u8,
 ) -> io::Result<()> {
     let repeated = matches!(config.mode, OutputMode::RepeatedOnly);
+    let data_len = data.len();
+    let base = data.as_ptr();
 
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
@@ -881,15 +886,20 @@ fn process_filter_fast_singlepass(
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
+    while cur_start < data_len {
+        let cur_end = match memchr::memchr(term, unsafe {
+            std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+        }) {
             Some(offset) => cur_start + offset,
-            None => data.len(),
+            None => data_len,
         };
 
         let cur_len = cur_end - cur_start;
-        let is_dup = cur_len == prev_len
-            && lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+        let is_dup = cur_len == prev_len && unsafe {
+            let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+            let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+            lines_equal_fast(a, b)
+        };
 
         if is_dup {
             count += 1;
@@ -897,7 +907,7 @@ fn process_filter_fast_singlepass(
             // Output previous group -- write directly from input data (zero-copy)
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                if prev_end < data.len() && data[prev_end] == term {
+                if prev_end < data_len && unsafe { *base.add(prev_end) } == term {
                     writer.write_all(&data[prev_start..prev_end + 1])?;
                 } else {
                     writer.write_all(&data[prev_start..prev_end])?;
@@ -910,7 +920,7 @@ fn process_filter_fast_singlepass(
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
@@ -920,7 +930,7 @@ fn process_filter_fast_singlepass(
     // Output last group
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        if prev_end < data.len() && data[prev_end] == term {
+        if prev_end < data_len && unsafe { *base.add(prev_end) } == term {
             writer.write_all(&data[prev_start..prev_end + 1])?;
         } else {
             writer.write_all(&data[prev_start..prev_end])?;
@@ -935,12 +945,16 @@ fn process_filter_fast_singlepass(
 /// Zero line_starts allocation: scans with memchr, counts groups inline,
 /// and writes count-prefixed lines directly.
 /// Uses cached length comparison for fast duplicate rejection.
+/// Uses raw pointer arithmetic to avoid bounds checking.
 fn process_count_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
     config: &UniqConfig,
     term: u8,
 ) -> io::Result<()> {
+    let data_len = data.len();
+    let base = data.as_ptr();
+
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
         None => {
@@ -964,15 +978,20 @@ fn process_count_fast_singlepass(
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
+    while cur_start < data_len {
+        let cur_end = match memchr::memchr(term, unsafe {
+            std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+        }) {
             Some(offset) => cur_start + offset,
-            None => data.len(),
+            None => data_len,
         };
 
         let cur_len = cur_end - cur_start;
-        let is_dup = cur_len == prev_len
-            && lines_equal_fast(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+        let is_dup = cur_len == prev_len && unsafe {
+            let a = std::slice::from_raw_parts(base.add(prev_start), prev_len);
+            let b = std::slice::from_raw_parts(base.add(cur_start), cur_len);
+            lines_equal_fast(a, b)
+        };
 
         if is_dup {
             count += 1;
@@ -993,7 +1012,7 @@ fn process_count_fast_singlepass(
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
