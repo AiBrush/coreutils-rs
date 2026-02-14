@@ -27,21 +27,16 @@ pub fn tac_bytes_owned(
 }
 
 /// After-separator mode: reverse-copy records into a contiguous buffer, single write_all.
-/// For 10MB data with ~130K lines: 1 memchr scan + 130K memcpy (10MB total) + 1 write().
-/// This is faster than streaming writev which needs ~130 writev syscalls.
+/// Uses memrchr_iter to scan backwards (SIMD-accelerated), finding separators from the end.
+/// This avoids the Vec<usize> positions allocation entirely (~1MB for 130K lines)
+/// and processes records in natural reverse order. Single pass: scan + copy interleaved.
 fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Single-pass collect separator positions with SIMD memchr.
-    let est_capacity = (data.len() / 50).max(64);
-    let mut positions: Vec<usize> = Vec::with_capacity(est_capacity);
-    positions.extend(memchr::memchr_iter(sep, data));
-
-    if positions.is_empty() {
+    // Quick check: if no separators exist, output as-is without allocating output buffer.
+    if memchr::memchr(sep, data).is_none() {
         return out.write_all(data);
     }
 
-    // Reverse-copy into contiguous output buffer for single write_all.
-    // Each record is copied with copy_nonoverlapping (memcpy) which is
-    // highly optimized for sequential destination writes.
+    // Allocate output buffer. For after-separator mode, output size <= input size.
     let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
     #[allow(clippy::uninit_vec)]
     unsafe { outbuf.set_len(data.len()) };
@@ -49,8 +44,11 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
     let src = data.as_ptr();
     let mut wp = 0;
 
+    // Scan backwards with SIMD memrchr: yields separator positions from end to start.
+    // For each separator found, copy the record between it and the previous end point.
     let mut end = data.len();
-    for &pos in positions.iter().rev() {
+
+    for pos in memchr::memrchr_iter(sep, data) {
         let rec_start = pos + 1;
         let rec_len = end - rec_start;
         if rec_len > 0 {
@@ -61,6 +59,7 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         }
         end = rec_start;
     }
+
     // Remaining prefix before the first separator
     if end > 0 {
         unsafe {
@@ -73,16 +72,12 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 }
 
 /// Before-separator mode: reverse-copy records into a contiguous buffer, single write_all.
+/// Uses memrchr_iter for zero-allocation reverse scanning.
 fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let est_capacity = (data.len() / 50).max(64);
-    let mut positions: Vec<usize> = Vec::with_capacity(est_capacity);
-    positions.extend(memchr::memchr_iter(sep, data));
-
-    if positions.is_empty() {
+    if memchr::memchr(sep, data).is_none() {
         return out.write_all(data);
     }
 
-    // Reverse-copy into contiguous output buffer for single write_all.
     let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
     #[allow(clippy::uninit_vec)]
     unsafe { outbuf.set_len(data.len()) };
@@ -91,7 +86,8 @@ fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
     let mut wp = 0;
 
     let mut end = data.len();
-    for &pos in positions.iter().rev() {
+
+    for pos in memchr::memrchr_iter(sep, data) {
         let rec_len = end - pos;
         if rec_len > 0 {
             unsafe {
@@ -101,6 +97,7 @@ fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         }
         end = pos;
     }
+
     if end > 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst.add(wp), end);
