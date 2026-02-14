@@ -11,6 +11,30 @@ use coreutils_rs::common::io::FileData;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
+/// Raw stdin reader for zero-overhead pipe reads on Linux.
+/// Bypasses Rust's StdinLock (mutex + 8KB BufReader) to use libc::read(0) directly.
+/// Each read returns immediately with whatever data is available in the pipe,
+/// enabling pipelining with upstream cat: ftr processes chunk N while cat writes N+1.
+#[cfg(target_os = "linux")]
+struct RawStdin;
+
+#[cfg(target_os = "linux")]
+impl io::Read for RawStdin {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let ret = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if ret >= 0 {
+                return Ok(ret as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "tr",
@@ -234,15 +258,21 @@ fn main() {
                         tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
                     }
                 } else {
-                    // Fallback: streaming path
-                    let stdin = io::stdin();
-                    let mut reader = stdin.lock();
-                    #[cfg(unix)]
+                    // Fallback: streaming path with raw stdin
+                    #[cfg(target_os = "linux")]
                     {
+                        tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+                    }
+                    #[cfg(all(unix, not(target_os = "linux")))]
+                    {
+                        let stdin = io::stdin();
+                        let mut reader = stdin.lock();
                         tr::translate(&set1, &set2, &mut reader, &mut *raw)
                     }
                     #[cfg(not(unix))]
                     {
+                        let stdin = io::stdin();
+                        let mut reader = stdin.lock();
                         let stdout = io::stdout();
                         let mut lock = stdout.lock();
                         tr::translate(&set1, &set2, &mut reader, &mut lock)
@@ -250,24 +280,26 @@ fn main() {
                 }
             }
         } else {
-            // Piped stdin: read all data, then use batch translate with
-            // optimized code paths (in-place SIMD, parallel for large inputs).
-            // Avoids per-chunk streaming overhead (N read+process+write cycles).
-            match coreutils_rs::common::io::read_stdin() {
-                Ok(mut data) => {
-                    #[cfg(unix)]
-                    {
-                        tr::translate_owned(&set1, &set2, &mut data, &mut *raw)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let stdout = io::stdout();
-                        let mut lock = stdout.lock();
-                        tr::translate_owned(&set1, &set2, &mut data, &mut lock)
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-                Err(e) => Err(e),
+            // Piped stdin: use streaming path with RawStdin for pipelining.
+            // Streaming processes each chunk immediately after read, enabling
+            // overlap with upstream cat. RawStdin bypasses StdinLock overhead.
+            #[cfg(target_os = "linux")]
+            {
+                tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                tr::translate(&set1, &set2, &mut reader, &mut *raw)
+            }
+            #[cfg(not(unix))]
+            {
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                tr::translate(&set1, &set2, &mut reader, &mut lock)
             }
         };
         if let Err(e) = result
@@ -300,34 +332,117 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: read all data first, then use batch processing.
-        // This allows optimized mmap-like code paths (parallel processing,
-        // zero-copy output) instead of per-chunk streaming. The 16MB
-        // pre-allocation is amortized over the batch processing savings.
-        match coreutils_rs::common::io::read_stdin() {
-            Ok(data) => {
-                #[cfg(unix)]
-                let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
-                #[cfg(not(unix))]
-                let result = {
-                    let stdout = io::stdout();
-                    let mut lock = stdout.lock();
-                    run_mmap_mode(&cli, set1_str, &data, &mut lock)
-                };
-                if let Err(e) = result
-                    && e.kind() != io::ErrorKind::BrokenPipe
-                {
-                    eprintln!("tr: {}", io_error_msg(&e));
-                    process::exit(1);
-                }
-            }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::BrokenPipe {
-                    eprintln!("tr: {}", io_error_msg(&e));
-                    process::exit(1);
-                }
-            }
+        // Piped stdin: use streaming functions directly for pipelining.
+        // Streaming processes each chunk as it arrives from the pipe,
+        // overlapping with upstream cat's writes. Avoids the 16MB read_stdin
+        // pre-allocation and eliminates waiting for EOF before processing.
+        #[cfg(unix)]
+        let result = run_streaming_mode(&cli, set1_str, &mut *raw);
+        #[cfg(not(unix))]
+        let result = {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            run_streaming_mode(&cli, set1_str, &mut lock)
+        };
+        if let Err(e) = result
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("tr: {}", io_error_msg(&e));
+            process::exit(1);
         }
+    }
+}
+
+/// Dispatch streaming modes for piped stdin — reads and processes chunks
+/// incrementally for pipelining with upstream cat/pipe. RawStdin on Linux
+/// bypasses StdinLock overhead; streaming processes each chunk as it arrives
+/// instead of waiting for EOF like the batch path.
+fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io::Result<()> {
+    if cli.delete && cli.squeeze {
+        if cli.sets.len() < 2 {
+            eprintln!("tr: missing operand after '{}'", set1_str);
+            eprintln!("Two strings must be given when both deleting and squeezing repeats.");
+            eprintln!("Try 'tr --help' for more information.");
+            process::exit(1);
+        }
+        let set2_str = &cli.sets[1];
+        let set1 = tr::parse_set(set1_str);
+        let set2 = tr::parse_set(set2_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        #[cfg(target_os = "linux")]
+        return tr::delete_squeeze(&delete_set, &set2, &mut RawStdin, writer);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            tr::delete_squeeze(&delete_set, &set2, &mut reader, writer)
+        }
+    } else if cli.delete {
+        if cli.sets.len() > 1 {
+            eprintln!("tr: extra operand '{}'", cli.sets[1]);
+            eprintln!("Only one string may be given when deleting without squeezing.");
+            eprintln!("Try 'tr --help' for more information.");
+            process::exit(1);
+        }
+        let set1 = tr::parse_set(set1_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        #[cfg(target_os = "linux")]
+        return tr::delete(&delete_set, &mut RawStdin, writer);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            tr::delete(&delete_set, &mut reader, writer)
+        }
+    } else if cli.squeeze && cli.sets.len() < 2 {
+        let set1 = tr::parse_set(set1_str);
+        let squeeze_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        #[cfg(target_os = "linux")]
+        return tr::squeeze(&squeeze_set, &mut RawStdin, writer);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            tr::squeeze(&squeeze_set, &mut reader, writer)
+        }
+    } else if cli.squeeze {
+        let set2_str = &cli.sets[1];
+        let mut set1 = tr::parse_set(set1_str);
+        if cli.complement {
+            set1 = tr::complement(&set1);
+        }
+        let set2 = if cli.truncate {
+            let raw_set = tr::parse_set(set2_str);
+            set1.truncate(raw_set.len());
+            raw_set
+        } else {
+            tr::expand_set2(set2_str, set1.len())
+        };
+        #[cfg(target_os = "linux")]
+        return tr::translate_squeeze(&set1, &set2, &mut RawStdin, writer);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            tr::translate_squeeze(&set1, &set2, &mut reader, writer)
+        }
+    } else {
+        eprintln!("tr: missing operand after '{}'", set1_str);
+        eprintln!("Two strings must be given when translating.");
+        eprintln!("Try 'tr --help' for more information.");
+        process::exit(1);
     }
 }
 

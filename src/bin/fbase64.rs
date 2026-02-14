@@ -14,6 +14,28 @@ use coreutils_rs::base64::core as b64;
 use coreutils_rs::common::io::{read_file, read_file_vec};
 use coreutils_rs::common::io_error_msg;
 
+/// Raw stdin reader for zero-overhead pipe reads on Linux.
+/// Bypasses Rust's StdinLock (mutex + 8KB BufReader) for direct libc::read(0).
+#[cfg(target_os = "linux")]
+struct RawStdin;
+
+#[cfg(target_os = "linux")]
+impl io::Read for RawStdin {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let ret = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if ret >= 0 {
+                return Ok(ret as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "base64",
@@ -184,10 +206,16 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
             return b64::decode_to_writer(&mmap, cli.ignore_garbage, out);
         }
 
-        // For piped stdin: use streaming decode to avoid 64MB read_stdin pre-alloc.
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        return b64::decode_stream(&mut reader, cli.ignore_garbage, out);
+        // For piped stdin: use streaming decode. RawStdin on Linux bypasses
+        // StdinLock overhead for direct libc::read(0).
+        #[cfg(target_os = "linux")]
+        return b64::decode_stream(&mut RawStdin, cli.ignore_garbage, out);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            return b64::decode_stream(&mut reader, cli.ignore_garbage, out);
+        }
     }
 
     // For encode: try mmap for zero-copy stdin when redirected from a file
@@ -196,10 +224,15 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
         return b64::encode_to_writer(&mmap, cli.wrap, out);
     }
 
-    // For piped encode: streaming to overlap pipe read with encode+write.
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    b64::encode_stream(&mut reader, cli.wrap, out)
+    // For piped encode: streaming with RawStdin on Linux.
+    #[cfg(target_os = "linux")]
+    return b64::encode_stream(&mut RawStdin, cli.wrap, out);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        b64::encode_stream(&mut reader, cli.wrap, out)
+    }
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
