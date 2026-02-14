@@ -714,11 +714,24 @@ static NOT_WHITESPACE: [bool; 256] = {
 /// Tracks rare whitespace presence during the gap-copy to skip the second scan
 /// entirely in the common case (pure \n/\r whitespace only).
 fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    // Quick check: any whitespace at all?  Use the lookup table for a single scan.
-    let has_ws = data.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
-    if !has_ws {
-        // No whitespace — decode directly from borrowed data
-        return decode_borrowed_clean(out, data);
+    // Quick check: skip stripping if no \n or \r in the data.
+    // Uses SIMD memchr2 for fast scanning (~10 GB/s) instead of per-byte check.
+    if memchr::memchr2(b'\n', b'\r', data).is_none() {
+        // No newlines/CR — check for rare whitespace only
+        if !data
+            .iter()
+            .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c)
+        {
+            return decode_borrowed_clean(out, data);
+        }
+        // Has rare whitespace only — strip and decode
+        let mut cleaned: Vec<u8> = Vec::with_capacity(data.len());
+        for &b in data {
+            if NOT_WHITESPACE[b as usize] {
+                cleaned.push(b);
+            }
+        }
+        return decode_clean_slice(&mut cleaned, out);
     }
 
     // SIMD gap-copy: use memchr2 to find \n and \r positions, then copy the

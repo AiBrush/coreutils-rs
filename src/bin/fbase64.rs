@@ -191,14 +191,13 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
+    // Use mmap for zero-copy file access (both encode and decode).
+    // For decode: mmap avoids the 13.7MB std::fs::read() allocation+copy,
+    // using borrowed decode_to_writer (memchr2 strip into clean buffer + decode).
+    let data = read_file(Path::new(filename))?;
     if cli.decode {
-        // For decode: read to owned Vec for in-place whitespace strip + decode.
-        // Avoids double-buffering (mmap + clean buffer) by stripping in-place.
-        let mut data = std::fs::read(filename)?;
-        b64::decode_owned(&mut data, cli.ignore_garbage, out)
+        b64::decode_to_writer(&data, cli.ignore_garbage, out)
     } else {
-        // For encode: mmap for zero-copy read access.
-        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }
