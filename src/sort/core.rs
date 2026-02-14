@@ -660,12 +660,16 @@ fn radix_sort_entries(
         return entries;
     }
 
-    let nbk: usize = 65536;
-
-    // === PASS 1: MSD radix on top 16 bits (bits 48-63) ===
+    // === PASS 1: MSD radix on top 8 bits (bits 56-63) ===
+    // Using 256 buckets for cache-friendly scatter:
+    // - wpos array (256 * 8B = 2KB) fits in L1 cache
+    // - Consecutive writes to same bucket are ~256 entries apart,
+    //   keeping cache lines warm in L3 for reuse
+    // - The larger buckets (~n/256) are then sorted in parallel by Level 2
+    let nbk: usize = 256;
     let mut cnts = vec![0u32; nbk];
     for &(pfx, _, _) in &entries {
-        cnts[(pfx >> 48) as usize] += 1;
+        cnts[(pfx >> 56) as usize] += 1;
     }
     let mut bk_starts = vec![0usize; nbk + 1];
     {
@@ -677,8 +681,6 @@ fn radix_sort_entries(
         bk_starts[nbk] = s;
     }
     // Scatter into sorted array with software prefetching.
-    // Pre-fetching the target cache line 4 entries ahead hides memory latency
-    // for the random-access write pattern of radix scatter.
     let mut sorted: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
     #[allow(clippy::uninit_vec)]
     unsafe {
@@ -691,7 +693,7 @@ fn radix_sort_entries(
         let prefetch_dist = 8usize;
         for idx in 0..n {
             let ent = unsafe { *eptr.add(idx) };
-            let b = (ent.0 >> 48) as usize;
+            let b = (ent.0 >> 56) as usize;
             unsafe {
                 *sptr.add(wpos[b]) = ent;
             }
@@ -699,7 +701,7 @@ fn radix_sort_entries(
             // Prefetch destination for an entry a few iterations ahead
             if idx + prefetch_dist < n {
                 let future_ent = unsafe { *eptr.add(idx + prefetch_dist) };
-                let future_b = (future_ent.0 >> 48) as usize;
+                let future_b = (future_ent.0 >> 56) as usize;
                 let future_pos = wpos[future_b];
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
@@ -722,10 +724,11 @@ fn radix_sort_entries(
     drop(entries);
     drop(cnts);
 
-    // === PASS 2: Within each large bucket, MSD radix on bits 32-47 ===
-    // Then comparison sort within each sub-bucket.
-    // Threshold: only do second radix pass for buckets with >32 entries
-    // (smaller buckets: comparison sort is faster due to no scatter overhead).
+    // === PASS 2: Within each bucket, uniform 8-bit MSD radix ===
+    // Level 1 sorted byte 0 (bits 56-63). Level 2 sorts byte 1 (bits 48-55).
+    // Level 3 sorts byte 2 (bits 40-47) if needed.
+    // Each level uses 256 buckets: count array = 1KB (L1 cache),
+    // and within-bucket scatter stays in L2 (80KB for ~5000 entries).
     {
         let sorted_ptr = sorted.as_mut_ptr() as usize;
         let data_addr = data.as_ptr() as usize;
@@ -776,7 +779,6 @@ fn radix_sort_entries(
         }
 
         // Process buckets in parallel with rayon
-        // For each bucket, decide between 2nd-level radix or comparison sort
         let chunk_fn = |(lo, hi): (usize, usize)| {
             let bucket = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -786,16 +788,12 @@ fn radix_sort_entries(
             };
             let blen = bucket.len();
 
-            // For large buckets (>64): second-level MSD radix.
-            // Uses 16-bit radix (bits 32-47, 65536 buckets) for large buckets (>512).
-            // Uses 8-bit radix (bits 40-47, 256 buckets) for medium buckets (65-512).
+            // For large buckets (>64): second-level 8-bit MSD radix on byte 1 (bits 48-55).
             if blen > 64 {
-                // Determine radix width based on bucket size
-                let use_wide = blen > 512;
-                let check_shift = if use_wide { 32u32 } else { 40u32 };
-                let check_mask: u64 = if use_wide { 0xFFFF } else { 0xFF };
+                let check_shift = 48u32;
+                let check_mask: u64 = 0xFF;
 
-                // Check if the selected radix bits have variation
+                // Check if byte 1 has variation
                 let first_bits = (bucket[0].0 >> check_shift) & check_mask;
                 let mut has_variation = false;
                 for e in &bucket[1..] {
@@ -806,7 +804,7 @@ fn radix_sort_entries(
                 }
 
                 if has_variation {
-                    let sub_nbk: usize = if use_wide { 65536 } else { 256 };
+                    let sub_nbk: usize = 256;
                     let shift = check_shift;
                     let mask = check_mask;
 
@@ -844,7 +842,6 @@ fn radix_sort_entries(
                     bucket.copy_from_slice(&temp);
                     drop(temp);
                     // Sort each non-trivial sub-bucket
-                    // For large sub-buckets (>64), do a 3rd-level radix on bits 16-31
                     for sb in 0..sub_nbk {
                         let slo = sub_starts[sb];
                         let shi = sub_starts[sb + 1];
@@ -853,7 +850,7 @@ fn radix_sort_entries(
                         }
                         let sub_slice = &mut bucket[slo..shi];
                         let sub_len = sub_slice.len();
-                        // Check for all-identical content (common in repetitive data)
+                        // Check for all-identical content
                         let ref_s = sub_slice[0].1 as usize;
                         let ref_l = sub_slice[0].2 as usize;
                         let last_s = sub_slice[sub_len - 1].1 as usize;
@@ -869,10 +866,10 @@ fn radix_sort_entries(
                             continue;
                         }
 
-                        // 3rd-level radix on bits 16-31 for large sub-buckets
+                        // 3rd-level 8-bit radix on byte 2 (bits 40-47)
                         if sub_len > 64 {
-                            let r3_shift = 16u32;
-                            let r3_mask: u64 = 0xFFFF;
+                            let r3_shift = 40u32;
+                            let r3_mask: u64 = 0xFF;
                             let r3_first = (sub_slice[0].0 >> r3_shift) & r3_mask;
                             let mut r3_has_var = false;
                             for e in &sub_slice[1..] {
@@ -882,9 +879,9 @@ fn radix_sort_entries(
                                 }
                             }
                             if r3_has_var {
-                                let r3_nbk: usize = 256; // 8-bit radix to save memory
-                                let r3_s = 24u32; // bits 24-31
-                                let r3_m: u64 = 0xFF;
+                                let r3_nbk: usize = 256;
+                                let r3_s = r3_shift;
+                                let r3_m = r3_mask;
                                 let mut r3_cnts = vec![0u32; r3_nbk];
                                 for &(pfx, _, _) in sub_slice.iter() {
                                     r3_cnts[((pfx >> r3_s) & r3_m) as usize] += 1;
@@ -916,23 +913,48 @@ fn radix_sort_entries(
                                 }
                                 sub_slice.copy_from_slice(&r3_temp);
                                 drop(r3_temp);
+                                // 4th-level 8-bit radix on byte 3 (bits 32-39) for still-large buckets
                                 for rb in 0..r3_nbk {
                                     let rlo = r3_starts[rb];
                                     let rhi = r3_starts[rb + 1];
-                                    if rhi - rlo > 1 {
-                                        let rs = &mut sub_slice[rlo..rhi];
-                                        if stable {
-                                            rs.sort_by(cmp_fn);
-                                        } else {
-                                            rs.sort_unstable_by(cmp_fn);
+                                    if rhi - rlo <= 1 {
+                                        continue;
+                                    }
+                                    let rs = &mut sub_slice[rlo..rhi];
+                                    if rs.len() > 64 {
+                                        radix_sort_byte(rs, 32, stable, &cmp_fn);
+                                    } else if rs.len() <= 16 {
+                                        for k in 1..rs.len() {
+                                            let mut pos = k;
+                                            while pos > 0
+                                                && cmp_fn(&rs[pos], &rs[pos - 1]) == Ordering::Less
+                                            {
+                                                rs.swap(pos, pos - 1);
+                                                pos -= 1;
+                                            }
                                         }
+                                    } else if stable {
+                                        rs.sort_by(cmp_fn);
+                                    } else {
+                                        rs.sort_unstable_by(cmp_fn);
                                     }
                                 }
                                 continue;
                             }
                         }
 
-                        if stable {
+                        if sub_len <= 16 {
+                            for k in 1..sub_len {
+                                let mut pos = k;
+                                while pos > 0
+                                    && cmp_fn(&sub_slice[pos], &sub_slice[pos - 1])
+                                        == Ordering::Less
+                                {
+                                    sub_slice.swap(pos, pos - 1);
+                                    pos -= 1;
+                                }
+                            }
+                        } else if stable {
                             sub_slice.sort_by(cmp_fn);
                         } else {
                             sub_slice.sort_unstable_by(cmp_fn);
@@ -975,7 +997,7 @@ fn radix_sort_entries(
             }
         };
 
-        if slices.len() > 16 {
+        if slices.len() > 4 {
             slices
                 .into_par_iter()
                 .for_each(|(lo, hi)| chunk_fn((lo, hi)));
@@ -987,6 +1009,91 @@ fn radix_sort_entries(
     }
 
     sorted
+}
+
+/// Single-byte radix sort helper for Level 4+.
+/// Sorts a slice of entries by an 8-bit radix at the given shift position,
+/// then comparison-sorts any remaining large sub-buckets.
+fn radix_sort_byte(
+    slice: &mut [(u64, u32, u32)],
+    shift: u32,
+    stable: bool,
+    cmp_fn: &impl Fn(&(u64, u32, u32), &(u64, u32, u32)) -> Ordering,
+) {
+    let slen = slice.len();
+    let mask: u64 = 0xFF;
+
+    let first_bits = (slice[0].0 >> shift) & mask;
+    let mut has_var = false;
+    for e in &slice[1..] {
+        if ((e.0 >> shift) & mask) != first_bits {
+            has_var = true;
+            break;
+        }
+    }
+    if !has_var {
+        // All same at this byte level — fall through to comparison sort
+        if stable {
+            slice.sort_by(cmp_fn);
+        } else {
+            slice.sort_unstable_by(cmp_fn);
+        }
+        return;
+    }
+
+    let nbk: usize = 256;
+    let mut cnts = vec![0u32; nbk];
+    for &(pfx, _, _) in slice.iter() {
+        cnts[((pfx >> shift) & mask) as usize] += 1;
+    }
+    let mut starts = vec![0usize; nbk + 1];
+    {
+        let mut s = 0usize;
+        for i in 0..nbk {
+            starts[i] = s;
+            s += cnts[i] as usize;
+        }
+        starts[nbk] = s;
+    }
+    let mut temp: Vec<(u64, u32, u32)> = Vec::with_capacity(slen);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        temp.set_len(slen);
+    }
+    {
+        let mut wpos = starts.clone();
+        let tp = temp.as_mut_ptr();
+        for &ent in slice.iter() {
+            let b = ((ent.0 >> shift) & mask) as usize;
+            unsafe {
+                *tp.add(wpos[b]) = ent;
+            }
+            wpos[b] += 1;
+        }
+    }
+    slice.copy_from_slice(&temp);
+    drop(temp);
+    for b in 0..nbk {
+        let lo = starts[b];
+        let hi = starts[b + 1];
+        if hi - lo <= 1 {
+            continue;
+        }
+        let rs = &mut slice[lo..hi];
+        if rs.len() <= 16 {
+            for k in 1..rs.len() {
+                let mut pos = k;
+                while pos > 0 && cmp_fn(&rs[pos], &rs[pos - 1]) == Ordering::Less {
+                    rs.swap(pos, pos - 1);
+                    pos -= 1;
+                }
+            }
+        } else if stable {
+            rs.sort_by(cmp_fn);
+        } else {
+            rs.sort_unstable_by(cmp_fn);
+        }
+    }
 }
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
