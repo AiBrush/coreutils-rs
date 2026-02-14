@@ -40,13 +40,9 @@ fn flush_iov(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
     Ok(())
 }
 
-/// Reverse records of an owned Vec in-place, then write.
-/// Avoids allocating a second output buffer by using a two-pass approach:
-/// 1. Reverse all bytes in the Vec
-/// 2. Reverse each individual record (between separators)
-/// This produces the same output as copying records in reverse order.
-///
-/// Only works for after-separator mode with single-byte separator.
+/// Reverse records of an owned buffer and write.
+/// Delegates to the zero-copy IoSlice path which is faster than the old
+/// in-place reverse+reverse approach (avoids touching 10MB twice).
 pub fn tac_bytes_owned(
     data: &mut [u8],
     separator: u8,
@@ -56,38 +52,7 @@ pub fn tac_bytes_owned(
     if data.is_empty() {
         return Ok(());
     }
-    // For before-separator mode or complex cases, fall back to the copy approach
-    if before {
-        return tac_bytes(data, separator, before, out);
-    }
-
-    let len = data.len();
-
-    // Step 1: Reverse the entire buffer
-    data.reverse();
-
-    // Step 2: Reverse each record within the reversed buffer.
-    // After step 1, records are in the right order but each record's bytes are reversed.
-    // We need to reverse each individual record.
-    //
-    // After global reverse, what were "\n" separators at the END of records
-    // are now at the START. So records are [sep][reversed_bytes]...[sep][reversed_bytes][maybe_no_sep]
-    //
-    // Collect separator positions first (memchr SIMD pass), then reverse each segment.
-    let positions: Vec<usize> = memchr::memchr_iter(separator, data).collect();
-    let mut start = 0;
-    for &pos in &positions {
-        if pos > start {
-            data[start..pos].reverse();
-        }
-        start = pos + 1;
-    }
-    // Reverse the last segment (no trailing separator)
-    if start < len {
-        data[start..len].reverse();
-    }
-
-    out.write_all(data)
+    tac_bytes(data, separator, before, out)
 }
 
 /// Reverse records separated by a single byte.
