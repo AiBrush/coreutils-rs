@@ -2598,10 +2598,66 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
 
     let member = build_member_set(delete_chars);
 
-    // Zero-copy writev path: scan for runs of kept bytes, build IoSlice entries
-    // pointing directly into the source data. No data copying needed.
-    // For sparse deletes (few bytes deleted), most data stays in long runs.
-    delete_bitset_zerocopy(data, &member, writer)
+    // Heuristic: sample first 1024 bytes to estimate delete frequency.
+    // If < 10% of bytes are deleted, zero-copy writev is efficient
+    // (long runs between deletes = few IoSlice entries).
+    // For dense deletes (>= 10%), copy-based approach with parallel processing
+    // produces fewer, larger writes.
+    let sample_size = data.len().min(1024);
+    let sample_deletes = data[..sample_size]
+        .iter()
+        .filter(|&&b| is_member(&member, b))
+        .count();
+    let delete_pct = sample_deletes * 100 / sample_size.max(1);
+
+    if delete_pct < 10 {
+        return delete_bitset_zerocopy(data, &member, writer);
+    }
+
+    // Dense delete: copy-based approach with parallel processing
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+
+        let mut outbuf = alloc_uninit_vec(data.len());
+        let chunk_lens: Vec<usize> = data
+            .par_chunks(chunk_size)
+            .zip(outbuf.par_chunks_mut(chunk_size))
+            .map(|(src_chunk, dst_chunk)| delete_chunk_bitset_into(src_chunk, &member, dst_chunk))
+            .collect();
+
+        let mut write_pos = 0;
+        let mut src_offset = 0;
+        for &clen in &chunk_lens {
+            if clen > 0 && src_offset != write_pos {
+                unsafe {
+                    std::ptr::copy(
+                        outbuf.as_ptr().add(src_offset),
+                        outbuf.as_mut_ptr().add(write_pos),
+                        clen,
+                    );
+                }
+            }
+            write_pos += clen;
+            src_offset += chunk_size;
+        }
+
+        return writer.write_all(&outbuf[..write_pos]);
+    }
+
+    if data.len() <= SINGLE_WRITE_LIMIT {
+        let mut outbuf = alloc_uninit_vec(data.len());
+        let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
+        return writer.write_all(&outbuf[..out_pos]);
+    }
+
+    let buf_size = data.len().min(BUF_SIZE);
+    let mut outbuf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(buf_size) {
+        let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
+        writer.write_all(&outbuf[..out_pos])?;
+    }
+    Ok(())
 }
 
 /// SIMD range delete for mmap data, with rayon parallel processing.
@@ -2648,7 +2704,6 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
 /// Delete bytes from chunk using bitset, writing into pre-allocated buffer.
 /// Returns number of bytes written.
 #[inline]
-#[allow(dead_code)]
 fn delete_chunk_bitset_into(chunk: &[u8], member: &[u8; 32], outbuf: &mut [u8]) -> usize {
     let len = chunk.len();
     let mut out_pos = 0;
