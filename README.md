@@ -8,21 +8,28 @@
 
 High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
 
-## Performance (independent benchmarks v0.0.53, Linux x86_64, hyperfine)
+## Performance (independent benchmarks v0.1.4, Linux x86_64, hyperfine)
 
-| Tool | Speedup vs GNU | Benchmark |
-|------|---------------:|-----------|
-| wc | **33.2x** | default 100MB text |
-| sort | **7.0x** | lexicographic 10MB |
-| uniq | **6.2x** | repetitive 10MB |
-| cut | **5.6x** | -b1-100 10MB CSV |
-| tr | **3.7x** | -d lowercase 10MB |
-| base64 | **3.1x** | decode 10MB |
-| tac | **2.6x** | reverse 100MB text |
-| b2sum | **1.3x** | single 100MB text |
-| sha256sum | **1.0x** | single 100MB text |
-| md5sum | **1.0x** | single 100MB text |
-
+| Platform | Tests | Passed | Failed | Pass Rate |
+|----------|-------|--------|--------|-----------|
+| Linux_aarch64 | 413 | 413 | 0 | 100.0% |
+| Linux_x86_64 | 413 | 413 | 0 | 100.0% |
+| Tool | Test | GNU (mean) | fcoreutils (mean) | uutils (mean) | f* vs GNU | f* vs uutils |
+|------|------|-----------|-------------------|---------------|----------:|-------------:|
+| wc | default 100KB text | 0.0011s | 0.0012s | 0.0013s | **1.0x** | **1.2x** |
+| wc | default 1MB text | 0.0038s | 0.0025s | 0.0034s | **1.5x** | **1.3x** |
+| wc | default 10MB text | 0.0345s | 0.0063s | 0.0252s | **5.5x** | **4.0x** |
+| wc | default 100MB text | 0.2988s | 0.0451s | 0.2209s | **6.6x** | **4.9x** |
+| wc | -l 10MB text | 0.0044s | 0.0022s | 0.0028s | **2.0x** | **1.3x** |
+| wc | -w 10MB text | 0.0343s | 0.0063s | 0.0216s | **5.4x** | **3.4x** |
+| wc | -c 10MB text | 0.0007s | 0.0009s | 0.0010s | **0.8x** | **1.1x** |
+| wc | -m 10MB text | 0.0343s | 0.0025s | 0.0031s | **13.6x** | **1.2x** |
+| wc | -L 10MB text | 0.0343s | 0.0063s | 0.0177s | **5.4x** | **2.8x** |
+| wc | default 10MB binary | 0.2340s | 0.0169s | 0.1142s | **13.8x** | **6.8x** |
+| wc | default 10MB repetitive | 0.0542s | 0.0084s | 0.0380s | **6.4x** | **4.5x** |
+| wc | 10 files | 0.0008s | 0.0011s | 0.0011s | **0.8x** | **1.0x** |
+| wc | 100 files | 0.0013s | 0.0014s | 0.0017s | **0.9x** | **1.2x** |
+| cut | -b1-100 10MB CSV | 0.0187s | 0.0035s | 0.0065s | **5.4x** | **1.9x** |
 ## Tools
 
 | Tool | Binary | Status | Description |
