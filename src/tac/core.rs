@@ -85,30 +85,31 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
 const ZEROCOPY_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Zero-copy after-separator mode: builds IoSlice entries pointing directly
-/// at the source data in reverse record order. Uses forward SIMD memchr_iter
-/// to find all separator positions, then constructs IoSlice entries in reverse
-/// order and writes them via batched write_vectored.
+/// at the source data in reverse record order. Uses reverse SIMD memrchr_iter
+/// to find separator positions from right to left, building IoSlice entries
+/// directly without an intermediate positions Vec.
 ///
-/// Eliminates the 10MB output buffer allocation and data copy that the previous
-/// contiguous-buffer approach required. For /dev/null or pipe output, this is
-/// significantly faster since we avoid touching 10MB of output memory entirely.
+/// This eliminates the 1.6MB positions Vec allocation (200K * 8 bytes) that
+/// the forward-scan-then-reverse approach required. memrchr_iter uses the
+/// same SIMD acceleration as memchr_iter, just scanning backward.
 fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Collect separator positions with forward SIMD memchr (single fast pass).
-    // For 10MB with 50-byte lines, this produces ~200K positions.
-    let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
-
-    // Build IoSlice entries in reverse order, pointing directly at source data.
-    // Each record is the slice between separators (after the separator byte).
-    let num_records = positions.len() + 1; // +1 for potential leading record
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    // Use memrchr_iter to scan backward, building IoSlice entries directly
+    // in the correct (reversed) order. No intermediate positions Vec needed.
+    let mut iov: Vec<IoSlice> = Vec::new();
 
     let mut end = data.len();
-    for &pos in positions.iter().rev() {
+    for pos in memchr::memrchr_iter(sep, data) {
         let rec_start = pos + 1;
         if rec_start < end {
             iov.push(IoSlice::new(&data[rec_start..end]));
         }
         end = rec_start;
+
+        // Flush when approaching MAX_IOV to keep batches efficient
+        if iov.len() >= MAX_IOV {
+            flush_iov(out, &iov)?;
+            iov.clear();
+        }
     }
     // First record (before the first separator)
     if end > 0 {
@@ -121,17 +122,19 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 /// Zero-copy before-separator mode: builds IoSlice entries pointing directly
 /// at the source data in reverse record order.
 fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
-
-    let num_records = positions.len() + 1;
-    let mut iov: Vec<IoSlice> = Vec::with_capacity(num_records);
+    let mut iov: Vec<IoSlice> = Vec::new();
 
     let mut end = data.len();
-    for &pos in positions.iter().rev() {
+    for pos in memchr::memrchr_iter(sep, data) {
         if pos < end {
             iov.push(IoSlice::new(&data[pos..end]));
         }
         end = pos;
+
+        if iov.len() >= MAX_IOV {
+            flush_iov(out, &iov)?;
+            iov.clear();
+        }
     }
     // First record (before the first separator)
     if end > 0 {
