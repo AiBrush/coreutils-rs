@@ -3549,7 +3549,24 @@ fn delete_range_mmap_zerocopy(
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { delete_range_zerocopy_neon(data, writer, lo, hi) };
+    }
+
     // Scalar fallback: byte-by-byte scan with IoSlice batching
+    #[allow(unreachable_code)]
+    delete_range_zerocopy_scalar(data, writer, lo, hi)
+}
+
+/// Scalar zero-copy range delete: byte-by-byte scan with IoSlice batching.
+/// Used as fallback when SIMD is unavailable.
+fn delete_range_zerocopy_scalar(
+    data: &[u8],
+    writer: &mut impl Write,
+    lo: u8,
+    hi: u8,
+) -> io::Result<()> {
     let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(MAX_IOV);
     let len = data.len();
     let mut run_start: usize = 0;
@@ -3712,6 +3729,98 @@ unsafe fn delete_range_zerocopy_sse2(
             ri += 16;
         }
 
+        while ri < len {
+            let b = *data.get_unchecked(ri);
+            if b >= lo && b <= hi {
+                if ri > run_start {
+                    iov.push(std::io::IoSlice::new(&data[run_start..ri]));
+                    if iov.len() >= MAX_IOV {
+                        write_ioslices(writer, &iov)?;
+                        iov.clear();
+                    }
+                }
+                run_start = ri + 1;
+            }
+            ri += 1;
+        }
+
+        if run_start < len {
+            iov.push(std::io::IoSlice::new(&data[run_start..]));
+        }
+        if !iov.is_empty() {
+            write_ioslices(writer, &iov)?;
+        }
+        Ok(())
+    }
+}
+
+/// NEON zero-copy range delete for aarch64: scans 16 bytes at a time using
+/// NEON unsigned comparison, creates bitmask via pairwise narrowing, then
+/// iterates delete positions from the bitmask.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn delete_range_zerocopy_neon(
+    data: &[u8],
+    writer: &mut impl Write,
+    lo: u8,
+    hi: u8,
+) -> io::Result<()> {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(MAX_IOV);
+        let len = data.len();
+        let mut run_start: usize = 0;
+        let mut ri: usize = 0;
+
+        let lo_v = vdupq_n_u8(lo);
+        let hi_v = vdupq_n_u8(hi);
+        // Bit position mask for extracting bitmask from comparison results
+        let bit_mask: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bit_mask_v = vld1q_u8(bit_mask.as_ptr());
+
+        while ri + 16 <= len {
+            let input = vld1q_u8(data.as_ptr().add(ri));
+            // in_range = 0xFF where lo <= byte <= hi
+            let ge_lo = vcgeq_u8(input, lo_v);
+            let le_hi = vcleq_u8(input, hi_v);
+            let in_range = vandq_u8(ge_lo, le_hi);
+
+            // Create 16-bit bitmask: reduce 16 bytes to 2 bytes
+            let bits = vandq_u8(in_range, bit_mask_v);
+            let pair = vpaddlq_u8(bits); // u8→u16 pairwise add
+            let quad = vpaddlq_u16(pair); // u16→u32
+            let octet = vpaddlq_u32(quad); // u32→u64
+            let mask_lo = vgetq_lane_u64(vreinterpretq_u64_u8(octet), 0) as u8;
+            let mask_hi = vgetq_lane_u64(vreinterpretq_u64_u8(octet), 1) as u8;
+            let del_mask = (mask_hi as u16) << 8 | mask_lo as u16;
+
+            if del_mask == 0 {
+                // No bytes to delete — run continues
+                ri += 16;
+                continue;
+            }
+
+            // Process each deleted byte position
+            let mut m = del_mask;
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                let abs_pos = ri + bit;
+                if abs_pos > run_start {
+                    iov.push(std::io::IoSlice::new(&data[run_start..abs_pos]));
+                    if iov.len() >= MAX_IOV {
+                        write_ioslices(writer, &iov)?;
+                        iov.clear();
+                    }
+                }
+                run_start = abs_pos + 1;
+                m &= m - 1;
+            }
+
+            ri += 16;
+        }
+
+        // Scalar tail
         while ri < len {
             let b = *data.get_unchecked(ri);
             if b >= lo && b <= hi {
