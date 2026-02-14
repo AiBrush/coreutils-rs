@@ -6,7 +6,6 @@ use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
-use clap::Parser;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
@@ -88,14 +87,18 @@ impl Write for VmspliceWriter {
         if !self.is_pipe || bufs.is_empty() {
             return (&*self.raw).write_vectored(bufs);
         }
-        let iovs: Vec<libc::iovec> = bufs
-            .iter()
-            .map(|b| libc::iovec {
-                iov_base: b.as_ptr() as *mut libc::c_void,
-                iov_len: b.len(),
-            })
-            .collect();
-        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), iovs.len(), 0) };
+        // Stack-allocated iovec array: avoids Vec heap allocation on every call.
+        // 1024 matches UIO_MAXIOV (Linux max iovecs per syscall) and the batch
+        // size used by the core tac functions.
+        let count = bufs.len().min(1024);
+        let mut iovs: [libc::iovec; 1024] = unsafe { std::mem::zeroed() };
+        for i in 0..count {
+            iovs[i] = libc::iovec {
+                iov_base: bufs[i].as_ptr() as *mut libc::c_void,
+                iov_len: bufs[i].len(),
+            };
+        }
+        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), count, 0) };
         if n >= 0 {
             Ok(n as usize)
         } else {
@@ -113,32 +116,119 @@ impl Write for VmspliceWriter {
     }
 }
 
-#[derive(Parser)]
-#[command(
-    name = "tac",
-    about = "Concatenate and print files in reverse",
-    version
-)]
 struct Cli {
-    /// Attach the separator before instead of after
-    #[arg(short = 'b', long = "before")]
     before: bool,
-
-    /// Interpret the separator as a regular expression
-    #[arg(short = 'r', long = "regex")]
     regex: bool,
-
-    /// Use STRING as the separator instead of newline
-    #[arg(
-        short = 's',
-        long = "separator",
-        value_name = "STRING",
-        allow_hyphen_values = true
-    )]
     separator: Option<String>,
-
-    /// Files to process (reads stdin if none given)
     files: Vec<String>,
+}
+
+/// Hand-rolled argument parser — eliminates clap's ~100-200µs initialization.
+/// tac has very few options: -b, -r, -s STRING, --help, --version, and files.
+fn parse_args() -> Cli {
+    let mut cli = Cli {
+        before: false,
+        regex: false,
+        separator: None,
+        files: Vec::new(),
+    };
+
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_encoded_bytes();
+        if bytes == b"--" {
+            for a in args {
+                cli.files.push(a.to_string_lossy().into_owned());
+            }
+            break;
+        }
+        if bytes.starts_with(b"--") {
+            if bytes.starts_with(b"--separator=") {
+                let val = arg.to_string_lossy();
+                cli.separator = Some(val[12..].to_string());
+                continue;
+            }
+            match bytes {
+                b"--before" => cli.before = true,
+                b"--regex" => cli.regex = true,
+                b"--separator" => {
+                    cli.separator = Some(
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("tac: option '--separator' requires an argument");
+                                process::exit(1);
+                            })
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                b"--help" => {
+                    print!(
+                        "Usage: tac [OPTION]... [FILE]...\n\
+                         Write each FILE to standard output, last line first.\n\n\
+                         With no FILE, or when FILE is -, read standard input.\n\n\
+                         Mandatory arguments to long options are mandatory for short options too.\n\
+                         \x20 -b, --before             attach the separator before instead of after\n\
+                         \x20 -r, --regex              interpret the separator as a regular expression\n\
+                         \x20 -s, --separator=STRING    use STRING as the separator instead of newline\n\
+                         \x20     --help               display this help and exit\n\
+                         \x20     --version            output version information and exit\n"
+                    );
+                    process::exit(0);
+                }
+                b"--version" => {
+                    println!("tac (fcoreutils) {}", env!("CARGO_PKG_VERSION"));
+                    process::exit(0);
+                }
+                _ => {
+                    eprintln!("tac: unrecognized option '{}'", arg.to_string_lossy());
+                    eprintln!("Try 'tac --help' for more information.");
+                    process::exit(1);
+                }
+            }
+        } else if bytes.len() > 1 && bytes[0] == b'-' {
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'b' => cli.before = true,
+                    b'r' => cli.regex = true,
+                    b's' => {
+                        // -s takes a value: rest of this arg or next arg
+                        if i + 1 < bytes.len() {
+                            let val = arg.to_string_lossy();
+                            cli.separator = Some(val[i + 1..].to_string());
+                        } else {
+                            cli.separator = Some(
+                                args.next()
+                                    .unwrap_or_else(|| {
+                                        eprintln!(
+                                            "tac: option requires an argument -- 's'"
+                                        );
+                                        process::exit(1);
+                                    })
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                        break; // consumed rest of arg
+                    }
+                    _ => {
+                        eprintln!(
+                            "tac: invalid option -- '{}'",
+                            bytes[i] as char
+                        );
+                        eprintln!("Try 'tac --help' for more information.");
+                        process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            cli.files.push(arg.to_string_lossy().into_owned());
+        }
+    }
+
+    cli
 }
 
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
@@ -285,12 +375,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     enlarge_pipes();
 
-    let cli = Cli::parse();
+    let mut cli = parse_args();
 
     let files: Vec<String> = if cli.files.is_empty() {
         vec!["-".to_string()]
     } else {
-        cli.files.clone()
+        std::mem::take(&mut cli.files)
     };
 
     let is_byte_sep = !cli.regex && cli.separator.is_none();
