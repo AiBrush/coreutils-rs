@@ -621,13 +621,32 @@ impl AsRef<[u8]> for FileContent {
 }
 
 /// Open a file and load its content for batch hashing.
-/// Uses mmap for regular files (zero-copy), read for others.
+/// Uses read for tiny files (avoids mmap syscall overhead), mmap for large
+/// files (zero-copy), and read-to-end for non-regular files.
 fn open_file_content(path: &Path) -> io::Result<FileContent> {
     let (file, size, is_regular) = open_and_stat(path)?;
     if is_regular && size == 0 {
         return Ok(FileContent::Buf(Vec::new()));
     }
     if is_regular && size > 0 {
+        // Tiny files: read directly into Vec. The mmap syscall + page fault
+        // overhead exceeds the data transfer cost for files under 8KB.
+        // For the 100-file benchmark (55 bytes each), this saves ~100 mmap calls.
+        if size < TINY_FILE_LIMIT {
+            let mut buf = vec![0u8; size as usize];
+            let mut total = 0;
+            let mut f = file;
+            while total < size as usize {
+                match f.read(&mut buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            buf.truncate(total);
+            return Ok(FileContent::Buf(buf));
+        }
         if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
             #[cfg(target_os = "linux")]
             {
@@ -724,8 +743,13 @@ pub fn hash_files_parallel(
     paths: &[&Path],
     algo: HashAlgorithm,
 ) -> Vec<io::Result<String>> {
-    // Issue readahead for all files (no size threshold)
-    readahead_files_all(paths);
+    // Only issue readahead for modest file counts (likely larger files).
+    // For 100+ tiny files, readahead's per-file overhead (open+stat+fadvise+close
+    // = ~30µs/file = ~3ms for 100 files) exceeds its benefit since tiny files
+    // are already served from page cache after warmup.
+    if paths.len() <= 20 {
+        readahead_files_all(paths);
+    }
 
     paths
         .par_iter()
