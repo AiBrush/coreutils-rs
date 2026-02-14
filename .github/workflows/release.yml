@@ -111,6 +111,21 @@ jobs:
             sed -i 's/^version = ".*"/version = "${{ needs.calculate-version.outputs.version }}"/' Cargo.toml
           fi
 
+      - name: Set RUSTFLAGS for target CPU
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-*)
+              echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"
+              ;;
+            aarch64-*)
+              echo "RUSTFLAGS=-C target-cpu=generic" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "RUSTFLAGS=" >> "$GITHUB_ENV"
+              ;;
+          esac
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
