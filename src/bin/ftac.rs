@@ -86,7 +86,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
     let mut had_error = false;
 
     for filename in files {
-        let data: FileData = if filename == "-" {
+        let mut data: FileData = if filename == "-" {
             #[cfg(unix)]
             {
                 match try_mmap_stdin() {
@@ -146,14 +146,20 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         }
 
-        let bytes: &[u8] = &data;
-
+        // For owned data (stdin) with default newline separator, use in-place reversal
+        // to avoid allocating a separate output buffer (saves ~10MB for 10MB input).
         let result = if cli.regex {
+            let bytes: &[u8] = &data;
             let sep = cli.separator.as_deref().unwrap_or("\n");
             tac::tac_regex_separator(bytes, sep, cli.before, out)
         } else if let Some(ref sep) = cli.separator {
+            let bytes: &[u8] = &data;
             tac::tac_string_separator(bytes, sep.as_bytes(), cli.before, out)
+        } else if let FileData::Owned(ref mut owned) = data {
+            // In-place reversal: no output buffer needed.
+            tac::tac_bytes_owned(owned, b'\n', cli.before, out)
         } else {
+            let bytes: &[u8] = &data;
             tac::tac_bytes(bytes, b'\n', cli.before, out)
         };
 
