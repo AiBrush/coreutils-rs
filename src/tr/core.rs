@@ -6,9 +6,6 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Main processing buffer: 4MB (fits in L3 cache, avoids cache thrashing).
-const BUF_SIZE: usize = 4 * 1024 * 1024;
-
 /// Stream buffer: 16MB — tr streaming operations (translate, delete, squeeze)
 /// are compute-light (single table lookup or bitset check per byte), so the
 /// bottleneck is I/O syscalls, not cache pressure. 16MB buffer means only
@@ -18,11 +15,11 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
-/// AVX2 translation runs at ~10 GB/s per core. At 4MB, parallel
-/// processing with 2 cores provides ~1.5x speedup (2MB/core in ~0.2ms)
-/// while rayon overhead is ~100us (thread pool is pre-warmed after first use).
-/// Lowered from 16MB to benefit 4-10MB inputs common in benchmarks.
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// AVX2 translation runs at ~10 GB/s per core. For 10MB benchmarks,
+/// rayon overhead (~100-200us for spawn+join) dominates the ~1ms
+/// single-core translate time. Only use parallel for genuinely large files
+/// where the parallel speedup outweighs rayon overhead.
+const PARALLEL_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Write multiple IoSlice buffers using write_vectored, batching into MAX_IOV-sized groups.
 /// Falls back to write_all per slice for partial writes.
@@ -977,6 +974,118 @@ fn translate_range_to_constant_simd_inplace(data: &mut [u8], lo: u8, hi: u8, rep
     }
 }
 
+/// SIMD range-to-constant translation from src to dst (no intermediate copy needed).
+/// Reads from src, writes translated result to dst in a single pass.
+#[cfg(target_arch = "x86_64")]
+fn translate_range_to_constant_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+    if get_simd_level() >= 3 {
+        unsafe { translate_range_to_constant_avx2(src, dst, lo, hi, replacement) };
+    } else {
+        unsafe { translate_range_to_constant_sse2(src, dst, lo, hi, replacement) };
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn translate_range_to_constant_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, replacement: u8) {
+    for (i, &b) in src.iter().enumerate() {
+        unsafe {
+            *dst.get_unchecked_mut(i) = if b >= lo && b <= hi { replacement } else { b };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn translate_range_to_constant_avx2(
+    src: &[u8],
+    dst: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let range = hi - lo;
+        let bias_v = _mm256_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm256_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let repl_v = _mm256_set1_epi8(replacement as i8);
+        let zero = _mm256_setzero_si256();
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut i = 0;
+        while i + 64 <= len {
+            let in0 = _mm256_loadu_si256(sp.add(i) as *const _);
+            let in1 = _mm256_loadu_si256(sp.add(i + 32) as *const _);
+            let bi0 = _mm256_add_epi8(in0, bias_v);
+            let bi1 = _mm256_add_epi8(in1, bias_v);
+            let gt0 = _mm256_cmpgt_epi8(bi0, threshold_v);
+            let gt1 = _mm256_cmpgt_epi8(bi1, threshold_v);
+            let ir0 = _mm256_cmpeq_epi8(gt0, zero);
+            let ir1 = _mm256_cmpeq_epi8(gt1, zero);
+            let r0 = _mm256_blendv_epi8(in0, repl_v, ir0);
+            let r1 = _mm256_blendv_epi8(in1, repl_v, ir1);
+            _mm256_storeu_si256(dp.add(i) as *mut _, r0);
+            _mm256_storeu_si256(dp.add(i + 32) as *mut _, r1);
+            i += 64;
+        }
+        if i + 32 <= len {
+            let input = _mm256_loadu_si256(sp.add(i) as *const _);
+            let biased = _mm256_add_epi8(input, bias_v);
+            let gt = _mm256_cmpgt_epi8(biased, threshold_v);
+            let in_range = _mm256_cmpeq_epi8(gt, zero);
+            let result = _mm256_blendv_epi8(input, repl_v, in_range);
+            _mm256_storeu_si256(dp.add(i) as *mut _, result);
+            i += 32;
+        }
+        while i < len {
+            let b = *sp.add(i);
+            *dp.add(i) = if b >= lo && b <= hi { replacement } else { b };
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn translate_range_to_constant_sse2(
+    src: &[u8],
+    dst: &mut [u8],
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let range = hi - lo;
+        let bias_v = _mm_set1_epi8(0x80u8.wrapping_sub(lo) as i8);
+        let threshold_v = _mm_set1_epi8(0x80u8.wrapping_add(range) as i8);
+        let repl_v = _mm_set1_epi8(replacement as i8);
+        let zero = _mm_setzero_si128();
+        let len = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut i = 0;
+        while i + 16 <= len {
+            let input = _mm_loadu_si128(sp.add(i) as *const _);
+            let biased = _mm_add_epi8(input, bias_v);
+            let gt = _mm_cmpgt_epi8(biased, threshold_v);
+            let in_range = _mm_cmpeq_epi8(gt, zero);
+            let result = _mm_or_si128(
+                _mm_and_si128(in_range, repl_v),
+                _mm_andnot_si128(in_range, input),
+            );
+            _mm_storeu_si128(dp.add(i) as *mut _, result);
+            i += 16;
+        }
+        while i < len {
+            let b = *sp.add(i);
+            *dp.add(i) = if b >= lo && b <= hi { replacement } else { b };
+            i += 1;
+        }
+    }
+}
+
 /// SIMD-accelerated range translation for mmap'd data.
 /// For tables where only a contiguous range [lo..=hi] is translated by a constant offset,
 /// uses AVX2 (32 bytes/iter) or SSE2 (16 bytes/iter) vectorized arithmetic.
@@ -1400,15 +1509,11 @@ unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
 
 /// Compact 8 source bytes into contiguous output bytes using a keep mask.
 /// Each bit in `mask` indicates whether the corresponding byte should be kept.
-/// Uses branchless writes: always writes 8 bytes (the extras are harmless since
-/// the caller tracks the write pointer by popcount).
+/// Uses a tight trailing_zeros loop: tzcnt extracts the next kept byte position,
+/// blsr clears the lowest set bit. This runs at ~3 ops per kept byte.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn compact_8bytes(src: *const u8, dst: *mut u8, mask: u8) {
-    // For each set bit position in the mask, copy that byte from src to the
-    // next output position. Using a tight trailing_zeros loop is faster than
-    // a lookup table for 8-bit masks because it's branch-predicted well
-    // and avoids cache misses on the table.
     unsafe {
         let mut m = mask;
         let mut w = 0;
@@ -2382,10 +2487,6 @@ pub fn translate_owned(
 // ============================================================================
 
 /// Maximum data size for single-allocation translate approach.
-/// Below this limit, translate ALL data into one buffer and do a single write_all.
-/// Above this, use chunked approach to limit memory usage.
-const SINGLE_WRITE_LIMIT: usize = 16 * 1024 * 1024;
-
 /// Translate bytes from an mmap'd byte slice.
 /// Detects single-range translations (e.g., a-z to A-Z) and uses SIMD vectorized
 /// arithmetic (AVX2: 32 bytes/iter, SSE2: 16 bytes/iter) for those cases.
@@ -2446,15 +2547,11 @@ fn translate_mmap_range(
         return writer.write_all(&buf);
     }
 
-    // Small data: single-threaded SIMD
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = alloc_uninit_vec(data.len());
-        translate_range_simd(data, &mut buf, lo, hi, offset);
-        return writer.write_all(&buf);
-    }
-    // Chunked path for large data (shouldn't happen since PARALLEL_THRESHOLD < SINGLE_WRITE_LIMIT)
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked SIMD translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         translate_range_simd(chunk, &mut buf[..chunk.len()], lo, hi, offset);
         writer.write_all(&buf[..chunk.len()])?;
     }
@@ -2492,13 +2589,11 @@ fn translate_mmap_range_to_constant(
         return writer.write_all(&buf);
     }
 
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = data.to_vec();
-        translate_range_to_constant_simd_inplace(&mut buf, lo, hi, replacement);
-        return writer.write_all(&buf);
-    }
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         buf[..chunk.len()].copy_from_slice(chunk);
         translate_range_to_constant_simd_inplace(&mut buf[..chunk.len()], lo, hi, replacement);
         writer.write_all(&buf[..chunk.len()])?;
@@ -2523,14 +2618,11 @@ fn translate_mmap_table(data: &[u8], writer: &mut impl Write, table: &[u8; 256])
         return writer.write_all(&buf);
     }
 
-    // Small data: single-threaded
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf = alloc_uninit_vec(data.len());
-        translate_to(data, &mut buf, table);
-        return writer.write_all(&buf);
-    }
-    let mut buf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
+    // Chunked translate: 256KB buffer fits in L2 cache.
+    const CHUNK: usize = 256 * 1024;
+    let buf_size = data.len().min(CHUNK);
+    let mut buf = alloc_uninit_vec(buf_size);
+    for chunk in data.chunks(CHUNK) {
         translate_to(chunk, &mut buf[..chunk.len()], table);
         writer.write_all(&buf[..chunk.len()])?;
     }
@@ -2562,8 +2654,8 @@ pub fn translate_mmap_inplace(
     // reading from mmap (read-only) + writing to a separate heap buffer is faster
     // because it avoids COW faults entirely. The output buffer is fresh memory
     // (no COW), and the input mmap stays read-only (MADV_SEQUENTIAL).
-    // Threshold: 32MB. Above this, in-place is better to avoid doubling memory.
-    const SEPARATE_BUF_THRESHOLD: usize = 32 * 1024 * 1024;
+    // Threshold: 64MB. For benchmark-sized files (10MB), avoid COW entirely.
+    const SEPARATE_BUF_THRESHOLD: usize = 64 * 1024 * 1024;
 
     if data.len() < SEPARATE_BUF_THRESHOLD {
         return translate_to_separate_buf(data, &table, writer);
@@ -2612,8 +2704,9 @@ pub fn translate_mmap_inplace(
 /// Uses the appropriate SIMD path (range offset, range-to-constant, or general nibble).
 ///
 /// For data >= PARALLEL_THRESHOLD: parallel chunked translate into full-size buffer.
-/// For smaller data: chunked translate+write with a reusable 4MB buffer to keep
-/// output data in L3 cache during write_all (avoids main memory round-trip).
+/// For smaller data: single full-size allocation + single write_all for minimum
+/// syscall overhead. At 10MB, the allocation is cheap and a single write() is faster
+/// than multiple 4MB chunked writes.
 fn translate_to_separate_buf(
     data: &[u8],
     table: &[u8; 256],
@@ -2642,8 +2735,8 @@ fn translate_to_separate_buf(
             data.par_chunks(chunk_size)
                 .zip(out_buf.par_chunks_mut(chunk_size))
                 .for_each(|(src, dst)| {
-                    dst[..src.len()].copy_from_slice(src);
-                    translate_range_to_constant_simd_inplace(
+                    translate_range_to_constant_simd(
+                        src,
                         &mut dst[..src.len()],
                         lo,
                         hi,
@@ -2660,27 +2753,21 @@ fn translate_to_separate_buf(
         return writer.write_all(&out_buf);
     }
 
-    // Sequential path: translate in L3-cache-sized chunks (4MB).
-    // This keeps the output buffer hot in L3 cache during write_all,
-    // avoiding a main memory round-trip that happens with a full-size buffer.
-    const CHUNK: usize = 4 * 1024 * 1024;
-    let buf_size = data.len().min(CHUNK);
-    let mut out_buf = alloc_uninit_vec(buf_size);
+    // Single-allocation translate: full-size output buffer + single write_all.
+    // For 10MB data, the 10MB allocation is trivial and a single write() syscall
+    // is much faster than 40 x 256KB chunked writes (saves ~39 syscalls).
+    // SIMD translate runs at ~10 GB/s, so the translate itself is <1ms;
+    // syscall overhead dominates at this size.
+    let mut out_buf = alloc_uninit_vec(data.len());
 
-    for src_chunk in data.chunks(CHUNK) {
-        let dst = &mut out_buf[..src_chunk.len()];
-        if let Some((lo, hi, offset)) = range_info {
-            translate_range_simd(src_chunk, dst, lo, hi, offset);
-        } else if let Some((lo, hi, replacement)) = const_info {
-            dst.copy_from_slice(src_chunk);
-            translate_range_to_constant_simd_inplace(dst, lo, hi, replacement);
-        } else {
-            translate_to(src_chunk, dst, table);
-        }
-        writer.write_all(dst)?;
+    if let Some((lo, hi, offset)) = range_info {
+        translate_range_simd(data, &mut out_buf, lo, hi, offset);
+    } else if let Some((lo, hi, replacement)) = const_info {
+        translate_range_to_constant_simd(data, &mut out_buf, lo, hi, replacement);
+    } else {
+        translate_to(data, &mut out_buf, table);
     }
-
-    Ok(())
+    writer.write_all(&out_buf)
 }
 
 /// Translate from a read-only mmap (or any byte slice) to a separate output buffer.
@@ -2776,64 +2863,29 @@ pub fn translate_squeeze_mmap(
         return writer.write_all(&translated[..wp]);
     }
 
-    // Single-write fast path: translate+squeeze all data in one pass, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut buf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        unsafe {
-            buf.set_len(data.len());
-            let outp: *mut u8 = buf.as_mut_ptr();
-            let inp = data.as_ptr();
-            let len = data.len();
-            let mut wp = 0;
-            let mut i = 0;
-            while i < len {
-                let translated = *table.get_unchecked(*inp.add(i) as usize);
-                if is_member(&squeeze_set, translated) {
-                    if last_squeezed == translated as u16 {
-                        i += 1;
-                        continue;
-                    }
-                    last_squeezed = translated as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *outp.add(wp) = translated;
-                wp += 1;
-                i += 1;
-            }
-            buf.set_len(wp);
-        }
-        return writer.write_all(&buf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut buf = vec![0u8; buf_size];
+    // Single-allocation translate+squeeze: full-size buffer, single write_all.
+    // For 10MB data, this does 1 write() instead of ~40 chunked writes.
+    let mut buf = alloc_uninit_vec(data.len());
+    translate_to(data, &mut buf, &table);
     let mut last_squeezed: u16 = 256;
-
-    for chunk in data.chunks(buf_size) {
-        translate_to(chunk, &mut buf[..chunk.len()], &table);
-        let mut wp = 0;
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            for i in 0..chunk.len() {
-                let b = *ptr.add(i);
-                if is_member(&squeeze_set, b) {
-                    if last_squeezed == b as u16 {
-                        continue;
-                    }
-                    last_squeezed = b as u16;
-                } else {
-                    last_squeezed = 256;
+    let mut wp = 0;
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        for i in 0..data.len() {
+            let b = *ptr.add(i);
+            if is_member(&squeeze_set, b) {
+                if last_squeezed == b as u16 {
+                    continue;
                 }
-                *ptr.add(wp) = b;
-                wp += 1;
+                last_squeezed = b as u16;
+            } else {
+                last_squeezed = 256;
             }
+            *ptr.add(wp) = b;
+            wp += 1;
         }
-        writer.write_all(&buf[..wp])?;
     }
-    Ok(())
+    writer.write_all(&buf[..wp])
 }
 
 /// Delete from mmap'd byte slice.
@@ -2903,16 +2955,11 @@ pub fn delete_mmap(delete_chars: &[u8], data: &[u8], writer: &mut impl Write) ->
         return writer.write_all(&outbuf[..write_pos]);
     }
 
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = alloc_uninit_vec(data.len());
-        let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
-        return writer.write_all(&outbuf[..out_pos]);
-    }
-
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = alloc_uninit_vec(buf_size);
-    for chunk in data.chunks(buf_size) {
-        let out_pos = delete_chunk_bitset_into(chunk, &member, &mut outbuf);
+    // Single-allocation delete: full-size buffer, single write_all.
+    // For 10MB data, this does 1 write() instead of ~40 chunked writes.
+    let mut outbuf = alloc_uninit_vec(data.len());
+    let out_pos = delete_chunk_bitset_into(data, &member, &mut outbuf);
+    if out_pos > 0 {
         writer.write_all(&outbuf[..out_pos])?;
     }
     Ok(())
@@ -2943,17 +2990,10 @@ fn delete_range_mmap(data: &[u8], writer: &mut impl Write, lo: u8, hi: u8) -> io
         return write_ioslices(writer, &slices);
     }
 
-    // Single-write fast path
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = alloc_uninit_vec(data.len());
-        let wp = delete_range_chunk(data, &mut outbuf, lo, hi);
-        return writer.write_all(&outbuf[..wp]);
-    }
-
-    // Chunked path
-    let mut outbuf = alloc_uninit_vec(BUF_SIZE);
-    for chunk in data.chunks(BUF_SIZE) {
-        let wp = delete_range_chunk(chunk, &mut outbuf, lo, hi);
+    // Single-allocation delete: full-size buffer, single write_all.
+    let mut outbuf = alloc_uninit_vec(data.len());
+    let wp = delete_range_chunk(data, &mut outbuf, lo, hi);
+    if wp > 0 {
         writer.write_all(&outbuf[..wp])?;
     }
     Ok(())
@@ -3055,24 +3095,28 @@ fn delete_bitset_zerocopy(
 }
 
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    // Zero-copy delete using writev: build IoSlice entries pointing to the
-    // gaps between deleted characters in the ORIGINAL data buffer.
-    // For `tr -d '\n'` on 10MB with ~200K newlines:
-    //   - Old: 10MB allocation + 10MB copy into output buffer
-    //   - New: ~200K * 16 = 3.2MB IoSlice entries, zero data copy
-    // Uses SIMD memchr_iter to find all positions, then builds IoSlice spans.
-    let mut iov: Vec<std::io::IoSlice> = Vec::new();
+    // Streaming zero-copy delete using writev: build IoSlice batches of MAX_IOV
+    // pointing to gaps between deleted characters, write each batch immediately.
+    // Avoids allocating the full Vec<IoSlice> for all positions.
+    let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut last = 0;
     for pos in memchr::memchr_iter(ch, data) {
         if pos > last {
             iov.push(std::io::IoSlice::new(&data[last..pos]));
+            if iov.len() >= MAX_IOV {
+                write_ioslices(writer, &iov)?;
+                iov.clear();
+            }
         }
         last = pos + 1;
     }
     if last < data.len() {
         iov.push(std::io::IoSlice::new(&data[last..]));
     }
-    write_ioslices(writer, &iov)
+    if !iov.is_empty() {
+        write_ioslices(writer, &iov)?;
+    }
+    Ok(())
 }
 
 fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
@@ -3081,29 +3125,39 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
     let c2 = if chars.len() >= 3 { chars[2] } else { 0 };
     let is_three = chars.len() >= 3;
 
-    // Zero-copy delete using writev: build IoSlice entries pointing to the
-    // gaps between deleted characters in the original data buffer.
-    let mut iov: Vec<std::io::IoSlice> = Vec::new();
+    // Streaming zero-copy delete: batch IoSlice entries and write in groups of MAX_IOV.
+    let mut iov: Vec<std::io::IoSlice> = Vec::with_capacity(MAX_IOV);
     let mut last = 0;
+
+    macro_rules! process_pos {
+        ($pos:expr) => {
+            if $pos > last {
+                iov.push(std::io::IoSlice::new(&data[last..$pos]));
+                if iov.len() >= MAX_IOV {
+                    write_ioslices(writer, &iov)?;
+                    iov.clear();
+                }
+            }
+            last = $pos + 1;
+        };
+    }
+
     if is_three {
         for pos in memchr::memchr3_iter(c0, c1, c2, data) {
-            if pos > last {
-                iov.push(std::io::IoSlice::new(&data[last..pos]));
-            }
-            last = pos + 1;
+            process_pos!(pos);
         }
     } else {
         for pos in memchr::memchr2_iter(c0, c1, data) {
-            if pos > last {
-                iov.push(std::io::IoSlice::new(&data[last..pos]));
-            }
-            last = pos + 1;
+            process_pos!(pos);
         }
     }
     if last < data.len() {
         iov.push(std::io::IoSlice::new(&data[last..]));
     }
-    write_ioslices(writer, &iov)
+    if !iov.is_empty() {
+        write_ioslices(writer, &iov)?;
+    }
+    Ok(())
 }
 
 /// Delete + squeeze from mmap'd byte slice.
@@ -3119,68 +3173,29 @@ pub fn delete_squeeze_mmap(
     let delete_set = build_member_set(delete_chars);
     let squeeze_set = build_member_set(squeeze_chars);
 
-    // Single-write fast path: delete+squeeze all data in one pass, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        unsafe {
-            outbuf.set_len(data.len());
-            let outp: *mut u8 = outbuf.as_mut_ptr();
-            let inp = data.as_ptr();
-            let len = data.len();
-            let mut out_pos = 0;
-            let mut i = 0;
-            while i < len {
-                let b = *inp.add(i);
-                if is_member(&delete_set, b) {
-                    i += 1;
-                    continue;
-                }
-                if is_member(&squeeze_set, b) {
-                    if last_squeezed == b as u16 {
-                        i += 1;
-                        continue;
-                    }
-                    last_squeezed = b as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *outp.add(out_pos) = b;
-                out_pos += 1;
-                i += 1;
-            }
-            outbuf.set_len(out_pos);
-        }
-        return writer.write_all(&outbuf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
+    // Single-allocation delete+squeeze: full-size buffer, single write_all.
+    let mut outbuf = alloc_uninit_vec(data.len());
     let mut last_squeezed: u16 = 256;
+    let mut out_pos = 0;
 
-    for chunk in data.chunks(buf_size) {
-        let mut out_pos = 0;
-        for &b in chunk {
-            if is_member(&delete_set, b) {
+    for &b in data.iter() {
+        if is_member(&delete_set, b) {
+            continue;
+        }
+        if is_member(&squeeze_set, b) {
+            if last_squeezed == b as u16 {
                 continue;
             }
-            if is_member(&squeeze_set, b) {
-                if last_squeezed == b as u16 {
-                    continue;
-                }
-                last_squeezed = b as u16;
-            } else {
-                last_squeezed = 256;
-            }
-            unsafe {
-                *outbuf.get_unchecked_mut(out_pos) = b;
-            }
-            out_pos += 1;
+            last_squeezed = b as u16;
+        } else {
+            last_squeezed = 256;
         }
-        writer.write_all(&outbuf[..out_pos])?;
+        unsafe {
+            *outbuf.get_unchecked_mut(out_pos) = b;
+        }
+        out_pos += 1;
     }
-    Ok(())
+    writer.write_all(&outbuf[..out_pos])
 }
 
 /// Squeeze from mmap'd byte slice.
@@ -3238,80 +3253,38 @@ pub fn squeeze_mmap(squeeze_chars: &[u8], data: &[u8], writer: &mut impl Write) 
         return write_ioslices(writer, &slices);
     }
 
-    // Single-write fast path: squeeze all data into one buffer, one write
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf: Vec<u8> = Vec::with_capacity(data.len());
-        let mut last_squeezed: u16 = 256;
-        let len = data.len();
-        let mut wp = 0;
-        let mut i = 0;
-
-        unsafe {
-            outbuf.set_len(data.len());
-            let inp = data.as_ptr();
-            let outp: *mut u8 = outbuf.as_mut_ptr();
-
-            while i < len {
-                let b = *inp.add(i);
-                if is_member(&member, b) {
-                    if last_squeezed != b as u16 {
-                        *outp.add(wp) = b;
-                        wp += 1;
-                        last_squeezed = b as u16;
-                    }
-                    i += 1;
-                    while i < len && *inp.add(i) == b {
-                        i += 1;
-                    }
-                } else {
-                    last_squeezed = 256;
-                    *outp.add(wp) = b;
-                    wp += 1;
-                    i += 1;
-                }
-            }
-            outbuf.set_len(wp);
-        }
-        return writer.write_all(&outbuf);
-    }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
+    // Single-allocation squeeze: full-size buffer, single write_all.
+    let mut outbuf = alloc_uninit_vec(data.len());
+    let len = data.len();
+    let mut wp = 0;
+    let mut i = 0;
     let mut last_squeezed: u16 = 256;
 
-    for chunk in data.chunks(buf_size) {
-        let len = chunk.len();
-        let mut wp = 0;
-        let mut i = 0;
+    unsafe {
+        let inp = data.as_ptr();
+        let outp = outbuf.as_mut_ptr();
 
-        unsafe {
-            let inp = chunk.as_ptr();
-            let outp = outbuf.as_mut_ptr();
-
-            while i < len {
-                let b = *inp.add(i);
-                if is_member(&member, b) {
-                    if last_squeezed != b as u16 {
-                        *outp.add(wp) = b;
-                        wp += 1;
-                        last_squeezed = b as u16;
-                    }
-                    i += 1;
-                    while i < len && *inp.add(i) == b {
-                        i += 1;
-                    }
-                } else {
-                    last_squeezed = 256;
+        while i < len {
+            let b = *inp.add(i);
+            if is_member(&member, b) {
+                if last_squeezed != b as u16 {
                     *outp.add(wp) = b;
                     wp += 1;
+                    last_squeezed = b as u16;
+                }
+                i += 1;
+                while i < len && *inp.add(i) == b {
                     i += 1;
                 }
+            } else {
+                last_squeezed = 256;
+                *outp.add(wp) = b;
+                wp += 1;
+                i += 1;
             }
         }
-        writer.write_all(&outbuf[..wp])?;
     }
-    Ok(())
+    writer.write_all(&outbuf[..wp])
 }
 
 /// Squeeze a single chunk using bitset membership. Returns squeezed output.

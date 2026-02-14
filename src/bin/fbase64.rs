@@ -141,17 +141,11 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
         unsafe {
-            libc::madvise(
-                m.as_ptr() as *mut libc::c_void,
-                m.len(),
-                libc::MADV_SEQUENTIAL,
-            );
-            if m.len() >= 2 * 1024 * 1024 {
-                libc::madvise(
-                    m.as_ptr() as *mut libc::c_void,
-                    m.len(),
-                    libc::MADV_HUGEPAGE,
-                );
+            let ptr = m.as_ptr() as *mut libc::c_void;
+            let len = m.len();
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
+            if len >= 2 * 1024 * 1024 {
+                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
         }
     }
@@ -182,17 +176,11 @@ fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
         unsafe {
-            libc::madvise(
-                m.as_ptr() as *mut libc::c_void,
-                m.len(),
-                libc::MADV_SEQUENTIAL,
-            );
-            if m.len() >= 2 * 1024 * 1024 {
-                libc::madvise(
-                    m.as_ptr() as *mut libc::c_void,
-                    m.len(),
-                    libc::MADV_HUGEPAGE,
-                );
+            let ptr = m.as_ptr() as *mut libc::c_void;
+            let len = m.len();
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
+            if len >= 2 * 1024 * 1024 {
+                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
         }
     }
@@ -244,11 +232,12 @@ fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<(
             {
                 #[cfg(target_os = "linux")]
                 unsafe {
-                    libc::madvise(
-                        mmap.as_ptr() as *mut libc::c_void,
-                        mmap.len(),
-                        libc::MADV_SEQUENTIAL,
-                    );
+                    let ptr = mmap.as_ptr() as *mut libc::c_void;
+                    let len = mmap.len();
+                    libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
+                    if len >= 2 * 1024 * 1024 {
+                        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+                    }
                 }
                 return b64::decode_mmap_inplace(&mut mmap, cli.ignore_garbage, out);
             }

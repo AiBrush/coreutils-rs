@@ -9,19 +9,18 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (4MB).
-/// base64_simd SIMD encoding runs at ~8 GB/s per core. With 2+ cores
-/// at 4MB, parallel encode provides ~1.4x speedup (2MB per core in ~0.25ms
-/// vs full 4MB in ~0.5ms + ~0.1ms rayon overhead). Lowered from 8MB to
-/// benefit the common 10MB benchmark input.
-const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel encoding (32MB).
+/// base64_simd SIMD encoding runs at ~8 GB/s per core. For the common
+/// 10MB benchmark input, rayon overhead (~100-200us for spawn+join)
+/// exceeds the benefit of parallel encoding (~0.2ms savings). Only use
+/// parallel for genuinely large files (32MB+) where the savings are 1ms+.
+const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
-/// Minimum data size for parallel decoding (2MB of base64 data).
-/// With 2+ cores, parallel decode at 2MB provides ~1.3x speedup:
-/// single-core decode at 8GB/s takes ~0.25ms for 2MB, while dual-core
-/// takes ~0.125ms + ~0.1ms rayon overhead = ~0.225ms. Lowered from
-/// 4MB to benefit the common 10MB benchmark input after whitespace strip.
-const PARALLEL_DECODE_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size for parallel decoding (32MB of base64 data).
+/// For 10MB benchmark inputs (~13MB base64), rayon overhead dominates.
+/// Single-core SIMD decode is already fast enough. Only parallelize
+/// for large files where the parallel speedup exceeds rayon overhead.
+const PARALLEL_DECODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with fused encode+wrap for maximum throughput.
@@ -108,10 +107,10 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
-    // Direct-to-position encode+wrap: encode each line's worth of input bytes
-    // directly into the correct position in the output buffer with newlines.
-    // Eliminates the backward memmove entirely.
-    // For 76-col wrapping: each 57 input bytes -> 76 encoded bytes + 1 newline.
+    // Single-allocation direct-to-position encode+wrap: allocate the exact output size,
+    // encode all lines directly into position, then single write_all. For 10MB input
+    // (13.5MB output), this does 1 write() instead of ~53 chunked writes. The 13.5MB
+    // allocation is trivial. SIMD encode at ~8 GB/s finishes in ~1.2ms.
     if bytes_per_line.is_multiple_of(3) {
         let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline per line
         let total_full_lines = data.len() / bytes_per_line;
@@ -119,7 +118,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 
         // Calculate exact output size
         let remainder_encoded = if remainder_input > 0 {
-            BASE64_ENGINE.encoded_length(remainder_input) + 1 // +1 for trailing newline
+            BASE64_ENGINE.encoded_length(remainder_input) + 1
         } else {
             0
         };
@@ -131,15 +130,13 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
             out_buf.set_len(total_output);
         }
 
-        // Encode each line directly into its final position.
-        // Each 57-byte input line -> 76 encoded bytes at offset line_idx * 77.
         let dst = out_buf.as_mut_ptr();
-        let mut line_idx = 0;
+        let mut i = 0;
 
-        // 4-line unrolled loop for better ILP
-        while line_idx + 4 <= total_full_lines {
-            let in_base = line_idx * bytes_per_line;
-            let out_base = line_idx * line_out;
+        // 4-line unrolled encode loop
+        while i + 4 <= total_full_lines {
+            let in_base = i * bytes_per_line;
+            let out_base = i * line_out;
             unsafe {
                 let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
                 let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s0.as_out());
@@ -166,30 +163,30 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
                 );
                 *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
             }
-            line_idx += 4;
+            i += 4;
         }
 
         // Remaining full lines
-        while line_idx < total_full_lines {
-            let in_base = line_idx * bytes_per_line;
-            let out_base = line_idx * line_out;
+        while i < total_full_lines {
+            let in_base = i * bytes_per_line;
+            let out_base = i * line_out;
             unsafe {
                 let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
                 let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s.as_out());
                 *dst.add(out_base + wrap_col) = b'\n';
             }
-            line_idx += 1;
+            i += 1;
         }
 
         // Handle remainder (last partial line)
         if remainder_input > 0 {
             let enc_len = BASE64_ENGINE.encoded_length(remainder_input);
-            let woff = total_full_lines * line_out;
+            let out_off = total_full_lines * line_out;
             unsafe {
-                let s = std::slice::from_raw_parts_mut(dst.add(woff), enc_len);
+                let s = std::slice::from_raw_parts_mut(dst.add(out_off), enc_len);
                 let _ =
                     BASE64_ENGINE.encode(&data[total_full_lines * bytes_per_line..], s.as_out());
-                *dst.add(woff + enc_len) = b'\n';
+                *dst.add(out_off + enc_len) = b'\n';
             }
         }
 
@@ -602,6 +599,15 @@ pub fn decode_to_writer(data: &[u8], ignore_garbage: bool, out: &mut impl Write)
         return decode_clean_slice(&mut cleaned, out);
     }
 
+    // Try line-by-line decode: if data has uniform 76+1 byte lines (76 base64
+    // chars + newline), decode each line directly into the output buffer.
+    // This avoids the whitespace stripping copy entirely.
+    if data.len() >= 77 {
+        if let Some(result) = try_line_decode(data, out) {
+            return result;
+        }
+    }
+
     // Fast path: single-pass strip + decode
     decode_stripping_whitespace(data, out)
 }
@@ -621,6 +627,14 @@ pub fn decode_mmap_inplace(
 ) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
+    }
+
+    // Try line-by-line decode first: avoids the in-place whitespace strip
+    // and COW page faults entirely. Each line is decoded independently.
+    if !ignore_garbage && data.len() >= 77 {
+        if let Some(result) = try_line_decode(data, out) {
+            return result;
+        }
     }
 
     if ignore_garbage {
@@ -955,6 +969,182 @@ fn decode_stripping_whitespace(data: &[u8], out: &mut impl Write) -> io::Result<
     } else {
         decode_clean_slice(&mut clean, out)
     }
+}
+
+/// Try to decode base64 data line-by-line, avoiding whitespace stripping.
+/// Returns Some(result) if the data has uniform line lengths suitable for
+/// per-line decode, or None if the data doesn't fit this pattern.
+///
+/// For standard 76-char-line base64 (wrap=76): each line is 76 encoded chars
+/// + newline = 77 bytes. 76 chars = 19 groups of 4 = 57 decoded bytes per line.
+/// We decode each line directly into its position in the output buffer.
+fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> {
+    // Find the first newline to determine line length
+    let first_nl = memchr::memchr(b'\n', data)?;
+    let line_len = first_nl; // encoded chars per line (without newline)
+
+    // Line length must be a multiple of 4 (complete base64 groups, no padding mid-stream)
+    if line_len == 0 || line_len % 4 != 0 {
+        return None;
+    }
+
+    let line_stride = line_len + 1; // line_len chars + 1 newline byte
+    let decoded_per_line = line_len * 3 / 4;
+
+    // Verify the data has a consistent line structure by checking the next few lines
+    let check_lines = 4.min(data.len() / line_stride);
+    for i in 1..check_lines {
+        let expected_nl = i * line_stride - 1;
+        if expected_nl >= data.len() {
+            break;
+        }
+        if data[expected_nl] != b'\n' {
+            return None; // Inconsistent line length
+        }
+    }
+
+    // Calculate full lines and remainder
+    let full_lines = if data.len() >= line_stride {
+        // Check how many complete lines fit
+        let candidate = data.len() / line_stride;
+        // Verify the last full line's newline
+        if candidate > 0 && data[candidate * line_stride - 1] != b'\n' {
+            return None; // Not a clean line-structured file
+        }
+        candidate
+    } else {
+        0
+    };
+
+    let remainder_start = full_lines * line_stride;
+    let remainder = &data[remainder_start..];
+
+    // Calculate exact output size
+    let remainder_clean_len = if remainder.is_empty() {
+        0
+    } else {
+        // Remainder might end with newline, strip it
+        let rem = if remainder.last() == Some(&b'\n') {
+            &remainder[..remainder.len() - 1]
+        } else {
+            remainder
+        };
+        if rem.is_empty() {
+            0
+        } else {
+            // Check for padding
+            let pad = rem.iter().rev().take(2).filter(|&&b| b == b'=').count();
+            if rem.len() % 4 != 0 {
+                return None; // Invalid remainder
+            }
+            rem.len() * 3 / 4 - pad
+        }
+    };
+
+    // Single-allocation decode: allocate full decoded output, decode all lines
+    // directly into it, then write_all in one syscall. For 10MB base64 (7.5MB decoded),
+    // this does 1 write() instead of ~30 chunked writes. The 7.5MB allocation is trivial
+    // compared to the mmap'd input. SIMD decode at ~8 GB/s finishes in <1ms.
+    let total_decoded = full_lines * decoded_per_line + remainder_clean_len;
+    let mut out_buf: Vec<u8> = Vec::with_capacity(total_decoded);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out_buf.set_len(total_decoded);
+    }
+
+    let dst = out_buf.as_mut_ptr();
+    let mut i = 0;
+
+    // 4x unrolled decode loop
+    while i + 4 <= full_lines {
+        let in_base = i * line_stride;
+        let out_base = i * decoded_per_line;
+        unsafe {
+            let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), decoded_per_line);
+            if BASE64_ENGINE
+                .decode(&data[in_base..in_base + line_len], s0.as_out())
+                .is_err()
+            {
+                return Some(decode_error());
+            }
+
+            let s1 = std::slice::from_raw_parts_mut(
+                dst.add(out_base + decoded_per_line),
+                decoded_per_line,
+            );
+            if BASE64_ENGINE
+                .decode(
+                    &data[in_base + line_stride..in_base + line_stride + line_len],
+                    s1.as_out(),
+                )
+                .is_err()
+            {
+                return Some(decode_error());
+            }
+
+            let s2 = std::slice::from_raw_parts_mut(
+                dst.add(out_base + 2 * decoded_per_line),
+                decoded_per_line,
+            );
+            if BASE64_ENGINE
+                .decode(
+                    &data[in_base + 2 * line_stride..in_base + 2 * line_stride + line_len],
+                    s2.as_out(),
+                )
+                .is_err()
+            {
+                return Some(decode_error());
+            }
+
+            let s3 = std::slice::from_raw_parts_mut(
+                dst.add(out_base + 3 * decoded_per_line),
+                decoded_per_line,
+            );
+            if BASE64_ENGINE
+                .decode(
+                    &data[in_base + 3 * line_stride..in_base + 3 * line_stride + line_len],
+                    s3.as_out(),
+                )
+                .is_err()
+            {
+                return Some(decode_error());
+            }
+        }
+        i += 4;
+    }
+
+    // Remaining full lines
+    while i < full_lines {
+        let in_start = i * line_stride;
+        let in_end = in_start + line_len;
+        let out_off = i * decoded_per_line;
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut(dst.add(out_off), decoded_per_line) };
+        match BASE64_ENGINE.decode(&data[in_start..in_end], out_slice.as_out()) {
+            Ok(_) => {}
+            Err(_) => return Some(decode_error()),
+        }
+        i += 1;
+    }
+
+    // Decode remainder
+    if remainder_clean_len > 0 {
+        let rem = if remainder.last() == Some(&b'\n') {
+            &remainder[..remainder.len() - 1]
+        } else {
+            remainder
+        };
+        let out_off = full_lines * decoded_per_line;
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut(dst.add(out_off), remainder_clean_len) };
+        match BASE64_ENGINE.decode(rem, out_slice.as_out()) {
+            Ok(_) => {}
+            Err(_) => return Some(decode_error()),
+        }
+    }
+
+    // Single write_all for the entire decoded output
+    Some(out.write_all(&out_buf[..total_decoded]))
 }
 
 /// Decode a clean (no whitespace) buffer in-place with SIMD.

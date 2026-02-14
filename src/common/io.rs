@@ -89,6 +89,7 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
+                    let _ = mmap.advise(memmap2::Advice::WillNeed);
                     // HUGEPAGE reduces TLB misses for large files (2MB+ = 1+ huge page).
                     // With 4KB pages, a 100MB file needs 25,600 TLB entries; with 2MB
                     // huge pages it needs only 50, reducing TLB miss overhead by ~500x.

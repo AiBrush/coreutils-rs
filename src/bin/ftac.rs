@@ -66,8 +66,10 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         unsafe {
             let ptr = m.as_ptr() as *mut libc::c_void;
             let len = m.len();
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+            // WILLNEED pre-faults all pages, RANDOM disables readahead since
+            // tac accesses pages in reverse order during output.
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
+            libc::madvise(ptr, len, libc::MADV_RANDOM);
             if len >= 2 * 1024 * 1024 {
                 libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
@@ -115,28 +117,8 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // tac scans forward with memchr_iter to collect separator positions,
-        // then builds IoSlice arrays for writev output. MADV_SEQUENTIAL optimizes
-        // the forward scan; HUGEPAGE reduces TLB misses for large files.
-        #[cfg(target_os = "linux")]
-        {
-            if let FileData::Mmap(ref mmap) = data {
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut libc::c_void;
-                    let len = mmap.len();
-                    // WILLNEED pre-faults all pages into the page cache,
-                    // eliminating page fault stalls during both the forward
-                    // memchr scan and the reverse record copy.
-                    libc::madvise(ptr, len, libc::MADV_WILLNEED);
-                    if len >= 2 * 1024 * 1024 {
-                        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-                    }
-                }
-            }
-        }
-
-        // For owned data (stdin) with default newline separator, use in-place reversal
-        // to avoid allocating a separate output buffer (saves ~10MB for 10MB input).
+        // madvise is already set in try_mmap_stdin / read_file.
+        // No duplicate madvise calls needed here.
         let result = if cli.regex {
             let bytes: &[u8] = &data;
             let sep = cli.separator.as_deref().unwrap_or("\n");
@@ -189,26 +171,20 @@ fn main() {
         cli.files.clone()
     };
 
-    // Use BufWriter with 16MB capacity on stdout. For files with many small
-    // records, the tac implementation now copies records into a contiguous buffer
-    // and calls write_all with large chunks. BufWriter coalesces these into
-    // fewer syscalls. For files with few records, writev is still used but
-    // BufWriter passes write_vectored through to the underlying fd.
+    // Write directly to raw fd stdout — tac already batches output into either:
+    // - A single write_all (buffered copy path for many records)
+    // - Batched write_vectored calls (writev path for few records)
+    // BufWriter would add an unnecessary memcpy of the entire output buffer.
     #[cfg(unix)]
     let had_error = {
         let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let mut writer = io::BufWriter::with_capacity(16 * 1024 * 1024, &mut *raw);
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        run(&cli, &files, &mut *raw)
     };
     #[cfg(not(unix))]
     let had_error = {
         let stdout = io::stdout();
-        let mut writer = io::BufWriter::with_capacity(16 * 1024 * 1024, stdout.lock());
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        let mut lock = stdout.lock();
+        run(&cli, &files, &mut lock)
     };
 
     if had_error {
