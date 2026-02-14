@@ -861,7 +861,8 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
 }
 
 /// Fast single-pass for RepeatedOnly (-d) and UniqueOnly (-u) modes.
-/// Zero-copy: writes directly from input data, no output buffer allocation.
+/// Batched output: accumulates output lines in a 64KB buffer before flushing,
+/// reducing the number of write() syscalls.
 /// Uses cached prefix comparison for fast duplicate detection.
 /// Uses raw pointer arithmetic throughout to avoid bounds checking.
 fn process_filter_fast_singlepass(
@@ -886,6 +887,9 @@ fn process_filter_fast_singlepass(
         }
     };
 
+    const BATCH_SIZE: usize = 64 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
+
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut prev_len = prev_end;
@@ -911,14 +915,14 @@ fn process_filter_fast_singlepass(
         if is_dup {
             count += 1;
         } else {
-            // Output previous group -- write directly from input data (zero-copy)
+            // Output previous group -- batched
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                if prev_end < data_len && unsafe { *base.add(prev_end) } == term {
-                    writer.write_all(&data[prev_start..prev_end + 1])?;
-                } else {
-                    writer.write_all(&data[prev_start..prev_end])?;
-                    writer.write_all(&[term])?;
+                batch_buf.extend_from_slice(&data[prev_start..prev_end]);
+                batch_buf.push(term);
+                if batch_buf.len() >= BATCH_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
                 }
             }
             prev_start = cur_start;
@@ -937,12 +941,12 @@ fn process_filter_fast_singlepass(
     // Output last group
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        if prev_end < data_len && unsafe { *base.add(prev_end) } == term {
-            writer.write_all(&data[prev_start..prev_end + 1])?;
-        } else {
-            writer.write_all(&data[prev_start..prev_end])?;
-            writer.write_all(&[term])?;
-        }
+        batch_buf.extend_from_slice(&data[prev_start..prev_end]);
+        batch_buf.push(term);
+    }
+
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())
@@ -953,6 +957,10 @@ fn process_filter_fast_singlepass(
 /// and writes count-prefixed lines directly.
 /// Uses cached length comparison for fast duplicate rejection.
 /// Uses raw pointer arithmetic to avoid bounds checking.
+///
+/// Batched output: accumulates count-prefixed lines in a 64KB buffer and
+/// flushes periodically, reducing the number of write() syscalls from
+/// one-per-group to one-per-64KB.
 fn process_count_fast_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -961,6 +969,7 @@ fn process_count_fast_singlepass(
 ) -> io::Result<()> {
     let data_len = data.len();
     let base = data.as_ptr();
+    let is_default = matches!(config.mode, OutputMode::Default);
 
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
@@ -978,6 +987,10 @@ fn process_count_fast_singlepass(
             return Ok(());
         }
     };
+
+    // Batch output buffer — 64KB to stay in L1 cache
+    const BATCH_SIZE: usize = 64 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
 
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
@@ -1004,15 +1017,22 @@ fn process_count_fast_singlepass(
         if is_dup {
             count += 1;
         } else {
-            // Output previous group with count
-            let should_print = match config.mode {
-                OutputMode::Default => true,
-                OutputMode::RepeatedOnly => count > 1,
-                OutputMode::UniqueOnly => count == 1,
-                _ => true,
+            // Output previous group with count — batched
+            let should_print = if is_default {
+                true
+            } else {
+                match config.mode {
+                    OutputMode::RepeatedOnly => count > 1,
+                    OutputMode::UniqueOnly => count == 1,
+                    _ => true,
+                }
             };
             if should_print {
-                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+                append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
+                if batch_buf.len() >= BATCH_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -1028,17 +1048,40 @@ fn process_count_fast_singlepass(
     }
 
     // Output last group
-    let should_print = match config.mode {
-        OutputMode::Default => true,
-        OutputMode::RepeatedOnly => count > 1,
-        OutputMode::UniqueOnly => count == 1,
-        _ => true,
+    let should_print = if is_default {
+        true
+    } else {
+        match config.mode {
+            OutputMode::RepeatedOnly => count > 1,
+            OutputMode::UniqueOnly => count == 1,
+            _ => true,
+        }
     };
     if should_print {
-        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+        append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
+    }
+
+    // Flush remaining
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())
+}
+
+/// Append a count-prefixed line to a batch buffer (no I/O, pure memory append).
+/// Same format as write_count_line: "%7lu " prefix, line content, terminator.
+#[inline(always)]
+fn append_count_line(buf: &mut Vec<u8>, count: u64, line: &[u8], term: u8) {
+    let mut prefix = [b' '; 28];
+    let digits = itoa_right_aligned_into(&mut prefix, count);
+    let width = digits.max(7);
+    let prefix_len = width + 1;
+    prefix[width] = b' ';
+
+    buf.extend_from_slice(&prefix[..prefix_len]);
+    buf.extend_from_slice(line);
+    buf.push(term);
 }
 
 /// Fast single-pass for case-insensitive (-i) default mode.
@@ -1094,6 +1137,7 @@ fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8)
 }
 
 /// Fast single-pass for case-insensitive (-i) repeated/unique-only modes.
+/// Uses batched output for reduced syscall overhead.
 fn process_filter_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1113,6 +1157,9 @@ fn process_filter_ci_singlepass(
         }
     };
 
+    const BATCH_SIZE: usize = 64 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
+
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut count: u64 = 1;
@@ -1129,11 +1176,11 @@ fn process_filter_ci_singlepass(
         } else {
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                if prev_end < data.len() && data[prev_end] == term {
-                    writer.write_all(&data[prev_start..prev_end + 1])?;
-                } else {
-                    writer.write_all(&data[prev_start..prev_end])?;
-                    writer.write_all(&[term])?;
+                batch_buf.extend_from_slice(&data[prev_start..prev_end]);
+                batch_buf.push(term);
+                if batch_buf.len() >= BATCH_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
                 }
             }
             prev_start = cur_start;
@@ -1150,18 +1197,19 @@ fn process_filter_ci_singlepass(
 
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        if prev_end < data.len() && data[prev_end] == term {
-            writer.write_all(&data[prev_start..prev_end + 1])?;
-        } else {
-            writer.write_all(&data[prev_start..prev_end])?;
-            writer.write_all(&[term])?;
-        }
+        batch_buf.extend_from_slice(&data[prev_start..prev_end]);
+        batch_buf.push(term);
+    }
+
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())
 }
 
 /// Fast single-pass for case-insensitive (-i) count (-c) mode.
+/// Uses batched output for reduced syscall overhead.
 fn process_count_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1184,6 +1232,10 @@ fn process_count_ci_singlepass(
         }
     };
 
+    const BATCH_SIZE: usize = 64 * 1024;
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
+    let is_default = matches!(config.mode, OutputMode::Default);
+
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut count: u64 = 1;
@@ -1198,14 +1250,21 @@ fn process_count_ci_singlepass(
         if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
             count += 1;
         } else {
-            let should_print = match config.mode {
-                OutputMode::Default => true,
-                OutputMode::RepeatedOnly => count > 1,
-                OutputMode::UniqueOnly => count == 1,
-                _ => true,
+            let should_print = if is_default {
+                true
+            } else {
+                match config.mode {
+                    OutputMode::RepeatedOnly => count > 1,
+                    OutputMode::UniqueOnly => count == 1,
+                    _ => true,
+                }
             };
             if should_print {
-                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+                append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
+                if batch_buf.len() >= BATCH_SIZE {
+                    writer.write_all(&batch_buf)?;
+                    batch_buf.clear();
+                }
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -1219,14 +1278,21 @@ fn process_count_ci_singlepass(
         }
     }
 
-    let should_print = match config.mode {
-        OutputMode::Default => true,
-        OutputMode::RepeatedOnly => count > 1,
-        OutputMode::UniqueOnly => count == 1,
-        _ => true,
+    let should_print = if is_default {
+        true
+    } else {
+        match config.mode {
+            OutputMode::RepeatedOnly => count > 1,
+            OutputMode::UniqueOnly => count == 1,
+            _ => true,
+        }
     };
     if should_print {
-        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
+        append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
+    }
+
+    if !batch_buf.is_empty() {
+        writer.write_all(&batch_buf)?;
     }
 
     Ok(())

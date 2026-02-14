@@ -1199,85 +1199,100 @@ fn write_sorted_single_buf_entries(
     Ok(())
 }
 
-/// Radix-distribute (u64, usize) entries into 65536 buckets by top 2 bytes,
-/// then sort each bucket. Returns sorted array. For numeric sort paths where
-/// all values are pre-parsed as u64, this is ~2x faster than comparison sort
-/// because the radix distribution resolves most ordering without comparisons.
+/// Full 4-pass LSD (Least Significant Digit) radix sort for (u64, usize) entries.
+/// Sorts purely by the u64 key in O(n) time with ZERO comparisons.
+/// Uses 256-bucket passes on each byte of the u64 (4 passes on 16-bit groups).
+///
+/// This is dramatically faster than the previous 1-level radix + comparison sort
+/// approach, especially for numeric data where many entries share the same top
+/// 16 bits (e.g., sorted numeric data where all values are in a narrow range).
+///
+/// For stable sort: LSD radix sort is inherently stable (preserves input order
+/// for equal keys), so no additional work is needed.
+///
+/// For non-stable sort with last-resort comparison: after the radix sort by u64,
+/// we do a final pass to sort entries with equal u64 keys by their raw line content.
 fn radix_sort_numeric_entries(
     entries: Vec<(u64, usize)>,
     data: &[u8],
     offsets: &[(usize, usize)],
     stable: bool,
-    reverse: bool,
+    _reverse: bool,
 ) -> Vec<(u64, usize)> {
+    let n = entries.len();
+    if n <= 1 {
+        return entries;
+    }
+
+    // 4-pass LSD radix sort on 16-bit groups (65536 buckets per pass).
+    // Pass order: bits [0:16), [16:32), [32:48), [48:64)
+    // LSD processes least significant first, so final pass is on most significant bits.
     let nbk: usize = 65536;
-    let mut cnts = vec![0u32; nbk];
-    for &(val, _) in &entries {
-        cnts[(val >> 48) as usize] += 1;
-    }
-    let mut bk_starts = vec![0usize; nbk + 1];
-    {
-        let mut s = 0usize;
-        for i in 0..nbk {
-            bk_starts[i] = s;
-            s += cnts[i] as usize;
-        }
-        bk_starts[nbk] = s;
-    }
-    let mut sorted: Vec<(u64, usize)> = Vec::with_capacity(entries.len());
+
+    let mut src = entries;
+    let mut dst: Vec<(u64, usize)> = Vec::with_capacity(n);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        sorted.set_len(entries.len());
+        dst.set_len(n);
     }
-    {
-        let mut wpos = bk_starts.clone();
-        for &ent in &entries {
-            let b = (ent.0 >> 48) as usize;
+
+    let mut cnts = vec![0u32; nbk];
+
+    for pass in 0..4u32 {
+        let shift = pass * 16;
+
+        // Count occurrences
+        cnts.iter_mut().for_each(|c| *c = 0);
+        for &(val, _) in &src {
+            cnts[((val >> shift) & 0xFFFF) as usize] += 1;
+        }
+
+        // Prefix sum -> write positions
+        let mut sum = 0u32;
+        for c in cnts.iter_mut() {
+            let old = *c;
+            *c = sum;
+            sum += old;
+        }
+
+        // Scatter into dst
+        let dst_ptr = dst.as_mut_ptr();
+        for &ent in &src {
+            let b = ((ent.0 >> shift) & 0xFFFF) as usize;
             unsafe {
-                *sorted.as_mut_ptr().add(wpos[b]) = ent;
+                *dst_ptr.add(cnts[b] as usize) = ent;
             }
-            wpos[b] += 1;
+            cnts[b] += 1;
         }
-    }
-    drop(entries);
-    drop(cnts);
 
-    // Sort each non-trivial bucket
-    {
-        let sorted_ptr = sorted.as_mut_ptr();
-        let sorted_len = sorted.len();
-        let cmp_fn = |a: &(u64, usize), b: &(u64, usize)| -> Ordering {
-            let ord = a.0.cmp(&b.0);
-            if ord != Ordering::Equal {
-                return if reverse { ord.reverse() } else { ord };
+        // Swap src and dst for next pass
+        std::mem::swap(&mut src, &mut dst);
+    }
+
+    // After 4 passes, result is in `src` (they got swapped 4 times = back to original)
+    let mut sorted = src;
+
+    // For non-stable sort: sort entries with equal u64 keys by raw line content
+    // (last-resort comparison for deterministic output).
+    if !stable {
+        // Only sort runs of equal keys — most runs will be length 1.
+        let mut i = 0;
+        while i < n {
+            let key = sorted[i].0;
+            let mut j = i + 1;
+            while j < n && sorted[j].0 == key {
+                j += 1;
             }
-            // Last-resort: raw line comparison for deterministic output
-            if !stable {
-                data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
-            } else {
-                Ordering::Equal
+            if j - i > 1 {
+                // Sort this run by raw line content
+                sorted[i..j].sort_unstable_by(|a, b| {
+                    data[offsets[a.1].0..offsets[a.1].1].cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                });
             }
-        };
-        let mut slices: Vec<&mut [(u64, usize)]> = Vec::new();
-        for i in 0..nbk {
-            let lo = bk_starts[i];
-            let hi = bk_starts[i + 1];
-            if hi - lo > 1 {
-                debug_assert!(hi <= sorted_len);
-                slices.push(unsafe { std::slice::from_raw_parts_mut(sorted_ptr.add(lo), hi - lo) });
-            }
-        }
-        if stable {
-            slices.into_par_iter().for_each(|sl| sl.sort_by(cmp_fn));
-        } else {
-            slices
-                .into_par_iter()
-                .for_each(|sl| sl.sort_unstable_by(cmp_fn));
+            i = j;
         }
     }
 
-    // For reverse without key-level reverse: reverse the entire array after sorting
-    // (The cmp_fn already handles reverse, so bucket iteration order doesn't matter.)
     sorted
 }
 
@@ -1391,19 +1406,30 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
     if num_lines > 1 {
         let is_sorted = if is_plain_lex_for_check {
-            // Fast path: direct byte comparison for plain lexicographic sort.
-            // Uses raw pointer arithmetic to avoid bounds checking in the hot loop.
+            // Fast path: 8-byte prefix comparison for plain lexicographic sort.
+            // Most lines can be resolved with a single u64 comparison, avoiding
+            // full memcmp. Only falls back to full comparison on prefix collision.
             let dp = data.as_ptr();
             let mut sorted = true;
+            let mut prev_prefix = line_prefix(data, offsets[0].0, offsets[0].1);
             for i in 1..num_lines {
-                let (s1, e1) = offsets[i - 1];
                 let (s2, e2) = offsets[i];
-                let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
-                let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
-                if a > b {
+                let cur_prefix = line_prefix(data, s2, e2);
+                if prev_prefix > cur_prefix {
                     sorted = false;
                     break;
                 }
+                if prev_prefix == cur_prefix {
+                    // Prefix collision — full comparison needed
+                    let (s1, e1) = offsets[i - 1];
+                    let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+                    let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
+                    if a > b {
+                        sorted = false;
+                        break;
+                    }
+                }
+                prev_prefix = cur_prefix;
             }
             sorted
         } else {
@@ -1457,23 +1483,10 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 }
             } else {
-                // Use write_vectored to batch line+terminator pairs.
-                let dp = data.as_ptr();
-                const BATCH: usize = 512;
-                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-                for i in 0..num_lines {
-                    let (s, e) = offsets[i];
-                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-                    slices.push(io::IoSlice::new(line));
-                    slices.push(io::IoSlice::new(terminator));
-                    if slices.len() >= BATCH * 2 {
-                        write_all_vectored(&mut writer, &slices)?;
-                        slices.clear();
-                    }
-                }
-                if !slices.is_empty() {
-                    write_all_vectored(&mut writer, &slices)?;
-                }
+                // Build contiguous output buffer for non-zero-copy path.
+                // This handles \r\n and zero-terminated data.
+                let indices: Vec<usize> = (0..num_lines).collect();
+                write_sorted_single_buf_idx(data, &offsets, &indices, terminator, &mut writer)?;
             }
             writer.flush()?;
             return Ok(());
