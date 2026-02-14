@@ -496,9 +496,10 @@ pub fn decode_owned(
     decode_clean_slice(data, out)
 }
 
-/// Strip all whitespace from a Vec in-place using the lookup table.
-/// Single-pass compaction: uses NOT_WHITESPACE table to classify all whitespace
-/// types simultaneously, avoiding the previous multi-scan approach.
+/// Strip all whitespace from a Vec in-place using SIMD memchr2 gap-copy.
+/// For typical base64 (76-char lines with \n), newlines are ~1/77 of the data,
+/// so SIMD memchr2 skips ~76 bytes per hit instead of checking every byte.
+/// Falls back to scalar compaction only for rare whitespace (tab, space, VT, FF).
 fn strip_whitespace_inplace(data: &mut Vec<u8>) {
     // Quick check: any whitespace at all?
     let has_ws = data.iter().any(|&b| !NOT_WHITESPACE[b as usize]);
@@ -506,21 +507,68 @@ fn strip_whitespace_inplace(data: &mut Vec<u8>) {
         return;
     }
 
-    // Single-pass in-place compaction using the lookup table.
-    let ptr = data.as_ptr();
-    let mut_ptr = data.as_mut_ptr();
+    // SIMD gap-copy: find \n and \r positions with memchr2, then memmove the
+    // gaps between them to compact the data in-place. For typical base64 streams,
+    // newlines are the only whitespace, so this handles >99% of cases.
+    let ptr = data.as_mut_ptr();
     let len = data.len();
     let mut wp = 0usize;
+    let mut gap_start = 0usize;
+    let mut has_rare_ws = false;
 
-    for i in 0..len {
-        let b = unsafe { *ptr.add(i) };
-        if NOT_WHITESPACE[b as usize] {
-            unsafe { *mut_ptr.add(wp) = b };
-            wp += 1;
+    for pos in memchr::memchr2_iter(b'\n', b'\r', data.as_slice()) {
+        let gap_len = pos - gap_start;
+        if gap_len > 0 {
+            if !has_rare_ws {
+                // Check for rare whitespace during copy (amortized ~1 branch per 77 bytes)
+                has_rare_ws = data[gap_start..pos]
+                    .iter()
+                    .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+            }
+            if wp != gap_start {
+                unsafe {
+                    std::ptr::copy(ptr.add(gap_start), ptr.add(wp), gap_len);
+                }
+            }
+            wp += gap_len;
         }
+        gap_start = pos + 1;
+    }
+    // Copy the final gap
+    let tail_len = len - gap_start;
+    if tail_len > 0 {
+        if !has_rare_ws {
+            has_rare_ws = data[gap_start..]
+                .iter()
+                .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
+        }
+        if wp != gap_start {
+            unsafe {
+                std::ptr::copy(ptr.add(gap_start), ptr.add(wp), tail_len);
+            }
+        }
+        wp += tail_len;
     }
 
     data.truncate(wp);
+
+    // Second pass for rare whitespace (tab, space, VT, FF) — only if detected.
+    // In typical base64 streams (76-char lines with \n), this is skipped entirely.
+    if has_rare_ws {
+        let ptr = data.as_mut_ptr();
+        let len = data.len();
+        let mut rp = 0;
+        let mut cwp = 0;
+        while rp < len {
+            let b = unsafe { *ptr.add(rp) };
+            if NOT_WHITESPACE[b as usize] {
+                unsafe { *ptr.add(cwp) = b };
+                cwp += 1;
+            }
+            rp += 1;
+        }
+        data.truncate(cwp);
+    }
 }
 
 /// 256-byte lookup table: true for non-whitespace bytes.
