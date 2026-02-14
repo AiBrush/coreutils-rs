@@ -60,8 +60,8 @@ pub fn tac_bytes_owned(
     // After step 1, records are in the right order but each record's bytes are reversed.
     let sub = &mut data[1..];
     let sub_len = sub.len();
-    let count = memchr::memchr_iter(separator, sub).count();
-    let mut positions: Vec<usize> = Vec::with_capacity(count);
+    let est_capacity = (sub_len / 50).max(64);
+    let mut positions: Vec<usize> = Vec::with_capacity(est_capacity);
     positions.extend(memchr::memchr_iter(separator, sub));
     let mut start = 0;
     for &pos in &positions {
@@ -85,12 +85,13 @@ pub fn tac_bytes_owned(
 /// buffer and writes with large write_all calls (cheaper than millions of
 /// writev IoSlice entries). For files with few records, uses writev directly.
 fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Two-pass approach: count first for exact-capacity allocation, then collect.
-    // memchr SIMD scan runs at ~50 GB/s, so two passes cost ~2x2ms for 100MB.
-    // This avoids Vec growth reallocations (log2(2M) = 21 reallocations for 2M records)
-    // which each involve copying the entire positions array.
-    let count = memchr::memchr_iter(sep, data).count();
-    let mut positions: Vec<usize> = Vec::with_capacity(count);
+    // Single-pass collect with estimated capacity.
+    // Estimate: assume ~50 bytes average per line. For 100MB, that's ~2M lines.
+    // Even if the estimate is off, Vec::collect only reallocates log2(N) times,
+    // and each reallocation is a memcpy (not a scan), which is cheaper than
+    // a second full SIMD memchr scan of the entire file.
+    let est_capacity = (data.len() / 50).max(64);
+    let mut positions: Vec<usize> = Vec::with_capacity(est_capacity);
     positions.extend(memchr::memchr_iter(sep, data));
 
     if positions.is_empty() {
@@ -170,9 +171,9 @@ fn tac_bytes_buffered_after(
 
 /// Before-separator mode: zero-copy write from mmap in reverse record order.
 fn tac_bytes_zerocopy_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Two-pass: count for exact-capacity allocation, then collect.
-    let count = memchr::memchr_iter(sep, data).count();
-    let mut positions: Vec<usize> = Vec::with_capacity(count);
+    // Single-pass collect with estimated capacity.
+    let est_capacity = (data.len() / 50).max(64);
+    let mut positions: Vec<usize> = Vec::with_capacity(est_capacity);
     positions.extend(memchr::memchr_iter(sep, data));
 
     if positions.is_empty() {

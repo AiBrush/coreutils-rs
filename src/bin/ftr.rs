@@ -195,7 +195,7 @@ fn main() {
         // This avoids MAP_PRIVATE COW page faults entirely. For large files (>= 32MB),
         // MAP_PRIVATE is better because it avoids doubling memory usage.
         let result = if let Some(mm) = try_mmap_stdin() {
-            if mm.len() < 32 * 1024 * 1024 {
+            if mm.len() < 64 * 1024 * 1024 {
                 // Read-only mmap: translate into separate buffer (no COW faults)
                 #[cfg(unix)]
                 {

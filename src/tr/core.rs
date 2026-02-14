@@ -18,11 +18,11 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
-/// AVX2 translation runs at ~10 GB/s per core. At 4MB, parallel
-/// processing with 2 cores provides ~1.5x speedup (2MB/core in ~0.2ms)
-/// while rayon overhead is ~100us (thread pool is pre-warmed after first use).
-/// Lowered from 16MB to benefit 4-10MB inputs common in benchmarks.
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// AVX2 translation runs at ~10 GB/s per core. For 10MB benchmarks,
+/// rayon overhead (~100-200us for spawn+join) dominates the ~1ms
+/// single-core translate time. Only use parallel for genuinely large files
+/// where the parallel speedup outweighs rayon overhead.
+const PARALLEL_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Write multiple IoSlice buffers using write_vectored, batching into MAX_IOV-sized groups.
 /// Falls back to write_all per slice for partial writes.
@@ -2562,8 +2562,8 @@ pub fn translate_mmap_inplace(
     // reading from mmap (read-only) + writing to a separate heap buffer is faster
     // because it avoids COW faults entirely. The output buffer is fresh memory
     // (no COW), and the input mmap stays read-only (MADV_SEQUENTIAL).
-    // Threshold: 32MB. Above this, in-place is better to avoid doubling memory.
-    const SEPARATE_BUF_THRESHOLD: usize = 32 * 1024 * 1024;
+    // Threshold: 64MB. For benchmark-sized files (10MB), avoid COW entirely.
+    const SEPARATE_BUF_THRESHOLD: usize = 64 * 1024 * 1024;
 
     if data.len() < SEPARATE_BUF_THRESHOLD {
         return translate_to_separate_buf(data, &table, writer);
@@ -2612,8 +2612,9 @@ pub fn translate_mmap_inplace(
 /// Uses the appropriate SIMD path (range offset, range-to-constant, or general nibble).
 ///
 /// For data >= PARALLEL_THRESHOLD: parallel chunked translate into full-size buffer.
-/// For smaller data: chunked translate+write with a reusable 4MB buffer to keep
-/// output data in L3 cache during write_all (avoids main memory round-trip).
+/// For smaller data: single full-size allocation + single write_all for minimum
+/// syscall overhead. At 10MB, the allocation is cheap and a single write() is faster
+/// than multiple 4MB chunked writes.
 fn translate_to_separate_buf(
     data: &[u8],
     table: &[u8; 256],
@@ -2660,27 +2661,21 @@ fn translate_to_separate_buf(
         return writer.write_all(&out_buf);
     }
 
-    // Sequential path: translate in L3-cache-sized chunks (4MB).
-    // This keeps the output buffer hot in L3 cache during write_all,
-    // avoiding a main memory round-trip that happens with a full-size buffer.
-    const CHUNK: usize = 4 * 1024 * 1024;
-    let buf_size = data.len().min(CHUNK);
-    let mut out_buf = alloc_uninit_vec(buf_size);
+    // Sequential path: single full-size allocation + single write_all.
+    // For 10MB, allocating 10MB is ~0.01ms (mmap) and a single write() call
+    // is faster than 2-3 chunked writes. The data stays hot in cache because
+    // translate_to processes sequentially and the write follows immediately.
+    let mut out_buf = alloc_uninit_vec(data.len());
 
-    for src_chunk in data.chunks(CHUNK) {
-        let dst = &mut out_buf[..src_chunk.len()];
-        if let Some((lo, hi, offset)) = range_info {
-            translate_range_simd(src_chunk, dst, lo, hi, offset);
-        } else if let Some((lo, hi, replacement)) = const_info {
-            dst.copy_from_slice(src_chunk);
-            translate_range_to_constant_simd_inplace(dst, lo, hi, replacement);
-        } else {
-            translate_to(src_chunk, dst, table);
-        }
-        writer.write_all(dst)?;
+    if let Some((lo, hi, offset)) = range_info {
+        translate_range_simd(data, &mut out_buf, lo, hi, offset);
+    } else if let Some((lo, hi, replacement)) = const_info {
+        out_buf.copy_from_slice(data);
+        translate_range_to_constant_simd_inplace(&mut out_buf, lo, hi, replacement);
+    } else {
+        translate_to(data, &mut out_buf, table);
     }
-
-    Ok(())
+    writer.write_all(&out_buf)
 }
 
 /// Translate from a read-only mmap (or any byte slice) to a separate output buffer.

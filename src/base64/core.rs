@@ -9,19 +9,18 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (4MB).
-/// base64_simd SIMD encoding runs at ~8 GB/s per core. With 2+ cores
-/// at 4MB, parallel encode provides ~1.4x speedup (2MB per core in ~0.25ms
-/// vs full 4MB in ~0.5ms + ~0.1ms rayon overhead). Lowered from 8MB to
-/// benefit the common 10MB benchmark input.
-const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel encoding (32MB).
+/// base64_simd SIMD encoding runs at ~8 GB/s per core. For the common
+/// 10MB benchmark input, rayon overhead (~100-200us for spawn+join)
+/// exceeds the benefit of parallel encoding (~0.2ms savings). Only use
+/// parallel for genuinely large files (32MB+) where the savings are 1ms+.
+const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
-/// Minimum data size for parallel decoding (2MB of base64 data).
-/// With 2+ cores, parallel decode at 2MB provides ~1.3x speedup:
-/// single-core decode at 8GB/s takes ~0.25ms for 2MB, while dual-core
-/// takes ~0.125ms + ~0.1ms rayon overhead = ~0.225ms. Lowered from
-/// 4MB to benefit the common 10MB benchmark input after whitespace strip.
-const PARALLEL_DECODE_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size for parallel decoding (32MB of base64 data).
+/// For 10MB benchmark inputs (~13MB base64), rayon overhead dominates.
+/// Single-core SIMD decode is already fast enough. Only parallelize
+/// for large files where the parallel speedup exceeds rayon overhead.
+const PARALLEL_DECODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with fused encode+wrap for maximum throughput.
