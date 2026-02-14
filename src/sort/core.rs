@@ -1092,11 +1092,13 @@ fn write_sorted_entries(
         write_sorted_single_buf_entries(data, offsets, entries, terminator, writer)?;
     } else {
         // Use write_vectored to batch line+terminator pairs.
+        let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            slices.push(io::IoSlice::new(&data[s..e]));
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            slices.push(io::IoSlice::new(line));
             slices.push(io::IoSlice::new(terminator));
             if slices.len() >= BATCH * 2 {
                 write_all_vectored(writer, &slices)?;
@@ -1426,30 +1428,35 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // Line-by-line output for unique/\r\n/zero-terminated cases
             // Write directly to BufWriter — it already handles batching.
             if config.unique {
+                let dp = data.as_ptr();
                 let mut prev: Option<usize> = None;
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
                     let emit = match prev {
                         Some(p) => {
                             let (ps, pe) = offsets[p];
-                            compare_lines_for_dedup(&data[ps..pe], &data[s..e], config)
+                            let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                            compare_lines_for_dedup(prev_line, line, config)
                                 != Ordering::Equal
                         }
                         None => true,
                     };
                     if emit {
-                        writer.write_all(&data[s..e])?;
+                        writer.write_all(line)?;
                         writer.write_all(terminator)?;
                         prev = Some(i);
                     }
                 }
             } else {
                 // Use write_vectored to batch line+terminator pairs.
+                let dp = data.as_ptr();
                 const BATCH: usize = 512;
                 let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
-                    slices.push(io::IoSlice::new(&data[s..e]));
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                    slices.push(io::IoSlice::new(line));
                     slices.push(io::IoSlice::new(terminator));
                     if slices.len() >= BATCH * 2 {
                         write_all_vectored(&mut writer, &slices)?;
@@ -1674,10 +1681,12 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 writer.write_all(&output)?;
             } else {
                 // Use write_vectored to batch line+terminator pairs.
+                let dp = data.as_ptr();
                 const BATCH: usize = 512;
                 let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for &(_, s, l) in &sorted {
-                    slices.push(io::IoSlice::new(&data[s as usize..(s + l) as usize]));
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
+                    slices.push(io::IoSlice::new(line));
                     slices.push(io::IoSlice::new(terminator));
                     if slices.len() >= BATCH * 2 {
                         write_all_vectored(&mut writer, &slices)?;
