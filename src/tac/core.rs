@@ -73,47 +73,79 @@ const CONTIG_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Contiguous-buffer after-separator mode for data <= CONTIG_LIMIT.
 /// Collects ALL separator positions in a single forward SIMD memchr pass,
-/// then copies records in reverse order into a contiguous output buffer.
-/// One write_all() of the full buffer is vastly faster than writev with
-/// thousands of small IoSlice entries (eliminates per-syscall overhead).
+/// then copies records in reverse order into a pre-allocated output buffer
+/// using ptr::copy_nonoverlapping for maximum throughput.
+/// One write_all() of the full buffer eliminates per-syscall overhead.
 fn tac_bytes_contig_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
+    // Pre-allocate exact-size output buffer without zero-init
     let mut buf: Vec<u8> = Vec::with_capacity(data.len());
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(data.len());
+    }
+
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = 0usize;
 
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
-        if rec_start < end {
-            buf.extend_from_slice(&data[rec_start..end]);
+        let rec_len = end - rec_start;
+        if rec_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(rec_start), dst.add(wp), rec_len);
+            }
+            wp += rec_len;
         }
         end = rec_start;
     }
     if end > 0 {
-        buf.extend_from_slice(&data[0..end]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst.add(wp), end);
+        }
+        wp += end;
     }
 
-    out.write_all(&buf)
+    out.write_all(&buf[..wp])
 }
 
 /// Contiguous-buffer before-separator mode for data <= CONTIG_LIMIT.
 fn tac_bytes_contig_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions: Vec<usize> = memchr::memchr_iter(sep, data).collect();
 
+    // Pre-allocate exact-size output buffer without zero-init
     let mut buf: Vec<u8> = Vec::with_capacity(data.len());
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(data.len());
+    }
+
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = 0usize;
 
     let mut end = data.len();
     for &pos in positions.iter().rev() {
-        if pos < end {
-            buf.extend_from_slice(&data[pos..end]);
+        let rec_len = end - pos;
+        if rec_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(pos), dst.add(wp), rec_len);
+            }
+            wp += rec_len;
         }
         end = pos;
     }
     if end > 0 {
-        buf.extend_from_slice(&data[0..end]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst.add(wp), end);
+        }
+        wp += end;
     }
 
-    out.write_all(&buf)
+    out.write_all(&buf[..wp])
 }
 
 /// After-separator mode: chunk-based forward SIMD scan, emitted in reverse.

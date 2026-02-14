@@ -18,8 +18,10 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
-/// Below this, single-threaded is faster due to thread pool overhead.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// AVX2 translation is so fast (~6 GB/s per core) that rayon thread pool
+/// overhead dominates for small data. 8MB threshold ensures each thread
+/// gets enough work (~2MB+) to amortize the ~100us spawn/sync cost.
+const PARALLEL_THRESHOLD: usize = 8 * 1024 * 1024;
 
 /// Write multiple IoSlice buffers using write_vectored, batching into MAX_IOV-sized groups.
 /// Falls back to write_all per slice for partial writes.
@@ -97,6 +99,29 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
     unsafe { (*set.get_unchecked(ch as usize >> 3) & (1 << (ch & 7))) != 0 }
 }
 
+/// Cached SIMD capability level for x86_64.
+/// 0 = unchecked, 1 = scalar only, 2 = SSSE3, 3 = AVX2
+#[cfg(target_arch = "x86_64")]
+static SIMD_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn get_simd_level() -> u8 {
+    let level = SIMD_LEVEL.load(std::sync::atomic::Ordering::Relaxed);
+    if level != 0 {
+        return level;
+    }
+    let detected = if is_x86_feature_detected!("avx2") {
+        3
+    } else if is_x86_feature_detected!("ssse3") {
+        2
+    } else {
+        1
+    };
+    SIMD_LEVEL.store(detected, std::sync::atomic::Ordering::Relaxed);
+    detected
+}
+
 /// Translate bytes in-place using a 256-byte lookup table.
 /// On x86_64 with SSSE3+, uses SIMD pshufb-based nibble decomposition for
 /// ~32 bytes per iteration. Falls back to 8x-unrolled scalar on other platforms.
@@ -104,11 +129,12 @@ fn is_member(set: &[u8; 32], ch: u8) -> bool {
 fn translate_inplace(data: &mut [u8], table: &[u8; 256]) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        let level = get_simd_level();
+        if level >= 3 {
             unsafe { translate_inplace_avx2_table(data, table) };
             return;
         }
-        if is_x86_feature_detected!("ssse3") {
+        if level >= 2 {
             unsafe { translate_inplace_ssse3_table(data, table) };
             return;
         }
@@ -346,11 +372,12 @@ fn translate_to(src: &[u8], dst: &mut [u8], table: &[u8; 256]) {
     debug_assert!(dst.len() >= src.len());
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        let level = get_simd_level();
+        if level >= 3 {
             unsafe { translate_to_avx2_table(src, dst, table) };
             return;
         }
-        if is_x86_feature_detected!("ssse3") {
+        if level >= 2 {
             unsafe { translate_to_ssse3_table(src, dst, table) };
             return;
         }
@@ -596,7 +623,7 @@ fn detect_range_offset(table: &[u8; 256]) -> Option<(u8, u8, i8)> {
 /// uses AVX2 (32 bytes/iter) or SSE2 (16 bytes/iter) vectorized arithmetic.
 #[cfg(target_arch = "x86_64")]
 fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) {
-    if is_x86_feature_detected!("avx2") {
+    if get_simd_level() >= 3 {
         unsafe { translate_range_avx2(src, dst, lo, hi, offset) };
     } else {
         unsafe { translate_range_sse2(src, dst, lo, hi, offset) };
@@ -724,7 +751,7 @@ fn translate_range_simd(src: &[u8], dst: &mut [u8], lo: u8, hi: u8, offset: i8) 
 /// Operates on the buffer in-place, eliminating the need for a separate output buffer.
 #[cfg(target_arch = "x86_64")]
 fn translate_range_simd_inplace(data: &mut [u8], lo: u8, hi: u8, offset: i8) {
-    if is_x86_feature_detected!("avx2") {
+    if get_simd_level() >= 3 {
         unsafe { translate_range_avx2_inplace(data, lo, hi, offset) };
     } else {
         unsafe { translate_range_sse2_inplace(data, lo, hi, offset) };
@@ -871,7 +898,7 @@ fn detect_delete_range(chars: &[u8]) -> Option<(u8, u8)> {
 /// then compacts output by skipping matched bytes.
 #[cfg(target_arch = "x86_64")]
 fn delete_range_chunk(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize {
-    if is_x86_feature_detected!("avx2") {
+    if get_simd_level() >= 3 {
         unsafe { delete_range_avx2(src, dst, lo, hi) }
     } else {
         unsafe { delete_range_sse2(src, dst, lo, hi) }
