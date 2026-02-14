@@ -632,24 +632,9 @@ impl Ord for MergeEntryOrd {
     }
 }
 
-/// Hybrid MSD radix sort for lexicographic (u64, u32, u32) entries.
-///
-/// Two-level MSD (Most Significant Digit) radix:
-/// 1. First pass: distribute by top 16 bits (bits 48-63) → 65536 buckets
-/// 2. Second pass within each large bucket: distribute by next 16 bits (bits 32-47)
-/// 3. Remaining sub-buckets: comparison sort (typically 0-2 entries)
-///
-/// This is more cache-friendly than full LSD radix (which makes 4 full O(n)
-/// passes over all data with random scatter writes). MSD touches the data once
-/// for the first pass, then only touches the entries in each bucket for the
-/// second pass. Most buckets are small (≤30 entries for 2M lines), so the
-/// second pass has excellent cache locality.
-///
-/// Key advantage over comparison sort alone: the first radix pass eliminates
-/// the top 16 bits from ALL comparisons. The second radix pass eliminates
-/// another 16 bits for larger buckets. Only the bottom 32 bits (4 bytes of
-/// the prefix) need comparison sort, which resolves almost instantly.
-fn radix_sort_entries(
+/// (Removed: radix_sort_entries — replaced by parallel pdqsort in FAST PATH 1)
+#[allow(dead_code)]
+fn _radix_sort_entries_removed(
     entries: Vec<(u64, u32, u32)>,
     data: &[u8],
     stable: bool,
@@ -2033,8 +2018,55 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
         }
 
-        // Full LSD radix sort on 8-byte prefix + tiebreak for collisions
-        let sorted = radix_sort_entries(entries, data, config.stable, reverse);
+        // Parallel pdqsort with 8-byte prefix comparison.
+        // Faster than MSD radix for typical inputs because:
+        // - In-place: no 2MB scatter buffers, much better cache behavior
+        // - u64 prefix resolves 99%+ of comparisons in 1 instruction
+        // - u64-wide loads for remaining bytes eliminate byte-at-a-time comparison
+        // - rayon par_sort splits across cores, each chunk fits in L2
+        let data_addr = data.as_ptr() as usize;
+        let pfx_cmp = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
+            match a.0.cmp(&b.0) {
+                Ordering::Equal => {
+                    let la = a.2 as usize;
+                    let lb = b.2 as usize;
+                    let skip_a = 8.min(la);
+                    let skip_b = 8.min(lb);
+                    let rem_a = la - skip_a;
+                    let rem_b = lb - skip_b;
+                    unsafe {
+                        let dp = data_addr as *const u8;
+                        let pa = dp.add(a.1 as usize + skip_a);
+                        let pb = dp.add(b.1 as usize + skip_b);
+                        let min_rem = rem_a.min(rem_b);
+                        let mut i = 0usize;
+                        while i + 8 <= min_rem {
+                            let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
+                            let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
+                            if wa != wb {
+                                return wa.cmp(&wb);
+                            }
+                            i += 8;
+                        }
+                        std::slice::from_raw_parts(pa.add(i), rem_a - i)
+                            .cmp(std::slice::from_raw_parts(pb.add(i), rem_b - i))
+                    }
+                }
+                ord => ord,
+            }
+        };
+        let mut sorted = entries;
+        if num_lines > 10_000 {
+            if config.stable {
+                sorted.par_sort_by(pfx_cmp);
+            } else {
+                sorted.par_sort_unstable_by(pfx_cmp);
+            }
+        } else if config.stable {
+            sorted.sort_by(pfx_cmp);
+        } else {
+            sorted.sort_unstable_by(pfx_cmp);
+        }
 
         // Switch to sequential for output phase
         #[cfg(target_os = "linux")]
