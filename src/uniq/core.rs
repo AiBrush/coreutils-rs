@@ -1360,6 +1360,7 @@ fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8)
 
 /// Fast single-pass for case-insensitive (-i) repeated/unique-only modes.
 /// Zero-copy: writes directly from mmap data through BufWriter.
+/// Uses speculative line-end detection and length-based early rejection.
 fn process_filter_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1367,6 +1368,8 @@ fn process_filter_ci_singlepass(
     term: u8,
 ) -> io::Result<()> {
     let repeated = matches!(config.mode, OutputMode::RepeatedOnly);
+    let data_len = data.len();
+    let base = data.as_ptr();
 
     let first_term = match memchr::memchr(term, data) {
         Some(pos) => pos,
@@ -1381,16 +1384,32 @@ fn process_filter_ci_singlepass(
 
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
+    let mut prev_len = prev_end;
     let mut count: u64 = 1;
     let mut cur_start = first_term + 1;
 
-    while cur_start < data.len() {
-        let cur_end = match memchr::memchr(term, &data[cur_start..]) {
-            Some(offset) => cur_start + offset,
-            None => data.len(),
+    while cur_start < data_len {
+        // Speculative line-end detection
+        let cur_end = {
+            let speculative = cur_start + prev_len;
+            if speculative < data_len && unsafe { *base.add(speculative) } == term {
+                speculative
+            } else {
+                match memchr::memchr(term, unsafe {
+                    std::slice::from_raw_parts(base.add(cur_start), data_len - cur_start)
+                }) {
+                    Some(offset) => cur_start + offset,
+                    None => data_len,
+                }
+            }
         };
 
-        if lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]) {
+        let cur_len = cur_end - cur_start;
+        // Length check + case-insensitive comparison
+        let is_dup = cur_len == prev_len
+            && lines_equal_case_insensitive(&data[prev_start..prev_end], &data[cur_start..cur_end]);
+
+        if is_dup {
             count += 1;
         } else {
             let should_print = if repeated { count > 1 } else { count == 1 };
@@ -1400,10 +1419,11 @@ fn process_filter_ci_singlepass(
             }
             prev_start = cur_start;
             prev_end = cur_end;
+            prev_len = cur_len;
             count = 1;
         }
 
-        if cur_end < data.len() {
+        if cur_end < data_len {
             cur_start = cur_end + 1;
         } else {
             break;
