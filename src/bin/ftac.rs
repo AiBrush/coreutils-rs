@@ -202,9 +202,7 @@ fn parse_args() -> Cli {
                             cli.separator = Some(
                                 args.next()
                                     .unwrap_or_else(|| {
-                                        eprintln!(
-                                            "tac: option requires an argument -- 's'"
-                                        );
+                                        eprintln!("tac: option requires an argument -- 's'");
                                         process::exit(1);
                                     })
                                     .to_string_lossy()
@@ -214,10 +212,7 @@ fn parse_args() -> Cli {
                         break; // consumed rest of arg
                     }
                     _ => {
-                        eprintln!(
-                            "tac: invalid option -- '{}'",
-                            bytes[i] as char
-                        );
+                        eprintln!("tac: invalid option -- '{}'", bytes[i] as char);
                         eprintln!("Try 'tac --help' for more information.");
                         process::exit(1);
                     }
