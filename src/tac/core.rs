@@ -31,10 +31,9 @@ pub fn tac_bytes_owned(
     tac_bytes(data, separator, before, out)
 }
 
-/// After-separator mode: zero-copy write from mmap in reverse record order.
-/// For files with many short records, copies record data into a contiguous
-/// buffer and writes with large write_all calls (cheaper than millions of
-/// writev IoSlice entries). For files with few records, uses writev directly.
+/// After-separator mode: streaming zero-copy writev from mmap in reverse record order.
+/// Builds IoSlice batches of IOV_BATCH at a time and writes each batch with writev,
+/// avoiding the full Vec<IoSlice> allocation for all records.
 fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     // Single-pass collect with estimated capacity.
     // Estimate: assume ~50 bytes average per line. For 100MB, that's ~2M lines.
@@ -198,20 +197,27 @@ fn tac_string_after(
         return out.write_all(data);
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 1);
+    // Streaming writev: batch IoSlice entries and write in groups of IOV_BATCH.
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_BATCH);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + sep_len;
         if rec_start < end {
             slices.push(IoSlice::new(&data[rec_start..end]));
+            if slices.len() >= IOV_BATCH {
+                write_ioslices(out, &slices)?;
+                slices.clear();
+            }
         }
         end = rec_start;
     }
     if end > 0 {
         slices.push(IoSlice::new(&data[..end]));
     }
-
-    write_ioslices(out, &slices)
+    if !slices.is_empty() {
+        write_ioslices(out, &slices)?;
+    }
+    Ok(())
 }
 
 /// Multi-byte string separator, before mode (separator at start of record).
@@ -228,19 +234,26 @@ fn tac_string_before(
         return out.write_all(data);
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(positions.len() + 1);
+    // Streaming writev: batch IoSlice entries and write in groups of IOV_BATCH.
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_BATCH);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
             slices.push(IoSlice::new(&data[pos..end]));
+            if slices.len() >= IOV_BATCH {
+                write_ioslices(out, &slices)?;
+                slices.clear();
+            }
         }
         end = pos;
     }
     if end > 0 {
         slices.push(IoSlice::new(&data[..end]));
     }
-
-    write_ioslices(out, &slices)
+    if !slices.is_empty() {
+        write_ioslices(out, &slices)?;
+    }
+    Ok(())
 }
 
 /// Find regex matches using backward scanning, matching GNU tac's re_search behavior.
