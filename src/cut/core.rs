@@ -736,7 +736,7 @@ fn complement_single_field_chunk(
 }
 
 /// Extract all fields except skip_idx from one line.
-/// Uses raw pointer arithmetic to eliminate bounds checking.
+/// Uses scalar byte scanning for short lines (< 256 bytes) and memchr_iter for longer.
 #[inline(always)]
 fn complement_single_field_line(
     line: &[u8],
@@ -762,22 +762,47 @@ fn complement_single_field_line(
     let mut first_output = true;
     let mut has_delim = false;
 
-    for pos in memchr_iter(delim, line) {
-        has_delim = true;
-        if field_idx != skip_idx {
-            if !first_output {
-                unsafe { buf_push(buf, delim) };
+    if len <= 256 {
+        // Scalar path for short lines
+        let mut i = 0;
+        unsafe {
+            while i < len {
+                if *base.add(i) == delim {
+                    has_delim = true;
+                    if field_idx != skip_idx {
+                        if !first_output {
+                            buf_push(buf, delim);
+                        }
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(field_start), i - field_start),
+                        );
+                        first_output = false;
+                    }
+                    field_idx += 1;
+                    field_start = i + 1;
+                }
+                i += 1;
             }
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(field_start), pos - field_start),
-                )
-            };
-            first_output = false;
         }
-        field_idx += 1;
-        field_start = pos + 1;
+    } else {
+        for pos in memchr_iter(delim, line) {
+            has_delim = true;
+            if field_idx != skip_idx {
+                if !first_output {
+                    unsafe { buf_push(buf, delim) };
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                    )
+                };
+                first_output = false;
+            }
+            field_idx += 1;
+            field_start = pos + 1;
+        }
     }
 
     if !has_delim {
@@ -941,7 +966,7 @@ fn fields_prefix_chunk(
 }
 
 /// Extract first N fields from one line (contiguous from-start range).
-/// Uses raw pointer arithmetic.
+/// Uses scalar byte scanning for short lines, memchr_iter for longer.
 #[inline(always)]
 fn fields_prefix_line(
     line: &[u8],
@@ -961,6 +986,41 @@ fn fields_prefix_line(
 
     buf.reserve(len + 1);
     let base = line.as_ptr();
+
+    if len <= 256 {
+        // Scalar path for short lines
+        let mut field_count = 1usize;
+        let mut has_delim = false;
+        let mut i = 0usize;
+        unsafe {
+            while i < len {
+                if *base.add(i) == delim {
+                    has_delim = true;
+                    if field_count >= last_field {
+                        buf_extend(buf, std::slice::from_raw_parts(base, i));
+                        buf_push(buf, line_delim);
+                        return;
+                    }
+                    field_count += 1;
+                }
+                i += 1;
+            }
+        }
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(buf, line);
+                    buf_push(buf, line_delim);
+                }
+            }
+            return;
+        }
+        unsafe {
+            buf_extend(buf, line);
+            buf_push(buf, line_delim);
+        }
+        return;
+    }
 
     let mut field_count = 1;
     let mut has_delim = false;
@@ -1057,7 +1117,7 @@ fn fields_suffix_chunk(
 }
 
 /// Extract fields from start_field to end from one line.
-/// Uses raw pointer arithmetic.
+/// Uses scalar byte scanning for short lines, memchr_iter for longer.
 #[inline(always)]
 fn fields_suffix_line(
     line: &[u8],
@@ -1079,6 +1139,42 @@ fn fields_suffix_line(
     let base = line.as_ptr();
 
     let skip_delims = start_field - 1;
+
+    if len <= 256 {
+        // Scalar path for short lines
+        let mut delim_count = 0usize;
+        let mut has_delim = false;
+        let mut i = 0usize;
+        unsafe {
+            while i < len {
+                if *base.add(i) == delim {
+                    has_delim = true;
+                    delim_count += 1;
+                    if delim_count >= skip_delims {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(i + 1), len - i - 1),
+                        );
+                        buf_push(buf, line_delim);
+                        return;
+                    }
+                }
+                i += 1;
+            }
+        }
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(buf, line);
+                    buf_push(buf, line_delim);
+                }
+            }
+            return;
+        }
+        unsafe { buf_push(buf, line_delim) };
+        return;
+    }
+
     let mut delim_count = 0;
     let mut has_delim = false;
 
