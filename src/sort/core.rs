@@ -1804,109 +1804,89 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let _ = mmap.advise(memmap2::Advice::Random);
         }
 
-        // Output sorted entries. For reverse, iterate buckets from high to low
-        // (within each bucket, entries are already in reverse order from the sort).
-        // For forward, iterate linearly through the sorted array.
+        // Output sorted entries using contiguous buffer construction.
+        // Instead of IoSlice batching (which has per-entry overhead and many
+        // write_vectored calls), copy sorted lines into a contiguous buffer
+        // and write_all once. Eliminates 2*N IoSlice pushes + N/512 writev calls.
+        let dp = data.as_ptr();
+        let n_sorted = sorted.len();
+        let term_byte = terminator[0];
         if config.unique {
-            // After full LSD radix sort, entries are in ascending order.
-            // For reverse, iterate backwards; for forward, iterate forwards.
-            // Optimized dedup: use prefix u64 as first-pass rejection.
-            // If prefixes differ, lines are definitely not equal (skip memcmp).
-            // Uses write_vectored batching to reduce syscall overhead.
-            let dp = data.as_ptr();
+            // Dedup output: use prefix u64 as fast rejection.
             let mut prev_prefix = u64::MAX;
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
-            let n_sorted = sorted.len();
-            let mut idx: usize = 0;
-            const BATCH: usize = 512;
-            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            while idx < n_sorted {
-                if idx + 8 < n_sorted {
-                    let ahead = if reverse {
-                        n_sorted - 1 - (idx + 8)
-                    } else {
-                        idx + 8
-                    };
-                    prefetch_read(unsafe { dp.add(sorted[ahead].1 as usize) });
-                }
+            // Upper bound on output size; actual may be smaller due to dedup.
+            let buf_cap = data.len() + n_sorted + 1;
+            let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+            let bptr = buf.as_mut_ptr();
+            let mut pos = 0usize;
+            for idx in 0..n_sorted {
                 let actual_idx = if reverse { n_sorted - 1 - idx } else { idx };
                 let (pfx, s, l) = sorted[actual_idx];
                 let su = s as usize;
                 let lu = l as usize;
-                let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
                 let emit = prev_start == u32::MAX || pfx != prev_prefix || {
                     let ps = prev_start as usize;
                     let pl = prev_len as usize;
                     if pl != lu {
                         true
                     } else {
-                        let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
-                        prev_line != line
+                        unsafe {
+                            std::slice::from_raw_parts(dp.add(ps), pl)
+                                != std::slice::from_raw_parts(dp.add(su), lu)
+                        }
                     }
                 };
                 if emit {
-                    slices.push(io::IoSlice::new(line));
-                    slices.push(io::IoSlice::new(terminator));
-                    if slices.len() >= BATCH * 2 {
-                        write_all_vectored(&mut writer, &slices)?;
-                        slices.clear();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(dp.add(su), bptr.add(pos), lu);
+                        *bptr.add(pos + lu) = term_byte;
                     }
+                    pos += lu + 1;
                     prev_prefix = pfx;
                     prev_start = s;
                     prev_len = l;
                 }
-                idx += 1;
             }
-            if !slices.is_empty() {
-                write_all_vectored(&mut writer, &slices)?;
+            unsafe {
+                buf.set_len(pos);
             }
-        } else if reverse {
-            // Reverse: zero-copy writev directly from mmap data in reverse order.
-            // Prefetch 8 entries ahead to hide memory latency.
-            let dp = data.as_ptr();
-            const BATCH: usize = 512;
-            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            let n = sorted.len();
-            for j in 0..n {
-                if j + 8 < n {
-                    prefetch_read(unsafe { dp.add(sorted[n - 1 - (j + 8)].1 as usize) });
-                }
-                let (_, s, l) = sorted[n - 1 - j];
-                let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
-                slices.push(io::IoSlice::new(line));
-                slices.push(io::IoSlice::new(terminator));
-                if slices.len() >= BATCH * 2 {
-                    write_all_vectored(&mut writer, &slices)?;
-                    slices.clear();
-                }
-            }
-            if !slices.is_empty() {
-                write_all_vectored(&mut writer, &slices)?;
-            }
+            writer.write_all(&buf)?;
         } else {
-            // Forward: zero-copy writev directly from mmap data.
-            // Prefetch 8 entries ahead to hide memory latency for random data access.
-            let dp = data.as_ptr();
-            const BATCH: usize = 512;
-            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-            let n = sorted.len();
-            for j in 0..n {
-                if j + 8 < n {
-                    prefetch_read(unsafe { dp.add(sorted[j + 8].1 as usize) });
+            // Non-unique output: build contiguous buffer with prefetch.
+            // Total output = data.len() (if trailing newline) or data.len()+1.
+            let total_size = if data.last() == Some(&term_byte) {
+                data.len()
+            } else {
+                data.len() + 1
+            };
+            let mut buf: Vec<u8> = Vec::with_capacity(total_size);
+            let bptr = buf.as_mut_ptr();
+            let mut pos = 0usize;
+            let iter_reverse = reverse;
+            for j in 0..n_sorted {
+                if j + 16 < n_sorted {
+                    let ahead = if iter_reverse {
+                        n_sorted - 1 - (j + 16)
+                    } else {
+                        j + 16
+                    };
+                    prefetch_read(unsafe { dp.add(sorted[ahead].1 as usize) });
                 }
-                let (_, s, l) = sorted[j];
-                let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
-                slices.push(io::IoSlice::new(line));
-                slices.push(io::IoSlice::new(terminator));
-                if slices.len() >= BATCH * 2 {
-                    write_all_vectored(&mut writer, &slices)?;
-                    slices.clear();
+                let actual = if iter_reverse { n_sorted - 1 - j } else { j };
+                let (_, s, l) = sorted[actual];
+                let len = l as usize;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(dp.add(s as usize), bptr.add(pos), len);
+                    *bptr.add(pos + len) = term_byte;
                 }
+                pos += len + 1;
             }
-            if !slices.is_empty() {
-                write_all_vectored(&mut writer, &slices)?;
+            unsafe {
+                buf.set_len(pos);
             }
+            writer.write_all(&buf)?;
         }
     } else if is_fold_case_lex && num_lines > 256 {
         // FAST PATH 1b: Case-insensitive prefix sort (sort -f)
