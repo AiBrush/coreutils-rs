@@ -1592,6 +1592,54 @@ fn squeeze_single_stream(
 }
 
 // ============================================================================
+// Batch in-place functions (owned data from piped stdin)
+// ============================================================================
+
+/// Translate bytes in-place on an owned buffer, then write.
+/// For piped stdin where we own the data, this avoids the separate output buffer
+/// allocation needed by translate_mmap. Uses parallel in-place SIMD for large data.
+pub fn translate_owned(
+    set1: &[u8],
+    set2: &[u8],
+    data: &mut [u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let table = build_translate_table(set1, set2);
+
+    // Identity table — pure passthrough
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
+    // SIMD range fast path (in-place)
+    if let Some((lo, hi, offset)) = detect_range_offset(&table) {
+        if data.len() >= PARALLEL_THRESHOLD {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (data.len() / n_threads).max(32 * 1024);
+            data.par_chunks_mut(chunk_size).for_each(|chunk| {
+                translate_range_simd_inplace(chunk, lo, hi, offset);
+            });
+        } else {
+            translate_range_simd_inplace(data, lo, hi, offset);
+        }
+        return writer.write_all(data);
+    }
+
+    // General table lookup (in-place)
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+        data.par_chunks_mut(chunk_size).for_each(|chunk| {
+            translate_inplace(chunk, &table);
+        });
+    } else {
+        translate_inplace(data, &table);
+    }
+    writer.write_all(data)
+}
+
+// ============================================================================
 // Mmap-based functions (zero-copy input from byte slice)
 // ============================================================================
 
@@ -2002,78 +2050,24 @@ fn delete_chunk_bitset_into(chunk: &[u8], member: &[u8; 32], outbuf: &mut [u8]) 
 }
 
 fn delete_single_char_mmap(ch: u8, data: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    // Parallel path for large data: each thread deletes from its chunk,
-    // then use writev to write all results in one syscall batch.
-    if data.len() >= PARALLEL_THRESHOLD {
-        let n_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (data.len() / n_threads).max(32 * 1024);
-
-        let results: Vec<Vec<u8>> = data
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut out = Vec::with_capacity(chunk.len());
-                let mut last = 0;
-                for pos in memchr::memchr_iter(ch, chunk) {
-                    if pos > last {
-                        out.extend_from_slice(&chunk[last..pos]);
-                    }
-                    last = pos + 1;
-                }
-                if last < chunk.len() {
-                    out.extend_from_slice(&chunk[last..]);
-                }
-                out
-            })
-            .collect();
-
-        // Use writev to batch all results into fewer syscalls
-        let slices: Vec<std::io::IoSlice> = results
-            .iter()
-            .filter(|r| !r.is_empty())
-            .map(|r| std::io::IoSlice::new(r))
-            .collect();
-        return write_ioslices(writer, &slices);
+    // Zero-copy delete using writev: build IoSlice entries pointing to the
+    // gaps between deleted characters in the ORIGINAL data buffer.
+    // For `tr -d '\n'` on 10MB with ~200K newlines:
+    //   - Old: 10MB allocation + 10MB copy into output buffer
+    //   - New: ~200K * 16 = 3.2MB IoSlice entries, zero data copy
+    // Uses SIMD memchr_iter to find all positions, then builds IoSlice spans.
+    let mut iov: Vec<std::io::IoSlice> = Vec::new();
+    let mut last = 0;
+    for pos in memchr::memchr_iter(ch, data) {
+        if pos > last {
+            iov.push(std::io::IoSlice::new(&data[last..pos]));
+        }
+        last = pos + 1;
     }
-
-    // Single-write fast path: collect all non-deleted spans into one buffer
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = Vec::with_capacity(data.len());
-        let mut last = 0;
-        for pos in memchr::memchr_iter(ch, data) {
-            if pos > last {
-                outbuf.extend_from_slice(&data[last..pos]);
-            }
-            last = pos + 1;
-        }
-        if last < data.len() {
-            outbuf.extend_from_slice(&data[last..]);
-        }
-        return writer.write_all(&outbuf);
+    if last < data.len() {
+        iov.push(std::io::IoSlice::new(&data[last..]));
     }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
-
-    for chunk in data.chunks(buf_size) {
-        let mut wp = 0;
-        let mut last = 0;
-        for pos in memchr::memchr_iter(ch, chunk) {
-            if pos > last {
-                let run = pos - last;
-                outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
-                wp += run;
-            }
-            last = pos + 1;
-        }
-        if last < chunk.len() {
-            let run = chunk.len() - last;
-            outbuf[wp..wp + run].copy_from_slice(&chunk[last..]);
-            wp += run;
-        }
-        writer.write_all(&outbuf[..wp])?;
-    }
-    Ok(())
+    write_ioslices(writer, &iov)
 }
 
 fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) -> io::Result<()> {
@@ -2082,110 +2076,29 @@ fn delete_multi_memchr_mmap(chars: &[u8], data: &[u8], writer: &mut impl Write) 
     let c2 = if chars.len() >= 3 { chars[2] } else { 0 };
     let is_three = chars.len() >= 3;
 
-    // Parallel path for large data
-    if data.len() >= PARALLEL_THRESHOLD {
-        let n_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (data.len() / n_threads).max(32 * 1024);
-
-        let results: Vec<Vec<u8>> = data
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut out = Vec::with_capacity(chunk.len());
-                let mut last = 0;
-                if is_three {
-                    for pos in memchr::memchr3_iter(c0, c1, c2, chunk) {
-                        if pos > last {
-                            out.extend_from_slice(&chunk[last..pos]);
-                        }
-                        last = pos + 1;
-                    }
-                } else {
-                    for pos in memchr::memchr2_iter(c0, c1, chunk) {
-                        if pos > last {
-                            out.extend_from_slice(&chunk[last..pos]);
-                        }
-                        last = pos + 1;
-                    }
-                }
-                if last < chunk.len() {
-                    out.extend_from_slice(&chunk[last..]);
-                }
-                out
-            })
-            .collect();
-
-        // Use writev to batch all results into fewer syscalls
-        let slices: Vec<std::io::IoSlice> = results
-            .iter()
-            .filter(|r| !r.is_empty())
-            .map(|r| std::io::IoSlice::new(r))
-            .collect();
-        return write_ioslices(writer, &slices);
+    // Zero-copy delete using writev: build IoSlice entries pointing to the
+    // gaps between deleted characters in the original data buffer.
+    let mut iov: Vec<std::io::IoSlice> = Vec::new();
+    let mut last = 0;
+    if is_three {
+        for pos in memchr::memchr3_iter(c0, c1, c2, data) {
+            if pos > last {
+                iov.push(std::io::IoSlice::new(&data[last..pos]));
+            }
+            last = pos + 1;
+        }
+    } else {
+        for pos in memchr::memchr2_iter(c0, c1, data) {
+            if pos > last {
+                iov.push(std::io::IoSlice::new(&data[last..pos]));
+            }
+            last = pos + 1;
+        }
     }
-
-    // Single-write fast path: collect all non-deleted spans into one buffer
-    if data.len() <= SINGLE_WRITE_LIMIT {
-        let mut outbuf = Vec::with_capacity(data.len());
-        let mut last = 0;
-        if is_three {
-            for pos in memchr::memchr3_iter(c0, c1, c2, data) {
-                if pos > last {
-                    outbuf.extend_from_slice(&data[last..pos]);
-                }
-                last = pos + 1;
-            }
-        } else {
-            for pos in memchr::memchr2_iter(c0, c1, data) {
-                if pos > last {
-                    outbuf.extend_from_slice(&data[last..pos]);
-                }
-                last = pos + 1;
-            }
-        }
-        if last < data.len() {
-            outbuf.extend_from_slice(&data[last..]);
-        }
-        return writer.write_all(&outbuf);
+    if last < data.len() {
+        iov.push(std::io::IoSlice::new(&data[last..]));
     }
-
-    // Chunked path for large data
-    let buf_size = data.len().min(BUF_SIZE);
-    let mut outbuf = vec![0u8; buf_size];
-
-    for chunk in data.chunks(buf_size) {
-        let mut wp = 0;
-        let mut last = 0;
-
-        // Iterate directly over memchr iterator without collecting into Vec<usize>.
-        // Positions are used exactly once in order, so no intermediate allocation needed.
-        if is_three {
-            for pos in memchr::memchr3_iter(c0, c1, c2, chunk) {
-                if pos > last {
-                    let run = pos - last;
-                    outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
-                    wp += run;
-                }
-                last = pos + 1;
-            }
-        } else {
-            for pos in memchr::memchr2_iter(c0, c1, chunk) {
-                if pos > last {
-                    let run = pos - last;
-                    outbuf[wp..wp + run].copy_from_slice(&chunk[last..pos]);
-                    wp += run;
-                }
-                last = pos + 1;
-            }
-        }
-
-        if last < chunk.len() {
-            let run = chunk.len() - last;
-            outbuf[wp..wp + run].copy_from_slice(&chunk[last..]);
-            wp += run;
-        }
-        writer.write_all(&outbuf[..wp])?;
-    }
-    Ok(())
+    write_ioslices(writer, &iov)
 }
 
 /// Delete + squeeze from mmap'd byte slice.
