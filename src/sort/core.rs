@@ -2140,6 +2140,9 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         let dp = data.as_ptr();
                         if config.unique {
                             let mut prev: Option<usize> = None;
+                            const BATCH: usize = 512;
+                            let mut slices: Vec<io::IoSlice<'_>> =
+                                Vec::with_capacity(BATCH * 2);
                             for i in 0..num_lines {
                                 let (s, e) = offsets[i];
                                 let line =
@@ -2156,10 +2159,17 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                                     None => true,
                                 };
                                 if emit {
-                                    writer.write_all(line)?;
-                                    writer.write_all(terminator)?;
+                                    slices.push(io::IoSlice::new(line));
+                                    slices.push(io::IoSlice::new(terminator));
+                                    if slices.len() >= BATCH * 2 {
+                                        write_all_vectored(&mut writer, &slices)?;
+                                        slices.clear();
+                                    }
                                     prev = Some(i);
                                 }
+                            }
+                            if !slices.is_empty() {
+                                write_all_vectored(&mut writer, &slices)?;
                             }
                         } else {
                             const BATCH: usize = 512;
