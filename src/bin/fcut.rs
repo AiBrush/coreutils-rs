@@ -6,7 +6,6 @@ use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
-use clap::Parser;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
@@ -14,47 +13,309 @@ use coreutils_rs::common::io::read_file;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::cut::{self, CutMode};
 
-#[derive(Parser)]
-#[command(name = "cut", about = "Remove sections from each line of files")]
+/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
+/// When stdout is a pipe, vmsplice references user-space pages directly
+/// in the pipe buffer (no kernel memcpy). Falls back to regular write
+/// for non-pipe fds (files, terminals).
+#[cfg(target_os = "linux")]
+struct VmspliceWriter {
+    raw: ManuallyDrop<std::fs::File>,
+    is_pipe: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl VmspliceWriter {
+    fn new() -> Self {
+        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let is_pipe = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        Self { raw, is_pipe }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Write for VmspliceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write(buf);
+        }
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write(buf)
+        }
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write_all(buf);
+        }
+        while !buf.is_empty() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                buf = &buf[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.is_pipe = false;
+                return (&*self.raw).write_all(buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if !self.is_pipe || bufs.is_empty() {
+            return (&*self.raw).write_vectored(bufs);
+        }
+        let iovs: Vec<libc::iovec> = bufs
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut libc::c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), iovs.len(), 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write_vectored(bufs)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Cli {
-    /// Select only these bytes
-    #[arg(short = 'b', long = "bytes", value_name = "LIST")]
     bytes: Option<String>,
-
-    /// Select only these characters
-    #[arg(short = 'c', long = "characters", value_name = "LIST")]
     characters: Option<String>,
-
-    /// Select only these fields
-    #[arg(short = 'f', long = "fields", value_name = "LIST")]
     fields: Option<String>,
-
-    /// Use DELIM instead of TAB for field delimiter
-    #[arg(short = 'd', long = "delimiter", value_name = "DELIM")]
     delimiter: Option<String>,
-
-    /// Complement the set of selected bytes, characters, or fields
-    #[arg(long = "complement")]
     complement: bool,
-
-    /// Do not print lines not containing delimiters
-    #[arg(short = 's', long = "only-delimited")]
     only_delimited: bool,
-
-    /// Use STRING as the output delimiter
-    #[arg(long = "output-delimiter", value_name = "STRING")]
     output_delimiter: Option<String>,
-
-    /// Line delimiter is NUL, not newline
-    #[arg(short = 'z', long = "zero-terminated")]
     zero_terminated: bool,
-
-    /// (ignored, for historical compatibility)
-    #[arg(short = 'n', hide = true)]
-    _legacy_n: bool,
-
-    /// Files to process
     files: Vec<String>,
+}
+
+/// Hand-rolled argument parser — eliminates clap's ~100-200µs initialization.
+/// cut's args: -b, -c, -f (with LIST), -d (with DELIM), -s, -z, -n, --complement,
+/// --output-delimiter, and positional files.
+fn parse_args() -> Cli {
+    let mut cli = Cli {
+        bytes: None,
+        characters: None,
+        fields: None,
+        delimiter: None,
+        complement: false,
+        only_delimited: false,
+        output_delimiter: None,
+        zero_terminated: false,
+        files: Vec::new(),
+    };
+
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_encoded_bytes();
+        if bytes == b"--" {
+            // Everything after -- is positional
+            for a in args {
+                cli.files.push(a.to_string_lossy().into_owned());
+            }
+            break;
+        }
+        if bytes.starts_with(b"--") {
+            // Long options
+            if bytes.starts_with(b"--bytes=") {
+                cli.bytes = Some(
+                    std::str::from_utf8(&bytes[8..])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if bytes.starts_with(b"--characters=") {
+                cli.characters = Some(
+                    std::str::from_utf8(&bytes[13..])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if bytes.starts_with(b"--fields=") {
+                cli.fields = Some(
+                    std::str::from_utf8(&bytes[9..])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if bytes.starts_with(b"--delimiter=") {
+                cli.delimiter = Some(
+                    std::str::from_utf8(&bytes[12..])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if bytes.starts_with(b"--output-delimiter=") {
+                cli.output_delimiter = Some(
+                    std::str::from_utf8(&bytes[19..])
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else {
+                match bytes {
+                    b"--bytes" => {
+                        if let Some(v) = args.next() {
+                            cli.bytes = Some(v.to_string_lossy().into_owned());
+                        } else {
+                            eprintln!("cut: option '--bytes' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--characters" => {
+                        if let Some(v) = args.next() {
+                            cli.characters = Some(v.to_string_lossy().into_owned());
+                        } else {
+                            eprintln!("cut: option '--characters' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--fields" => {
+                        if let Some(v) = args.next() {
+                            cli.fields = Some(v.to_string_lossy().into_owned());
+                        } else {
+                            eprintln!("cut: option '--fields' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--delimiter" => {
+                        if let Some(v) = args.next() {
+                            cli.delimiter = Some(v.to_string_lossy().into_owned());
+                        } else {
+                            eprintln!("cut: option '--delimiter' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--output-delimiter" => {
+                        if let Some(v) = args.next() {
+                            cli.output_delimiter = Some(v.to_string_lossy().into_owned());
+                        } else {
+                            eprintln!("cut: option '--output-delimiter' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--complement" => cli.complement = true,
+                    b"--only-delimited" => cli.only_delimited = true,
+                    b"--zero-terminated" => cli.zero_terminated = true,
+                    b"--help" => {
+                        print!(
+                            "Usage: cut OPTION... [FILE]...\n\
+                            Print selected parts of lines from each FILE to standard output.\n\n\
+                            With no FILE, or when FILE is -, read standard input.\n\n\
+                            Mandatory arguments to long options are mandatory for short options too.\n\
+                            \x20 -b, --bytes=LIST        select only these bytes\n\
+                            \x20 -c, --characters=LIST   select only these characters\n\
+                            \x20 -d, --delimiter=DELIM   use DELIM instead of TAB for field delimiter\n\
+                            \x20 -f, --fields=LIST       select only these fields;  also print any line\n\
+                            \x20                           that contains no delimiter character, unless\n\
+                            \x20                           the -s option is specified\n\
+                            \x20 -n                       (ignored)\n\
+                            \x20     --complement         complement the set of selected bytes, characters\n\
+                            \x20                           or fields\n\
+                            \x20 -s, --only-delimited     do not print lines not containing delimiters\n\
+                            \x20     --output-delimiter=STRING  use STRING as the output delimiter\n\
+                            \x20                           the default is to use the input delimiter\n\
+                            \x20 -z, --zero-terminated    line delimiter is NUL, not newline\n\
+                            \x20     --help               display this help and exit\n\
+                            \x20     --version            output version information and exit\n"
+                        );
+                        process::exit(0);
+                    }
+                    b"--version" => {
+                        println!("cut (fcoreutils) {}", env!("CARGO_PKG_VERSION"));
+                        process::exit(0);
+                    }
+                    _ => {
+                        eprintln!(
+                            "cut: unrecognized option '{}'",
+                            arg.to_string_lossy()
+                        );
+                        eprintln!("Try 'cut --help' for more information.");
+                        process::exit(1);
+                    }
+                }
+            }
+        } else if bytes.len() > 1 && bytes[0] == b'-' {
+            // Short options: can be combined (-sf1-3 means -s -f 1-3)
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'n' => {} // ignored (POSIX compat)
+                    b's' => cli.only_delimited = true,
+                    b'z' => cli.zero_terminated = true,
+                    b'b' | b'c' | b'd' | b'f' => {
+                        // These take a value: rest of arg or next arg
+                        let flag = bytes[i];
+                        let val = if i + 1 < bytes.len() {
+                            // Value attached: -b1-3, -d:
+                            std::str::from_utf8(&bytes[i + 1..])
+                                .unwrap_or("")
+                                .to_string()
+                        } else if let Some(v) = args.next() {
+                            v.to_string_lossy().into_owned()
+                        } else {
+                            eprintln!(
+                                "cut: option requires an argument -- '{}'",
+                                flag as char
+                            );
+                            process::exit(1);
+                        };
+                        match flag {
+                            b'b' => cli.bytes = Some(val),
+                            b'c' => cli.characters = Some(val),
+                            b'd' => cli.delimiter = Some(val),
+                            b'f' => cli.fields = Some(val),
+                            _ => unreachable!(),
+                        }
+                        // Skip remaining bytes since they were consumed as value
+                        i = bytes.len();
+                        continue;
+                    }
+                    _ => {
+                        eprintln!("cut: invalid option -- '{}'", bytes[i] as char);
+                        eprintln!("Try 'cut --help' for more information.");
+                        process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            cli.files.push(arg.to_string_lossy().into_owned());
+        }
+    }
+
+    cli
 }
 
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
@@ -97,13 +358,23 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
-/// 8MB matches the other tools (ftr, ftac, fbase64) for consistent syscall reduction.
+/// Reads system max from /proc, falls back through decreasing sizes.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
-    unsafe {
-        libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdin
-        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE); // stdout
+    let max_size = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    for &fd in &[0i32, 1] {
+        if let Some(max) = max_size
+            && unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, max) } > 0
+        {
+            continue;
+        }
+        for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
+            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
+                break;
+            }
+        }
     }
 }
 
@@ -113,7 +384,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     enlarge_pipes();
 
-    let cli = Cli::parse();
+    let cli = parse_args();
 
     // Determine mode
     let mode_count =
@@ -174,10 +445,17 @@ fn main() {
         cli.files.clone()
     };
 
-    // Raw fd stdout on Unix for zero-overhead writes
-    #[cfg(unix)]
+    // On Linux: VmspliceWriter wrapped in BufWriter for zero-copy pipe output.
+    // BufWriter batches the many small writes from cut processing, then
+    // VmspliceWriter uses vmsplice(2) for zero-copy when flushing to pipes.
+    #[cfg(target_os = "linux")]
+    let mut vwriter = VmspliceWriter::new();
+    #[cfg(target_os = "linux")]
+    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut vwriter);
+    // On other Unix: raw fd stdout
+    #[cfg(all(unix, not(target_os = "linux")))]
     let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();

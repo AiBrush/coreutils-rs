@@ -6,7 +6,6 @@ use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
-use clap::Parser;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
@@ -36,66 +35,144 @@ impl io::Read for RawStdin {
     }
 }
 
-#[derive(Parser)]
-#[command(
-    name = "base64",
-    about = "Base64 encode or decode FILE, or standard input, to standard output.",
-    after_help = "With no FILE, or when FILE is -, read standard input.\n\n\
-        The data are encoded as described for the base64 alphabet in RFC 4648.\n\
-        When decoding, the input may contain newlines in addition to the bytes of\n\
-        the formal base64 alphabet.  Use --ignore-garbage to attempt to recover\n\
-        from any other non-alphabet bytes in the encoded stream.",
-    version
-)]
 struct Cli {
-    /// Decode data
-    #[arg(short = 'd', long = "decode")]
     decode: bool,
-
-    /// When decoding, ignore non-alphabet characters
-    #[arg(short = 'i', long = "ignore-garbage")]
     ignore_garbage: bool,
-
-    /// Wrap encoded lines after COLS character (default 76).
-    /// Use 0 to disable line wrapping
-    #[arg(short = 'w', long = "wrap", value_name = "COLS", default_value = "76")]
     wrap: usize,
-
-    /// File to process (reads stdin if omitted or -)
     file: Option<String>,
 }
 
-/// Raw fd stdout for zero-overhead writes on Unix (non-Linux).
-/// On Linux, VmspliceWriter is used instead for zero-copy pipe output.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Hand-rolled argument parser — eliminates clap's ~100-200µs initialization.
+/// base64's args are simple: -d, -i, -w COLS, and an optional FILE positional.
+fn parse_args() -> Cli {
+    let mut cli = Cli {
+        decode: false,
+        ignore_garbage: false,
+        wrap: 76,
+        file: None,
+    };
+
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_encoded_bytes();
+        if bytes == b"--" {
+            if let Some(f) = args.next() {
+                cli.file = Some(f.to_string_lossy().into_owned());
+            }
+            break;
+        }
+        if bytes.starts_with(b"--") {
+            if bytes.starts_with(b"--wrap=") {
+                let val = std::str::from_utf8(&bytes[7..]).unwrap_or("76");
+                cli.wrap = val.parse().unwrap_or_else(|_| {
+                    eprintln!("base64: invalid wrap size: '{}'", val);
+                    process::exit(1);
+                });
+            } else {
+                match bytes {
+                    b"--decode" => cli.decode = true,
+                    b"--ignore-garbage" => cli.ignore_garbage = true,
+                    b"--wrap" => {
+                        if let Some(v) = args.next() {
+                            let s = v.to_string_lossy();
+                            cli.wrap = s.parse().unwrap_or_else(|_| {
+                                eprintln!("base64: invalid wrap size: '{}'", s);
+                                process::exit(1);
+                            });
+                        } else {
+                            eprintln!("base64: option '--wrap' requires an argument");
+                            process::exit(1);
+                        }
+                    }
+                    b"--help" => {
+                        print!(
+                            "Usage: base64 [OPTION]... [FILE]\n\
+                            Base64 encode or decode FILE, or standard input, to standard output.\n\n\
+                            With no FILE, or when FILE is -, read standard input.\n\n\
+                            Mandatory arguments to long options are mandatory for short options too.\n\
+                            \x20 -d, --decode          decode data\n\
+                            \x20 -i, --ignore-garbage  when decoding, ignore non-alphabet characters\n\
+                            \x20 -w, --wrap=COLS       wrap encoded lines after COLS character (default 76).\n\
+                            \x20                         Use 0 to disable line wrapping\n\
+                            \x20     --help             display this help and exit\n\
+                            \x20     --version          output version information and exit\n\n\
+                            The data are encoded as described for the base64 alphabet in RFC 4648.\n\
+                            When decoding, the input may contain newlines in addition to the bytes of\n\
+                            the formal base64 alphabet.  Use --ignore-garbage to attempt to recover\n\
+                            from any other non-alphabet bytes in the encoded stream.\n"
+                        );
+                        process::exit(0);
+                    }
+                    b"--version" => {
+                        println!("base64 (fcoreutils) {}", env!("CARGO_PKG_VERSION"));
+                        process::exit(0);
+                    }
+                    _ => {
+                        eprintln!(
+                            "base64: unrecognized option '{}'",
+                            arg.to_string_lossy()
+                        );
+                        eprintln!("Try 'base64 --help' for more information.");
+                        process::exit(1);
+                    }
+                }
+            }
+        } else if bytes.len() > 1 && bytes[0] == b'-' {
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'd' => cli.decode = true,
+                    b'i' => cli.ignore_garbage = true,
+                    b'w' => {
+                        // -w can be followed by value in same arg (-w76) or next arg (-w 76)
+                        if i + 1 < bytes.len() {
+                            let val = std::str::from_utf8(&bytes[i + 1..]).unwrap_or("76");
+                            cli.wrap = val.parse().unwrap_or_else(|_| {
+                                eprintln!("base64: invalid wrap size: '{}'", val);
+                                process::exit(1);
+                            });
+                            i = bytes.len();
+                            continue;
+                        } else if let Some(v) = args.next() {
+                            let s = v.to_string_lossy();
+                            cli.wrap = s.parse().unwrap_or_else(|_| {
+                                eprintln!("base64: invalid wrap size: '{}'", s);
+                                process::exit(1);
+                            });
+                        } else {
+                            eprintln!("base64: option requires an argument -- 'w'");
+                            process::exit(1);
+                        }
+                    }
+                    _ => {
+                        eprintln!("base64: invalid option -- '{}'", bytes[i] as char);
+                        eprintln!("Try 'base64 --help' for more information.");
+                        process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            cli.file = Some(arg.to_string_lossy().into_owned());
+        }
+    }
+
+    cli
+}
+
+/// Raw fd stdout for zero-overhead writes on Unix.
+#[cfg(unix)]
 #[inline]
 fn raw_stdout() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
 }
 
-/// Raw fd stdout for zero-overhead writes on Linux.
-/// Uses regular write() — vmsplice is unsafe because the caller may free/reuse
-/// buffers before the pipe reader consumes the data.
-#[cfg(target_os = "linux")]
-#[inline]
-fn raw_stdout_linux() -> ManuallyDrop<std::fs::File> {
-    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
-}
-
 /// Enlarge pipe buffers on Linux for higher throughput.
-/// Reads system max from /proc, falls back through decreasing sizes.
-/// Larger pipe buffers = fewer write() syscalls for encode/decode output.
+/// Skips /proc read — directly tries decreasing sizes via fcntl.
+/// Saves ~50µs startup vs reading /proc/sys/fs/pipe-max-size.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    let max_size = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
     for &fd in &[0i32, 1] {
-        if let Some(max) = max_size
-            && unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, max) } > 0
-        {
-            continue;
-        }
         for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
             if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
                 break;
@@ -110,25 +187,13 @@ fn main() {
     #[cfg(target_os = "linux")]
     enlarge_pipes();
 
-    let cli = Cli::parse();
+    let cli = parse_args();
 
     let filename = cli.file.as_deref().unwrap_or("-");
 
-    // On Linux: use VmspliceWriter for zero-copy pipe output (vmsplice(2)).
-    // Eliminates memcpy from user buffer to kernel pipe buffer, saving ~1-2ms
-    // for 10MB+ output. Falls back to write() for non-pipe stdout.
-    // On other Unix: use raw fd (no BufWriter since callers produce large chunks).
-    #[cfg(target_os = "linux")]
-    let mut raw = raw_stdout_linux();
-    #[cfg(target_os = "linux")]
-    let result = if filename == "-" {
-        process_stdin(&cli, &mut *raw)
-    } else {
-        process_file(filename, &cli, &mut *raw)
-    };
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(unix)]
     let mut raw = raw_stdout();
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(unix)]
     let result = if filename == "-" {
         process_stdin(&cli, &mut *raw)
     } else {
@@ -199,15 +264,11 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Try read-only mmap for stdin decode (avoids MAP_PRIVATE COW overhead).
-        // For large data, decode_to_writer uses bulk strip+decode (faster than per-line).
         #[cfg(unix)]
         if let Some(mmap) = try_mmap_stdin() {
             return b64::decode_to_writer(&mmap, cli.ignore_garbage, out);
         }
 
-        // For piped stdin: use streaming decode. RawStdin on Linux bypasses
-        // StdinLock overhead for direct libc::read(0).
         #[cfg(target_os = "linux")]
         return b64::decode_stream(&mut RawStdin, cli.ignore_garbage, out);
         #[cfg(not(target_os = "linux"))]
@@ -218,13 +279,11 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
         }
     }
 
-    // For encode: try mmap for zero-copy stdin when redirected from a file
     #[cfg(unix)]
     if let Some(mmap) = try_mmap_stdin() {
         return b64::encode_to_writer(&mmap, cli.wrap, out);
     }
 
-    // For piped encode: streaming with RawStdin on Linux.
     #[cfg(target_os = "linux")]
     return b64::encode_stream(&mut RawStdin, cli.wrap, out);
     #[cfg(not(target_os = "linux"))]
@@ -237,13 +296,9 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Decode: read to Vec for in-place strip+decode.
-        // Avoids separate 12MB+ clean buffer — strip whitespace in-place on the Vec,
-        // then parallel decode from the cleaned slice. Saves one large allocation.
         let mut data = read_file_vec(Path::new(filename))?;
         b64::decode_mmap_inplace(&mut data, cli.ignore_garbage, out)
     } else {
-        // Encode: use read-only mmap (zero-copy, no modification needed).
         let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }

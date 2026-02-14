@@ -6,66 +6,168 @@ use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::process;
 
-use clap::Parser;
-
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::hash;
 
 const TOOL_NAME: &str = "b2sum";
 
-#[derive(Parser)]
-#[command(
-    name = "b2sum",
-    about = "Compute and check BLAKE2b message digest",
-    after_help = "With no FILE, or when FILE is -, read standard input."
-)]
 struct Cli {
-    /// Read in binary mode
-    #[arg(short = 'b', long = "binary")]
     binary: bool,
-
-    /// Read checksums from the FILEs and check them
-    #[arg(short = 'c', long = "check")]
     check: bool,
-
-    /// Don't fail or report status for missing files
-    #[arg(long = "ignore-missing")]
     ignore_missing: bool,
-
-    /// Digest length in bits; must not exceed 512 and must be a multiple of 8
-    #[arg(short = 'l', long = "length", default_value = "0")]
     length: usize,
-
-    /// Don't print OK for each successfully verified file
-    #[arg(long = "quiet")]
     quiet: bool,
-
-    /// Don't output anything, status code shows success
-    #[arg(long = "status")]
     status: bool,
-
-    /// Exit non-zero for improperly formatted checksum lines
-    #[arg(long = "strict")]
     strict: bool,
-
-    /// Read in text mode (default)
-    #[arg(short = 't', long = "text")]
     text: bool,
-
-    /// Create a BSD-style checksum
-    #[arg(long = "tag")]
     tag: bool,
-
-    /// Warn about improperly formatted checksum lines
-    #[arg(short = 'w', long = "warn")]
     warn: bool,
-
-    /// End each output line with NUL, not newline, and disable file name escaping
-    #[arg(short = 'z', long = "zero")]
     zero: bool,
-
-    /// Files to process
     files: Vec<String>,
+}
+
+/// Hand-rolled argument parser — eliminates clap's ~100-200µs initialization.
+fn parse_args() -> Cli {
+    let mut cli = Cli {
+        binary: false,
+        check: false,
+        ignore_missing: false,
+        length: 0,
+        quiet: false,
+        status: false,
+        strict: false,
+        text: false,
+        tag: false,
+        warn: false,
+        zero: false,
+        files: Vec::new(),
+    };
+
+    let mut args = std::env::args_os().skip(1);
+    let mut saw_dashdash = false;
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_encoded_bytes();
+        if saw_dashdash {
+            cli.files.push(arg.to_string_lossy().into_owned());
+            continue;
+        }
+        if bytes == b"--" {
+            saw_dashdash = true;
+            continue;
+        }
+        if bytes.starts_with(b"--") {
+            if bytes.starts_with(b"--length=") {
+                let val = std::str::from_utf8(&bytes[9..]).unwrap_or("0");
+                cli.length = val.parse().unwrap_or_else(|_| {
+                    eprintln!("{}: invalid length: '{}'", TOOL_NAME, val);
+                    process::exit(1);
+                });
+            } else {
+                match bytes {
+                    b"--binary" => cli.binary = true,
+                    b"--check" => cli.check = true,
+                    b"--ignore-missing" => cli.ignore_missing = true,
+                    b"--length" => {
+                        if let Some(v) = args.next() {
+                            let s = v.to_string_lossy();
+                            cli.length = s.parse().unwrap_or_else(|_| {
+                                eprintln!("{}: invalid length: '{}'", TOOL_NAME, s);
+                                process::exit(1);
+                            });
+                        } else {
+                            eprintln!("{}: option '--length' requires an argument", TOOL_NAME);
+                            process::exit(1);
+                        }
+                    }
+                    b"--quiet" => cli.quiet = true,
+                    b"--status" => cli.status = true,
+                    b"--strict" => cli.strict = true,
+                    b"--text" => cli.text = true,
+                    b"--tag" => cli.tag = true,
+                    b"--warn" => cli.warn = true,
+                    b"--zero" => cli.zero = true,
+                    b"--help" => {
+                        print!(
+                            "Usage: {} [OPTION]... [FILE]...\n\
+                            Print or check BLAKE2b (512-bit) checksums.\n\n\
+                            With no FILE, or when FILE is -, read standard input.\n\n\
+                            \x20 -b, --binary         read in binary mode\n\
+                            \x20 -c, --check          read checksums from the FILEs and check them\n\
+                            \x20 -l, --length=BITS    digest length in bits; must not exceed 512\n\
+                            \x20                        and must be a multiple of 8\n\
+                            \x20     --tag             create a BSD-style checksum\n\
+                            \x20 -t, --text           read in text mode (default)\n\
+                            \x20 -z, --zero           end each output line with NUL, not newline\n\n\
+                            The following five options are useful only when verifying checksums:\n\
+                            \x20     --ignore-missing  don't fail or report status for missing files\n\
+                            \x20     --quiet           don't print OK for each successfully verified file\n\
+                            \x20     --status          don't output anything, status code shows success\n\
+                            \x20     --strict          exit non-zero for improperly formatted checksum lines\n\
+                            \x20 -w, --warn           warn about improperly formatted checksum lines\n\n\
+                            \x20     --help            display this help and exit\n\
+                            \x20     --version         output version information and exit\n",
+                            TOOL_NAME
+                        );
+                        process::exit(0);
+                    }
+                    b"--version" => {
+                        println!("{} (fcoreutils) {}", TOOL_NAME, env!("CARGO_PKG_VERSION"));
+                        process::exit(0);
+                    }
+                    _ => {
+                        eprintln!(
+                            "{}: unrecognized option '{}'",
+                            TOOL_NAME,
+                            arg.to_string_lossy()
+                        );
+                        eprintln!("Try '{} --help' for more information.", TOOL_NAME);
+                        process::exit(1);
+                    }
+                }
+            }
+        } else if bytes.len() > 1 && bytes[0] == b'-' {
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'b' => cli.binary = true,
+                    b'c' => cli.check = true,
+                    b't' => cli.text = true,
+                    b'w' => cli.warn = true,
+                    b'z' => cli.zero = true,
+                    b'l' => {
+                        if i + 1 < bytes.len() {
+                            let val = std::str::from_utf8(&bytes[i + 1..]).unwrap_or("0");
+                            cli.length = val.parse().unwrap_or_else(|_| {
+                                eprintln!("{}: invalid length: '{}'", TOOL_NAME, val);
+                                process::exit(1);
+                            });
+                            i = bytes.len();
+                            continue;
+                        } else if let Some(v) = args.next() {
+                            let s = v.to_string_lossy();
+                            cli.length = s.parse().unwrap_or_else(|_| {
+                                eprintln!("{}: invalid length: '{}'", TOOL_NAME, s);
+                                process::exit(1);
+                            });
+                        } else {
+                            eprintln!("{}: option requires an argument -- 'l'", TOOL_NAME);
+                            process::exit(1);
+                        }
+                    }
+                    _ => {
+                        eprintln!("{}: invalid option -- '{}'", TOOL_NAME, bytes[i] as char);
+                        eprintln!("Try '{} --help' for more information.", TOOL_NAME);
+                        process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            cli.files.push(arg.to_string_lossy().into_owned());
+        }
+    }
+
+    cli
 }
 
 /// Check if a filename needs escaping (contains backslash or newline).
@@ -111,7 +213,7 @@ fn unescape_filename(s: &str) -> String {
 
 fn main() {
     coreutils_rs::common::reset_sigpipe();
-    let cli = Cli::parse();
+    let cli = parse_args();
 
     // -l 0 means use default (512), matching GNU behavior
     let length = if cli.length == 0 { 512 } else { cli.length };

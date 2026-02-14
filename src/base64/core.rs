@@ -9,17 +9,16 @@ const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 /// Larger chunks = fewer write() syscalls for big files.
 const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (4MB).
+/// Minimum data size for parallel encoding (1MB).
 /// With rayon's lazy thread pool init (~300µs) amortized over warmup runs,
-/// parallel encoding wins at 4MB+ (sequential ~0.4ms vs parallel ~0.15ms + dispatch).
-/// For 10MB benchmarks, this enables 2-4x encode speedup on multi-core.
-const PARALLEL_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// parallel encoding wins at 1MB+ on multi-core. Lowered from 4MB to enable
+/// parallel encoding for the 1MB benchmark (2-4x speedup on multi-core).
+const PARALLEL_ENCODE_THRESHOLD: usize = 1024 * 1024;
 
-/// Minimum data size for parallel decoding (4MB of base64 data).
-/// At 4MB+, the parallel decode speedup (2-4x on multi-core) exceeds rayon overhead.
-/// For the decode 10MB benchmark (~13MB base64 input), this enables parallel decode
-/// which reduces decode time from ~2ms to ~0.6ms on 4 cores.
-const PARALLEL_DECODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel decoding (1MB of base64 data).
+/// At 1MB+, the parallel decode speedup (2-4x on multi-core) exceeds rayon overhead.
+/// Lowered from 4MB to enable parallel decoding for the 1MB benchmark.
+const PARALLEL_DECODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with fused encode+wrap for maximum throughput.
