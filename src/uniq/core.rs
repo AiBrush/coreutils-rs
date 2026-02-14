@@ -176,6 +176,32 @@ fn lines_equal_fast(a: &[u8], b: &[u8]) -> bool {
         let b_tail = unsafe { (b.as_ptr().add(alen - 8) as *const u64).read_unaligned() };
         return a_tail == b_tail;
     }
+    // For 33-64 bytes: check 4 u64 words + last 8 bytes (overlapping)
+    // Covers common medium-length lines without falling through to full memcmp
+    if alen <= 64 {
+        unsafe {
+            let ap = a.as_ptr();
+            let bp = b.as_ptr();
+            let a16 = (ap.add(8) as *const u64).read_unaligned();
+            let b16 = (bp.add(8) as *const u64).read_unaligned();
+            if a16 != b16 {
+                return false;
+            }
+            let a24 = (ap.add(16) as *const u64).read_unaligned();
+            let b24 = (bp.add(16) as *const u64).read_unaligned();
+            if a24 != b24 {
+                return false;
+            }
+            let a32 = (ap.add(24) as *const u64).read_unaligned();
+            let b32 = (bp.add(24) as *const u64).read_unaligned();
+            if a32 != b32 {
+                return false;
+            }
+            let a_tail = (ap.add(alen - 8) as *const u64).read_unaligned();
+            let b_tail = (bp.add(alen - 8) as *const u64).read_unaligned();
+            return a_tail == b_tail;
+        }
+    }
     // Longer lines: prefix passed, fall through to full memcmp
     a == b
 }
@@ -638,6 +664,33 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
                         a_tail == b_tail
                     }
                 }
+            } else if cur_len <= 64 {
+                // 33-64 bytes: check 4 u64 words + last 8 bytes
+                unsafe {
+                    let a16 = (base.add(prev_start + 8) as *const u64).read_unaligned();
+                    let b16 = (base.add(cur_start + 8) as *const u64).read_unaligned();
+                    if a16 != b16 {
+                        false
+                    } else {
+                        let a24 = (base.add(prev_start + 16) as *const u64).read_unaligned();
+                        let b24 = (base.add(cur_start + 16) as *const u64).read_unaligned();
+                        if a24 != b24 {
+                            false
+                        } else {
+                            let a32 = (base.add(prev_start + 24) as *const u64).read_unaligned();
+                            let b32 = (base.add(cur_start + 24) as *const u64).read_unaligned();
+                            if a32 != b32 {
+                                false
+                            } else {
+                                let a_tail = (base.add(prev_start + prev_len - 8) as *const u64)
+                                    .read_unaligned();
+                                let b_tail = (base.add(cur_start + cur_len - 8) as *const u64)
+                                    .read_unaligned();
+                                a_tail == b_tail
+                            }
+                        }
+                    }
+                }
             } else {
                 // For longer lines, use unsafe slice comparison to skip bounds checks
                 unsafe {
@@ -887,9 +940,8 @@ fn process_filter_fast_singlepass(
         }
     };
 
-    const BATCH_SIZE: usize = 64 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
-
+    // Write directly to the BufWriter (already 16MB) — no batch_buf needed.
+    // This is zero-copy: we write slices from the original mmap data.
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut prev_len = prev_end;
@@ -915,15 +967,11 @@ fn process_filter_fast_singlepass(
         if is_dup {
             count += 1;
         } else {
-            // Output previous group -- batched
+            // Output previous group directly from mmap data
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                batch_buf.extend_from_slice(&data[prev_start..prev_end]);
-                batch_buf.push(term);
-                if batch_buf.len() >= BATCH_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
-                }
+                writer.write_all(&data[prev_start..prev_end])?;
+                writer.write_all(&[term])?;
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -941,12 +989,8 @@ fn process_filter_fast_singlepass(
     // Output last group
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        batch_buf.extend_from_slice(&data[prev_start..prev_end]);
-        batch_buf.push(term);
-    }
-
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+        writer.write_all(&data[prev_start..prev_end])?;
+        writer.write_all(&[term])?;
     }
 
     Ok(())
@@ -988,10 +1032,6 @@ fn process_count_fast_singlepass(
         }
     };
 
-    // Batch output buffer — 64KB to stay in L1 cache
-    const BATCH_SIZE: usize = 64 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
-
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut prev_len = prev_end;
@@ -1017,7 +1057,7 @@ fn process_count_fast_singlepass(
         if is_dup {
             count += 1;
         } else {
-            // Output previous group with count — batched
+            // Output previous group with count — directly via BufWriter
             let should_print = if is_default {
                 true
             } else {
@@ -1028,11 +1068,7 @@ fn process_count_fast_singlepass(
                 }
             };
             if should_print {
-                append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
-                if batch_buf.len() >= BATCH_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
-                }
+                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -1058,30 +1094,10 @@ fn process_count_fast_singlepass(
         }
     };
     if should_print {
-        append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
-    }
-
-    // Flush remaining
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
     }
 
     Ok(())
-}
-
-/// Append a count-prefixed line to a batch buffer (no I/O, pure memory append).
-/// Same format as write_count_line: "%7lu " prefix, line content, terminator.
-#[inline(always)]
-fn append_count_line(buf: &mut Vec<u8>, count: u64, line: &[u8], term: u8) {
-    let mut prefix = [b' '; 28];
-    let digits = itoa_right_aligned_into(&mut prefix, count);
-    let width = digits.max(7);
-    let prefix_len = width + 1;
-    prefix[width] = b' ';
-
-    buf.extend_from_slice(&prefix[..prefix_len]);
-    buf.extend_from_slice(line);
-    buf.push(term);
 }
 
 /// Fast single-pass for case-insensitive (-i) default mode.
@@ -1137,7 +1153,7 @@ fn process_default_ci_singlepass(data: &[u8], writer: &mut impl Write, term: u8)
 }
 
 /// Fast single-pass for case-insensitive (-i) repeated/unique-only modes.
-/// Uses batched output for reduced syscall overhead.
+/// Zero-copy: writes directly from mmap data through BufWriter.
 fn process_filter_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1157,9 +1173,6 @@ fn process_filter_ci_singlepass(
         }
     };
 
-    const BATCH_SIZE: usize = 64 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
-
     let mut prev_start: usize = 0;
     let mut prev_end: usize = first_term;
     let mut count: u64 = 1;
@@ -1176,12 +1189,8 @@ fn process_filter_ci_singlepass(
         } else {
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
-                batch_buf.extend_from_slice(&data[prev_start..prev_end]);
-                batch_buf.push(term);
-                if batch_buf.len() >= BATCH_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
-                }
+                writer.write_all(&data[prev_start..prev_end])?;
+                writer.write_all(&[term])?;
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -1197,19 +1206,15 @@ fn process_filter_ci_singlepass(
 
     let should_print = if repeated { count > 1 } else { count == 1 };
     if should_print {
-        batch_buf.extend_from_slice(&data[prev_start..prev_end]);
-        batch_buf.push(term);
-    }
-
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+        writer.write_all(&data[prev_start..prev_end])?;
+        writer.write_all(&[term])?;
     }
 
     Ok(())
 }
 
 /// Fast single-pass for case-insensitive (-i) count (-c) mode.
-/// Uses batched output for reduced syscall overhead.
+/// Writes directly to BufWriter — no batch_buf allocation needed.
 fn process_count_ci_singlepass(
     data: &[u8],
     writer: &mut impl Write,
@@ -1232,8 +1237,6 @@ fn process_count_ci_singlepass(
         }
     };
 
-    const BATCH_SIZE: usize = 64 * 1024;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
     let is_default = matches!(config.mode, OutputMode::Default);
 
     let mut prev_start: usize = 0;
@@ -1260,11 +1263,7 @@ fn process_count_ci_singlepass(
                 }
             };
             if should_print {
-                append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
-                if batch_buf.len() >= BATCH_SIZE {
-                    writer.write_all(&batch_buf)?;
-                    batch_buf.clear();
-                }
+                write_count_line(writer, count, &data[prev_start..prev_end], term)?;
             }
             prev_start = cur_start;
             prev_end = cur_end;
@@ -1288,11 +1287,7 @@ fn process_count_ci_singlepass(
         }
     };
     if should_print {
-        append_count_line(&mut batch_buf, count, &data[prev_start..prev_end], term);
-    }
-
-    if !batch_buf.is_empty() {
-        writer.write_all(&batch_buf)?;
+        write_count_line(writer, count, &data[prev_start..prev_end], term)?;
     }
 
     Ok(())

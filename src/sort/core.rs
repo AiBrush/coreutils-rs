@@ -907,15 +907,9 @@ fn write_sorted_output(
                 prev = Some(idx);
             }
         }
-    } else if sorted_indices.len() > 10_000 {
-        // For medium-to-large inputs, use single contiguous buffer with parallel fill.
-        // Threshold lowered from 50K to 10K because single-buffer + one write syscall
-        // beats N small write_vectored calls even at moderate sizes.
-        write_sorted_single_buf_idx(data, offsets, sorted_indices, terminator, writer)?;
     } else {
-        // Use write_vectored to batch line+terminator pairs into fewer syscalls.
-        // Each entry produces 2 IoSlices (line data + terminator), batched in
-        // groups of 512 entries (1024 IoSlices) to stay within typical writev limits.
+        // Batch line+terminator pairs via write_vectored to reduce function call
+        // overhead (2N write_all calls -> N/BATCH write_vectored calls).
         let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
@@ -969,102 +963,6 @@ fn write_all_vectored(writer: &mut impl Write, slices: &[io::IoSlice<'_>]) -> io
     Ok(())
 }
 
-/// Build output from sorted indices using single allocation + parallel fill.
-/// One allocation instead of N per-thread allocations reduces mmap/brk overhead.
-fn write_sorted_single_buf_idx(
-    data: &[u8],
-    offsets: &[(usize, usize)],
-    sorted_indices: &[usize],
-    terminator: &[u8],
-    writer: &mut impl Write,
-) -> io::Result<()> {
-    let tl = terminator.len();
-    let n = sorted_indices.len();
-
-    if n > 10_000 {
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (n + num_threads - 1) / num_threads;
-
-        // Compute per-chunk sizes in parallel
-        let chunk_sizes: Vec<usize> = sorted_indices
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&idx| (offsets[idx].1 - offsets[idx].0) + tl)
-                    .sum()
-            })
-            .collect();
-
-        // Single contiguous buffer with parallel fill — avoids N separate allocations
-        // and N write syscalls. Prefix sum gives each thread its disjoint write region.
-        let mut chunk_offsets: Vec<usize> = Vec::with_capacity(chunk_sizes.len() + 1);
-        chunk_offsets.push(0usize);
-        let mut total_out = 0usize;
-        for &sz in &chunk_sizes {
-            total_out += sz;
-            chunk_offsets.push(total_out);
-        }
-
-        let mut output: Vec<u8> = Vec::with_capacity(total_out);
-        // SAFETY: every byte in [0..total_out) is written by the parallel fill below.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            output.set_len(total_out);
-        }
-
-        let output_addr = output.as_mut_ptr() as usize;
-        let data_addr = data.as_ptr() as usize;
-        sorted_indices
-            .par_chunks(chunk_size)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let op = output_addr as *mut u8;
-                let dp = data_addr as *const u8;
-                let mut wp = chunk_offsets[ci];
-                for &idx in chunk {
-                    let (s, e) = offsets[idx];
-                    let ll = e - s;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(dp.add(s), op.add(wp), ll);
-                        wp += ll;
-                        std::ptr::copy_nonoverlapping(terminator.as_ptr(), op.add(wp), tl);
-                        wp += tl;
-                    }
-                }
-            });
-
-        writer.write_all(&output)?;
-        return Ok(());
-    }
-
-    // Small output: single sequential buffer (no zero-init)
-    let total: usize = sorted_indices
-        .iter()
-        .map(|&idx| (offsets[idx].1 - offsets[idx].0) + tl)
-        .sum();
-    let mut output: Vec<u8> = Vec::with_capacity(total);
-    // SAFETY: every byte in [0..total) is written by the sequential fill below.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output.set_len(total);
-    }
-    let out_ptr = output.as_mut_ptr();
-    let data_ptr = data.as_ptr();
-    let mut wp = 0usize;
-    for &idx in sorted_indices {
-        let (s, e) = offsets[idx];
-        let ll = e - s;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data_ptr.add(s), out_ptr.add(wp), ll);
-            wp += ll;
-            std::ptr::copy_nonoverlapping(terminator.as_ptr(), out_ptr.add(wp), tl);
-            wp += tl;
-        }
-    }
-    writer.write_all(&output)
-}
-
 /// Write sorted (key, index) entries to output. Like write_sorted_output but
 /// iterates (u64, usize) entries directly, avoiding the O(n) copy-back to indices.
 /// For large outputs: builds a single buffer with parallel memcpy.
@@ -1096,10 +994,9 @@ fn write_sorted_entries(
                 prev = Some(idx);
             }
         }
-    } else if entries.len() > 10_000 {
-        write_sorted_single_buf_entries(data, offsets, entries, terminator, writer)?;
     } else {
-        // Use write_vectored to batch line+terminator pairs.
+        // Batch line+terminator pairs via write_vectored to reduce function call
+        // overhead (2N write_all calls -> N/BATCH write_vectored calls).
         let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
@@ -1116,85 +1013,6 @@ fn write_sorted_entries(
         if !slices.is_empty() {
             write_all_vectored(writer, &slices)?;
         }
-    }
-    Ok(())
-}
-
-/// Build output from sorted (key, index) entries using single contiguous buffer.
-/// One allocation + one write vs N allocations + N writes.
-fn write_sorted_single_buf_entries(
-    data: &[u8],
-    offsets: &[(usize, usize)],
-    entries: &[(u64, usize)],
-    terminator: &[u8],
-    writer: &mut impl Write,
-) -> io::Result<()> {
-    let tl = terminator.len();
-    let n = entries.len();
-
-    if n > 10_000 {
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (n + num_threads - 1) / num_threads;
-
-        // Compute per-chunk sizes in parallel
-        let chunk_sizes: Vec<usize> = entries
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&(_, idx)| (offsets[idx].1 - offsets[idx].0) + tl)
-                    .sum()
-            })
-            .collect();
-
-        // Prefix sum for chunk write offsets
-        let mut chunk_offsets: Vec<usize> = Vec::with_capacity(chunk_sizes.len() + 1);
-        chunk_offsets.push(0usize);
-        let mut total_out = 0usize;
-        for &sz in &chunk_sizes {
-            total_out += sz;
-            chunk_offsets.push(total_out);
-        }
-
-        // Single allocation (no zero-init)
-        let mut output: Vec<u8> = Vec::with_capacity(total_out);
-        // SAFETY: every byte in [0..total_out) is written by the parallel fill below.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            output.set_len(total_out);
-        }
-
-        // Parallel fill — each thread writes to its disjoint region
-        let output_addr = output.as_mut_ptr() as usize;
-        let data_addr = data.as_ptr() as usize;
-        entries
-            .par_chunks(chunk_size)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let op = output_addr as *mut u8;
-                let dp = data_addr as *const u8;
-                let mut wp = chunk_offsets[ci];
-                for &(_, idx) in chunk {
-                    let (s, e) = offsets[idx];
-                    let ll = e - s;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(dp.add(s), op.add(wp), ll);
-                        wp += ll;
-                        std::ptr::copy_nonoverlapping(terminator.as_ptr(), op.add(wp), tl);
-                        wp += tl;
-                    }
-                }
-            });
-
-        writer.write_all(&output)?;
-        return Ok(());
-    }
-
-    // Small output: direct writes to BufWriter
-    for &(_, idx) in entries {
-        let (s, e) = offsets[idx];
-        writer.write_all(&data[s..e])?;
-        writer.write_all(terminator)?;
     }
     Ok(())
 }
@@ -1224,10 +1042,51 @@ fn radix_sort_numeric_entries(
         return entries;
     }
 
-    // 4-pass LSD radix sort on 16-bit groups (65536 buckets per pass).
-    // Pass order: bits [0:16), [16:32), [32:48), [48:64)
-    // LSD processes least significant first, so final pass is on most significant bits.
+    // LSD radix sort on 16-bit groups. Up to 4 passes: bits [0:16), [16:32), [32:48), [48:64)
+    // Skip passes where all entries share the same 16-bit group (common for numeric data
+    // in a limited range, e.g., integers 0-999999 all share the same top 32 bits).
     let nbk: usize = 65536;
+
+    // Pre-scan: determine which 16-bit groups actually have variation.
+    // XOR all values to find bits that differ, then check each 16-bit group.
+    let first_val = entries[0].0;
+    let mut xor_all = 0u64;
+    for &(val, _) in &entries[1..] {
+        xor_all |= val ^ first_val;
+    }
+
+    // Build list of passes that need sorting (where bits differ)
+    let mut passes_needed: Vec<u32> = Vec::with_capacity(4);
+    for pass in 0..4u32 {
+        let shift = pass * 16;
+        if ((xor_all >> shift) & 0xFFFF) != 0 {
+            passes_needed.push(pass);
+        }
+    }
+
+    // If no passes needed, all values are identical — already sorted
+    if passes_needed.is_empty() {
+        let mut sorted = entries;
+        // Still need last-resort comparison for non-stable sort
+        if !stable {
+            let mut i = 0;
+            while i < n {
+                let key = sorted[i].0;
+                let mut j = i + 1;
+                while j < n && sorted[j].0 == key {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    sorted[i..j].sort_unstable_by(|a, b| {
+                        data[offsets[a.1].0..offsets[a.1].1]
+                            .cmp(&data[offsets[b.1].0..offsets[b.1].1])
+                    });
+                }
+                i = j;
+            }
+        }
+        return sorted;
+    }
 
     let mut src = entries;
     let mut dst: Vec<(u64, usize)> = Vec::with_capacity(n);
@@ -1238,7 +1097,7 @@ fn radix_sort_numeric_entries(
 
     let mut cnts = vec![0u32; nbk];
 
-    for pass in 0..4u32 {
+    for &pass in &passes_needed {
         let shift = pass * 16;
 
         // Count occurrences
@@ -1269,7 +1128,8 @@ fn radix_sort_numeric_entries(
         std::mem::swap(&mut src, &mut dst);
     }
 
-    // After 4 passes, result is in `src` (they got swapped 4 times = back to original)
+    // After N passes, result is in `src` (swapped N times).
+    // If N is odd, the result ended up in the original `dst` (now in `src` after swap).
     let mut sorted = src;
 
     // For non-stable sort: sort entries with equal u64 keys by raw line content
@@ -1404,7 +1264,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         && !gopts.ignore_leading_blanks
         && !gopts.reverse;
 
-    if num_lines > 1 {
+    // Pre-detect numeric mode to skip the generic sorted check.
+    // Numeric mode does its own sorted check after parsing u64 values.
+    let is_numeric_only_precheck = no_keys
+        && (gopts.numeric || gopts.general_numeric || gopts.human_numeric)
+        && !gopts.dictionary_order
+        && !gopts.ignore_case
+        && !gopts.ignore_nonprinting;
+
+    if num_lines > 1 && !is_numeric_only_precheck {
         let is_sorted = if is_plain_lex_for_check {
             // Fast path: 8-byte prefix comparison for plain lexicographic sort.
             // Most lines can be resolved with a single u64 comparison, avoiding
@@ -1483,10 +1351,24 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 }
             } else {
-                // Build contiguous output buffer for non-zero-copy path.
-                // This handles \r\n and zero-terminated data.
-                let indices: Vec<usize> = (0..num_lines).collect();
-                write_sorted_single_buf_idx(data, &offsets, &indices, terminator, &mut writer)?;
+                // Already sorted: write lines directly using write_vectored batching.
+                // Zero-copy: IoSlice entries point into mmap data, no output buffer allocation.
+                let dp = data.as_ptr();
+                const BATCH: usize = 512;
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+                for i in 0..num_lines {
+                    let (s, e) = offsets[i];
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                    slices.push(io::IoSlice::new(line));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
+                }
+                if !slices.is_empty() {
+                    write_all_vectored(&mut writer, &slices)?;
+                }
             }
             writer.flush()?;
             return Ok(());
@@ -1603,107 +1485,14 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
             }
         } else if reverse {
-            // Reverse: build per-bucket output, write from highest bucket down
-            let tl = terminator.len();
-            let bucket_bufs: Vec<Vec<u8>> = (0..nbk)
-                .into_par_iter()
-                .map(|bi| {
-                    let lo = bk_starts[bi];
-                    let hi = bk_starts[bi + 1];
-                    if lo == hi {
-                        return Vec::new();
-                    }
-                    let bkt = &sorted[lo..hi];
-                    let sz: usize = bkt.iter().map(|&(_, _, l)| l as usize + tl).sum();
-                    let mut buf: Vec<u8> = Vec::with_capacity(sz);
-                    let dp = data.as_ptr();
-                    for &(_, s, l) in bkt {
-                        unsafe {
-                            let old_len = buf.len();
-                            buf.set_len(old_len + l as usize + tl);
-                            let bp = buf.as_mut_ptr().add(old_len);
-                            std::ptr::copy_nonoverlapping(dp.add(s as usize), bp, l as usize);
-                            std::ptr::copy_nonoverlapping(
-                                terminator.as_ptr(),
-                                bp.add(l as usize),
-                                tl,
-                            );
-                        }
-                    }
-                    buf
-                })
-                .collect();
+            // Reverse: write buckets from highest to lowest using write_vectored.
+            // Zero-copy: IoSlice entries point directly into mmap data.
+            // Avoids per-bucket Vec<u8> buffer allocations entirely.
+            let dp = data.as_ptr();
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
             for bi in (0..nbk).rev() {
-                if !bucket_bufs[bi].is_empty() {
-                    writer.write_all(&bucket_bufs[bi])?;
-                }
-            }
-        } else {
-            // Forward: single contiguous output buffer with parallel fill.
-            // One allocation + one write syscall vs N allocations + N writes.
-            // Reduces memory allocation overhead and write syscall count.
-            let tl = terminator.len();
-            let n = sorted.len();
-            if n > 10_000 {
-                let num_threads = rayon::current_num_threads().max(1);
-                let chunk_size = (n + num_threads - 1) / num_threads;
-
-                // Phase 1: compute per-chunk output sizes (parallel)
-                let chunk_sizes: Vec<usize> = sorted
-                    .par_chunks(chunk_size)
-                    .map(|chunk| chunk.iter().map(|&(_, _, l)| l as usize + tl).sum())
-                    .collect();
-
-                // Phase 2: prefix sum for chunk write offsets (serial, tiny)
-                let mut chunk_offsets: Vec<usize> = Vec::with_capacity(chunk_sizes.len() + 1);
-                chunk_offsets.push(0usize);
-                let mut total_out = 0usize;
-                for &sz in &chunk_sizes {
-                    total_out += sz;
-                    chunk_offsets.push(total_out);
-                }
-
-                // Phase 3: single allocation (no zero-init)
-                let mut output: Vec<u8> = Vec::with_capacity(total_out);
-                // SAFETY: every byte in [0..total_out) is written by the parallel fill below.
-                #[allow(clippy::uninit_vec)]
-                unsafe {
-                    output.set_len(total_out);
-                }
-
-                // Phase 4: parallel fill — each thread writes to its disjoint region
-                // SAFETY: chunk_offsets guarantees non-overlapping write regions.
-                let output_addr = output.as_mut_ptr() as usize;
-                let data_addr = data.as_ptr() as usize;
-                sorted
-                    .par_chunks(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let op = output_addr as *mut u8;
-                        let dp = data_addr as *const u8;
-                        let mut wp = chunk_offsets[ci];
-                        for &(_, s, l) in chunk {
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    dp.add(s as usize),
-                                    op.add(wp),
-                                    l as usize,
-                                );
-                                wp += l as usize;
-                                std::ptr::copy_nonoverlapping(terminator.as_ptr(), op.add(wp), tl);
-                                wp += tl;
-                            }
-                        }
-                    });
-
-                // Phase 5: single write
-                writer.write_all(&output)?;
-            } else {
-                // Use write_vectored to batch line+terminator pairs.
-                let dp = data.as_ptr();
-                const BATCH: usize = 512;
-                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-                for &(_, s, l) in &sorted {
+                for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
                     let line =
                         unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
                     slices.push(io::IoSlice::new(line));
@@ -1713,9 +1502,29 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         slices.clear();
                     }
                 }
-                if !slices.is_empty() {
+            }
+            if !slices.is_empty() {
+                write_all_vectored(&mut writer, &slices)?;
+            }
+        } else {
+            // Forward: write_vectored batching from sorted entries.
+            // Zero-copy: IoSlice entries point directly into mmap data.
+            // Eliminates the ~100MB contiguous output buffer allocation that
+            // the parallel fill approach required.
+            let dp = data.as_ptr();
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+            for &(_, s, l) in &sorted {
+                let line = unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
+                slices.push(io::IoSlice::new(line));
+                slices.push(io::IoSlice::new(terminator));
+                if slices.len() >= BATCH * 2 {
                     write_all_vectored(&mut writer, &slices)?;
+                    slices.clear();
                 }
+            }
+            if !slices.is_empty() {
+                write_all_vectored(&mut writer, &slices)?;
             }
         }
     } else if is_fold_case_lex && num_lines > 256 {
@@ -1805,58 +1614,28 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         let stable = config.stable;
 
         let mut entries: Vec<(u64, usize)> = if gopts.numeric {
-            // Try integer fast path: parse all values as i64 first.
-            // If any value has a decimal point, fall back to f64 path.
-            let int_entries: Option<Vec<(u64, usize)>> = if num_lines > 10_000 {
-                let results: Vec<Option<(u64, usize)>> = offsets
+            // Single-pass numeric parse: try integer first, fall back to f64 inline.
+            // This avoids the two-pass penalty when some lines have decimals —
+            // instead of parsing ALL lines twice, each line is parsed exactly once.
+            let parse_numeric_inline = |i: usize, &(s, e): &(usize, usize)| -> (u64, usize) {
+                let line = &data[s..e];
+                match try_parse_integer(line) {
+                    Some(v) => (int_to_sortable_u64(v), i),
+                    None => (float_to_sortable_u64(parse_numeric_value(line)), i),
+                }
+            };
+            if num_lines > 10_000 {
+                offsets
                     .par_iter()
                     .enumerate()
-                    .map(|(i, &(s, e))| {
-                        try_parse_integer(&data[s..e]).map(|v| (int_to_sortable_u64(v), i))
-                    })
-                    .collect();
-                // Check if all parses succeeded (no decimal points)
-                if results.iter().all(|r| r.is_some()) {
-                    Some(results.into_iter().map(|r| r.unwrap()).collect())
-                } else {
-                    None
-                }
+                    .map(|(i, off)| parse_numeric_inline(i, off))
+                    .collect()
             } else {
-                let mut entries = Vec::with_capacity(num_lines);
-                let mut all_int = true;
-                for (i, &(s, e)) in offsets.iter().enumerate() {
-                    match try_parse_integer(&data[s..e]) {
-                        Some(v) => entries.push((int_to_sortable_u64(v), i)),
-                        None => {
-                            all_int = false;
-                            break;
-                        }
-                    }
-                }
-                if all_int { Some(entries) } else { None }
-            };
-
-            if let Some(entries) = int_entries {
-                entries
-            } else {
-                // Fall back to f64 path
-                if num_lines > 10_000 {
-                    offsets
-                        .par_iter()
-                        .enumerate()
-                        .map(|(i, &(s, e))| {
-                            (float_to_sortable_u64(parse_numeric_value(&data[s..e])), i)
-                        })
-                        .collect()
-                } else {
-                    offsets
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &(s, e))| {
-                            (float_to_sortable_u64(parse_numeric_value(&data[s..e])), i)
-                        })
-                        .collect()
-                }
+                offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, off)| parse_numeric_inline(i, off))
+                    .collect()
             }
         } else {
             // General numeric (-g) or human numeric (-h): always use f64
@@ -1884,6 +1663,37 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     .collect()
             }
         };
+
+        // Fast already-sorted check using pre-parsed u64 values.
+        // O(n) u64 comparisons instead of O(n) string-parsing comparisons.
+        // For reverse mode, check descending order.
+        if entries.len() > 1 {
+            let is_sorted = if reverse {
+                entries.windows(2).all(|w| w[0].0 >= w[1].0)
+            } else {
+                entries.windows(2).all(|w| w[0].0 <= w[1].0)
+            };
+            if is_sorted {
+                // Data is already sorted by numeric value
+                if !config.unique
+                    && !config.zero_terminated
+                    && memchr::memchr(b'\r', data).is_none()
+                {
+                    if data.last() == Some(&b'\n') {
+                        writer.write_all(data)?;
+                    } else if !data.is_empty() {
+                        writer.write_all(data)?;
+                        writer.write_all(b"\n")?;
+                    }
+                    writer.flush()?;
+                    return Ok(());
+                }
+                // Handle unique/zero-terminated
+                write_sorted_entries(data, &offsets, &entries, config, &mut writer, terminator)?;
+                writer.flush()?;
+                return Ok(());
+            }
+        }
 
         // Use radix sort for large numeric inputs (>256 entries).
         // Radix distribution on top 16 bits resolves ~99.9% of ordering without
@@ -1942,68 +1752,29 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let stable = config.stable;
 
             let mut entries: Vec<(u64, usize)> = if is_pure_numeric {
-                // Try integer fast path for single-key -n sort
-                let int_entries: Option<Vec<(u64, usize)>> = if num_lines > 10_000 {
-                    let results: Vec<Option<(u64, usize)>> = key_offs
+                // Single-pass numeric parse: try integer first, fall back to f64 inline.
+                let parse_entry = |i: usize, &(s, e): &(usize, usize)| -> (u64, usize) {
+                    if s == e {
+                        return (int_to_sortable_u64(0), i);
+                    }
+                    let line = &data[s..e];
+                    match try_parse_integer(line) {
+                        Some(v) => (int_to_sortable_u64(v), i),
+                        None => (float_to_sortable_u64(parse_numeric_value(line)), i),
+                    }
+                };
+                if num_lines > 10_000 {
+                    key_offs
                         .par_iter()
                         .enumerate()
-                        .map(|(i, &(s, e))| {
-                            if s == e {
-                                Some((int_to_sortable_u64(0), i))
-                            } else {
-                                try_parse_integer(&data[s..e]).map(|v| (int_to_sortable_u64(v), i))
-                            }
-                        })
-                        .collect();
-                    if results.iter().all(|r| r.is_some()) {
-                        Some(results.into_iter().map(|r| r.unwrap()).collect())
-                    } else {
-                        None
-                    }
+                        .map(|(i, ko)| parse_entry(i, ko))
+                        .collect()
                 } else {
-                    let mut entries = Vec::with_capacity(num_lines);
-                    let mut all_int = true;
-                    for (i, &(s, e)) in key_offs.iter().enumerate() {
-                        if s == e {
-                            entries.push((int_to_sortable_u64(0), i));
-                        } else {
-                            match try_parse_integer(&data[s..e]) {
-                                Some(v) => entries.push((int_to_sortable_u64(v), i)),
-                                None => {
-                                    all_int = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if all_int { Some(entries) } else { None }
-                };
-
-                if let Some(entries) = int_entries {
-                    entries
-                } else {
-                    // Fall back to f64
-                    let parse_entry = |i: usize, &(s, e): &(usize, usize)| {
-                        let f = if s == e {
-                            0.0
-                        } else {
-                            parse_numeric_value(&data[s..e])
-                        };
-                        (float_to_sortable_u64(f), i)
-                    };
-                    if num_lines > 10_000 {
-                        key_offs
-                            .par_iter()
-                            .enumerate()
-                            .map(|(i, ko)| parse_entry(i, ko))
-                            .collect()
-                    } else {
-                        key_offs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, ko)| parse_entry(i, ko))
-                            .collect()
-                    }
+                    key_offs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ko)| parse_entry(i, ko))
+                        .collect()
                 }
             } else {
                 let parse_entry = |i: usize, &(s, e): &(usize, usize)| {
