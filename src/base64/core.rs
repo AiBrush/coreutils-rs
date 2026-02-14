@@ -105,10 +105,9 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
-    // For data that fits in a single chunk, use fuse_wrap to build a contiguous
-    // output buffer with newlines interleaved, then write_all in one syscall.
-    // This is much faster than writev with many small IoSlice entries for piped
-    // output (single write() vs hundreds of writev() calls).
+    // For aligned bytes_per_line (common: 57 for 76-col wrapping), encode each
+    // input line directly into its final output position with newline appended.
+    // Single-pass: no intermediate encode buffer or fuse_wrap copy needed.
     if bytes_per_line.is_multiple_of(3) {
         let line_out = wrap_col + 1;
         let total_full_lines = data.len() / bytes_per_line;
@@ -120,21 +119,63 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         };
         let total_output = total_full_lines * line_out + remainder_encoded;
 
-        let enc_max = BASE64_ENGINE.encoded_length(data.len());
-        let total_buf_size = total_output + enc_max;
-        let mut work_buf: Vec<u8> = Vec::with_capacity(total_buf_size);
+        let mut out_buf: Vec<u8> = Vec::with_capacity(total_output);
         #[allow(clippy::uninit_vec)]
         unsafe {
-            work_buf.set_len(total_buf_size);
+            out_buf.set_len(total_output);
         }
 
-        // Encode into second region, fuse_wrap into first region
-        let encode_start = total_output;
-        let _ = BASE64_ENGINE.encode(data, work_buf[encode_start..encode_start + enc_max].as_out());
-        let (fused_region, encode_region) = work_buf.split_at_mut(total_output);
-        let encoded = &encode_region[..enc_max];
-        let wp = fuse_wrap(encoded, wrap_col, fused_region);
-        return out.write_all(&fused_region[..wp]);
+        // Direct-to-position encode: each input line encoded directly into output
+        let dst = out_buf.as_mut_ptr();
+        let mut line_idx = 0;
+
+        // 4-line unrolled loop for ILP
+        while line_idx + 4 <= total_full_lines {
+            let in_base = line_idx * bytes_per_line;
+            let out_base = line_idx * line_out;
+            unsafe {
+                let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s0.as_out());
+                *dst.add(out_base + wrap_col) = b'\n';
+
+                let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&data[in_base + bytes_per_line..in_base + 2 * bytes_per_line], s1.as_out());
+                *dst.add(out_base + line_out + wrap_col) = b'\n';
+
+                let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&data[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line], s2.as_out());
+                *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
+
+                let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&data[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line], s3.as_out());
+                *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
+            }
+            line_idx += 4;
+        }
+
+        while line_idx < total_full_lines {
+            let in_base = line_idx * bytes_per_line;
+            let out_base = line_idx * line_out;
+            unsafe {
+                let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s.as_out());
+                *dst.add(out_base + wrap_col) = b'\n';
+            }
+            line_idx += 1;
+        }
+
+        // Handle remainder
+        if remainder_input > 0 {
+            let enc_len = BASE64_ENGINE.encoded_length(remainder_input);
+            let wp = total_full_lines * line_out;
+            unsafe {
+                let s = std::slice::from_raw_parts_mut(dst.add(wp), enc_len);
+                let _ = BASE64_ENGINE.encode(&data[total_full_lines * bytes_per_line..], s.as_out());
+                *dst.add(wp + enc_len) = b'\n';
+            }
+        }
+
+        return out.write_all(&out_buf[..total_output]);
     }
 
     // Fallback for non-3-aligned bytes_per_line: use writev
@@ -404,6 +445,7 @@ fn encode_wrapped_parallel(
 /// Fuse encoded base64 data with newlines in a single pass.
 /// Uses ptr::copy_nonoverlapping with 8-line unrolling for max throughput.
 /// Returns number of bytes written.
+#[allow(dead_code)]
 #[inline]
 fn fuse_wrap(encoded: &[u8], wrap_col: usize, out_buf: &mut [u8]) -> usize {
     let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline
@@ -938,8 +980,9 @@ fn encode_stream_wrapped(
     Ok(())
 }
 
-/// Fused encode+wrap streaming: align reads to bytes_per_line boundaries,
-/// encode chunk, fuse_wrap into contiguous buffer with newlines, single write().
+/// Direct-to-position encode+wrap streaming: align reads to bytes_per_line boundaries,
+/// encode each line directly into its final position with newline appended.
+/// Eliminates the two-pass encode-then-fuse_wrap approach.
 /// For 76-col wrapping (bytes_per_line=57): 12MB / 57 = ~210K complete lines per chunk.
 /// Output = 210K * 77 bytes = ~16MB, one write() syscall per chunk.
 fn encode_stream_wrapped_fused(
@@ -952,25 +995,22 @@ fn encode_stream_wrapped_fused(
     // ~210K lines * 57 bytes = ~12MB input, ~16MB output.
     let lines_per_chunk = (12 * 1024 * 1024) / bytes_per_line;
     let read_size = lines_per_chunk * bytes_per_line;
+    let line_out = wrap_col + 1; // wrap_col encoded bytes + 1 newline
 
     // SAFETY: buf bytes are written by read_full before being processed.
-    // work_buf bytes are written by encode/fuse_wrap before being read.
+    // out_buf bytes are written by encode before being read.
     let mut buf: Vec<u8> = Vec::with_capacity(read_size);
     #[allow(clippy::uninit_vec)]
     unsafe {
         buf.set_len(read_size);
     }
-    let enc_max = BASE64_ENGINE.encoded_length(read_size);
-    let fused_max = enc_max + (enc_max / wrap_col + 2); // encoded + newlines
-    let total_buf_size = fused_max + enc_max;
-    // Single buffer: [0..fused_max) = fuse_wrap output, [fused_max..total_buf_size) = encode region
-    let mut work_buf: Vec<u8> = Vec::with_capacity(total_buf_size);
+    // Output buffer: enough for all lines + remainder
+    let max_output = lines_per_chunk * line_out + BASE64_ENGINE.encoded_length(bytes_per_line) + 2;
+    let mut out_buf: Vec<u8> = Vec::with_capacity(max_output);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        work_buf.set_len(total_buf_size);
+        out_buf.set_len(max_output);
     }
-
-    let mut trailing_partial = false;
 
     loop {
         let n = read_full(reader, &mut buf)?;
@@ -978,37 +1018,77 @@ fn encode_stream_wrapped_fused(
             break;
         }
 
-        let enc_len = BASE64_ENGINE.encoded_length(n);
-        // Encode into the second region
-        let encode_start = fused_max;
-        let _ = BASE64_ENGINE.encode(
-            &buf[..n],
-            work_buf[encode_start..encode_start + enc_len].as_out(),
-        );
+        let full_lines = n / bytes_per_line;
+        let remainder = n % bytes_per_line;
 
-        // Fuse wrap: copy encoded data with newlines interleaved into first region
-        let (fused_region, encode_region) = work_buf.split_at_mut(fused_max);
-        let encoded = &encode_region[..enc_len];
-        let wp = fuse_wrap(encoded, wrap_col, fused_region);
+        // Encode each input line directly into its final output position.
+        // Each 57-byte input line -> 76 encoded bytes + '\n' = 77 bytes at offset line_idx * 77.
+        // This eliminates the separate encode + fuse_wrap copy entirely.
+        let dst = out_buf.as_mut_ptr();
+        let mut line_idx = 0;
 
-        writer.write_all(&fused_region[..wp])?;
-        trailing_partial = !enc_len.is_multiple_of(wrap_col);
+        // 4-line unrolled loop for better ILP
+        while line_idx + 4 <= full_lines {
+            let in_base = line_idx * bytes_per_line;
+            let out_base = line_idx * line_out;
+            unsafe {
+                let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                let _ = BASE64_ENGINE.encode(&buf[in_base..in_base + bytes_per_line], s0.as_out());
+                *dst.add(out_base + wrap_col) = b'\n';
+
+                let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&buf[in_base + bytes_per_line..in_base + 2 * bytes_per_line], s1.as_out());
+                *dst.add(out_base + line_out + wrap_col) = b'\n';
+
+                let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&buf[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line], s2.as_out());
+                *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
+
+                let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
+                let _ = BASE64_ENGINE.encode(&buf[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line], s3.as_out());
+                *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
+            }
+            line_idx += 4;
+        }
+
+        // Remaining full lines
+        while line_idx < full_lines {
+            let in_base = line_idx * bytes_per_line;
+            let out_base = line_idx * line_out;
+            unsafe {
+                let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                let _ = BASE64_ENGINE.encode(&buf[in_base..in_base + bytes_per_line], s.as_out());
+                *dst.add(out_base + wrap_col) = b'\n';
+            }
+            line_idx += 1;
+        }
+
+        let mut wp = full_lines * line_out;
+
+        // Handle remainder (partial last line of this chunk)
+        if remainder > 0 {
+            let enc_len = BASE64_ENGINE.encoded_length(remainder);
+            let line_input = &buf[full_lines * bytes_per_line..n];
+            unsafe {
+                let s = std::slice::from_raw_parts_mut(dst.add(wp), enc_len);
+                let _ = BASE64_ENGINE.encode(line_input, s.as_out());
+                *dst.add(wp + enc_len) = b'\n';
+            }
+            wp += enc_len + 1;
+        }
+
+        writer.write_all(&out_buf[..wp])?;
     }
-
-    // fuse_wrap already adds a trailing newline for partial last lines,
-    // so we don't need to add one here. But if we never wrote any data
-    // at all or the last encoded chunk was exactly aligned, we're fine.
-    let _ = trailing_partial;
 
     Ok(())
 }
 
 /// Stream-decode from a reader to a writer. Used for stdin processing.
-/// Fused single-pass: read chunk -> strip whitespace -> decode immediately.
+/// In-place strip + decode: read chunk -> strip whitespace in-place in read buffer
+/// -> decode in-place -> write. Eliminates separate clean buffer allocation (saves 16MB).
 /// Uses 16MB read buffer for maximum pipe throughput — read_full retries to
 /// fill the entire buffer from the pipe, and 16MB means the entire 10MB
 /// benchmark input is read in a single syscall batch, minimizing overhead.
-/// memchr2-based SIMD whitespace stripping handles the common case efficiently.
 pub fn decode_stream(
     reader: &mut impl Read,
     ignore_garbage: bool,
@@ -1016,96 +1096,89 @@ pub fn decode_stream(
 ) -> io::Result<()> {
     const READ_CHUNK: usize = 16 * 1024 * 1024;
     // SAFETY: buf bytes are written by read_full before being processed.
-    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+    // The extra 4 bytes accommodate carry-over from previous chunk.
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK + 4);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        buf.set_len(READ_CHUNK);
+        buf.set_len(READ_CHUNK + 4);
     }
-    // Pre-allocate clean buffer once and reuse across iterations.
-    // Use Vec with set_len for zero-overhead reset instead of clear() + extend().
-    let mut clean: Vec<u8> = Vec::with_capacity(READ_CHUNK + 4);
     let mut carry = [0u8; 4];
     let mut carry_len = 0usize;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        // Copy carry bytes to start of buffer, read new data after them
+        if carry_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(carry.as_ptr(), buf.as_mut_ptr(), carry_len);
+            }
+        }
+        let n = read_full(reader, &mut buf[carry_len..carry_len + READ_CHUNK])?;
         if n == 0 {
             break;
         }
+        let total_raw = carry_len + n;
 
-        // Copy carry bytes to start of clean buffer (0-3 bytes from previous chunk)
-        unsafe {
-            std::ptr::copy_nonoverlapping(carry.as_ptr(), clean.as_mut_ptr(), carry_len);
-        }
-
-        let chunk = &buf[..n];
-        if ignore_garbage {
+        // Strip whitespace in-place in the buffer itself.
+        // This eliminates the separate clean buffer allocation (saves 16MB).
+        let clean_len = if ignore_garbage {
             // Scalar filter for ignore_garbage mode (rare path)
-            let dst = unsafe { clean.as_mut_ptr().add(carry_len) };
+            let ptr = buf.as_mut_ptr();
             let mut wp = 0usize;
-            for &b in chunk {
+            for i in 0..total_raw {
+                let b = unsafe { *ptr.add(i) };
                 if is_base64_char(b) {
-                    unsafe { *dst.add(wp) = b };
+                    unsafe { *ptr.add(wp) = b };
                     wp += 1;
                 }
             }
-            unsafe { clean.set_len(carry_len + wp) };
+            wp
         } else {
-            // SIMD gap-copy: use memchr2 to find \n and \r positions, then copy
-            // the gaps between them. For typical base64 (76-char lines), newlines
-            // are ~1/77 of the data, so we process ~76 bytes per memchr hit
-            // instead of 1 byte per scalar iteration.
-            // Track rare whitespace during gap-copy to skip the second scan.
-            let dst = unsafe { clean.as_mut_ptr().add(carry_len) };
+            // In-place SIMD gap-copy using memchr2 to find \n and \r positions.
+            // For typical base64 (76-char lines), newlines are ~1/77 of the data,
+            // so we process ~76 bytes per memchr hit.
+            let ptr = buf.as_mut_ptr();
+            let data = &buf[..total_raw];
             let mut wp = 0usize;
             let mut gap_start = 0usize;
             let mut has_rare_ws = false;
 
-            for pos in memchr::memchr2_iter(b'\n', b'\r', chunk) {
+            for pos in memchr::memchr2_iter(b'\n', b'\r', data) {
                 let gap_len = pos - gap_start;
                 if gap_len > 0 {
                     if !has_rare_ws {
-                        has_rare_ws = chunk[gap_start..pos]
+                        has_rare_ws = data[gap_start..pos]
                             .iter()
                             .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
                     }
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            chunk.as_ptr().add(gap_start),
-                            dst.add(wp),
-                            gap_len,
-                        );
+                    if wp != gap_start {
+                        unsafe {
+                            std::ptr::copy(ptr.add(gap_start), ptr.add(wp), gap_len);
+                        }
                     }
                     wp += gap_len;
                 }
                 gap_start = pos + 1;
             }
-            let tail_len = n - gap_start;
+            let tail_len = total_raw - gap_start;
             if tail_len > 0 {
                 if !has_rare_ws {
-                    has_rare_ws = chunk[gap_start..n]
+                    has_rare_ws = data[gap_start..total_raw]
                         .iter()
                         .any(|&b| b == b' ' || b == b'\t' || b == 0x0b || b == 0x0c);
                 }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        chunk.as_ptr().add(gap_start),
-                        dst.add(wp),
-                        tail_len,
-                    );
+                if wp != gap_start {
+                    unsafe {
+                        std::ptr::copy(ptr.add(gap_start), ptr.add(wp), tail_len);
+                    }
                 }
                 wp += tail_len;
             }
-            let total_clean = carry_len + wp;
-            unsafe { clean.set_len(total_clean) };
 
             // Second pass for rare whitespace (tab, space, VT, FF) — only when detected.
-            // In typical base64 streams (76-char lines with \n), this is skipped entirely.
             if has_rare_ws {
-                let ptr = clean.as_mut_ptr();
-                let mut rp = carry_len;
-                let mut cwp = carry_len;
-                while rp < total_clean {
+                let mut rp = 0;
+                let mut cwp = 0;
+                while rp < wp {
                     let b = unsafe { *ptr.add(rp) };
                     if NOT_WHITESPACE[b as usize] {
                         unsafe { *ptr.add(cwp) = b };
@@ -1113,25 +1186,26 @@ pub fn decode_stream(
                     }
                     rp += 1;
                 }
-                clean.truncate(cwp);
+                cwp
+            } else {
+                wp
             }
-        }
+        };
 
         carry_len = 0;
         let is_last = n < READ_CHUNK;
 
         if is_last {
             // Last chunk: decode everything (including padding)
-            decode_clean_slice(&mut clean, writer)?;
+            decode_clean_slice(&mut buf[..clean_len], writer)?;
         } else {
             // Save incomplete base64 quadruplet for next iteration
-            let clean_len = clean.len();
             let decode_len = (clean_len / 4) * 4;
             let leftover = clean_len - decode_len;
             if leftover > 0 {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        clean.as_ptr().add(decode_len),
+                        buf.as_ptr().add(decode_len),
                         carry.as_mut_ptr(),
                         leftover,
                     );
@@ -1139,8 +1213,7 @@ pub fn decode_stream(
                 carry_len = leftover;
             }
             if decode_len > 0 {
-                clean.truncate(decode_len);
-                decode_clean_slice(&mut clean, writer)?;
+                decode_clean_slice(&mut buf[..decode_len], writer)?;
             }
         }
     }
