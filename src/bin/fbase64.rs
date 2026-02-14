@@ -160,20 +160,18 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Try mmap first for file-redirected stdin (zero-copy + parallel decode)
+        // Try mmap first for file-redirected stdin (zero-copy decode)
         #[cfg(unix)]
         if let Some(mmap) = try_mmap_stdin() {
-            let mut data = mmap.to_vec();
-            return b64::decode_owned(&mut data, cli.ignore_garbage, out);
+            return b64::decode_to_writer(&mmap, cli.ignore_garbage, out);
         }
 
-        // For piped stdin: read ALL input first with raw read_stdin (64MB pre-alloc,
-        // zero Vec growth overhead), then decode the entire buffer at once.
-        // This enables parallel decode for large inputs and eliminates the streaming
-        // carry-over/chunking overhead. For 10MB base64 input, this is:
-        // 1 batch read -> 1 whitespace strip -> 1 parallel decode -> 1 write.
-        let mut data = coreutils_rs::common::io::read_stdin()?;
-        return b64::decode_owned(&mut data, cli.ignore_garbage, out);
+        // For piped stdin: use streaming decode to avoid 64MB read_stdin pre-alloc.
+        // decode_stream reads 16MB chunks, strips whitespace with SIMD memchr2,
+        // and decodes in-place. For 10MB input this processes everything in 1 chunk.
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        return b64::decode_stream(&mut reader, cli.ignore_garbage, out);
     }
 
     // For encode: try mmap for zero-copy stdin when redirected from a file
@@ -182,20 +180,23 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
         return b64::encode_to_writer(&mmap, cli.wrap, out);
     }
 
-    // For piped encode: read ALL stdin first for parallel encode + zero-copy
-    let data = coreutils_rs::common::io::read_stdin()?;
-    b64::encode_to_writer(&data, cli.wrap, out)
+    // For piped encode: use streaming to overlap pipe read with encode+write.
+    // read_full reads 12MB aligned chunks from the pipe, encodes + fuse_wraps
+    // each chunk, then writes in a single syscall. For 10MB input this processes
+    // everything in 1 iteration, avoiding the 64MB read_stdin pre-allocation.
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    b64::encode_stream(&mut reader, cli.wrap, out)
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
+    // Use mmap for zero-copy file access (both encode and decode).
+    // For decode: mmap avoids the 13.7MB std::fs::read() allocation+copy,
+    // using borrowed decode_to_writer (memchr2 strip into clean buffer + decode).
+    let data = read_file(Path::new(filename))?;
     if cli.decode {
-        // For decode: read to owned Vec for in-place whitespace strip + decode.
-        // Avoids double-buffering (mmap + clean buffer) by stripping in-place.
-        let mut data = std::fs::read(filename)?;
-        b64::decode_owned(&mut data, cli.ignore_garbage, out)
+        b64::decode_to_writer(&data, cli.ignore_garbage, out)
     } else {
-        // For encode: mmap for zero-copy read access.
-        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }
