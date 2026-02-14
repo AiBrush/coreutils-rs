@@ -621,18 +621,23 @@ impl Ord for MergeEntryOrd {
     }
 }
 
-/// Full 4-pass LSD radix sort for lexicographic (u64, u32, u32) entries.
-/// Sorts purely by the u64 prefix in O(n) time with ZERO comparisons,
-/// then only runs comparison sort on entries with identical 8-byte prefixes
-/// (which is rare for text data — most lines differ in the first 8 bytes).
+/// Hybrid MSD radix sort for lexicographic (u64, u32, u32) entries.
 ///
-/// This replaces the previous 1-level radix + comparison sort approach.
-/// Previous: 65536-bucket radix distribute + pdqsort within buckets (~80ms for 2M lines)
-/// New: 4 passes of 16-bit LSD radix (O(n)) + tiebreak only for prefix collisions (~20ms)
+/// Two-level MSD (Most Significant Digit) radix:
+/// 1. First pass: distribute by top 16 bits (bits 48-63) → 65536 buckets
+/// 2. Second pass within each large bucket: distribute by next 16 bits (bits 32-47)
+/// 3. Remaining sub-buckets: comparison sort (typically 0-2 entries)
 ///
-/// Key insight: with 2M lines of random ASCII text, ~99.9% of lines have unique
-/// 8-byte prefixes. The radix sort handles all of them in O(n), and only the ~0.1%
-/// with collisions need comparison-based tiebreaking.
+/// This is more cache-friendly than full LSD radix (which makes 4 full O(n)
+/// passes over all data with random scatter writes). MSD touches the data once
+/// for the first pass, then only touches the entries in each bucket for the
+/// second pass. Most buckets are small (≤30 entries for 2M lines), so the
+/// second pass has excellent cache locality.
+///
+/// Key advantage over comparison sort alone: the first radix pass eliminates
+/// the top 16 bits from ALL comparisons. The second radix pass eliminates
+/// another 16 bits for larger buckets. Only the bottom 32 bits (4 bytes of
+/// the prefix) need comparison sort, which resolves almost instantly.
 fn radix_sort_entries(
     entries: Vec<(u64, u32, u32)>,
     data: &[u8],
@@ -644,181 +649,226 @@ fn radix_sort_entries(
         return entries;
     }
 
-    // LSD radix sort on 16-bit groups. Up to 4 passes: bits [0:16), [16:32), [32:48), [48:64)
-    // Skip passes where all entries share the same 16-bit group.
     let nbk: usize = 65536;
 
-    // Pre-scan: determine which 16-bit groups actually have variation.
-    let first_val = entries[0].0;
-    let mut xor_all = 0u64;
-    for &(val, _, _) in &entries[1..] {
-        xor_all |= val ^ first_val;
+    // === PASS 1: MSD radix on top 16 bits (bits 48-63) ===
+    let mut cnts = vec![0u32; nbk];
+    for &(pfx, _, _) in &entries {
+        cnts[(pfx >> 48) as usize] += 1;
     }
-
-    let mut passes_needed: Vec<u32> = Vec::with_capacity(4);
-    for pass in 0..4u32 {
-        let shift = pass * 16;
-        if ((xor_all >> shift) & 0xFFFF) != 0 {
-            passes_needed.push(pass);
+    let mut bk_starts = vec![0usize; nbk + 1];
+    {
+        let mut s = 0usize;
+        for i in 0..nbk {
+            bk_starts[i] = s;
+            s += cnts[i] as usize;
         }
+        bk_starts[nbk] = s;
     }
-
-    // If no passes needed, all prefixes are identical — need tiebreaker only
-    if passes_needed.is_empty() {
-        let mut sorted = entries;
-        if !stable {
-            let data_addr = data.as_ptr() as usize;
-            sorted.sort_unstable_by(|a, b| {
-                let sa = a.1 as usize;
-                let la = a.2 as usize;
-                let sb = b.1 as usize;
-                let lb = b.2 as usize;
-                let skip = 8.min(la).min(lb);
-                unsafe {
-                    let dp = data_addr as *const u8;
-                    let pa = dp.add(sa + skip);
-                    let pb = dp.add(sb + skip);
-                    let rem_a = la - skip;
-                    let rem_b = lb - skip;
-                    let min_rem = rem_a.min(rem_b);
-                    let mut i = 0usize;
-                    while i + 8 <= min_rem {
-                        let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
-                        let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
-                        if wa != wb {
-                            return wa.cmp(&wb);
-                        }
-                        i += 8;
-                    }
-                    let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
-                    let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
-                    tail_a.cmp(tail_b)
-                }
-            });
-        }
-        return sorted;
-    }
-
-    let mut src = entries;
-    let mut dst: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
+    // Scatter into sorted array
+    let mut sorted: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        dst.set_len(n);
+        sorted.set_len(n);
     }
-
-    let mut cnts = vec![0u32; nbk];
-
-    for &pass in &passes_needed {
-        let shift = pass * 16;
-
-        // Count occurrences
-        cnts.iter_mut().for_each(|c| *c = 0);
-        for &(val, _, _) in &src {
-            cnts[((val >> shift) & 0xFFFF) as usize] += 1;
-        }
-
-        // Prefix sum -> write positions
-        let mut sum = 0u32;
-        for c in cnts.iter_mut() {
-            let old = *c;
-            *c = sum;
-            sum += old;
-        }
-
-        // Scatter into dst
-        let dst_ptr = dst.as_mut_ptr();
-        for &ent in &src {
-            let b = ((ent.0 >> shift) & 0xFFFF) as usize;
-            unsafe {
-                *dst_ptr.add(cnts[b] as usize) = ent;
-            }
-            cnts[b] += 1;
-        }
-
-        // Swap src and dst for next pass
-        std::mem::swap(&mut src, &mut dst);
-    }
-
-    let mut sorted = src;
-
-    // Tiebreak: sort runs of equal u64 prefixes by raw line content.
-    // For non-stable sort, this is the last-resort comparison.
-    // For text data, most runs are length 1 (unique prefix), so this loop
-    // completes in O(n) with very few actual sort calls.
     {
-        let data_addr = data.as_ptr() as usize;
-        let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
-            let sa = a.1 as usize;
-            let la = a.2 as usize;
-            let sb = b.1 as usize;
-            let lb = b.2 as usize;
-            let skip = 8.min(la).min(lb);
+        let mut wpos = bk_starts.clone();
+        for &ent in &entries {
+            let b = (ent.0 >> 48) as usize;
             unsafe {
-                let dp = data_addr as *const u8;
-                let pa = dp.add(sa + skip);
-                let pb = dp.add(sb + skip);
-                let rem_a = la - skip;
-                let rem_b = lb - skip;
-                let min_rem = rem_a.min(rem_b);
-                let mut i = 0usize;
-                while i + 8 <= min_rem {
-                    let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
-                    let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
-                    if wa != wb {
-                        return wa.cmp(&wb);
+                *sorted.as_mut_ptr().add(wpos[b]) = ent;
+            }
+            wpos[b] += 1;
+        }
+    }
+    drop(entries);
+    drop(cnts);
+
+    // === PASS 2: Within each large bucket, MSD radix on bits 32-47 ===
+    // Then comparison sort within each sub-bucket.
+    // Threshold: only do second radix pass for buckets with >32 entries
+    // (smaller buckets: comparison sort is faster due to no scatter overhead).
+    {
+        let sorted_ptr = sorted.as_mut_ptr() as usize;
+        let data_addr = data.as_ptr() as usize;
+
+        // Comparison function for tiebreaking within sub-buckets.
+        // Starts comparison after the prefix bytes (skip first 8 or min(8,len) bytes).
+        let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
+            match a.0.cmp(&b.0) {
+                Ordering::Equal => {
+                    let sa = a.1 as usize;
+                    let la = a.2 as usize;
+                    let sb = b.1 as usize;
+                    let lb = b.2 as usize;
+                    let skip = 8.min(la).min(lb);
+                    let rem_a = la - skip;
+                    let rem_b = lb - skip;
+                    unsafe {
+                        let dp = data_addr as *const u8;
+                        let pa = dp.add(sa + skip);
+                        let pb = dp.add(sb + skip);
+                        let min_rem = rem_a.min(rem_b);
+                        let mut i = 0usize;
+                        while i + 8 <= min_rem {
+                            let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
+                            let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
+                            if wa != wb {
+                                return wa.cmp(&wb);
+                            }
+                            i += 8;
+                        }
+                        let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
+                        let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
+                        tail_a.cmp(tail_b)
                     }
-                    i += 8;
                 }
-                let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
-                let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
-                tail_a.cmp(tail_b)
+                ord => ord,
             }
         };
-        let dp = data.as_ptr();
-        let mut i = 0;
-        while i < n {
-            let key = sorted[i].0;
-            let mut j = i + 1;
-            while j < n && sorted[j].0 == key {
-                j += 1;
+
+        // Collect non-trivial buckets for parallel processing
+        let mut slices: Vec<(usize, usize)> = Vec::new();
+        for i in 0..nbk {
+            let lo = bk_starts[i];
+            let hi = bk_starts[i + 1];
+            if hi - lo > 1 {
+                slices.push((lo, hi));
             }
-            if j - i > 1 {
-                // For repetitive data: check if all entries in this run have
-                // identical content. If so, skip the sort entirely.
-                // Check first vs last: if they're equal, high probability all are.
-                let run_len = j - i;
-                let ref_s = sorted[i].1 as usize;
-                let ref_l = sorted[i].2 as usize;
-                let last_s = sorted[j - 1].1 as usize;
-                let last_l = sorted[j - 1].2 as usize;
-                let all_same = ref_l == last_l
-                    && unsafe {
-                        let a = std::slice::from_raw_parts(dp.add(ref_s), ref_l);
-                        let b = std::slice::from_raw_parts(dp.add(last_s), last_l);
-                        a == b
-                    };
-                if !all_same {
-                    // For small runs, use insertion sort instead of pdqsort
-                    // to avoid function call overhead.
-                    if run_len <= 16 {
-                        // Insertion sort for tiny runs
-                        for k in (i + 1)..j {
-                            let mut pos = k;
-                            while pos > i
-                                && cmp_fn(&sorted[pos], &sorted[pos - 1]) == Ordering::Less
-                            {
-                                sorted.swap(pos, pos - 1);
-                                pos -= 1;
-                            }
-                        }
-                    } else if stable {
-                        sorted[i..j].sort_by(cmp_fn);
-                    } else {
-                        sorted[i..j].sort_unstable_by(cmp_fn);
+        }
+
+        // Process buckets in parallel with rayon
+        // For each bucket, decide between 2nd-level radix or comparison sort
+        let chunk_fn = |(lo, hi): (usize, usize)| {
+            let bucket = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (sorted_ptr as *mut (u64, u32, u32)).add(lo),
+                    hi - lo,
+                )
+            };
+            let blen = bucket.len();
+
+            // For large buckets (>64): second-level MSD radix on bits 32-47
+            // This creates 65536 sub-buckets, most with 0-1 entries.
+            if blen > 64 {
+                // Check if second-level radix has variation in bits 32-47
+                let first_mid = (bucket[0].0 >> 32) & 0xFFFF;
+                let mut has_variation = false;
+                for e in &bucket[1..] {
+                    if ((e.0 >> 32) & 0xFFFF) != first_mid {
+                        has_variation = true;
+                        break;
                     }
                 }
+
+                if has_variation {
+                    let sub_nbk: usize = 65536;
+                    let mut sub_cnts = vec![0u32; sub_nbk];
+                    for &(pfx, _, _) in bucket.iter() {
+                        sub_cnts[((pfx >> 32) & 0xFFFF) as usize] += 1;
+                    }
+                    let mut sub_starts = vec![0usize; sub_nbk + 1];
+                    {
+                        let mut s = 0usize;
+                        for i in 0..sub_nbk {
+                            sub_starts[i] = s;
+                            s += sub_cnts[i] as usize;
+                        }
+                        sub_starts[sub_nbk] = s;
+                    }
+                    // Scatter within bucket using temp buffer
+                    let mut temp: Vec<(u64, u32, u32)> = Vec::with_capacity(blen);
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        temp.set_len(blen);
+                    }
+                    {
+                        let mut wpos = sub_starts.clone();
+                        let temp_ptr = temp.as_mut_ptr();
+                        for &ent in bucket.iter() {
+                            let b = ((ent.0 >> 32) & 0xFFFF) as usize;
+                            unsafe {
+                                *temp_ptr.add(wpos[b]) = ent;
+                            }
+                            wpos[b] += 1;
+                        }
+                    }
+                    // Copy back and sort sub-buckets
+                    bucket.copy_from_slice(&temp);
+                    drop(temp);
+                    // Sort each non-trivial sub-bucket
+                    for sb in 0..sub_nbk {
+                        let slo = sub_starts[sb];
+                        let shi = sub_starts[sb + 1];
+                        if shi - slo > 1 {
+                            let sub_slice = &mut bucket[slo..shi];
+                            let sub_len = sub_slice.len();
+                            // Check for all-identical content (common in repetitive data)
+                            let ref_s = sub_slice[0].1 as usize;
+                            let ref_l = sub_slice[0].2 as usize;
+                            let last_s = sub_slice[sub_len - 1].1 as usize;
+                            let last_l = sub_slice[sub_len - 1].2 as usize;
+                            let all_same = ref_l == last_l
+                                && unsafe {
+                                    let ddp = data_addr as *const u8;
+                                    let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
+                                    let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
+                                    a == b
+                                };
+                            if !all_same {
+                                if stable {
+                                    sub_slice.sort_by(cmp_fn);
+                                } else {
+                                    sub_slice.sort_unstable_by(cmp_fn);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
             }
-            i = j;
+
+            // For small/medium buckets or no second-level variation:
+            // Check for all-identical content first
+            let ref_s = bucket[0].1 as usize;
+            let ref_l = bucket[0].2 as usize;
+            let last_s = bucket[blen - 1].1 as usize;
+            let last_l = bucket[blen - 1].2 as usize;
+            let all_same = ref_l == last_l
+                && unsafe {
+                    let ddp = data_addr as *const u8;
+                    let a = std::slice::from_raw_parts(ddp.add(ref_s), ref_l);
+                    let b = std::slice::from_raw_parts(ddp.add(last_s), last_l);
+                    a == b
+                };
+            if all_same {
+                return;
+            }
+
+            // Comparison sort (insertion sort for tiny buckets, pdqsort for larger)
+            if blen <= 16 {
+                for k in 1..blen {
+                    let mut pos = k;
+                    while pos > 0 && cmp_fn(&bucket[pos], &bucket[pos - 1]) == Ordering::Less {
+                        bucket.swap(pos, pos - 1);
+                        pos -= 1;
+                    }
+                }
+            } else if stable {
+                bucket.sort_by(cmp_fn);
+            } else {
+                bucket.sort_unstable_by(cmp_fn);
+            }
+        };
+
+        if slices.len() > 16 {
+            slices
+                .into_par_iter()
+                .for_each(|(lo, hi)| chunk_fn((lo, hi)));
+        } else {
+            for (lo, hi) in slices {
+                chunk_fn((lo, hi));
+            }
         }
     }
 
