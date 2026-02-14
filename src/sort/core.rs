@@ -797,55 +797,65 @@ fn write_sorted_output(
     terminator: &[u8],
 ) -> io::Result<()> {
     let dp = data.as_ptr();
+    let n = sorted_indices.len();
+    let term_byte = terminator[0];
     if config.unique {
+        let buf_cap = data.len() + n + 1;
+        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+        let bptr = buf.as_mut_ptr();
+        let mut pos = 0usize;
         let mut prev: Option<usize> = None;
-        const UBATCH: usize = 512;
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(UBATCH * 2);
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            let len = e - s;
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
                     let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), len) };
                     compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
             if should_output {
-                slices.push(io::IoSlice::new(line));
-                slices.push(io::IoSlice::new(terminator));
-                if slices.len() >= UBATCH * 2 {
-                    write_all_vectored(writer, &slices)?;
-                    slices.clear();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                    *bptr.add(pos + len) = term_byte;
                 }
+                pos += len + 1;
                 prev = Some(idx);
             }
         }
-        if !slices.is_empty() {
-            write_all_vectored(writer, &slices)?;
+        unsafe {
+            buf.set_len(pos);
         }
+        writer.write_all(&buf)?;
     } else {
-        const BATCH: usize = 512;
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-        let n = sorted_indices.len();
+        let total_size = if data.last() == Some(&term_byte) {
+            data.len()
+        } else {
+            data.len() + 1
+        };
+        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
+        let bptr = buf.as_mut_ptr();
+        let mut pos = 0usize;
         for j in 0..n {
-            if j + 8 < n {
-                let (ps, _) = offsets[sorted_indices[j + 8]];
+            if j + 16 < n {
+                let (ps, _) = offsets[sorted_indices[j + 16]];
                 prefetch_read(unsafe { dp.add(ps) });
             }
             let (s, e) = offsets[sorted_indices[j]];
-            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-            slices.push(io::IoSlice::new(line));
-            slices.push(io::IoSlice::new(terminator));
-            if slices.len() >= BATCH * 2 {
-                write_all_vectored(writer, &slices)?;
-                slices.clear();
+            let len = e - s;
+            unsafe {
+                std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                *bptr.add(pos + len) = term_byte;
             }
+            pos += len + 1;
         }
-        if !slices.is_empty() {
-            write_all_vectored(writer, &slices)?;
+        unsafe {
+            buf.set_len(pos);
         }
+        writer.write_all(&buf)?;
     }
     Ok(())
 }
@@ -883,9 +893,9 @@ fn write_all_vectored(writer: &mut impl Write, slices: &[io::IoSlice<'_>]) -> io
     Ok(())
 }
 
-/// Write sorted (key, index) entries to output. Like write_sorted_output but
-/// iterates (u64, usize) entries directly, avoiding the O(n) copy-back to indices.
-/// For large outputs: builds a single buffer with parallel memcpy.
+/// Write sorted (key, index) entries to output using contiguous buffer.
+/// Copies lines in sorted order into a buffer, then single write_all.
+/// Eliminates IoSlice per-entry overhead and writev syscall count.
 fn write_sorted_entries(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -894,57 +904,66 @@ fn write_sorted_entries(
     writer: &mut impl Write,
     terminator: &[u8],
 ) -> io::Result<()> {
+    let dp = data.as_ptr();
+    let n = entries.len();
+    let term_byte = terminator[0];
     if config.unique {
-        let dp = data.as_ptr();
+        let buf_cap = data.len() + n + 1;
+        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+        let bptr = buf.as_mut_ptr();
+        let mut pos = 0usize;
         let mut prev: Option<usize> = None;
-        const UBATCH: usize = 512;
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(UBATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            let len = e - s;
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
                     let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), len) };
                     compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
             if should_output {
-                slices.push(io::IoSlice::new(line));
-                slices.push(io::IoSlice::new(terminator));
-                if slices.len() >= UBATCH * 2 {
-                    write_all_vectored(writer, &slices)?;
-                    slices.clear();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                    *bptr.add(pos + len) = term_byte;
                 }
+                pos += len + 1;
                 prev = Some(idx);
             }
         }
-        if !slices.is_empty() {
-            write_all_vectored(writer, &slices)?;
+        unsafe {
+            buf.set_len(pos);
         }
+        writer.write_all(&buf)?;
     } else {
-        let dp = data.as_ptr();
-        const BATCH: usize = 512;
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
-        let n = entries.len();
+        let total_size = if data.last() == Some(&term_byte) {
+            data.len()
+        } else {
+            data.len() + 1
+        };
+        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
+        let bptr = buf.as_mut_ptr();
+        let mut pos = 0usize;
         for j in 0..n {
-            if j + 8 < n {
-                let (ps, _) = offsets[entries[j + 8].1];
+            if j + 16 < n {
+                let (ps, _) = offsets[entries[j + 16].1];
                 prefetch_read(unsafe { dp.add(ps) });
             }
             let (s, e) = offsets[entries[j].1];
-            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
-            slices.push(io::IoSlice::new(line));
-            slices.push(io::IoSlice::new(terminator));
-            if slices.len() >= BATCH * 2 {
-                write_all_vectored(writer, &slices)?;
-                slices.clear();
+            let len = e - s;
+            unsafe {
+                std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
+                *bptr.add(pos + len) = term_byte;
             }
+            pos += len + 1;
         }
-        if !slices.is_empty() {
-            write_all_vectored(writer, &slices)?;
+        unsafe {
+            buf.set_len(pos);
         }
+        writer.write_all(&buf)?;
     }
     Ok(())
 }
