@@ -963,102 +963,6 @@ fn write_all_vectored(writer: &mut impl Write, slices: &[io::IoSlice<'_>]) -> io
     Ok(())
 }
 
-/// Build output from sorted indices using single allocation + parallel fill.
-/// One allocation instead of N per-thread allocations reduces mmap/brk overhead.
-fn write_sorted_single_buf_idx(
-    data: &[u8],
-    offsets: &[(usize, usize)],
-    sorted_indices: &[usize],
-    terminator: &[u8],
-    writer: &mut impl Write,
-) -> io::Result<()> {
-    let tl = terminator.len();
-    let n = sorted_indices.len();
-
-    if n > 10_000 {
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (n + num_threads - 1) / num_threads;
-
-        // Compute per-chunk sizes in parallel
-        let chunk_sizes: Vec<usize> = sorted_indices
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&idx| (offsets[idx].1 - offsets[idx].0) + tl)
-                    .sum()
-            })
-            .collect();
-
-        // Single contiguous buffer with parallel fill — avoids N separate allocations
-        // and N write syscalls. Prefix sum gives each thread its disjoint write region.
-        let mut chunk_offsets: Vec<usize> = Vec::with_capacity(chunk_sizes.len() + 1);
-        chunk_offsets.push(0usize);
-        let mut total_out = 0usize;
-        for &sz in &chunk_sizes {
-            total_out += sz;
-            chunk_offsets.push(total_out);
-        }
-
-        let mut output: Vec<u8> = Vec::with_capacity(total_out);
-        // SAFETY: every byte in [0..total_out) is written by the parallel fill below.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            output.set_len(total_out);
-        }
-
-        let output_addr = output.as_mut_ptr() as usize;
-        let data_addr = data.as_ptr() as usize;
-        sorted_indices
-            .par_chunks(chunk_size)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let op = output_addr as *mut u8;
-                let dp = data_addr as *const u8;
-                let mut wp = chunk_offsets[ci];
-                for &idx in chunk {
-                    let (s, e) = offsets[idx];
-                    let ll = e - s;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(dp.add(s), op.add(wp), ll);
-                        wp += ll;
-                        std::ptr::copy_nonoverlapping(terminator.as_ptr(), op.add(wp), tl);
-                        wp += tl;
-                    }
-                }
-            });
-
-        writer.write_all(&output)?;
-        return Ok(());
-    }
-
-    // Small output: single sequential buffer (no zero-init)
-    let total: usize = sorted_indices
-        .iter()
-        .map(|&idx| (offsets[idx].1 - offsets[idx].0) + tl)
-        .sum();
-    let mut output: Vec<u8> = Vec::with_capacity(total);
-    // SAFETY: every byte in [0..total) is written by the sequential fill below.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output.set_len(total);
-    }
-    let out_ptr = output.as_mut_ptr();
-    let data_ptr = data.as_ptr();
-    let mut wp = 0usize;
-    for &idx in sorted_indices {
-        let (s, e) = offsets[idx];
-        let ll = e - s;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data_ptr.add(s), out_ptr.add(wp), ll);
-            wp += ll;
-            std::ptr::copy_nonoverlapping(terminator.as_ptr(), out_ptr.add(wp), tl);
-            wp += tl;
-        }
-    }
-    writer.write_all(&output)
-}
-
 /// Write sorted (key, index) entries to output. Like write_sorted_output but
 /// iterates (u64, usize) entries directly, avoiding the O(n) copy-back to indices.
 /// For large outputs: builds a single buffer with parallel memcpy.
@@ -1447,10 +1351,24 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 }
             } else {
-                // Build contiguous output buffer for non-zero-copy path.
-                // This handles \r\n and zero-terminated data.
-                let indices: Vec<usize> = (0..num_lines).collect();
-                write_sorted_single_buf_idx(data, &offsets, &indices, terminator, &mut writer)?;
+                // Already sorted: write lines directly using write_vectored batching.
+                // Zero-copy: IoSlice entries point into mmap data, no output buffer allocation.
+                let dp = data.as_ptr();
+                const BATCH: usize = 512;
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
+                for i in 0..num_lines {
+                    let (s, e) = offsets[i];
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                    slices.push(io::IoSlice::new(line));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
+                }
+                if !slices.is_empty() {
+                    write_all_vectored(&mut writer, &slices)?;
+                }
             }
             writer.flush()?;
             return Ok(());
@@ -1567,40 +1485,26 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 }
             }
         } else if reverse {
-            // Reverse: build per-bucket output, write from highest bucket down
-            let tl = terminator.len();
-            let bucket_bufs: Vec<Vec<u8>> = (0..nbk)
-                .into_par_iter()
-                .map(|bi| {
-                    let lo = bk_starts[bi];
-                    let hi = bk_starts[bi + 1];
-                    if lo == hi {
-                        return Vec::new();
-                    }
-                    let bkt = &sorted[lo..hi];
-                    let sz: usize = bkt.iter().map(|&(_, _, l)| l as usize + tl).sum();
-                    let mut buf: Vec<u8> = Vec::with_capacity(sz);
-                    let dp = data.as_ptr();
-                    for &(_, s, l) in bkt {
-                        unsafe {
-                            let old_len = buf.len();
-                            buf.set_len(old_len + l as usize + tl);
-                            let bp = buf.as_mut_ptr().add(old_len);
-                            std::ptr::copy_nonoverlapping(dp.add(s as usize), bp, l as usize);
-                            std::ptr::copy_nonoverlapping(
-                                terminator.as_ptr(),
-                                bp.add(l as usize),
-                                tl,
-                            );
-                        }
-                    }
-                    buf
-                })
-                .collect();
+            // Reverse: write buckets from highest to lowest using write_vectored.
+            // Zero-copy: IoSlice entries point directly into mmap data.
+            // Avoids per-bucket Vec<u8> buffer allocations entirely.
+            let dp = data.as_ptr();
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
             for bi in (0..nbk).rev() {
-                if !bucket_bufs[bi].is_empty() {
-                    writer.write_all(&bucket_bufs[bi])?;
+                for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
+                    let line =
+                        unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
+                    slices.push(io::IoSlice::new(line));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
                 }
+            }
+            if !slices.is_empty() {
+                write_all_vectored(&mut writer, &slices)?;
             }
         } else {
             // Forward: single contiguous output buffer with parallel fill.
