@@ -123,29 +123,28 @@ fn tac_bytes_zerocopy_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
 }
 
 /// Buffered after-separator reverse: pre-allocates output buffer of exact size,
-/// copies records from mmap in reverse order into contiguous memory, then writes
-/// the entire result in a single write_all. For 2M records, this is much faster
-/// than 2M writev IoSlice entries (eliminates per-IoSlice kernel overhead).
+/// copies records from mmap in reverse order, then writes with a single write_all.
+/// For 2M records, this is much faster than 2M writev IoSlice entries.
 fn tac_bytes_buffered_after(
     data: &[u8],
     positions: &[usize],
     out: &mut impl Write,
 ) -> io::Result<()> {
-    // Pre-allocate exact-size output buffer (same size as input)
+    // Pre-allocate exact-size output buffer
     let mut buf: Vec<u8> = Vec::with_capacity(data.len());
     let data_ptr = data.as_ptr();
-    let mut end = data.len();
+    let out_ptr = buf.as_mut_ptr();
+    let mut wp: usize = 0;
 
-    // Copy records in reverse order into contiguous output buffer
+    let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
             let rec_len = end - rec_start;
             unsafe {
-                let dst = buf.as_mut_ptr().add(buf.len());
-                std::ptr::copy_nonoverlapping(data_ptr.add(rec_start), dst, rec_len);
-                buf.set_len(buf.len() + rec_len);
+                std::ptr::copy_nonoverlapping(data_ptr.add(rec_start), out_ptr.add(wp), rec_len);
             }
+            wp += rec_len;
         }
         end = rec_start;
     }
@@ -153,13 +152,12 @@ fn tac_bytes_buffered_after(
     // Remaining prefix before the first separator
     if end > 0 {
         unsafe {
-            let dst = buf.as_mut_ptr().add(buf.len());
-            std::ptr::copy_nonoverlapping(data_ptr, dst, end);
-            buf.set_len(buf.len() + end);
+            std::ptr::copy_nonoverlapping(data_ptr, out_ptr.add(wp), end);
         }
+        wp += end;
     }
 
-    // Single write_all for the entire output
+    unsafe { buf.set_len(wp) };
     out.write_all(&buf)
 }
 
@@ -203,27 +201,28 @@ fn tac_bytes_buffered_before(
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(data.len());
     let data_ptr = data.as_ptr();
-    let mut end = data.len();
+    let out_ptr = buf.as_mut_ptr();
+    let mut wp: usize = 0;
 
+    let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
             let rec_len = end - pos;
             unsafe {
-                let dst = buf.as_mut_ptr().add(buf.len());
-                std::ptr::copy_nonoverlapping(data_ptr.add(pos), dst, rec_len);
-                buf.set_len(buf.len() + rec_len);
+                std::ptr::copy_nonoverlapping(data_ptr.add(pos), out_ptr.add(wp), rec_len);
             }
+            wp += rec_len;
         }
         end = pos;
     }
     if end > 0 {
         unsafe {
-            let dst = buf.as_mut_ptr().add(buf.len());
-            std::ptr::copy_nonoverlapping(data_ptr, dst, end);
-            buf.set_len(buf.len() + end);
+            std::ptr::copy_nonoverlapping(data_ptr, out_ptr.add(wp), end);
         }
+        wp += end;
     }
 
+    unsafe { buf.set_len(wp) };
     out.write_all(&buf)
 }
 
