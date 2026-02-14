@@ -178,11 +178,11 @@ fn main() {
     #[cfg(unix)]
     let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
     #[cfg(unix)]
-    let mut out = BufWriter::with_capacity(8 * 1024 * 1024, &mut *raw);
+    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();
     #[cfg(not(unix))]
-    let mut out = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, stdout.lock());
     let mut had_error = false;
 
     let cfg = cut::CutConfig {

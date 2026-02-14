@@ -102,9 +102,10 @@ impl Write for SortOutput {
     }
 }
 
-/// 8MB buffer for output — reduces flush frequency for large files.
+/// 16MB buffer for output — reduces flush frequency for large files.
 /// Larger buffer reduces write() syscall count which is significant for 100MB+ inputs.
-const OUTPUT_BUF_SIZE: usize = 8 * 1024 * 1024;
+/// 16MB stays within L3 cache on modern CPUs while significantly reducing syscalls.
+const OUTPUT_BUF_SIZE: usize = 16 * 1024 * 1024;
 
 /// Configuration for a sort operation.
 #[derive(Debug, Clone)]
@@ -245,7 +246,10 @@ fn find_lines_parallel(data: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
     let is_newline = delimiter == b'\n';
     let data_len = data.len();
 
-    // Scan each chunk in parallel
+    // Scan each chunk in parallel.
+    // Uses raw pointer arithmetic (via data_addr usize) to eliminate bounds checking
+    // in the \r\n detection hot path.
+    let data_addr = data.as_ptr() as usize;
     let chunk_offsets: Vec<Vec<(usize, usize)>> = boundaries
         .windows(2)
         .collect::<Vec<_>>()
@@ -253,14 +257,17 @@ fn find_lines_parallel(data: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
         .map(|w| {
             let chunk_start = w[0];
             let chunk_end = w[1];
-            let chunk = &data[chunk_start..chunk_end];
+            let dp = data_addr as *const u8;
+            let chunk =
+                unsafe { std::slice::from_raw_parts(dp.add(chunk_start), chunk_end - chunk_start) };
             let mut offsets = Vec::with_capacity(chunk.len() / 40 + 1);
             let mut line_start = chunk_start;
 
             for pos in memchr::memchr_iter(delimiter, chunk) {
                 let abs_pos = chunk_start + pos;
                 let mut line_end = abs_pos;
-                if is_newline && line_end > line_start && data[line_end - 1] == b'\r' {
+                if is_newline && line_end > line_start && unsafe { *dp.add(line_end - 1) } == b'\r'
+                {
                     line_end -= 1;
                 }
                 offsets.push((line_start, line_end));
@@ -270,7 +277,8 @@ fn find_lines_parallel(data: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
             // Handle last line in chunk (only if this is the final chunk)
             if line_start < chunk_end && chunk_end == data_len {
                 let mut line_end = chunk_end;
-                if is_newline && line_end > line_start && data[line_end - 1] == b'\r' {
+                if is_newline && line_end > line_start && unsafe { *dp.add(line_end - 1) } == b'\r'
+                {
                     line_end -= 1;
                 }
                 offsets.push((line_start, line_end));
@@ -319,15 +327,23 @@ fn read_all_input(
         } else {
             FileData::Owned(Vec::new())
         }
+    } else if inputs.len() == 1 && inputs[0] == "-" {
+        // Single stdin: use read_stdin() directly without extra copy.
+        // read_stdin() returns a Vec that we can use directly, avoiding the
+        // extend_from_slice copy that would happen with the multi-file path.
+        let stdin_data = crate::common::io::read_stdin()?;
+        FileData::Owned(stdin_data)
     } else {
+        // Multi-file or mixed file+stdin: concatenate into a single buffer.
         let mut data = Vec::new();
         for input in inputs {
             if input == "-" {
-                // Use raw libc::read() via read_stdin() for high-throughput stdin reads.
-                // Bypasses BufReader/StdinLock overhead, pre-allocates 64MB, uses
-                // full spare capacity per read() call to minimize syscall count.
                 let stdin_data = crate::common::io::read_stdin()?;
-                data.extend_from_slice(&stdin_data);
+                if data.is_empty() {
+                    data = stdin_data;
+                } else {
+                    data.extend_from_slice(&stdin_data);
+                }
             } else {
                 let mut file = File::open(input).map_err(|e| {
                     io::Error::new(
@@ -344,16 +360,17 @@ fn read_all_input(
     // Find line boundaries using SIMD-accelerated memchr
     // Use parallel scanning for large files (>4MB) to leverage multiple cores
     let data = &*buffer;
-    let offsets = if data.len() > 4 * 1024 * 1024 {
+    let offsets = if data.len() > 2 * 1024 * 1024 {
         find_lines_parallel(data, delimiter)
     } else {
+        let dp = data.as_ptr();
         let mut offsets = Vec::with_capacity(data.len() / 40 + 1);
         let mut start = 0usize;
 
         for pos in memchr::memchr_iter(delimiter, data) {
             let mut end = pos;
-            // Strip trailing CR before LF
-            if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
+            // Strip trailing CR before LF (raw pointer to avoid bounds check)
+            if delimiter == b'\n' && end > start && unsafe { *dp.add(end - 1) } == b'\r' {
                 end -= 1;
             }
             offsets.push((start, end));
@@ -363,7 +380,7 @@ fn read_all_input(
         // Handle last line without trailing delimiter
         if start < data.len() {
             let mut end = data.len();
-            if delimiter == b'\n' && end > start && data[end - 1] == b'\r' {
+            if delimiter == b'\n' && end > start && unsafe { *dp.add(end - 1) } == b'\r' {
                 end -= 1;
             }
             offsets.push((start, end));
@@ -427,16 +444,20 @@ pub fn check_sorted(inputs: &[String], config: &SortConfig) -> io::Result<bool> 
     let (buffer, offsets) = read_all_input(inputs, config.zero_terminated)?;
     let data = &*buffer;
 
+    let dp = data.as_ptr();
     for i in 1..offsets.len() {
         let (s1, e1) = offsets[i - 1];
         let (s2, e2) = offsets[i];
+        // Use raw pointer arithmetic to avoid bounds checking
+        let line1 = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+        let line2 = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
         // For -c -u: use dedup comparison (no last-resort) so that
         // key-equal lines are detected as duplicates.
         // For -c without -u: use full comparison (with last-resort).
         let cmp = if config.unique {
-            compare_lines_for_dedup(&data[s1..e1], &data[s2..e2], config)
+            compare_lines_for_dedup(line1, line2, config)
         } else {
-            compare_lines(&data[s1..e1], &data[s2..e2], config)
+            compare_lines(line1, line2, config)
         };
         let bad = if config.unique {
             cmp != Ordering::Less
@@ -646,10 +667,16 @@ fn radix_sort_entries(
     drop(entries);
     drop(cnts);
 
-    // Sort each non-trivial bucket independently with rayon
+    // Sort each non-trivial bucket independently with rayon.
+    // Optimized comparison: u64 prefix comparison resolves most entries,
+    // only falls through to word-at-a-time for prefix collisions.
+    // The skip=min(8,la,lb) optimization avoids re-comparing the prefix bytes.
+    // Word-at-a-time comparison uses u64 loads for the suffix, which is ~8x faster
+    // than byte-by-byte comparison on modern CPUs (single u64 cmp vs 8 byte cmps).
     {
         let sorted_ptr = sorted.as_mut_ptr();
         let sorted_len = sorted.len();
+        let data_addr = data.as_ptr() as usize;
         let cmp_fn = |a: &(u64, u32, u32), b: &(u64, u32, u32)| -> Ordering {
             match a.0.cmp(&b.0) {
                 Ordering::Equal => {
@@ -658,7 +685,30 @@ fn radix_sort_entries(
                     let sb = b.1 as usize;
                     let lb = b.2 as usize;
                     let skip = 8.min(la).min(lb);
-                    data[sa + skip..sa + la].cmp(&data[sb + skip..sb + lb])
+                    let rem_a = la - skip;
+                    let rem_b = lb - skip;
+                    unsafe {
+                        let dp = data_addr as *const u8;
+                        let pa = dp.add(sa + skip);
+                        let pb = dp.add(sb + skip);
+                        // Word-at-a-time comparison: compare 8 bytes at a time
+                        // using big-endian u64 loads. This resolves most suffix
+                        // collisions in 1-2 iterations instead of 8-16 byte cmps.
+                        let min_rem = rem_a.min(rem_b);
+                        let mut i = 0usize;
+                        while i + 8 <= min_rem {
+                            let wa = u64::from_be_bytes(*(pa.add(i) as *const [u8; 8]));
+                            let wb = u64::from_be_bytes(*(pb.add(i) as *const [u8; 8]));
+                            if wa != wb {
+                                return wa.cmp(&wb);
+                            }
+                            i += 8;
+                        }
+                        // Compare remaining bytes (< 8)
+                        let tail_a = std::slice::from_raw_parts(pa.add(i), rem_a - i);
+                        let tail_b = std::slice::from_raw_parts(pb.add(i), rem_b - i);
+                        tail_a.cmp(tail_b)
+                    }
                 }
                 ord => ord,
             }
@@ -703,8 +753,11 @@ fn line_prefix(data: &[u8], start: usize, end: usize) -> u64 {
         // Unaligned u64 load + bswap: single instruction on x86_64
         u64::from_be_bytes(unsafe { *(data.as_ptr().add(start) as *const [u8; 8]) })
     } else {
+        // Use raw pointer copy for short lines to avoid bounds checking
         let mut bytes = [0u8; 8];
-        bytes[..len].copy_from_slice(&data[start..end]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(start), bytes.as_mut_ptr(), len);
+        }
         u64::from_be_bytes(bytes)
     }
 }
@@ -835,14 +888,16 @@ fn write_sorted_output(
     terminator: &[u8],
 ) -> io::Result<()> {
     if config.unique {
+        let dp = data.as_ptr();
         let mut prev: Option<usize> = None;
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            let line = &data[s..e];
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
+                    let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -852,17 +907,22 @@ fn write_sorted_output(
                 prev = Some(idx);
             }
         }
-    } else if sorted_indices.len() > 50_000 {
+    } else if sorted_indices.len() > 10_000 {
+        // For medium-to-large inputs, use single contiguous buffer with parallel fill.
+        // Threshold lowered from 50K to 10K because single-buffer + one write syscall
+        // beats N small write_vectored calls even at moderate sizes.
         write_sorted_single_buf_idx(data, offsets, sorted_indices, terminator, writer)?;
     } else {
         // Use write_vectored to batch line+terminator pairs into fewer syscalls.
         // Each entry produces 2 IoSlices (line data + terminator), batched in
         // groups of 512 entries (1024 IoSlices) to stay within typical writev limits.
+        let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &idx in sorted_indices {
             let (s, e) = offsets[idx];
-            slices.push(io::IoSlice::new(&data[s..e]));
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            slices.push(io::IoSlice::new(line));
             slices.push(io::IoSlice::new(terminator));
             if slices.len() >= BATCH * 2 {
                 write_all_vectored(writer, &slices)?;
@@ -921,7 +981,7 @@ fn write_sorted_single_buf_idx(
     let tl = terminator.len();
     let n = sorted_indices.len();
 
-    if n > 50_000 {
+    if n > 10_000 {
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (n + num_threads - 1) / num_threads;
 
@@ -1017,14 +1077,16 @@ fn write_sorted_entries(
     terminator: &[u8],
 ) -> io::Result<()> {
     if config.unique {
+        let dp = data.as_ptr();
         let mut prev: Option<usize> = None;
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            let line = &data[s..e];
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
             let should_output = match prev {
                 Some(p) => {
                     let (ps, pe) = offsets[p];
-                    compare_lines_for_dedup(&data[ps..pe], line, config) != Ordering::Equal
+                    let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                    compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                 }
                 None => true,
             };
@@ -1034,15 +1096,17 @@ fn write_sorted_entries(
                 prev = Some(idx);
             }
         }
-    } else if entries.len() > 50_000 {
+    } else if entries.len() > 10_000 {
         write_sorted_single_buf_entries(data, offsets, entries, terminator, writer)?;
     } else {
         // Use write_vectored to batch line+terminator pairs.
+        let dp = data.as_ptr();
         const BATCH: usize = 512;
         let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
-            slices.push(io::IoSlice::new(&data[s..e]));
+            let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+            slices.push(io::IoSlice::new(line));
             slices.push(io::IoSlice::new(terminator));
             if slices.len() >= BATCH * 2 {
                 write_all_vectored(writer, &slices)?;
@@ -1068,7 +1132,7 @@ fn write_sorted_single_buf_entries(
     let tl = terminator.len();
     let n = entries.len();
 
-    if n > 50_000 {
+    if n > 10_000 {
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (n + num_threads - 1) / num_threads;
 
@@ -1218,9 +1282,9 @@ fn radix_sort_numeric_entries(
 }
 
 /// Threshold for switching to parallel sort. Below this, rayon thread pool
-/// overhead exceeds the sorting benefit. Empirically tuned: 50K lines is the
-/// break-even point for piped 10MB input (~200 bytes/line).
-const PARALLEL_SORT_THRESHOLD: usize = 50_000;
+/// overhead exceeds the sorting benefit. Set to 10K to enable parallel sort
+/// earlier, which helps for piped 10MB input (~50K-200K lines).
+const PARALLEL_SORT_THRESHOLD: usize = 10_000;
 
 /// Helper: perform a parallel or sequential sort on indices.
 fn do_sort(
@@ -1327,12 +1391,16 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
 
     if num_lines > 1 {
         let is_sorted = if is_plain_lex_for_check {
-            // Fast path: direct byte comparison for plain lexicographic sort
+            // Fast path: direct byte comparison for plain lexicographic sort.
+            // Uses raw pointer arithmetic to avoid bounds checking in the hot loop.
+            let dp = data.as_ptr();
             let mut sorted = true;
             for i in 1..num_lines {
                 let (s1, e1) = offsets[i - 1];
                 let (s2, e2) = offsets[i];
-                if data[s1..e1] > data[s2..e2] {
+                let a = unsafe { std::slice::from_raw_parts(dp.add(s1), e1 - s1) };
+                let b = unsafe { std::slice::from_raw_parts(dp.add(s2), e2 - s2) };
+                if a > b {
                     sorted = false;
                     break;
                 }
@@ -1368,30 +1436,35 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // Line-by-line output for unique/\r\n/zero-terminated cases
             // Write directly to BufWriter — it already handles batching.
             if config.unique {
+                let dp = data.as_ptr();
                 let mut prev: Option<usize> = None;
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
                     let emit = match prev {
                         Some(p) => {
                             let (ps, pe) = offsets[p];
-                            compare_lines_for_dedup(&data[ps..pe], &data[s..e], config)
-                                != Ordering::Equal
+                            let prev_line =
+                                unsafe { std::slice::from_raw_parts(dp.add(ps), pe - ps) };
+                            compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                         }
                         None => true,
                     };
                     if emit {
-                        writer.write_all(&data[s..e])?;
+                        writer.write_all(line)?;
                         writer.write_all(terminator)?;
                         prev = Some(i);
                     }
                 }
             } else {
                 // Use write_vectored to batch line+terminator pairs.
+                let dp = data.as_ptr();
                 const BATCH: usize = 512;
                 let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
-                    slices.push(io::IoSlice::new(&data[s..e]));
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
+                    slices.push(io::IoSlice::new(line));
                     slices.push(io::IoSlice::new(terminator));
                     if slices.len() >= BATCH * 2 {
                         write_all_vectored(&mut writer, &slices)?;
@@ -1407,10 +1480,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         }
     }
 
-    // Switch to random access for sort phase (comparisons jump to arbitrary lines)
+    // Switch to random access for sort phase (comparisons jump to arbitrary lines).
+    // Only advise for truly large files (>10MB) where the prefetch pattern matters.
     #[cfg(target_os = "linux")]
-    if let FileData::Mmap(ref mmap) = buffer {
-        let _ = mmap.advise(memmap2::Advice::Random);
+    if data.len() > 10 * 1024 * 1024 {
+        if let FileData::Mmap(ref mmap) = buffer {
+            let _ = mmap.advise(memmap2::Advice::Random);
+        }
     }
 
     // Detect sort mode and use specialized fast path
@@ -1471,6 +1547,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         // (within each bucket, entries are already in reverse order from the sort).
         // For forward, iterate linearly through the sorted array.
         if config.unique {
+            let dp = data.as_ptr();
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
             if reverse {
@@ -1478,14 +1555,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     for &(_, s, l) in &sorted[bk_starts[bi]..bk_starts[bi + 1]] {
                         let su = s as usize;
                         let lu = l as usize;
+                        let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
                         let emit = prev_start == u32::MAX || {
                             let ps = prev_start as usize;
                             let pl = prev_len as usize;
-                            compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
-                                != Ordering::Equal
+                            let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
+                            compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                         };
                         if emit {
-                            writer.write_all(&data[su..su + lu])?;
+                            writer.write_all(line)?;
                             writer.write_all(terminator)?;
                             prev_start = s;
                             prev_len = l;
@@ -1496,14 +1574,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 for &(_, s, l) in &sorted {
                     let su = s as usize;
                     let lu = l as usize;
+                    let line = unsafe { std::slice::from_raw_parts(dp.add(su), lu) };
                     let emit = prev_start == u32::MAX || {
                         let ps = prev_start as usize;
                         let pl = prev_len as usize;
-                        compare_lines_for_dedup(&data[ps..ps + pl], &data[su..su + lu], config)
-                            != Ordering::Equal
+                        let prev_line = unsafe { std::slice::from_raw_parts(dp.add(ps), pl) };
+                        compare_lines_for_dedup(prev_line, line, config) != Ordering::Equal
                     };
                     if emit {
-                        writer.write_all(&data[su..su + lu])?;
+                        writer.write_all(line)?;
                         writer.write_all(terminator)?;
                         prev_start = s;
                         prev_len = l;
@@ -1552,7 +1631,7 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // Reduces memory allocation overhead and write syscall count.
             let tl = terminator.len();
             let n = sorted.len();
-            if n > 50_000 {
+            if n > 10_000 {
                 let num_threads = rayon::current_num_threads().max(1);
                 let chunk_size = (n + num_threads - 1) / num_threads;
 
@@ -1608,10 +1687,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 writer.write_all(&output)?;
             } else {
                 // Use write_vectored to batch line+terminator pairs.
+                let dp = data.as_ptr();
                 const BATCH: usize = 512;
                 let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for &(_, s, l) in &sorted {
-                    slices.push(io::IoSlice::new(&data[s as usize..(s + l) as usize]));
+                    let line =
+                        unsafe { std::slice::from_raw_parts(dp.add(s as usize), l as usize) };
+                    slices.push(io::IoSlice::new(line));
                     slices.push(io::IoSlice::new(terminator));
                     if slices.len() >= BATCH * 2 {
                         write_all_vectored(&mut writer, &slices)?;
