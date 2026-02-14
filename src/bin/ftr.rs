@@ -7,7 +7,7 @@ use std::process;
 
 use clap::Parser;
 
-use coreutils_rs::common::io::{FileData, read_stdin};
+use coreutils_rs::common::io::FileData;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
@@ -119,20 +119,9 @@ fn main() {
 
     let set1_str = &cli.sets[0];
 
-    // Load ALL stdin data: try mmap first (zero-copy for file redirects),
-    // fall back to read_stdin() for pipes (raw libc::read, 64MB pre-alloc).
-    // This unified approach means all modes (translate, delete, squeeze) use
-    // the optimized _mmap batch paths with parallel processing + single write.
-    let data: FileData = match try_mmap_stdin() {
-        Some(m) => FileData::Mmap(m),
-        None => match read_stdin() {
-            Ok(d) => FileData::Owned(d),
-            Err(e) => {
-                eprintln!("tr: {}", io_error_msg(&e));
-                process::exit(1);
-            }
-        },
-    };
+    // Try mmap for file-redirected stdin (< file). Falls back to streaming/batch
+    // for piped input.
+    let mmap = try_mmap_stdin();
 
     #[cfg(unix)]
     let mut raw = raw_stdout();
@@ -153,32 +142,35 @@ fn main() {
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        // Use in-place translate for owned data (piped stdin) to avoid output buffer.
-        // For mmap'd data (file redirect), use the mmap path that allocates an output buffer.
-        let result = match data {
-            FileData::Owned(mut vec) => {
-                #[cfg(unix)]
-                {
-                    tr::translate_owned(&set1, &set2, &mut vec, &mut *raw)
-                }
-                #[cfg(not(unix))]
-                {
-                    let stdout = io::stdout();
-                    let mut lock = stdout.lock();
-                    tr::translate_owned(&set1, &set2, &mut vec, &mut lock)
-                }
+
+        let result = if mmap.is_some() {
+            // File-redirected stdin: use mmap batch path (zero-copy + parallel)
+            let m = mmap.as_ref().unwrap();
+            #[cfg(unix)]
+            {
+                tr::translate_mmap(&set1, &set2, m.as_ref(), &mut *raw)
             }
-            _ => {
-                #[cfg(unix)]
-                {
-                    tr::translate_mmap(&set1, &set2, &data, &mut *raw)
-                }
-                #[cfg(not(unix))]
-                {
-                    let stdout = io::stdout();
-                    let mut lock = stdout.lock();
-                    tr::translate_mmap(&set1, &set2, &data, &mut lock)
-                }
+            #[cfg(not(unix))]
+            {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                tr::translate_mmap(&set1, &set2, m.as_ref(), &mut lock)
+            }
+        } else {
+            // Piped stdin: use streaming path (16MB buffer, read+translate+write
+            // in chunks). This avoids the 64MB read_stdin pre-allocation and
+            // overlaps pipe reads with processing.
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            #[cfg(unix)]
+            {
+                tr::translate(&set1, &set2, &mut reader, &mut *raw)
+            }
+            #[cfg(not(unix))]
+            {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                tr::translate(&set1, &set2, &mut reader, &mut lock)
             }
         };
         if let Err(e) = result
@@ -190,20 +182,109 @@ fn main() {
         return;
     }
 
-    // All modes use _mmap batch paths: parallel processing + single write_all.
-    #[cfg(unix)]
-    let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
-    #[cfg(not(unix))]
-    let result = {
-        let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        run_mmap_mode(&cli, set1_str, &data, &mut lock)
-    };
+    if mmap.is_some() {
+        // File-redirected stdin: use batch path with mmap data
+        let data = FileData::Mmap(mmap.unwrap());
+        #[cfg(unix)]
+        let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
+        #[cfg(not(unix))]
+        let result = {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            run_mmap_mode(&cli, set1_str, &data, &mut lock)
+        };
+        if let Err(e) = result
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("tr: {}", io_error_msg(&e));
+            process::exit(1);
+        }
+    } else {
+        // Piped stdin: use streaming path to avoid 64MB read_stdin pre-allocation
+        // and overlap pipe reads with processing.
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        #[cfg(unix)]
+        let result = run_streaming_mode(&cli, set1_str, &mut reader, &mut *raw);
+        #[cfg(not(unix))]
+        let result = {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            run_streaming_mode(&cli, set1_str, &mut reader, &mut lock)
+        };
+        if let Err(e) = result
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("tr: {}", io_error_msg(&e));
+            process::exit(1);
+        }
+    }
+}
 
-    if let Err(e) = result
-        && e.kind() != io::ErrorKind::BrokenPipe
-    {
-        eprintln!("tr: {}", io_error_msg(&e));
+/// Dispatch streaming modes for piped stdin — uses 16MB buffer with
+/// read+process+write in chunks, avoiding the 64MB read_stdin pre-allocation.
+fn run_streaming_mode(
+    cli: &Cli,
+    set1_str: &str,
+    reader: &mut impl io::Read,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if cli.delete && cli.squeeze {
+        if cli.sets.len() < 2 {
+            eprintln!("tr: missing operand after '{}'", set1_str);
+            eprintln!("Two strings must be given when both deleting and squeezing repeats.");
+            eprintln!("Try 'tr --help' for more information.");
+            process::exit(1);
+        }
+        let set2_str = &cli.sets[1];
+        let set1 = tr::parse_set(set1_str);
+        let set2 = tr::parse_set(set2_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::delete_squeeze(&delete_set, &set2, reader, writer)
+    } else if cli.delete {
+        if cli.sets.len() > 1 {
+            eprintln!("tr: extra operand '{}'", cli.sets[1]);
+            eprintln!("Only one string may be given when deleting without squeezing.");
+            eprintln!("Try 'tr --help' for more information.");
+            process::exit(1);
+        }
+        let set1 = tr::parse_set(set1_str);
+        let delete_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::delete(&delete_set, reader, writer)
+    } else if cli.squeeze && cli.sets.len() < 2 {
+        let set1 = tr::parse_set(set1_str);
+        let squeeze_set = if cli.complement {
+            tr::complement(&set1)
+        } else {
+            set1
+        };
+        tr::squeeze(&squeeze_set, reader, writer)
+    } else if cli.squeeze {
+        let set2_str = &cli.sets[1];
+        let mut set1 = tr::parse_set(set1_str);
+        if cli.complement {
+            set1 = tr::complement(&set1);
+        }
+        let set2 = if cli.truncate {
+            let raw_set = tr::parse_set(set2_str);
+            set1.truncate(raw_set.len());
+            raw_set
+        } else {
+            tr::expand_set2(set2_str, set1.len())
+        };
+        tr::translate_squeeze(&set1, &set2, reader, writer)
+    } else {
+        eprintln!("tr: missing operand after '{}'", set1_str);
+        eprintln!("Two strings must be given when translating.");
+        eprintln!("Try 'tr --help' for more information.");
         process::exit(1);
     }
 }

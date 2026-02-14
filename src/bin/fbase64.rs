@@ -182,9 +182,13 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
         return b64::encode_to_writer(&mmap, cli.wrap, out);
     }
 
-    // For piped encode: read ALL stdin first for parallel encode + zero-copy
-    let data = coreutils_rs::common::io::read_stdin()?;
-    b64::encode_to_writer(&data, cli.wrap, out)
+    // For piped encode: use streaming to overlap pipe read with encode+write.
+    // read_full reads 12MB aligned chunks from the pipe, encodes + fuse_wraps
+    // each chunk, then writes in a single syscall. For 10MB input this processes
+    // everything in 1 iteration, avoiding the 64MB read_stdin pre-allocation.
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    b64::encode_stream(&mut reader, cli.wrap, out)
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
