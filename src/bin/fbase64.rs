@@ -108,10 +108,7 @@ fn parse_args() -> Cli {
                         process::exit(0);
                     }
                     _ => {
-                        eprintln!(
-                            "base64: unrecognized option '{}'",
-                            arg.to_string_lossy()
-                        );
+                        eprintln!("base64: unrecognized option '{}'", arg.to_string_lossy());
                         eprintln!("Try 'base64 --help' for more information.");
                         process::exit(1);
                     }

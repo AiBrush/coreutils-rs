@@ -154,35 +154,16 @@ fn parse_args() -> Cli {
         if bytes.starts_with(b"--") {
             // Long options
             if bytes.starts_with(b"--bytes=") {
-                cli.bytes = Some(
-                    std::str::from_utf8(&bytes[8..])
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                cli.bytes = Some(std::str::from_utf8(&bytes[8..]).unwrap_or("").to_string());
             } else if bytes.starts_with(b"--characters=") {
-                cli.characters = Some(
-                    std::str::from_utf8(&bytes[13..])
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                cli.characters = Some(std::str::from_utf8(&bytes[13..]).unwrap_or("").to_string());
             } else if bytes.starts_with(b"--fields=") {
-                cli.fields = Some(
-                    std::str::from_utf8(&bytes[9..])
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                cli.fields = Some(std::str::from_utf8(&bytes[9..]).unwrap_or("").to_string());
             } else if bytes.starts_with(b"--delimiter=") {
-                cli.delimiter = Some(
-                    std::str::from_utf8(&bytes[12..])
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                cli.delimiter = Some(std::str::from_utf8(&bytes[12..]).unwrap_or("").to_string());
             } else if bytes.starts_with(b"--output-delimiter=") {
-                cli.output_delimiter = Some(
-                    std::str::from_utf8(&bytes[19..])
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                cli.output_delimiter =
+                    Some(std::str::from_utf8(&bytes[19..]).unwrap_or("").to_string());
             } else {
                 match bytes {
                     b"--bytes" => {
@@ -257,10 +238,7 @@ fn parse_args() -> Cli {
                         process::exit(0);
                     }
                     _ => {
-                        eprintln!(
-                            "cut: unrecognized option '{}'",
-                            arg.to_string_lossy()
-                        );
+                        eprintln!("cut: unrecognized option '{}'", arg.to_string_lossy());
                         eprintln!("Try 'cut --help' for more information.");
                         process::exit(1);
                     }
@@ -285,10 +263,7 @@ fn parse_args() -> Cli {
                         } else if let Some(v) = args.next() {
                             v.to_string_lossy().into_owned()
                         } else {
-                            eprintln!(
-                                "cut: option requires an argument -- '{}'",
-                                flag as char
-                            );
+                            eprintln!("cut: option requires an argument -- '{}'", flag as char);
                             process::exit(1);
                         };
                         match flag {
