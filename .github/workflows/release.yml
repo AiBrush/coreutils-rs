@@ -116,7 +116,7 @@ jobs:
         run: |
           case "${{ matrix.target }}" in
             x86_64-*)
-              echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"
+              echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
               ;;
             aarch64-*)
               echo "RUSTFLAGS=-C target-cpu=generic" >> "$GITHUB_ENV"
