@@ -2511,7 +2511,9 @@ fn bytes_from_offset_chunk(data: &[u8], skip_bytes: usize, line_delim: u8, buf: 
             }
             wp += take;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
         start = pos + 1;
     }
@@ -2524,7 +2526,9 @@ fn bytes_from_offset_chunk(data: &[u8], skip_bytes: usize, line_delim: u8, buf: 
             }
             wp += take;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
     }
     unsafe { buf.set_len(wp) };
@@ -2570,7 +2574,13 @@ fn process_bytes_mid_range(
 /// For each line, output bytes skip..min(line_len, end_byte).
 /// Single reserve + deferred set_len.
 #[inline]
-fn bytes_mid_range_chunk(data: &[u8], skip: usize, end_byte: usize, line_delim: u8, buf: &mut Vec<u8>) {
+fn bytes_mid_range_chunk(
+    data: &[u8],
+    skip: usize,
+    end_byte: usize,
+    line_delim: u8,
+    buf: &mut Vec<u8>,
+) {
     buf.reserve(data.len());
 
     let src = data.as_ptr();
@@ -2588,7 +2598,9 @@ fn bytes_mid_range_chunk(data: &[u8], skip: usize, end_byte: usize, line_delim: 
             }
             wp += take;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
         start = pos + 1;
     }
@@ -2602,7 +2614,9 @@ fn bytes_mid_range_chunk(data: &[u8], skip: usize, end_byte: usize, line_delim: 
             }
             wp += take;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
     }
     unsafe { buf.set_len(wp) };
@@ -2646,7 +2660,13 @@ fn process_bytes_complement_mid(
 /// Process a chunk for complement mid-range byte extraction.
 /// For each line: output bytes 0..prefix_bytes, then bytes skip_end..line_len.
 #[inline]
-fn bytes_complement_mid_chunk(data: &[u8], prefix_bytes: usize, skip_end: usize, line_delim: u8, buf: &mut Vec<u8>) {
+fn bytes_complement_mid_chunk(
+    data: &[u8],
+    prefix_bytes: usize,
+    skip_end: usize,
+    line_delim: u8,
+    buf: &mut Vec<u8>,
+) {
     buf.reserve(data.len());
 
     let src = data.as_ptr();
@@ -2668,11 +2688,17 @@ fn bytes_complement_mid_chunk(data: &[u8], prefix_bytes: usize, skip_end: usize,
         if line_len > skip_end {
             let suffix_len = line_len - skip_end;
             unsafe {
-                std::ptr::copy_nonoverlapping(src.add(start + skip_end), dst_base.add(wp), suffix_len);
+                std::ptr::copy_nonoverlapping(
+                    src.add(start + skip_end),
+                    dst_base.add(wp),
+                    suffix_len,
+                );
             }
             wp += suffix_len;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
         start = pos + 1;
     }
@@ -2688,11 +2714,17 @@ fn bytes_complement_mid_chunk(data: &[u8], prefix_bytes: usize, skip_end: usize,
         if line_len > skip_end {
             let suffix_len = line_len - skip_end;
             unsafe {
-                std::ptr::copy_nonoverlapping(src.add(start + skip_end), dst_base.add(wp), suffix_len);
+                std::ptr::copy_nonoverlapping(
+                    src.add(start + skip_end),
+                    dst_base.add(wp),
+                    suffix_len,
+                );
             }
             wp += suffix_len;
         }
-        unsafe { *dst_base.add(wp) = line_delim; }
+        unsafe {
+            *dst_base.add(wp) = line_delim;
+        }
         wp += 1;
     }
     unsafe { buf.set_len(wp) };
@@ -2722,23 +2754,43 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
     }
 
     // Fast path: single mid-range (e.g., cut -b5-100)
-    if !complement && ranges.len() == 1 && ranges[0].start > 1 && ranges[0].end < usize::MAX && output_delim.is_empty() {
+    if !complement
+        && ranges.len() == 1
+        && ranges[0].start > 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
         return process_bytes_mid_range(data, ranges[0].start, ranges[0].end, line_delim, out);
     }
 
     // Fast path: complement of single from-start range (e.g., --complement -b1-100 = output bytes 101+)
-    if complement && ranges.len() == 1 && ranges[0].start == 1 && ranges[0].end < usize::MAX && output_delim.is_empty() {
+    if complement
+        && ranges.len() == 1
+        && ranges[0].start == 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
         return process_bytes_from_offset(data, ranges[0].end, line_delim, out);
     }
 
     // Fast path: complement of single from-offset range (e.g., --complement -b5- = output bytes 1-4)
-    if complement && ranges.len() == 1 && ranges[0].end == usize::MAX && ranges[0].start > 1 && output_delim.is_empty() {
+    if complement
+        && ranges.len() == 1
+        && ranges[0].end == usize::MAX
+        && ranges[0].start > 1
+        && output_delim.is_empty()
+    {
         let max_bytes = ranges[0].start - 1;
         return process_bytes_from_start(data, max_bytes, line_delim, out);
     }
 
     // Fast path: complement of single mid-range (e.g., --complement -b5-100 = bytes 1-4,101+)
-    if complement && ranges.len() == 1 && ranges[0].start > 1 && ranges[0].end < usize::MAX && output_delim.is_empty() {
+    if complement
+        && ranges.len() == 1
+        && ranges[0].start > 1
+        && ranges[0].end < usize::MAX
+        && output_delim.is_empty()
+    {
         return process_bytes_complement_mid(data, ranges[0].start, ranges[0].end, line_delim, out);
     }
 

@@ -91,9 +91,8 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
     let buf_addr = outbuf.as_mut_ptr() as usize;
     tasks.par_iter().for_each(|&(in_off, out_off, chunk_len)| {
         let enc_len = BASE64_ENGINE.encoded_length(chunk_len);
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((buf_addr as *mut u8).add(out_off), enc_len)
-        };
+        let out_slice =
+            unsafe { std::slice::from_raw_parts_mut((buf_addr as *mut u8).add(out_off), enc_len) };
         let _ = BASE64_ENGINE.encode(&data[in_off..in_off + chunk_len], out_slice.as_out());
     });
 
@@ -1129,7 +1128,10 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                             .decode(&data[in_base..in_base + line_len], s0.as_out())
                             .is_err()
                         {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid input",
+                            ));
                         }
                         let s1 = std::slice::from_raw_parts_mut(
                             out_ptr.add(ob + decoded_per_line),
@@ -1142,7 +1144,10 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                             )
                             .is_err()
                         {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid input",
+                            ));
                         }
                         let s2 = std::slice::from_raw_parts_mut(
                             out_ptr.add(ob + 2 * decoded_per_line),
@@ -1150,12 +1155,16 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                         );
                         if BASE64_ENGINE
                             .decode(
-                                &data[in_base + 2 * line_stride..in_base + 2 * line_stride + line_len],
+                                &data[in_base + 2 * line_stride
+                                    ..in_base + 2 * line_stride + line_len],
                                 s2.as_out(),
                             )
                             .is_err()
                         {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid input",
+                            ));
                         }
                         let s3 = std::slice::from_raw_parts_mut(
                             out_ptr.add(ob + 3 * decoded_per_line),
@@ -1163,12 +1172,16 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                         );
                         if BASE64_ENGINE
                             .decode(
-                                &data[in_base + 3 * line_stride..in_base + 3 * line_stride + line_len],
+                                &data[in_base + 3 * line_stride
+                                    ..in_base + 3 * line_stride + line_len],
                                 s3.as_out(),
                             )
                             .is_err()
                         {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid input",
+                            ));
                         }
                     }
                     i += 4;
