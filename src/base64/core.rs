@@ -229,50 +229,120 @@ fn write_wrapped_iov_streaming(
     Ok(())
 }
 
-/// Parallel wrapped encoding: split at bytes_per_line boundaries, encode + wrap in parallel.
+/// Parallel wrapped encoding: single output buffer, direct-to-position encode+wrap.
 /// Requires bytes_per_line % 3 == 0 so each chunk encodes without intermediate padding.
-/// Uses write_vectored (writev) to send all encoded+wrapped chunks in a single syscall.
+///
+/// Pre-calculates exact output size and each thread's write offset, then encodes
+/// 57-byte input groups directly to their final position in a shared output buffer.
+/// Each thread writes wrap_col encoded bytes + newline per line, so output for line N
+/// starts at N * (wrap_col + 1). This eliminates per-chunk heap allocations and
+/// the fuse_wrap copy pass entirely.
 fn encode_wrapped_parallel(
     data: &[u8],
     wrap_col: usize,
     bytes_per_line: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let num_threads = rayon::current_num_threads().max(1);
-    // Split at bytes_per_line boundaries for complete output lines per chunk
-    let lines_per_chunk = (data.len() / bytes_per_line / num_threads).max(1);
-    let chunk_size = lines_per_chunk * bytes_per_line;
+    let line_out = wrap_col + 1; // wrap_col data + 1 newline per line
+    let total_full_lines = data.len() / bytes_per_line;
+    let remainder_input = data.len() % bytes_per_line;
 
-    let chunks: Vec<&[u8]> = data.chunks(chunk_size.max(bytes_per_line)).collect();
-    let encoded_chunks: Vec<Vec<u8>> = chunks
-        .par_iter()
-        .map(|chunk| {
-            let enc_max = BASE64_ENGINE.encoded_length(chunk.len());
-            let max_lines = enc_max / wrap_col + 2;
-            // Single allocation with two non-overlapping regions:
-            //   [0..fused_size) = fuse_wrap output region
-            //   [fused_size..fused_size+enc_max) = encode region
-            let fused_size = enc_max + max_lines;
-            let total_size = fused_size + enc_max;
-            let mut buf: Vec<u8> = Vec::with_capacity(total_size);
+    // Calculate exact output size
+    let remainder_encoded = if remainder_input > 0 {
+        BASE64_ENGINE.encoded_length(remainder_input) + 1 // +1 for trailing newline
+    } else {
+        0
+    };
+    let total_output = total_full_lines * line_out + remainder_encoded;
+
+    // Pre-allocate single contiguous output buffer
+    let mut outbuf: Vec<u8> = Vec::with_capacity(total_output);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        outbuf.set_len(total_output);
+    }
+
+    // Split work at line boundaries for parallel processing
+    let num_threads = rayon::current_num_threads().max(1);
+    let lines_per_chunk = (total_full_lines / num_threads).max(1);
+    let input_chunk = lines_per_chunk * bytes_per_line;
+
+    // Compute per-chunk metadata: (input_offset, output_offset, num_input_bytes)
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+    while in_off < data.len() {
+        let chunk_input = input_chunk.min(data.len() - in_off);
+        // Align to bytes_per_line except for the very last chunk
+        let aligned_input = if in_off + chunk_input < data.len() {
+            (chunk_input / bytes_per_line) * bytes_per_line
+        } else {
+            chunk_input
+        };
+        if aligned_input == 0 {
+            break;
+        }
+        let full_lines = aligned_input / bytes_per_line;
+        let rem = aligned_input % bytes_per_line;
+        let chunk_output = full_lines * line_out
+            + if rem > 0 {
+                BASE64_ENGINE.encoded_length(rem) + 1
+            } else {
+                0
+            };
+        tasks.push((in_off, out_off, aligned_input));
+        in_off += aligned_input;
+        out_off += chunk_output;
+    }
+
+    // Parallel encode: each thread processes its lines directly into outbuf.
+    // SAFETY: tasks have non-overlapping output regions.
+    let out_addr = outbuf.as_mut_ptr() as usize;
+
+    tasks.par_iter().for_each(|&(in_off, out_off, chunk_len)| {
+        let input = &data[in_off..in_off + chunk_len];
+        let full_lines = chunk_len / bytes_per_line;
+        let rem = chunk_len % bytes_per_line;
+
+        // Thread-local encode buffer: encode one line at a time into final position
+        let enc_line_len = wrap_col; // bytes_per_line encodes to exactly wrap_col
+        let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_line_len);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            enc_buf.set_len(enc_line_len);
+        }
+
+        let out_ptr = out_addr as *mut u8;
+        let mut woff = out_off;
+
+        for i in 0..full_lines {
+            let line_input = &input[i * bytes_per_line..(i + 1) * bytes_per_line];
+            let _ = BASE64_ENGINE.encode(line_input, enc_buf[..enc_line_len].as_out());
+            unsafe {
+                std::ptr::copy_nonoverlapping(enc_buf.as_ptr(), out_ptr.add(woff), enc_line_len);
+                *out_ptr.add(woff + enc_line_len) = b'\n';
+            }
+            woff += line_out;
+        }
+
+        // Handle remainder (last partial line of this chunk)
+        if rem > 0 {
+            let line_input = &input[full_lines * bytes_per_line..];
+            let enc_len = BASE64_ENGINE.encoded_length(rem);
+            let mut rem_buf: Vec<u8> = Vec::with_capacity(enc_len);
             #[allow(clippy::uninit_vec)]
             unsafe {
-                buf.set_len(total_size);
+                rem_buf.set_len(enc_len);
             }
-            // Encode into the second region [fused_size..fused_size+enc_max]
-            let _ = BASE64_ENGINE.encode(chunk, buf[fused_size..fused_size + enc_max].as_out());
-            // Use split_at_mut to get non-overlapping mutable/immutable refs
-            let (fused_region, encode_region) = buf.split_at_mut(fused_size);
-            let encoded = &encode_region[..enc_max];
-            let wp = fuse_wrap(encoded, wrap_col, fused_region);
-            buf.truncate(wp);
-            buf
-        })
-        .collect();
+            let _ = BASE64_ENGINE.encode(line_input, rem_buf[..enc_len].as_out());
+            unsafe {
+                std::ptr::copy_nonoverlapping(rem_buf.as_ptr(), out_ptr.add(woff), enc_len);
+                *out_ptr.add(woff + enc_len) = b'\n';
+            }
+        }
+    });
 
-    // Use write_vectored to send all chunks in a single syscall
-    let iov: Vec<io::IoSlice> = encoded_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
-    write_all_vectored(out, &iov)
+    out.write_all(&outbuf[..total_output])
 }
 
 /// Fuse encoded base64 data with newlines in a single pass.
