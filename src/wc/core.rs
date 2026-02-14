@@ -231,39 +231,39 @@ unsafe fn count_lw_c_chunk_avx2(data: &[u8]) -> (u64, u64, bool, bool) {
             let is_tab_range = _mm256_and_si256(gt_08, lt_0e);
             let is_space = _mm256_or_si256(is_sp, is_tab_range);
 
-            // For 3-state SIMD word counting:
-            // Printable bytes set the "in word" bit, space bytes clear it,
-            // transparent bytes preserve the previous state.
-            // We need to process bit-by-bit for correct 3-state propagation.
             let print_mask = _mm256_movemask_epi8(is_printable) as u32;
             let space_mask = _mm256_movemask_epi8(is_space) as u32;
 
-            // Process 32 bits with 3-state propagation
-            let mut local_words = 0u32;
-            let mut in_word = prev_in_word;
-            let mut bits = 32u32;
-            let mut pm = print_mask;
-            let mut sm = space_mask;
-
-            // Process in groups for speed — but we need exact 3-state semantics
-            while bits > 0 {
-                let p = pm & 1;
-                let s = sm & 1;
-                if s != 0 {
-                    in_word = false;
-                } else if p != 0 {
-                    if !in_word {
-                        local_words += 1;
-                        in_word = true;
+            // Fast path: if all bytes are printable or space (no transparent bytes),
+            // use the 2-state bitmask approach. This handles pure ASCII text.
+            if (print_mask | space_mask) == 0xFFFF_FFFF {
+                // 2-state: printable = word content, space = break
+                let prev_mask = (print_mask << 1) | (prev_in_word as u32);
+                total_words += (print_mask & !prev_mask).count_ones() as u64;
+                prev_in_word = (print_mask >> 31) & 1 == 1;
+            } else {
+                // 3-state: bit-by-bit propagation for transparent bytes
+                let mut local_words = 0u32;
+                let mut in_word = prev_in_word;
+                let mut pm = print_mask;
+                let mut sm = space_mask;
+                for _ in 0..32 {
+                    let p = pm & 1;
+                    let s = sm & 1;
+                    if s != 0 {
+                        in_word = false;
+                    } else if p != 0 {
+                        if !in_word {
+                            local_words += 1;
+                            in_word = true;
+                        }
                     }
+                    pm >>= 1;
+                    sm >>= 1;
                 }
-                // transparent: in_word unchanged
-                pm >>= 1;
-                sm >>= 1;
-                bits -= 1;
+                total_words += local_words as u64;
+                prev_in_word = in_word;
             }
-            total_words += local_words as u64;
-            prev_in_word = in_word;
 
             batch += 1;
             if batch >= 255 {
@@ -366,28 +366,35 @@ unsafe fn count_lw_c_chunk_sse2(data: &[u8]) -> (u64, u64, bool, bool) {
             let print_mask = _mm_movemask_epi8(is_printable) as u32;
             let space_mask = _mm_movemask_epi8(is_space) as u32;
 
-            // Process 16 bits with 3-state propagation
-            let mut local_words = 0u32;
-            let mut in_word = prev_in_word;
-            let mut pm = print_mask;
-            let mut sm = space_mask;
-
-            for _ in 0..16 {
-                let p = pm & 1;
-                let s = sm & 1;
-                if s != 0 {
-                    in_word = false;
-                } else if p != 0 {
-                    if !in_word {
-                        local_words += 1;
-                        in_word = true;
+            // Fast path: if all bytes are printable or space (no transparent bytes),
+            // use the 2-state bitmask approach for pure ASCII text.
+            if (print_mask | space_mask) == 0xFFFF {
+                let prev_mask = (print_mask << 1) | (prev_in_word as u32);
+                total_words += (print_mask & !prev_mask).count_ones() as u64;
+                prev_in_word = (print_mask >> 15) & 1 == 1;
+            } else {
+                // 3-state: bit-by-bit propagation for transparent bytes
+                let mut local_words = 0u32;
+                let mut in_word = prev_in_word;
+                let mut pm = print_mask;
+                let mut sm = space_mask;
+                for _ in 0..16 {
+                    let p = pm & 1;
+                    let s = sm & 1;
+                    if s != 0 {
+                        in_word = false;
+                    } else if p != 0 {
+                        if !in_word {
+                            local_words += 1;
+                            in_word = true;
+                        }
                     }
+                    pm >>= 1;
+                    sm >>= 1;
                 }
-                pm >>= 1;
-                sm >>= 1;
+                total_words += local_words as u64;
+                prev_in_word = in_word;
             }
-            total_words += local_words as u64;
-            prev_in_word = in_word;
 
             batch += 1;
             if batch >= 255 {
