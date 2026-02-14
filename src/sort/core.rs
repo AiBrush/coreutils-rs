@@ -1193,11 +1193,13 @@ fn write_sorted_output(
             let out_ptr = out_buf.as_mut_ptr() as usize;
             let dp_addr = dp as usize;
             const CHUNK: usize = 16384;
-            let chunks: Vec<_> = (0..n).collect::<Vec<_>>();
-            chunks.par_chunks(CHUNK).for_each(|idxs| {
+            let n_chunks = (n + CHUNK - 1) / CHUNK;
+            (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                 let dst = out_ptr as *mut u8;
                 let src = dp_addr as *const u8;
-                for &i in idxs {
+                let start = chunk_idx * CHUNK;
+                let end = (start + CHUNK).min(n);
+                for i in start..end {
                     let idx = sorted_indices[i];
                     let (s, e) = offsets[idx];
                     let lu = e - s;
@@ -1330,11 +1332,13 @@ fn write_sorted_entries(
             let out_ptr = out_buf.as_mut_ptr() as usize;
             let dp_addr = dp as usize;
             const CHUNK: usize = 16384;
-            let chunks: Vec<_> = (0..n).collect::<Vec<_>>();
-            chunks.par_chunks(CHUNK).for_each(|idxs| {
+            let n_chunks = (n + CHUNK - 1) / CHUNK;
+            (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                 let dst = out_ptr as *mut u8;
                 let src = dp_addr as *const u8;
-                for &i in idxs {
+                let start = chunk_idx * CHUNK;
+                let end = (start + CHUNK).min(n);
+                for i in start..end {
                     let (_, idx) = entries[i];
                     let (s, e) = offsets[idx];
                     let lu = e - s;
@@ -1790,11 +1794,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let dp_addr = dp as usize;
                 let nlines = num_lines; // capture for closure
                 const CHUNK: usize = 16384;
-                let chunks: Vec<_> = (0..num_lines).collect::<Vec<_>>();
-                chunks.par_chunks(CHUNK).for_each(|idxs| {
+                let n_chunks = (num_lines + CHUNK - 1) / CHUNK;
+                (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                     let dst = out_ptr as *mut u8;
                     let src = dp_addr as *const u8;
-                    for &i in idxs {
+                    let start = chunk_idx * CHUNK;
+                    let end = (start + CHUNK).min(nlines);
+                    for i in start..end {
                         let orig_idx = nlines - 1 - i;
                         let (s, e) = offsets[orig_idx];
                         let lu = e - s;
@@ -2001,11 +2007,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let dp_addr = dp as usize;
                 let sorted_len = n_sorted; // capture for closure
                 const CHUNK: usize = 16384;
-                let chunks: Vec<_> = (0..n_sorted).collect::<Vec<_>>();
-                chunks.par_chunks(CHUNK).for_each(|idxs| {
+                let n_chunks = (n_sorted + CHUNK - 1) / CHUNK;
+                (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                     let dst = out_ptr as *mut u8;
                     let src = dp_addr as *const u8;
-                    for &idx in idxs {
+                    let start = chunk_idx * CHUNK;
+                    let end = (start + CHUNK).min(sorted_len);
+                    for idx in start..end {
                         // Map output index to reversed sorted index
                         let rev_idx = sorted_len - 1 - idx;
                         let (_, s, l) = sorted[rev_idx];
@@ -2063,11 +2071,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                 let out_ptr = out_buf.as_mut_ptr() as usize;
                 let dp_addr = dp as usize;
                 const CHUNK: usize = 16384;
-                let chunks: Vec<_> = (0..n_sorted).collect::<Vec<_>>();
-                chunks.par_chunks(CHUNK).for_each(|idxs| {
+                let n_chunks = (n_sorted + CHUNK - 1) / CHUNK;
+                (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                     let dst = out_ptr as *mut u8;
                     let src = dp_addr as *const u8;
-                    for &idx in idxs {
+                    let start = chunk_idx * CHUNK;
+                    let end = (start + CHUNK).min(n_sorted);
+                    for idx in start..end {
                         let (_, s, l) = sorted[idx];
                         let off = out_offsets[idx];
                         let lu = l as usize;
