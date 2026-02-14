@@ -716,9 +716,12 @@ pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::
 
     // Phase 1: Read all files into memory in parallel using rayon.
     // For many files (100+), use fast path that skips fstat.
+    // Batch into chunks of N/4 to reduce rayon work-stealing overhead.
     let use_fast = paths.len() >= 20;
+    let min_chunk = (paths.len() / 4).max(1);
     let file_data: Vec<io::Result<FileContent>> = paths
         .par_iter()
+        .with_min_len(min_chunk)
         .map(|&path| {
             if use_fast {
                 open_file_content_fast(path)
@@ -781,8 +784,14 @@ pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Resu
     // For many files (100+), use nostat path that skips fstat syscall.
     // Saves ~5µs/file = ~0.5ms for 100 files.
     let use_fast = paths.len() >= 20;
+
+    // Batch files into chunks of at least N/4 to reduce rayon work-stealing
+    // overhead. For 100 tiny files, this means ~4 chunks of 25 instead of
+    // 100 individual tasks — saves ~100µs of scheduling overhead.
+    let min_chunk = (paths.len() / 4).max(1);
     paths
         .par_iter()
+        .with_min_len(min_chunk)
         .map(|&path| {
             if use_fast {
                 hash_file_nostat(algo, path)
