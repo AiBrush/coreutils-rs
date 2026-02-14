@@ -1397,15 +1397,11 @@ unsafe fn delete_range_avx2(src: &[u8], dst: &mut [u8], lo: u8, hi: u8) -> usize
 
 /// Compact 8 source bytes into contiguous output bytes using a keep mask.
 /// Each bit in `mask` indicates whether the corresponding byte should be kept.
-/// Uses branchless writes: always writes 8 bytes (the extras are harmless since
-/// the caller tracks the write pointer by popcount).
+/// Uses a tight trailing_zeros loop: tzcnt extracts the next kept byte position,
+/// blsr clears the lowest set bit. This runs at ~3 ops per kept byte.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn compact_8bytes(src: *const u8, dst: *mut u8, mask: u8) {
-    // For each set bit position in the mask, copy that byte from src to the
-    // next output position. Using a tight trailing_zeros loop is faster than
-    // a lookup table for 8-bit masks because it's branch-predicted well
-    // and avoids cache misses on the table.
     unsafe {
         let mut m = mask;
         let mut w = 0;

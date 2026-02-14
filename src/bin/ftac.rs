@@ -117,28 +117,8 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // tac scans forward with memchr_iter to collect separator positions,
-        // then builds IoSlice arrays for writev output. MADV_SEQUENTIAL optimizes
-        // the forward scan; HUGEPAGE reduces TLB misses for large files.
-        #[cfg(target_os = "linux")]
-        {
-            if let FileData::Mmap(ref mmap) = data {
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut libc::c_void;
-                    let len = mmap.len();
-                    // WILLNEED pre-faults all pages. RANDOM disables readahead
-                    // since tac reads forward but outputs in reverse order.
-                    libc::madvise(ptr, len, libc::MADV_WILLNEED);
-                    libc::madvise(ptr, len, libc::MADV_RANDOM);
-                    if len >= 2 * 1024 * 1024 {
-                        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-                    }
-                }
-            }
-        }
-
-        // For owned data (stdin) with default newline separator, use in-place reversal
-        // to avoid allocating a separate output buffer (saves ~10MB for 10MB input).
+        // madvise is already set in try_mmap_stdin / read_file.
+        // No duplicate madvise calls needed here.
         let result = if cli.regex {
             let bytes: &[u8] = &data;
             let sep = cli.separator.as_deref().unwrap_or("\n");
