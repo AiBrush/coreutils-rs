@@ -2471,12 +2471,62 @@ unsafe fn delete_range_inplace_avx2(buf: &mut [u8], n: usize, lo: u8, hi: u8) ->
                 }
                 wp += 32;
             } else if del_mask != 0xFFFFFFFF {
-                // Mixed: branchless scalar compaction for this block
-                for j in 0..32 {
-                    let b = *ptr.add(ri + j);
-                    *ptr.add(wp) = b;
-                    wp += (b < lo || b > hi) as usize;
+                // Mixed block: pshufb-based 8-byte compaction.
+                // Process 4 × 8-byte sub-chunks using COMPACT_LUT + pshufb.
+                // Each sub-chunk: load 8 bytes into register (safe for overlap),
+                // shuffle kept bytes to front, store. 4 SIMD ops vs 32 scalar.
+                let keep_mask = !del_mask;
+                let m0 = keep_mask as u8;
+                let m1 = (keep_mask >> 8) as u8;
+                let m2 = (keep_mask >> 16) as u8;
+                let m3 = (keep_mask >> 24) as u8;
+
+                let c0 = m0.count_ones() as usize;
+                let c1 = m1.count_ones() as usize;
+                let c2 = m2.count_ones() as usize;
+                let c3 = m3.count_ones() as usize;
+
+                // Sub-chunk 0: bytes 0-7
+                if m0 == 0xFF {
+                    std::ptr::copy(ptr.add(ri), ptr.add(wp), 8);
+                } else if m0 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m0 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp) as *mut _, out_v);
                 }
+
+                // Sub-chunk 1: bytes 8-15
+                if m1 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 8), ptr.add(wp + c0), 8);
+                } else if m1 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 8) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m1 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0) as *mut _, out_v);
+                }
+
+                // Sub-chunk 2: bytes 16-23
+                if m2 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 16), ptr.add(wp + c0 + c1), 8);
+                } else if m2 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 16) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m2 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0 + c1) as *mut _, out_v);
+                }
+
+                // Sub-chunk 3: bytes 24-31
+                if m3 == 0xFF {
+                    std::ptr::copy(ptr.add(ri + 24), ptr.add(wp + c0 + c1 + c2), 8);
+                } else if m3 != 0 {
+                    let src_v = _mm_loadl_epi64(ptr.add(ri + 24) as *const _);
+                    let shuf = _mm_loadl_epi64(COMPACT_LUT[m3 as usize].as_ptr() as *const _);
+                    let out_v = _mm_shuffle_epi8(src_v, shuf);
+                    _mm_storel_epi64(ptr.add(wp + c0 + c1 + c2) as *mut _, out_v);
+                }
+
+                wp += c0 + c1 + c2 + c3;
             }
             // del_mask == 0xFFFFFFFF: all deleted, skip entirely
             ri += 32;
