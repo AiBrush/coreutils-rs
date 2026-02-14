@@ -295,7 +295,10 @@ fn encode_wrapped_parallel(
         out_off += chunk_output;
     }
 
-    // Parallel encode: each thread processes its lines directly into outbuf.
+    // Parallel encode: each thread batch-encodes all its input at once, then
+    // scatters the contiguous encoded output to line-separated positions.
+    // This does 1 SIMD encode call per thread (vs N calls per line), trading
+    // one thread-local encode buffer for dramatically fewer function calls.
     // SAFETY: tasks have non-overlapping output regions.
     let out_addr = outbuf.as_mut_ptr() as usize;
 
@@ -303,42 +306,100 @@ fn encode_wrapped_parallel(
         let input = &data[in_off..in_off + chunk_len];
         let full_lines = chunk_len / bytes_per_line;
         let rem = chunk_len % bytes_per_line;
-
-        // Thread-local encode buffer: encode one line at a time into final position
-        let enc_line_len = wrap_col; // bytes_per_line encodes to exactly wrap_col
-        let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_line_len);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            enc_buf.set_len(enc_line_len);
-        }
+        let full_input = full_lines * bytes_per_line;
 
         let out_ptr = out_addr as *mut u8;
-        let mut woff = out_off;
 
-        for i in 0..full_lines {
-            let line_input = &input[i * bytes_per_line..(i + 1) * bytes_per_line];
-            let _ = BASE64_ENGINE.encode(line_input, enc_buf[..enc_line_len].as_out());
+        // Batch encode all full lines at once into a thread-local buffer
+        if full_lines > 0 {
+            let enc_total = BASE64_ENGINE.encoded_length(full_input);
+            let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_total);
+            #[allow(clippy::uninit_vec)]
             unsafe {
-                std::ptr::copy_nonoverlapping(enc_buf.as_ptr(), out_ptr.add(woff), enc_line_len);
-                *out_ptr.add(woff + enc_line_len) = b'\n';
+                enc_buf.set_len(enc_total);
             }
-            woff += line_out;
+            let _ = BASE64_ENGINE.encode(&input[..full_input], enc_buf[..enc_total].as_out());
+
+            // Scatter: copy wrap_col bytes per line + insert newlines
+            // Uses fuse_wrap-style unrolled copy for throughput.
+            let src = enc_buf.as_ptr();
+            let dst = unsafe { out_ptr.add(out_off) };
+            let mut rp = 0;
+            let mut wp = 0;
+
+            // 8-line unrolled scatter loop
+            while rp + 8 * wrap_col <= enc_total {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), wrap_col);
+                    *dst.add(wp + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + wrap_col),
+                        dst.add(wp + line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 2 * wrap_col),
+                        dst.add(wp + 2 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 2 * line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 3 * wrap_col),
+                        dst.add(wp + 3 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 3 * line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 4 * wrap_col),
+                        dst.add(wp + 4 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 4 * line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 5 * wrap_col),
+                        dst.add(wp + 5 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 5 * line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 6 * wrap_col),
+                        dst.add(wp + 6 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 6 * line_out + wrap_col) = b'\n';
+                    std::ptr::copy_nonoverlapping(
+                        src.add(rp + 7 * wrap_col),
+                        dst.add(wp + 7 * line_out),
+                        wrap_col,
+                    );
+                    *dst.add(wp + 7 * line_out + wrap_col) = b'\n';
+                }
+                rp += 8 * wrap_col;
+                wp += 8 * line_out;
+            }
+
+            // Remaining lines one at a time
+            while rp + wrap_col <= enc_total {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(rp), dst.add(wp), wrap_col);
+                    *dst.add(wp + wrap_col) = b'\n';
+                }
+                rp += wrap_col;
+                wp += line_out;
+            }
         }
 
         // Handle remainder (last partial line of this chunk)
         if rem > 0 {
-            let line_input = &input[full_lines * bytes_per_line..];
+            let line_input = &input[full_input..];
             let enc_len = BASE64_ENGINE.encoded_length(rem);
-            let mut rem_buf: Vec<u8> = Vec::with_capacity(enc_len);
-            #[allow(clippy::uninit_vec)]
-            unsafe {
-                rem_buf.set_len(enc_len);
-            }
-            let _ = BASE64_ENGINE.encode(line_input, rem_buf[..enc_len].as_out());
-            unsafe {
-                std::ptr::copy_nonoverlapping(rem_buf.as_ptr(), out_ptr.add(woff), enc_len);
-                *out_ptr.add(woff + enc_len) = b'\n';
-            }
+            let woff = out_off + full_lines * line_out;
+            // Encode directly into final output position
+            let out_slice =
+                unsafe { std::slice::from_raw_parts_mut(out_ptr.add(woff), enc_len + 1) };
+            let _ = BASE64_ENGINE.encode(line_input, out_slice[..enc_len].as_out());
+            out_slice[enc_len] = b'\n';
         }
     });
 
