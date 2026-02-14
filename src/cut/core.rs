@@ -1522,7 +1522,7 @@ fn fields_suffix_chunk(
 }
 
 /// Extract fields from start_field to end from one line.
-/// Uses scalar byte scanning for short lines, memchr_iter for longer.
+/// Uses memchr SIMD for delimiter scanning on all line sizes.
 #[inline(always)]
 fn fields_suffix_line(
     line: &[u8],
@@ -1544,43 +1544,7 @@ fn fields_suffix_line(
     let base = line.as_ptr();
 
     let skip_delims = start_field - 1;
-
-    if len <= 256 {
-        // Scalar path for short lines
-        let mut delim_count = 0usize;
-        let mut has_delim = false;
-        let mut i = 0usize;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    has_delim = true;
-                    delim_count += 1;
-                    if delim_count >= skip_delims {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(i + 1), len - i - 1),
-                        );
-                        buf_push(buf, line_delim);
-                        return;
-                    }
-                }
-                i += 1;
-            }
-        }
-        if !has_delim {
-            if !suppress {
-                unsafe {
-                    buf_extend(buf, line);
-                    buf_push(buf, line_delim);
-                }
-            }
-            return;
-        }
-        unsafe { buf_push(buf, line_delim) };
-        return;
-    }
-
-    let mut delim_count = 0;
+    let mut delim_count = 0usize;
     let mut has_delim = false;
 
     for pos in memchr_iter(delim, line) {
@@ -1734,52 +1698,24 @@ fn fields_mid_range_line(
     let mut range_start = 0;
     let mut has_delim = false;
 
-    if len <= 256 {
-        // Scalar path for short lines
-        let mut i = 0usize;
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    has_delim = true;
-                    delim_count += 1;
-                    if delim_count == skip_before {
-                        range_start = i + 1;
-                    }
-                    if delim_count == target_end_delim {
-                        if skip_before == 0 {
-                            range_start = 0;
-                        }
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(range_start), i - range_start),
-                        );
-                        buf_push(buf, line_delim);
-                        return;
-                    }
-                }
-                i += 1;
-            }
+    for pos in memchr_iter(delim, line) {
+        has_delim = true;
+        delim_count += 1;
+        if delim_count == skip_before {
+            range_start = pos + 1;
         }
-    } else {
-        for pos in memchr_iter(delim, line) {
-            has_delim = true;
-            delim_count += 1;
-            if delim_count == skip_before {
-                range_start = pos + 1;
+        if delim_count == target_end_delim {
+            if skip_before == 0 {
+                range_start = 0;
             }
-            if delim_count == target_end_delim {
-                if skip_before == 0 {
-                    range_start = 0;
-                }
-                unsafe {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(range_start), pos - range_start),
-                    );
-                    buf_push(buf, line_delim);
-                }
-                return;
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(range_start), pos - range_start),
+                );
+                buf_push(buf, line_delim);
             }
+            return;
         }
     }
 
@@ -2066,57 +2002,7 @@ fn extract_single_field_line(
         return;
     }
 
-    // For short lines (passwd-style), direct scalar scanning is faster than memchr_iter
-    if len <= 256 {
-        let mut field_idx = 0usize;
-        let mut field_start = 0usize;
-        let mut has_delim = false;
-        let mut i = 0usize;
-
-        unsafe {
-            while i < len {
-                if *base.add(i) == delim {
-                    has_delim = true;
-                    if field_idx == target_idx {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(field_start), i - field_start),
-                        );
-                        buf_push(buf, line_delim);
-                        return;
-                    }
-                    field_idx += 1;
-                    field_start = i + 1;
-                }
-                i += 1;
-            }
-        }
-
-        if !has_delim {
-            if !suppress {
-                unsafe {
-                    buf_extend(buf, line);
-                    buf_push(buf, line_delim);
-                }
-            }
-            return;
-        }
-
-        if field_idx == target_idx {
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(field_start), len - field_start),
-                );
-                buf_push(buf, line_delim);
-            }
-        } else {
-            unsafe { buf_push(buf, line_delim) };
-        }
-        return;
-    }
-
-    // For longer lines, use memchr_iter for SIMD scanning
+    // Use memchr SIMD for all line sizes (faster than scalar even for short lines)
     let mut field_start = 0;
     let mut field_idx = 0;
     let mut has_delim = false;

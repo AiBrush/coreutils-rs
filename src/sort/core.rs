@@ -1117,6 +1117,8 @@ fn write_sorted_entries(
     if config.unique {
         let dp = data.as_ptr();
         let mut prev: Option<usize> = None;
+        const UBATCH: usize = 512;
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(UBATCH * 2);
         for &(_, idx) in entries {
             let (s, e) = offsets[idx];
             let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
@@ -1129,10 +1131,17 @@ fn write_sorted_entries(
                 None => true,
             };
             if should_output {
-                writer.write_all(line)?;
-                writer.write_all(terminator)?;
+                slices.push(io::IoSlice::new(line));
+                slices.push(io::IoSlice::new(terminator));
+                if slices.len() >= UBATCH * 2 {
+                    write_all_vectored(writer, &slices)?;
+                    slices.clear();
+                }
                 prev = Some(idx);
             }
+        }
+        if !slices.is_empty() {
+            write_all_vectored(writer, &slices)?;
         }
     } else {
         // Batch line+terminator pairs via write_vectored to reduce function call
@@ -1498,6 +1507,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             if config.unique {
                 let dp = data.as_ptr();
                 let mut prev: Option<usize> = None;
+                const BATCH: usize = 512;
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
                 for i in 0..num_lines {
                     let (s, e) = offsets[i];
                     let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
@@ -1511,10 +1522,17 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         None => true,
                     };
                     if emit {
-                        writer.write_all(line)?;
-                        writer.write_all(terminator)?;
+                        slices.push(io::IoSlice::new(line));
+                        slices.push(io::IoSlice::new(terminator));
+                        if slices.len() >= BATCH * 2 {
+                            write_all_vectored(&mut writer, &slices)?;
+                            slices.clear();
+                        }
                         prev = Some(i);
                     }
+                }
+                if !slices.is_empty() {
+                    write_all_vectored(&mut writer, &slices)?;
                 }
             } else {
                 let dp = data.as_ptr();
@@ -1568,6 +1586,8 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // Reverse-sorted with unique: output in reverse with dedup
             let dp = data.as_ptr();
             let mut prev: Option<usize> = None;
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
             for i in (0..num_lines).rev() {
                 let (s, e) = offsets[i];
                 let line = unsafe { std::slice::from_raw_parts(dp.add(s), e - s) };
@@ -1581,10 +1601,17 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     None => true,
                 };
                 if emit {
-                    writer.write_all(line)?;
-                    writer.write_all(terminator)?;
+                    slices.push(io::IoSlice::new(line));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
                     prev = Some(i);
                 }
+            }
+            if !slices.is_empty() {
+                write_all_vectored(&mut writer, &slices)?;
             }
             writer.flush()?;
             return Ok(());
@@ -1661,12 +1688,15 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             // For reverse, iterate backwards; for forward, iterate forwards.
             // Optimized dedup: use prefix u64 as first-pass rejection.
             // If prefixes differ, lines are definitely not equal (skip memcmp).
+            // Uses write_vectored batching to reduce syscall overhead.
             let dp = data.as_ptr();
             let mut prev_prefix = u64::MAX;
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
             let n_sorted = sorted.len();
             let mut idx: usize = 0;
+            const BATCH: usize = 512;
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH * 2);
             while idx < n_sorted {
                 let actual_idx = if reverse { n_sorted - 1 - idx } else { idx };
                 let (pfx, s, l) = sorted[actual_idx];
@@ -1684,13 +1714,20 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 };
                 if emit {
-                    writer.write_all(line)?;
-                    writer.write_all(terminator)?;
+                    slices.push(io::IoSlice::new(line));
+                    slices.push(io::IoSlice::new(terminator));
+                    if slices.len() >= BATCH * 2 {
+                        write_all_vectored(&mut writer, &slices)?;
+                        slices.clear();
+                    }
                     prev_prefix = pfx;
                     prev_start = s;
                     prev_len = l;
                 }
                 idx += 1;
+            }
+            if !slices.is_empty() {
+                write_all_vectored(&mut writer, &slices)?;
             }
         } else if reverse {
             // Reverse: iterate the fully-sorted array backwards.
