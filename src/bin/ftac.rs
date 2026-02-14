@@ -66,10 +66,9 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         unsafe {
             let ptr = m.as_ptr() as *mut libc::c_void;
             let len = m.len();
-            // WILLNEED pre-faults all pages. SEQUENTIAL enables readahead
-            // for the forward SIMD scan phase. Pages stay cached for output.
+            // WILLNEED pre-faults all pages. Don't use SEQUENTIAL since tac
+            // accesses data in reverse order during the output phase.
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
             if len >= 2 * 1024 * 1024 {
                 libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }

@@ -2,8 +2,9 @@ use std::io::{self, IoSlice, Write};
 
 use rayon::prelude::*;
 
-/// Threshold for parallel processing (4MB).
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Threshold for parallel processing (512KB).
+/// Lower threshold allows parallelism for smaller files in benchmarks.
+const PARALLEL_THRESHOLD: usize = 512 * 1024;
 
 /// Reverse records separated by a single byte.
 /// Scans for separators with SIMD memchr, then outputs records in reverse
@@ -111,6 +112,18 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
     unsafe {
         output.set_len(data.len());
     }
+    // Request transparent huge pages for the output buffer to reduce page faults.
+    // 10MB / 4KB = 2500 minor faults; with 2MB THP: only ~5 faults.
+    #[cfg(target_os = "linux")]
+    if output.len() >= 2 * 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                output.as_mut_ptr() as *mut libc::c_void,
+                output.len(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
     let optr_addr = output.as_mut_ptr() as usize;
     let iptr_addr = data.as_ptr() as usize;
 
@@ -188,6 +201,16 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
     unsafe {
         output.set_len(data.len());
     }
+    #[cfg(target_os = "linux")]
+    if output.len() >= 2 * 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                output.as_mut_ptr() as *mut libc::c_void,
+                output.len(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
     let optr_addr = output.as_mut_ptr() as usize;
     let iptr_addr = data.as_ptr() as usize;
 
@@ -239,10 +262,10 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
     out.write_all(&output)
 }
 
-/// After-separator mode: forward SIMD scan + writev batching.
-/// Forward scan is cache-friendly with sequential mmap access (MADV_SEQUENTIAL).
-/// writev batching sends up to 1024 IoSlices per syscall for zero-copy output
-/// from mmap pages (when caller provides raw File, not BufWriter).
+/// After-separator mode: contiguous output buffer + single write_all.
+/// Builds the reversed output into a pre-allocated buffer, then writes
+/// it in one syscall. Eliminates per-entry writev overhead for dense
+/// separator patterns (typical text files with ~40 byte lines).
 fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions = collect_positions_byte(data, sep);
 
@@ -250,37 +273,41 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
         return out.write_all(data);
     }
 
-    // Output records in reverse order using writev batching.
-    // Each batch sends up to BATCH IoSlices pointing directly at mmap pages.
-    // With raw File: zero-copy writev syscall (no intermediate buffer copy).
-    // With BufWriter: degrades to per-slice write_all (still correct).
-    const BATCH: usize = 1024;
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
+    // Build contiguous output buffer with records in reverse order.
+    let mut output = Vec::with_capacity(data.len());
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(data.len());
+    }
+    let op: *mut u8 = output.as_mut_ptr();
+    let sp = data.as_ptr();
+    let mut wp = 0;
     let mut end = data.len();
 
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
-        if rec_start < end {
-            slices.push(IoSlice::new(&data[rec_start..end]));
-            if slices.len() >= BATCH {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
+        let len = end - rec_start;
+        if len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(sp.add(rec_start), op.add(wp), len);
             }
+            wp += len;
         }
         end = rec_start;
     }
 
     // Remaining prefix before the first separator
     if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
+        unsafe {
+            std::ptr::copy_nonoverlapping(sp, op.add(wp), end);
+        }
+        wp += end;
     }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
+
+    out.write_all(&output[..wp])
 }
 
-/// Before-separator mode: forward SIMD scan + writev batching.
+/// Before-separator mode: contiguous output buffer + single write_all.
 fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let positions = collect_positions_byte(data, sep);
 
@@ -288,28 +315,35 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
         return out.write_all(data);
     }
 
-    const BATCH: usize = 1024;
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
+    let mut output = Vec::with_capacity(data.len());
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(data.len());
+    }
+    let op: *mut u8 = output.as_mut_ptr();
+    let sp = data.as_ptr();
+    let mut wp = 0;
     let mut end = data.len();
 
     for &pos in positions.iter().rev() {
         if pos < end {
-            slices.push(IoSlice::new(&data[pos..end]));
-            if slices.len() >= BATCH {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
+            let len = end - pos;
+            unsafe {
+                std::ptr::copy_nonoverlapping(sp.add(pos), op.add(wp), len);
             }
+            wp += len;
         }
         end = pos;
     }
 
     if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
+        unsafe {
+            std::ptr::copy_nonoverlapping(sp, op.add(wp), end);
+        }
+        wp += end;
     }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
+
+    out.write_all(&output[..wp])
 }
 
 /// Reverse records using a multi-byte string separator.
