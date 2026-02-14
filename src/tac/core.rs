@@ -62,8 +62,8 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     if data.is_empty() {
         return Ok(());
     }
-    // For data up to 32MB, build contiguous output buffer for single write().
-    // This trades one memcpy (fast, sequential) for N writev syscalls.
+    // For data up to 128MB, zero-copy writev: collect all positions in one forward
+    // SIMD pass, build IoSlice entries in reverse, flush with batched writev.
     if data.len() <= CONTIG_LIMIT {
         if !before {
             tac_bytes_contig_after(data, separator, out)
@@ -77,9 +77,13 @@ pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write)
     }
 }
 
-/// Threshold for contiguous output buffer strategy.
-/// Up to 32MB, the extra memcpy is cheaper than hundreds of writev() syscalls.
-const CONTIG_LIMIT: usize = 32 * 1024 * 1024;
+/// Threshold for zero-copy writev strategy.
+/// Up to 128MB, collect all separator positions in one pass, then writev
+/// with IoSlice entries pointing into the original buffer. Memory overhead
+/// is ~24 bytes per line (8 for position + 16 for IoSlice), much less than
+/// the old contiguous-copy approach that needed a full output buffer.
+/// For data > 128MB, falls back to chunked backward scan with batched writev.
+const CONTIG_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Zero-copy after-separator mode for data <= CONTIG_LIMIT.
 /// Collects ALL separator positions in a single forward memchr pass, then builds
