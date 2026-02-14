@@ -79,7 +79,6 @@ fn escape_filename(name: &str) -> String {
     out
 }
 
-
 fn main() {
     coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();

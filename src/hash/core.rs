@@ -711,11 +711,8 @@ fn open_file_content_fast(path: &Path) -> io::Result<FileContent> {
 /// then hashed simultaneously. Returns results in input order.
 ///
 /// For 100 files on AVX2: 4x throughput from SIMD parallelism.
-pub fn blake2b_hash_files_many(
-    paths: &[&Path],
-    output_bytes: usize,
-) -> Vec<io::Result<String>> {
-    use blake2b_simd::many::{hash_many, HashManyJob};
+pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::Result<String>> {
+    use blake2b_simd::many::{HashManyJob, hash_many};
 
     // Phase 1: Read all files into memory in parallel using rayon.
     // For many files (100+), use fast path that skips fstat.
@@ -772,10 +769,7 @@ pub fn blake2b_hash_files_many(
 /// Batch-hash multiple files with SHA-256/MD5 using rayon parallel processing.
 /// Pre-loads all files in parallel, then hashes them in parallel.
 /// Returns results in input order.
-pub fn hash_files_parallel(
-    paths: &[&Path],
-    algo: HashAlgorithm,
-) -> Vec<io::Result<String>> {
+pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Result<String>> {
     // Only issue readahead for modest file counts (likely larger files).
     // For 100+ tiny files, readahead's per-file overhead (open+stat+fadvise+close
     // = ~30µs/file = ~3ms for 100 files) exceeds its benefit since tiny files
