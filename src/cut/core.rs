@@ -2,9 +2,11 @@ use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::io::{self, BufRead, IoSlice, Write};
 
-/// Minimum file size for parallel processing (1MB).
-/// Lowered from 2MB to benefit from parallel chunk processing on smaller piped inputs.
-const PARALLEL_THRESHOLD: usize = 1024 * 1024;
+/// Minimum file size for parallel processing (512KB).
+/// Lowered to benefit from parallel chunk processing on smaller piped inputs.
+/// At 512KB with 2+ threads, the per-thread chunk is ~256KB which still
+/// amortizes the rayon overhead (~100-200us) well.
+const PARALLEL_THRESHOLD: usize = 512 * 1024;
 
 /// Max iovec entries per writev call (Linux default).
 const MAX_IOV: usize = 1024;
@@ -236,17 +238,11 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
     let output_delim = cfg.output_delim;
     let suppress = cfg.suppress_no_delim;
 
-    // Zero-copy fast path: if delimiter never appears, output = input unchanged.
-    if !complement && memchr::memchr(delim, data).is_none() {
-        if suppress {
-            return Ok(());
-        }
-        out.write_all(data)?;
-        if !data.is_empty() && *data.last().unwrap() != line_delim {
-            out.write_all(&[line_delim])?;
-        }
-        return Ok(());
-    }
+    // NOTE: Removed the full-file `memchr(delim, data).is_none()` scan.
+    // That scan was O(N) over the entire file just to check an edge case
+    // (no delimiter in any line). The per-line processing already handles
+    // lines without delimiters correctly, so the scan was pure overhead
+    // for files that DO contain delimiters (the common case).
 
     // Ultra-fast path: single field extraction (e.g., cut -f5)
     if !complement && ranges.len() == 1 && ranges[0].start == ranges[0].end {
