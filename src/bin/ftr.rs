@@ -250,20 +250,24 @@ fn main() {
                 }
             }
         } else {
-            // Piped stdin: use streaming path (16MB buffer, read+translate+write
-            // in chunks). This avoids the 64MB read_stdin pre-allocation and
-            // overlaps pipe reads with processing.
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            #[cfg(unix)]
-            {
-                tr::translate(&set1, &set2, &mut reader, &mut *raw)
-            }
-            #[cfg(not(unix))]
-            {
-                let stdout = io::stdout();
-                let mut lock = stdout.lock();
-                tr::translate(&set1, &set2, &mut reader, &mut lock)
+            // Piped stdin: read all data, then use batch translate with
+            // optimized code paths (in-place SIMD, parallel for large inputs).
+            // Avoids per-chunk streaming overhead (N read+process+write cycles).
+            match coreutils_rs::common::io::read_stdin() {
+                Ok(mut data) => {
+                    #[cfg(unix)]
+                    {
+                        tr::translate_owned(&set1, &set2, &mut data, &mut *raw)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let stdout = io::stdout();
+                        let mut lock = stdout.lock();
+                        tr::translate_owned(&set1, &set2, &mut data, &mut lock)
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => Err(e),
             }
         };
         if let Err(e) = result
@@ -296,23 +300,33 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: use streaming path to avoid 64MB read_stdin pre-allocation
-        // and overlap pipe reads with processing.
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        #[cfg(unix)]
-        let result = run_streaming_mode(&cli, set1_str, &mut reader, &mut *raw);
-        #[cfg(not(unix))]
-        let result = {
-            let stdout = io::stdout();
-            let mut lock = stdout.lock();
-            run_streaming_mode(&cli, set1_str, &mut reader, &mut lock)
-        };
-        if let Err(e) = result
-            && e.kind() != io::ErrorKind::BrokenPipe
-        {
-            eprintln!("tr: {}", io_error_msg(&e));
-            process::exit(1);
+        // Piped stdin: read all data first, then use batch processing.
+        // This allows optimized mmap-like code paths (parallel processing,
+        // zero-copy output) instead of per-chunk streaming. The 16MB
+        // pre-allocation is amortized over the batch processing savings.
+        match coreutils_rs::common::io::read_stdin() {
+            Ok(data) => {
+                #[cfg(unix)]
+                let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
+                #[cfg(not(unix))]
+                let result = {
+                    let stdout = io::stdout();
+                    let mut lock = stdout.lock();
+                    run_mmap_mode(&cli, set1_str, &data, &mut lock)
+                };
+                if let Err(e) = result
+                    && e.kind() != io::ErrorKind::BrokenPipe
+                {
+                    eprintln!("tr: {}", io_error_msg(&e));
+                    process::exit(1);
+                }
+            }
+            Err(e) => {
+                if e.kind() != io::ErrorKind::BrokenPipe {
+                    eprintln!("tr: {}", io_error_msg(&e));
+                    process::exit(1);
+                }
+            }
         }
     }
 }

@@ -2273,6 +2273,36 @@ fn process_bytes_from_start(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    // Fast path: if all lines fit within max_bytes, output = input.
+    // Single memchr scan with early exit on first oversized line.
+    // For `-b1-100` on CSV where average line is < 100 bytes, this
+    // skips all per-line processing and outputs the data directly.
+    if max_bytes > 0 && max_bytes < usize::MAX {
+        let mut start = 0;
+        let mut all_fit = true;
+        for pos in memchr_iter(line_delim, data) {
+            if pos - start > max_bytes {
+                all_fit = false;
+                break;
+            }
+            start = pos + 1;
+        }
+        // Check last line (no trailing delimiter)
+        if all_fit && start < data.len() && data.len() - start > max_bytes {
+            all_fit = false;
+        }
+        if all_fit {
+            // All lines fit: output = input. Handle missing trailing delimiter.
+            if !data.is_empty() && data[data.len() - 1] == line_delim {
+                return out.write_all(data);
+            } else if !data.is_empty() {
+                out.write_all(data)?;
+                return out.write_all(&[line_delim]);
+            }
+            return Ok(());
+        }
+    }
+
     if data.len() >= PARALLEL_THRESHOLD {
         let chunks = split_into_chunks(data, line_delim);
         let results: Vec<Vec<u8>> = chunks
