@@ -148,12 +148,20 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         return None;
     }
 
-    // mmap the stdin file descriptor with MAP_POPULATE for pre-faulted pages
+    // mmap the stdin file descriptor.
+    // For small files (< 4MB), skip MAP_POPULATE — the upfront page table walk
+    // costs ~0.5ms for 10MB which is significant relative to total time.
+    // Instead use MADV_WILLNEED to trigger async readahead without blocking.
+    // For large files (>= 4MB), MAP_POPULATE amortizes the upfront cost.
     // SAFETY: fd is valid, file is regular, size > 0
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap: Option<memmap2::Mmap> =
-        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
+    let file_size = stat.st_size as usize;
+    let mmap: Option<memmap2::Mmap> = if file_size >= 4 * 1024 * 1024 {
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok()
+    } else {
+        unsafe { memmap2::MmapOptions::new().map(&file) }.ok()
+    };
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -201,8 +209,14 @@ fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
 
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file_size = stat.st_size as usize;
     // map_copy creates MAP_PRIVATE mapping — writes are COW, file untouched
-    let mmap = unsafe { memmap2::MmapOptions::new().populate().map_copy(&file) }.ok();
+    // Skip MAP_POPULATE for small files to avoid upfront page table walk overhead
+    let mmap = if file_size >= 4 * 1024 * 1024 {
+        unsafe { memmap2::MmapOptions::new().populate().map_copy(&file) }.ok()
+    } else {
+        unsafe { memmap2::MmapOptions::new().map_copy(&file) }.ok()
+    };
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
