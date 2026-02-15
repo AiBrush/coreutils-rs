@@ -466,12 +466,10 @@ fn main() {
         } else {
             // Piped stdin: use streaming translate for pipelining with upstream cat.
             // RawStdin reads chunks as they arrive; ftr processes chunk N while cat writes N+1.
-            // VmspliceWriter for zero-copy pipe output (vmsplice copies without SPLICE_F_GIFT,
-            // so buffer reuse after write_all is safe).
+            // This is critical for `cat file | ftr` benchmarks — batch mode kills pipelining.
             #[cfg(target_os = "linux")]
             {
-                let mut writer = VmspliceWriter::new();
-                tr::translate(&set1, &set2, &mut RawStdin, &mut writer)
+                tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -526,13 +524,10 @@ fn main() {
         // Piped stdin: use streaming mode for pipelining with upstream cat.
         // Streaming processes chunks as they arrive from the pipe, enabling
         // ftr to process chunk N while cat writes chunk N+1.
-        // VmspliceWriter is safe here: vmsplice without SPLICE_F_GIFT copies data
-        // to pipe pages, so buffers can be reused after write_all returns.
+        // Using raw write (not vmsplice) because delete/squeeze allocate temporary
+        // output buffers — vmsplice would cause use-after-free.
         #[cfg(target_os = "linux")]
-        let result = {
-            let mut writer = VmspliceWriter::new();
-            run_streaming_mode(&cli, set1_str, &mut writer)
-        };
+        let result = run_streaming_mode(&cli, set1_str, &mut *raw);
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
         #[cfg(not(unix))]
