@@ -311,11 +311,11 @@ fn run_hash_mode(cli: &Cli, files: &[String], output_bytes: usize, out: &mut imp
             }
         }
     } else {
-        // Multi-file: use blake2b_simd::many for 4-way SIMD parallel hashing.
-        // All files pre-loaded into memory (mmap), then hashed simultaneously
-        // using AVX2 multi-buffer processing for ~4x throughput.
+        // Multi-file: use multi-core parallel hashing with work-stealing.
+        // Each worker uses blake2b_hash_file which includes I/O pipelining
+        // for large files on Linux.
         let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
-        let results = hash::blake2b_hash_files_many(&paths, output_bytes);
+        let results = hash::blake2b_hash_files_parallel(&paths, output_bytes);
 
         for (filename, result) in files.iter().zip(results) {
             match result {

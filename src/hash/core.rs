@@ -309,17 +309,44 @@ thread_local! {
     static SMALL_FILE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
 }
 
-/// I/O-pipelined hash for large files (>=16MB) on Linux.
-/// Uses a reader thread that reads 4MB chunks while the main thread hashes,
-/// overlapping NVMe/SSD read latency with SHA-NI computation.
-/// For a 100MB file: I/O ~15ms from cache, hash ~40ms → pipelined ~42ms vs ~55ms sequential.
+/// Optimized hash for large files (>=16MB) on Linux.
+/// Primary path: mmap with HUGEPAGE + POPULATE_READ for zero-copy, single-shot hash.
+/// Falls back to streaming I/O with double-buffered reader thread if mmap fails.
 #[cfg(target_os = "linux")]
-fn hash_file_pipelined(algo: HashAlgorithm, mut file: File, file_size: u64) -> io::Result<String> {
+fn hash_file_pipelined(algo: HashAlgorithm, file: File, file_size: u64) -> io::Result<String> {
+    // Primary path: mmap with huge pages for zero-copy single-shot hash.
+    match unsafe { memmap2::MmapOptions::new().map(&file) } {
+        Ok(mmap) => {
+            if file_size >= 2 * 1024 * 1024 {
+                let _ = mmap.advise(memmap2::Advice::HugePage);
+            }
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            if file_size >= 4 * 1024 * 1024 {
+                if mmap.advise(memmap2::Advice::PopulateRead).is_err() {
+                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+                }
+            } else {
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+            }
+            Ok(hash_bytes(algo, &mmap))
+        }
+        Err(_) => hash_file_pipelined_read(algo, file, file_size),
+    }
+}
+
+/// Streaming fallback for large files when mmap is unavailable.
+/// Uses double-buffered reader thread with fadvise hints.
+/// Fixed: uses blocking recv() to eliminate triple-buffer allocation bug.
+#[cfg(target_os = "linux")]
+fn hash_file_pipelined_read(
+    algo: HashAlgorithm,
+    mut file: File,
+    file_size: u64,
+) -> io::Result<String> {
     use std::os::unix::io::AsRawFd;
 
     const PIPE_BUF_SIZE: usize = 4 * 1024 * 1024; // 4MB per buffer
 
-    // Hint kernel for sequential access
     unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
@@ -329,27 +356,12 @@ fn hash_file_pipelined(algo: HashAlgorithm, mut file: File, file_size: u64) -> i
         );
     }
 
-    // Channel for sending filled buffers from reader to hasher.
-    // sync_channel(1) provides natural double-buffering: reader can fill one
-    // buffer ahead while hasher processes the current one.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
     let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-
-    // Seed the buffer return channel with an initial buffer
     let _ = buf_tx.send(vec![0u8; PIPE_BUF_SIZE]);
 
-    // Reader thread: reads file into buffers and sends them to hasher
     let reader_handle = std::thread::spawn(move || -> io::Result<()> {
-        let mut own_buf = vec![0u8; PIPE_BUF_SIZE];
-        loop {
-            // Try to get a returned buffer from hasher, or use our own
-            let mut buf = buf_rx
-                .try_recv()
-                .unwrap_or_else(|_| std::mem::take(&mut own_buf));
-            if buf.is_empty() {
-                buf = vec![0u8; PIPE_BUF_SIZE];
-            }
-
+        while let Ok(mut buf) = buf_rx.recv() {
             let mut total = 0;
             while total < buf.len() {
                 match file.read(&mut buf[total..]) {
@@ -369,14 +381,12 @@ fn hash_file_pipelined(algo: HashAlgorithm, mut file: File, file_size: u64) -> i
         Ok(())
     });
 
-    // Hasher runs on the calling thread
     let hash_result = match algo {
         HashAlgorithm::Sha256 => {
             let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
                 .map_err(|e| io::Error::other(e))?;
             while let Ok((buf, n)) = rx.recv() {
                 hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
-                // Return the buffer to reader for reuse
                 let _ = buf_tx.send(buf);
             }
             let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
@@ -402,17 +412,22 @@ fn hash_file_pipelined(algo: HashAlgorithm, mut file: File, file_size: u64) -> i
         }
     };
 
-    // Wait for reader thread to finish and propagate any I/O errors
     match reader_handle.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            // If hasher already produced a result, prefer the reader's I/O error
             if hash_result.is_ok() {
                 return Err(e);
             }
         }
-        Err(_) => {
-            return Err(io::Error::other("reader thread panicked"));
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                format!("reader thread panicked: {}", s)
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                format!("reader thread panicked: {}", s)
+            } else {
+                "reader thread panicked".to_string()
+            };
+            return Err(io::Error::other(msg));
         }
     }
 
@@ -620,32 +635,18 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
         if file_size < TINY_FILE_LIMIT {
             return blake2b_hash_file_tiny(file, file_size as usize, output_bytes);
         }
-        // mmap for large files — zero-copy, eliminates multiple read() syscalls
+        // Large files (>=16MB): I/O pipelining on Linux, mmap on other platforms
         if file_size >= SMALL_FILE_LIMIT {
             #[cfg(target_os = "linux")]
-            if file_size >= FADVISE_MIN_SIZE {
-                use std::os::unix::io::AsRawFd;
-                unsafe {
-                    libc::posix_fadvise(
-                        file.as_raw_fd(),
-                        0,
-                        file_size as i64,
-                        libc::POSIX_FADV_SEQUENTIAL,
-                    );
-                }
+            {
+                return blake2b_hash_file_pipelined(file, file_size, output_bytes);
             }
-            // No MAP_POPULATE — HUGEPAGE first, then WILLNEED (same as hash_file)
-            let mmap_result = unsafe { memmap2::MmapOptions::new().map(&file) };
-            if let Ok(mmap) = mmap_result {
-                #[cfg(target_os = "linux")]
-                {
-                    if file_size >= 2 * 1024 * 1024 {
-                        let _ = mmap.advise(memmap2::Advice::HugePage);
-                    }
-                    let _ = mmap.advise(memmap2::Advice::Sequential);
-                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mmap_result = unsafe { memmap2::MmapOptions::new().map(&file) };
+                if let Ok(mmap) = mmap_result {
+                    return Ok(blake2b_hash_data(&mmap, output_bytes));
                 }
-                return Ok(blake2b_hash_data(&mmap, output_bytes));
             }
         }
         // Small files (8KB..1MB): single read into thread-local buffer, then single-shot hash
@@ -703,6 +704,129 @@ fn blake2b_hash_file_small(mut file: File, size: usize, output_bytes: usize) -> 
         }
         Ok(blake2b_hash_data(&buf[..total], output_bytes))
     })
+}
+
+/// Optimized BLAKE2b hash for large files (>=16MB) on Linux.
+/// Primary path: mmap with HUGEPAGE + POPULATE_READ for zero-copy, single-shot hash.
+/// Eliminates thread spawn, channel synchronization, buffer allocation (24MB→0),
+/// and read() memcpy overhead. Falls back to streaming I/O if mmap fails.
+#[cfg(target_os = "linux")]
+fn blake2b_hash_file_pipelined(
+    file: File,
+    file_size: u64,
+    output_bytes: usize,
+) -> io::Result<String> {
+    // Primary path: mmap with huge pages for zero-copy single-shot hash.
+    // Eliminates: thread spawn (~50µs), channel sync, buffer allocs (24MB),
+    // 13+ read() syscalls, and page-cache → user-buffer memcpy.
+    match unsafe { memmap2::MmapOptions::new().map(&file) } {
+        Ok(mmap) => {
+            // HUGEPAGE MUST come before any page faults: reduces 25,600 minor
+            // faults (4KB) to ~50 faults (2MB) for 100MB. Saves ~12ms overhead.
+            if file_size >= 2 * 1024 * 1024 {
+                let _ = mmap.advise(memmap2::Advice::HugePage);
+            }
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            // POPULATE_READ (Linux 5.14+): synchronously prefaults all pages with
+            // huge pages before hashing begins. Falls back to WillNeed on older kernels.
+            if file_size >= 4 * 1024 * 1024 {
+                if mmap.advise(memmap2::Advice::PopulateRead).is_err() {
+                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+                }
+            } else {
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+            }
+            // Single-shot hash: processes entire file in one call, streaming
+            // directly from page cache with no user-space buffer copies.
+            Ok(blake2b_hash_data(&mmap, output_bytes))
+        }
+        Err(_) => {
+            // mmap failed (FUSE, NFS without mmap support, etc.) — fall back
+            // to streaming pipelined I/O.
+            blake2b_hash_file_streamed(file, file_size, output_bytes)
+        }
+    }
+}
+
+/// Streaming fallback for BLAKE2b large files when mmap is unavailable.
+/// Uses double-buffered reader thread with fadvise hints.
+/// Fixed: uses blocking recv() to eliminate triple-buffer allocation bug.
+#[cfg(target_os = "linux")]
+fn blake2b_hash_file_streamed(
+    mut file: File,
+    file_size: u64,
+    output_bytes: usize,
+) -> io::Result<String> {
+    use std::os::unix::io::AsRawFd;
+
+    const PIPE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB per buffer
+
+    // Hint kernel for sequential access
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            0,
+            file_size as i64,
+            libc::POSIX_FADV_SEQUENTIAL,
+        );
+    }
+
+    // Double-buffered channels: reader fills one buffer while hasher processes another.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(1);
+    let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let _ = buf_tx.send(vec![0u8; PIPE_BUF_SIZE]);
+
+    let reader_handle = std::thread::spawn(move || -> io::Result<()> {
+        // Blocking recv reuses hasher's returned buffer (2 buffers total, not 3).
+        while let Ok(mut buf) = buf_rx.recv() {
+            let mut total = 0;
+            while total < buf.len() {
+                match file.read(&mut buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            if total == 0 {
+                break;
+            }
+            if tx.send((buf, total)).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    let mut state = blake2b_simd::Params::new()
+        .hash_length(output_bytes)
+        .to_state();
+    while let Ok((buf, n)) = rx.recv() {
+        state.update(&buf[..n]);
+        let _ = buf_tx.send(buf);
+    }
+    let hash_result = Ok(hex_encode(state.finalize().as_bytes()));
+
+    match reader_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if hash_result.is_ok() {
+                return Err(e);
+            }
+        }
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                format!("reader thread panicked: {}", s)
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                format!("reader thread panicked: {}", s)
+            } else {
+                "reader thread panicked".to_string()
+            };
+            return Err(io::Error::other(msg));
+        }
+    }
+
+    hash_result
 }
 
 /// Hash stdin with BLAKE2b variable output length.
@@ -949,6 +1073,118 @@ pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::
         .collect()
 }
 
+/// Batch-hash multiple files with BLAKE2b using the best strategy for the workload.
+/// Samples a few files to estimate total data size. For small workloads, uses
+/// single-core SIMD batch hashing (`blake2b_hash_files_many`) to avoid stat and
+/// thread spawn overhead. For larger workloads, uses multi-core work-stealing
+/// parallelism where each worker calls `blake2b_hash_file` (with I/O pipelining
+/// for large files on Linux).
+/// Returns results in input order.
+pub fn blake2b_hash_files_parallel(
+    paths: &[&Path],
+    output_bytes: usize,
+) -> Vec<io::Result<String>> {
+    let n = paths.len();
+
+    // Sample a few files to estimate whether parallel processing is worthwhile.
+    // This avoids the cost of statting ALL files (~70µs/file) when the workload
+    // is too small for parallelism to help.
+    let sample_count = n.min(5);
+    let mut sample_max: u64 = 0;
+    let mut sample_total: u64 = 0;
+    for &p in paths.iter().take(sample_count) {
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        sample_total += size;
+        sample_max = sample_max.max(size);
+    }
+    let estimated_total = if sample_count > 0 {
+        sample_total * (n as u64) / (sample_count as u64)
+    } else {
+        0
+    };
+
+    // For small workloads, thread spawn overhead (~120µs × N_threads) exceeds
+    // any parallelism benefit. Use SIMD batch hashing directly (no stat pass).
+    if estimated_total < 1024 * 1024 && sample_max < SMALL_FILE_LIMIT {
+        return blake2b_hash_files_many(paths, output_bytes);
+    }
+
+    // Full stat pass for parallel scheduling — worth it for larger workloads.
+    let mut indexed: Vec<(usize, &Path, u64)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            (i, p, size)
+        })
+        .collect();
+
+    // Sort largest first: ensures big files start hashing immediately while
+    // small files fill in gaps, minimizing tail latency.
+    indexed.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Warm page cache for the largest files using async readahead(2).
+    // Each hash call handles its own mmap prefaulting, but issuing readahead
+    // here lets the kernel start I/O for upcoming files while workers process
+    // current ones. readahead(2) returns immediately (non-blocking).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        for &(_, path, size) in indexed.iter().take(20) {
+            if size >= 1024 * 1024 {
+                if let Ok(file) = open_noatime(path) {
+                    unsafe {
+                        libc::readahead(file.as_raw_fd(), 0, size as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(n);
+
+    // Atomic work index for dynamic work-stealing.
+    let work_idx = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        let work_idx = &work_idx;
+        let indexed = &indexed;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                s.spawn(move || {
+                    let mut local_results = Vec::new();
+                    loop {
+                        let idx = work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= indexed.len() {
+                            break;
+                        }
+                        let (orig_idx, path, _size) = indexed[idx];
+                        let result = blake2b_hash_file(path, output_bytes);
+                        local_results.push((orig_idx, result));
+                    }
+                    local_results
+                })
+            })
+            .collect();
+
+        // Collect results and reorder to match original input order.
+        let mut results: Vec<Option<io::Result<String>>> = (0..n).map(|_| None).collect();
+        for handle in handles {
+            for (orig_idx, result) in handle.join().unwrap() {
+                results[orig_idx] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|opt| opt.unwrap_or_else(|| Err(io::Error::other("missing result"))))
+            .collect()
+    })
+}
+
 /// Batch-hash multiple files with SHA-256/MD5 using work-stealing parallelism.
 /// Files are sorted by size (largest first) so the biggest files start processing
 /// immediately. Each worker thread grabs the next unprocessed file via atomic index,
@@ -972,7 +1208,10 @@ pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Resu
     // small files fill in gaps, minimizing tail latency.
     indexed.sort_by(|a, b| b.2.cmp(&a.2));
 
-    // Issue readahead for the largest files to warm the page cache.
+    // Warm page cache for the largest files using async readahead(2).
+    // Each hash call handles its own mmap prefaulting, but issuing readahead
+    // here lets the kernel start I/O for upcoming files while workers process
+    // current ones. readahead(2) returns immediately (non-blocking).
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -980,12 +1219,7 @@ pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Resu
             if size >= 1024 * 1024 {
                 if let Ok(file) = open_noatime(path) {
                     unsafe {
-                        libc::posix_fadvise(
-                            file.as_raw_fd(),
-                            0,
-                            size as i64,
-                            libc::POSIX_FADV_WILLNEED,
-                        );
+                        libc::readahead(file.as_raw_fd(), 0, size as usize);
                     }
                 }
             }
