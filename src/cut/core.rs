@@ -1871,8 +1871,6 @@ fn fields_mid_range_line(
     }
 }
 
-
-
 /// Zero-copy field-1 extraction using writev: builds IoSlice entries pointing
 /// directly into the source data, flushing in MAX_IOV-sized batches.
 /// For each line: if delimiter exists, output field1 + newline; otherwise pass through.
