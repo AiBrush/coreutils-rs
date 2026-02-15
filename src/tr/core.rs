@@ -6,12 +6,11 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Stream buffer: 8MB — larger buffers reduce syscall count for piped I/O.
-/// For 10MB piped input: 2 iterations (2 reads + 2 translates + 2 writes)
-/// instead of 3 at 4MB. The extra L3 spill is offset by fewer syscalls.
-/// With enlarged pipe buffers (8MB via F_SETPIPE_SZ), each read can return
-/// up to 8MB, so one iteration handles the bulk of the data.
-const STREAM_BUF: usize = 8 * 1024 * 1024;
+/// Stream buffer: 16MB — with read accumulation, larger buffers mean fewer
+/// write syscalls and better SIMD/rayon utilization. For piped I/O, multiple
+/// small pipe reads (64KB-1MB) accumulate before a single process+write.
+/// For 100MB input: ~6 writes instead of ~100+ with smaller buffers.
+const STREAM_BUF: usize = 16 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// AVX2 translation runs at ~10 GB/s per core. For 10MB data:
