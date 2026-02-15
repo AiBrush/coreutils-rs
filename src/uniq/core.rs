@@ -531,6 +531,68 @@ fn line_full_at<'a>(data: &'a [u8], line_starts: &[usize], idx: usize) -> &'a [u
     &data[start..end]
 }
 
+/// Skip a run of identical lines using doubling memcmp.
+/// When a duplicate is found at `dup_start`, this verifies progressively larger
+/// blocks of identical `pattern_len`-byte copies using memcmp (SIMD-accelerated).
+/// Returns the byte offset just past the last verified duplicate copy.
+///
+/// For 50K identical 6-byte lines: ~16 memcmp calls (~600KB total) vs 50K per-line
+/// comparisons. At memcmp's SIMD throughput (~48GB/s), this takes ~12µs vs ~250µs.
+///
+/// Correctness: the doubling trick verifies every byte in the range by induction.
+/// Block[0..N] verified → check Block[N..2N] == Block[0..N] → Block[0..2N] verified.
+#[inline]
+fn skip_dup_run(data: &[u8], dup_start: usize, pattern_start: usize, pattern_len: usize) -> usize {
+    let data_len = data.len();
+    // Need at least 2 more copies worth of data for doubling to help
+    if pattern_len == 0 || dup_start + 2 * pattern_len > data_len {
+        return dup_start + pattern_len.min(data_len - dup_start);
+    }
+
+    let mut verified_end = dup_start + pattern_len; // 1 copy verified
+
+    // Phase 1: doubling — compare verified block vs next block of same size.
+    // Each step doubles the verified region. Total bytes compared ≈ 2 × total region.
+    let mut block_copies = 1usize;
+    loop {
+        let block_bytes = block_copies * pattern_len;
+        let next_end = verified_end + block_bytes;
+        if next_end > data_len {
+            // Not enough room for a full doubling. Check remaining complete copies.
+            let remaining = data_len - verified_end;
+            let remaining_bytes = (remaining / pattern_len) * pattern_len;
+            if remaining_bytes > 0
+                && data[dup_start..dup_start + remaining_bytes]
+                    == data[verified_end..verified_end + remaining_bytes]
+            {
+                verified_end += remaining_bytes;
+            }
+            break;
+        }
+
+        if data[dup_start..dup_start + block_bytes] == data[verified_end..next_end] {
+            verified_end = next_end;
+            block_copies *= 2;
+        } else {
+            break;
+        }
+    }
+
+    // Phase 2: linear scan for remaining lines at the boundary.
+    // At most `block_copies` iterations (the last failed block size).
+    while verified_end + pattern_len <= data_len {
+        if data[verified_end..verified_end + pattern_len]
+            == data[pattern_start..pattern_start + pattern_len]
+        {
+            verified_end += pattern_len;
+        } else {
+            break;
+        }
+    }
+
+    verified_end
+}
+
 /// Linear scan for the end of a duplicate group.
 /// Returns the index of the first line that differs from line_starts[group_start].
 /// Must use linear scan (not binary search) because uniq input may NOT be sorted --
@@ -902,7 +964,9 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
         };
 
         if is_dup {
-            // Duplicate — save the current run up to this line, then skip it
+            // Duplicate found — use doubling memcmp to skip entire run of identical lines.
+            // For 50K identical lines, this takes ~12µs vs ~250µs per-line comparison.
+            let pattern_len = prev_len + 1; // line content + terminator
             if run_start < cur_start {
                 slices.push(io::IoSlice::new(&data[run_start..cur_start]));
                 if slices.len() >= BATCH {
@@ -910,12 +974,12 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
                     slices.clear();
                 }
             }
-            // Start new run after this duplicate
-            run_start = if cur_end < data_len {
-                cur_end + 1
-            } else {
-                cur_end
-            };
+            // Skip all identical copies using doubling memcmp
+            let skip_end = skip_dup_run(data, cur_start, prev_start, pattern_len);
+            run_start = skip_end;
+            cur_start = skip_end;
+            // prev_start/prev_len/prev_prefix unchanged (still the group representative)
+            continue;
         } else {
             // Different line — update cached comparison state
             prev_start = cur_start;
@@ -1092,18 +1156,17 @@ fn process_default_parallel(data: &[u8], writer: &mut impl Write, term: u8) -> i
                 };
 
                 if is_dup {
-                    // Duplicate — flush current run up to this line
+                    // Duplicate — use doubling memcmp to skip entire run
+                    let pattern_len = prev_len + 1;
                     let abs_cur = chunk_start + cur_start;
                     if run_start < abs_cur {
                         runs.push((run_start, abs_cur));
                     }
-                    // New run starts after this duplicate
-                    run_start = chunk_start
-                        + if cur_end < chunk_len {
-                            cur_end + 1
-                        } else {
-                            cur_end
-                        };
+                    let skip_end = skip_dup_run(chunk, cur_start, prev_start, pattern_len);
+                    run_start = chunk_start + skip_end;
+                    cur_start = skip_end;
+                    // prev_start/prev_len/prev_prefix unchanged
+                    continue;
                 } else {
                     last_out_start = chunk_start + cur_start;
                     last_out_end = chunk_start + cur_end;
@@ -1273,7 +1336,13 @@ fn process_filter_fast_singlepass(
         };
 
         if is_dup {
-            count += 1;
+            // Use doubling memcmp to skip entire duplicate run
+            let pattern_len = prev_len + 1;
+            let skip_end = skip_dup_run(data, cur_start, prev_start, pattern_len);
+            let skipped = (skip_end - cur_start) / pattern_len;
+            count += skipped as u64;
+            cur_start = skip_end;
+            continue;
         } else {
             let should_print = if repeated { count > 1 } else { count == 1 };
             if should_print {
@@ -1421,7 +1490,13 @@ fn process_count_fast_singlepass(
         };
 
         if is_dup {
-            count += 1;
+            // Use doubling memcmp to skip entire duplicate run
+            let pattern_len = prev_len + 1;
+            let skip_end = skip_dup_run(data, cur_start, prev_start, pattern_len);
+            let skipped = (skip_end - cur_start) / pattern_len;
+            count += skipped as u64;
+            cur_start = skip_end;
+            continue;
         } else {
             let should_print = match config.mode {
                 OutputMode::RepeatedOnly => count > 1,
