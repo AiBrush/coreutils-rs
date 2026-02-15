@@ -5,17 +5,24 @@ use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
+/// Chunk size for sequential no-wrap encoding: 4MB aligned to 3 bytes.
 /// Smaller chunks reduce peak memory (page fault overhead for large buffers).
 /// For 10MB input, 4MB chunks = 5.3MB buffer vs 13.3MB with 32MB chunks,
 /// saving ~2000 page faults (~0.4ms). Subsequent chunks reuse hot pages.
 const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (32MB).
-/// Rayon dispatch costs ~100µs + shared output buffer allocation overhead.
-/// For files under 32MB (including the 10MB benchmark), sequential encode
-/// is faster because it avoids thread dispatch and large shared buffer alloc.
-const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
+/// Minimum data size for parallel no-wrap encoding (2MB).
+/// No-wrap parallel has minimal overhead: split at 3-byte boundaries,
+/// encode each chunk independently, single shared output buffer.
+/// At 2MB+ the 2-4x parallel speedup easily amortizes Rayon dispatch.
+const PARALLEL_NOWRAP_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Minimum data size for parallel wrapped encoding (32MB).
+/// Wrapped parallel requires line-boundary alignment and a large shared
+/// output buffer. For files under 32MB (including the 10MB benchmark),
+/// sequential chunked encode is faster because it avoids the large shared
+/// buffer allocation (13.5MB for 10MB input = ~3400 page faults).
+const PARALLEL_WRAPPED_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (2MB of base64 data).
 /// Lower threshold lets parallel decode kick in earlier for medium files.
@@ -37,7 +44,7 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
 
 /// Encode without wrapping — parallel SIMD encoding for large data, sequential for small.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    if data.len() >= PARALLEL_ENCODE_THRESHOLD && rayon::current_num_threads() > 1 {
+    if data.len() >= PARALLEL_NOWRAP_THRESHOLD && rayon::current_num_threads() > 1 {
         return encode_no_wrap_parallel(data, out);
     }
 
@@ -118,7 +125,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 
     // Parallel encoding for large data when bytes_per_line is a multiple of 3.
     // This guarantees each chunk encodes to complete base64 without padding.
-    if data.len() >= PARALLEL_ENCODE_THRESHOLD && bytes_per_line.is_multiple_of(3) {
+    if data.len() >= PARALLEL_WRAPPED_THRESHOLD && bytes_per_line.is_multiple_of(3) {
         return encode_wrapped_parallel(data, wrap_col, bytes_per_line, out);
     }
 
