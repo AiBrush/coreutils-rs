@@ -411,12 +411,26 @@ fn itoa_right_aligned_into(buf: &mut [u8; 28], mut val: u64) -> usize {
 // ============================================================================
 
 /// Process uniq from a byte slice (mmap'd file). Zero-copy, no per-line allocation.
-pub fn process_uniq_bytes(data: &[u8], output: impl Write, config: &UniqConfig) -> io::Result<()> {
-    // 16MB output buffer — optimal for L3 cache utilization on modern CPUs.
-    // 32MB can cause cache thrashing; 16MB stays within L3 while still
-    // reducing write() syscall count significantly.
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, output);
+pub fn process_uniq_bytes(
+    data: &[u8],
+    mut output: impl Write,
+    config: &UniqConfig,
+) -> io::Result<()> {
     let term = if config.zero_terminated { b'\0' } else { b'\n' };
+
+    // Zero-copy fast path for default mode: bypass BufWriter entirely.
+    // The single-pass path writes contiguous runs from the original mmap data.
+    // Without BufWriter, writes go directly via writev/vmsplice (zero-copy).
+    // For mostly-unique data (the common case), this produces 1-2 large writes
+    // instead of copying ~10MB through BufWriter's internal heap buffer.
+    let fast = !needs_key_extraction(config) && !config.ignore_case;
+    if fast && !config.count && matches!(config.mode, OutputMode::Default) {
+        return process_default_fast_singlepass(data, &mut output, term);
+    }
+
+    // General path with BufWriter for modes that need formatting/buffering.
+    // 16MB buffer — optimal for L3 cache utilization on modern CPUs.
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, output);
 
     match config.mode {
         OutputMode::Group(method) => {
