@@ -2,12 +2,12 @@ use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::io::{self, BufRead, IoSlice, Write};
 
-/// Minimum file size for parallel processing (32MB).
-/// Rayon's thread pool initialization costs ~0.5ms on first use, and memchr-based
-/// scanning runs at ~10GB/s per core. For 10MB data, sequential takes ~0.001s
-/// while rayon overhead alone is ~0.5ms — making parallel 50x slower for init.
-/// At 32MB, the parallel savings (~1.5ms with 4 cores) clearly exceed the overhead.
-const PARALLEL_THRESHOLD: usize = 32 * 1024 * 1024;
+/// Minimum file size for parallel processing (2MB).
+/// Rayon's thread pool initialization costs ~0.5ms on first use, but for data >= 2MB
+/// with 4 cores, the parallel savings (~3ms) far exceed the overhead. The 10MB
+/// benchmark regressed from ~7x to ~5.3x when this was set to 32MB because it
+/// no longer got parallelized.
+const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Max iovec entries per writev call (Linux default).
 const MAX_IOV: usize = 1024;
@@ -970,10 +970,9 @@ fn process_single_field(
 ) -> io::Result<()> {
     let target_idx = target - 1;
 
-    // For single-field extraction, rayon's thread pool initialization (~0.5ms)
-    // dominates for data < 32MB. memchr2-based scanning runs at ~10GB/s per core,
-    // so 10MB takes ~0.001s sequential. Only parallelize for very large data.
-    const FIELD_PARALLEL_MIN: usize = 32 * 1024 * 1024;
+    // For single-field extraction, parallelize at 2MB+ to match PARALLEL_THRESHOLD.
+    // The 10MB benchmark regressed from ~7x to ~5.3x when this was set to 32MB.
+    const FIELD_PARALLEL_MIN: usize = 2 * 1024 * 1024;
 
     if delim != line_delim {
         // Field 1 fast path: memchr2 single-pass scan.
