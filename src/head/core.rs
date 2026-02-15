@@ -200,6 +200,60 @@ pub fn sendfile_bytes(path: &Path, n: u64, out_fd: i32) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Streaming head for positive line count on a regular file.
+/// Reads small chunks from the start, never mmaps the whole file.
+/// This is the critical fast path: `head -n 10` on a 100MB file
+/// reads only a few KB instead of mapping all 100MB.
+fn head_lines_streaming_file(
+    path: &Path,
+    n: u64,
+    delimiter: u8,
+    out: &mut impl Write,
+) -> io::Result<bool> {
+    if n == 0 {
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+            .or_else(|_| std::fs::File::open(path))?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = std::fs::File::open(path)?;
+
+    let mut reader = io::BufReader::with_capacity(65536, file);
+    let mut buf = [0u8; 65536];
+    let mut count = 0u64;
+
+    loop {
+        let bytes_read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+
+        let chunk = &buf[..bytes_read];
+
+        for pos in memchr_iter(delimiter, chunk) {
+            count += 1;
+            if count == n {
+                out.write_all(&chunk[..=pos])?;
+                return Ok(true);
+            }
+        }
+
+        out.write_all(chunk)?;
+    }
+
+    Ok(true)
+}
+
 /// Process a single file/stdin for head
 pub fn head_file(
     filename: &str,
@@ -213,21 +267,54 @@ pub fn head_file(
         b'\n'
     };
 
-    // For positive byte counts on regular files, try sendfile first
-    #[cfg(target_os = "linux")]
-    if let HeadMode::Bytes(n) = config.mode {
-        if filename != "-" {
-            use std::os::unix::io::AsRawFd;
-            let stdout = io::stdout();
-            let out_fd = stdout.as_raw_fd();
-            match sendfile_bytes(Path::new(filename), n, out_fd) {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(_) => {} // fall through to mmap path
+    if filename != "-" {
+        let path = Path::new(filename);
+
+        // Fast paths that avoid reading/mmapping the whole file
+        match &config.mode {
+            HeadMode::Lines(n) => {
+                // Streaming: read small chunks, stop after N lines
+                match head_lines_streaming_file(path, *n, delimiter, out) {
+                    Ok(true) => return Ok(true),
+                    Err(e) => {
+                        eprintln!(
+                            "{}: cannot open '{}' for reading: {}",
+                            tool_name,
+                            filename,
+                            crate::common::io_error_msg(&e)
+                        );
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+            HeadMode::Bytes(n) => {
+                // sendfile: zero-copy, reads only N bytes
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let stdout = io::stdout();
+                    let out_fd = stdout.as_raw_fd();
+                    if let Ok(true) = sendfile_bytes(path, *n, out_fd) {
+                        return Ok(true);
+                    }
+                }
+                // Non-Linux: still avoid full mmap
+                #[cfg(not(target_os = "linux"))]
+                {
+                    match head_bytes_streaming_file(path, *n, out) {
+                        Ok(true) => return Ok(true),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                // LinesFromEnd and BytesFromEnd need the whole file — use mmap
             }
         }
     }
 
+    // Slow path: read entire file (needed for -n -N, -c -N, or stdin)
     let data: FileData = if filename == "-" {
         match read_stdin() {
             Ok(d) => FileData::Owned(d),
@@ -260,6 +347,32 @@ pub fn head_file(
         HeadMode::LinesFromEnd(n) => head_lines_from_end(&data, *n, delimiter, out)?,
         HeadMode::Bytes(n) => head_bytes(&data, *n, out)?,
         HeadMode::BytesFromEnd(n) => head_bytes_from_end(&data, *n, out)?,
+    }
+
+    Ok(true)
+}
+
+/// Streaming head for positive byte count on non-Linux.
+#[cfg(not(target_os = "linux"))]
+fn head_bytes_streaming_file(
+    path: &Path,
+    n: u64,
+    out: &mut impl Write,
+) -> io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut remaining = n as usize;
+    let mut buf = [0u8; 65536];
+
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let bytes_read = match file.read(&mut buf[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        out.write_all(&buf[..bytes_read])?;
+        remaining -= bytes_read;
     }
 
     Ok(true)
