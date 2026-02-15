@@ -986,7 +986,7 @@ fn process_single_field(
             // Faster than writev/IoSlice for moderate data because it produces
             // one contiguous buffer → one write syscall, and avoids IoSlice
             // allocation overhead for high-delimiter-density data.
-            let mut buf = Vec::with_capacity(data.len());
+            let mut buf = Vec::with_capacity(data.len() / 4);
             single_field1_to_buf(data, delim, line_delim, &mut buf);
             if !buf.is_empty() {
                 out.write_all(&buf)?;
@@ -2294,7 +2294,7 @@ fn single_field1_parallel(
     let results: Vec<Vec<u8>> = chunks
         .par_iter()
         .map(|chunk| {
-            let mut buf = Vec::with_capacity(chunk.len());
+            let mut buf = Vec::with_capacity(chunk.len() / 4);
             single_field1_to_buf(chunk, delim, line_delim, &mut buf);
             buf
         })
@@ -2307,50 +2307,56 @@ fn single_field1_parallel(
     write_ioslices(out, &slices)
 }
 
-/// Extract field 1 from a chunk using memchr2 single-pass scanning.
-/// Uses memchr2(delim, line_delim) to find the first special byte per line:
-/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline
-/// - If newline: no delimiter on this line, output unchanged
-/// This scans ~N total bytes vs ~1.5N for two-level (outer newline + inner delimiter).
+/// Extract field 1 from a chunk using memchr2_iter single-pass scanning.
+///
+/// Single SIMD pass over the entire chunk with a state machine:
+/// - COPY mode: output bytes from line_start to first delimiter or newline
+/// - SKIP mode: ignore bytes until next newline
+///
+/// Eliminates per-line memchr2+memchr function call overhead (~200K calls for
+/// 10MB CSV). The iterator yields all matches in one forward pass.
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
-    use memchr::memchr2;
-    buf.reserve(data.len());
-    let mut pos = 0;
-    while pos < data.len() {
-        match memchr2(delim, line_delim, &data[pos..]) {
-            None => {
-                // Rest is a partial line, no delimiter — output as-is
-                unsafe {
-                    buf_extend(buf, &data[pos..]);
-                }
-                break;
+    let base = data.as_ptr();
+    let mut pos: usize = 0; // start of current copy region
+    let mut in_skip = false; // true = skipping to next newline after delimiter
+
+    for offset in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(offset) };
+
+        if in_skip {
+            if byte == line_delim {
+                // Found newline after delimiter — resume COPY mode
+                pos = offset + 1;
+                in_skip = false;
             }
-            Some(offset) => {
-                let actual = pos + offset;
-                if data[actual] == line_delim {
-                    // No delimiter on this line — output entire line including newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual + 1]);
-                    }
-                    pos = actual + 1;
-                } else {
-                    // Delimiter found — output field 1 (up to delimiter) + newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual]);
-                        buf_push(buf, line_delim);
-                    }
-                    // Skip to next newline
-                    match memchr::memchr(line_delim, &data[actual + 1..]) {
-                        None => {
-                            pos = data.len();
-                        }
-                        Some(nl_off) => {
-                            pos = actual + 1 + nl_off + 1;
-                        }
-                    }
-                }
+            // Ignore extra delimiters in skip region
+        } else if byte == line_delim {
+            // No delimiter on this line — output up to and including newline
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(pos), offset + 1 - pos),
+                );
             }
+            pos = offset + 1;
+        } else {
+            // First delimiter on this line — output field 1 + newline
+            unsafe {
+                buf_extend(buf, std::slice::from_raw_parts(base.add(pos), offset - pos));
+                buf_push(buf, line_delim);
+            }
+            in_skip = true;
+        }
+    }
+
+    // Handle remaining data (no trailing newline)
+    if !in_skip && pos < data.len() {
+        unsafe {
+            buf_extend(
+                buf,
+                std::slice::from_raw_parts(base.add(pos), data.len() - pos),
+            );
         }
     }
 }
