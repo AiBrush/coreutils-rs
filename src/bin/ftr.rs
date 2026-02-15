@@ -9,8 +9,9 @@ use coreutils_rs::common::io::FileData;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
-// Note: VmspliceWriter and RawStdin removed — all paths now use raw write(2)
-// for simplicity. The mmap paths use ManuallyDrop<File> for raw fd output.
+// Streaming paths use raw write(2) since buffers are reused.
+// Splice+mmap paths use raw write(2) too — safe because mmap lives until
+// the write completes. No VmspliceWriter needed.
 
 struct Cli {
     complement: bool,
@@ -325,18 +326,22 @@ fn main() {
                 tr::translate_mmap_readonly(&set1, &set2, &mm, &mut lock)
             }
         } else {
-            // Piped stdin: streaming translate for pipeline parallelism.
-            // Read chunks, translate in-place with SIMD, write immediately.
-            // This overlaps I/O with compute: while ftr translates chunk N,
-            // upstream cat writes chunk N+1 to the pipe.
-            // MUST use raw write (not vmsplice) — stdin is read in chunks via a
-            // locked reader, and the internal buffer is overwritten each iteration.
+            // Piped stdin: try splice for zero-copy transfer, then streaming fallback.
             #[cfg(target_os = "linux")]
             {
-                let stdin = io::stdin();
-                let mut reader = stdin.lock();
-                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                tr::translate(&set1, &set2, &mut reader, &mut *raw_out)
+                // splice moves pipe buffer pages to memfd without copying (kernel→kernel).
+                // Then translate in-place on the MAP_SHARED mmap (no COW overhead).
+                // Eliminates both read() copy and chunked write overhead vs streaming.
+                if let Ok(Some(mut splice_mm)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
+                    let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                    tr::translate_mmap_inplace(&set1, &set2, &mut splice_mm, &mut *raw_out)
+                } else {
+                    // Streaming fallback: read chunks, translate in-place, write immediately.
+                    let stdin = io::stdin();
+                    let mut reader = stdin.lock();
+                    let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                    tr::translate(&set1, &set2, &mut reader, &mut *raw_out)
+                }
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -391,13 +396,19 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: streaming mode for pipeline parallelism with upstream cat.
-        // Process chunks as they arrive instead of batching all data first.
-        // Use raw write (not vmsplice) since streaming buffers are reused.
+        // Piped stdin: try splice for zero-copy transfer, then streaming fallback.
         #[cfg(target_os = "linux")]
         let result = {
-            let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-            run_streaming_mode(&cli, set1_str, &mut *raw_out)
+            if let Ok(Some(splice_mm)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
+                // splice succeeded: use mmap batch path (same as file-redirected stdin).
+                let data: &[u8] = &splice_mm;
+                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                run_mmap_mode(&cli, set1_str, data, &mut *raw_out)
+            } else {
+                // Streaming fallback: process chunks for pipeline parallelism.
+                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                run_streaming_mode(&cli, set1_str, &mut *raw_out)
+            }
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
