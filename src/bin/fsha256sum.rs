@@ -221,10 +221,8 @@ fn run_hash_mode(
 ) {
     let has_stdin = files.iter().any(|f| f == "-");
 
-    if has_stdin || files.len() <= 10 {
-        // Sequential for stdin or small file counts.
-        // For <=10 tiny files, sequential avoids thread::scope spawn overhead
-        // (~90µs) which exceeds the parallel speedup on sub-millisecond work.
+    if has_stdin || files.len() <= 1 {
+        // Sequential for stdin or single file.
         // Uses hash_file_nostat to skip fstat (~5µs/file) since the nostat path
         // handles all file sizes via two-tier buffer + streaming fallback.
         for filename in files {
@@ -251,7 +249,7 @@ fn run_hash_mode(
             }
         }
     } else {
-        // Multi-file (11+): use parallel hashing with thread::scope.
+        // Multi-file (2+): use parallel hashing with thread::scope.
         let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
         let results = hash::hash_files_parallel(&paths, algo);
 
