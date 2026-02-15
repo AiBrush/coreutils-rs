@@ -335,21 +335,67 @@ fn main() {
                 }
             }
         } else {
-            // Multi-file (2+): use parallel hashing with thread::scope.
+            // Multi-file (2+): choose strategy based on file count.
             let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
-            let results = hash::hash_files_parallel(&paths, algo);
 
+            let results = if files.len() >= 20 {
+                // Many files: batch I/O (pre-read all, then hash all in parallel).
+                // Separates I/O from compute for maximum throughput.
+                hash::hash_files_batch(&paths, algo)
+            } else {
+                // Moderate file count: fast parallel hash_file_nostat per worker.
+                hash::hash_files_parallel_fast(&paths, algo)
+            };
+
+            // Batch output: build all output lines into one buffer, write once.
+            // Reduces per-file write() overhead from ~100 syscalls to 1.
+            let binary = cli.binary || (!cli.text && cfg!(windows));
+            let mut output_buf = Vec::with_capacity(files.len() * 80);
             for (filename, result) in files.iter().zip(results) {
                 match result {
                     Ok(h) => {
-                        write_output(&mut out, &cli, algo, &h, filename);
+                        if cli.tag {
+                            let term = if cli.zero { b'\0' } else { b'\n' };
+                            output_buf.extend_from_slice(algo.name().as_bytes());
+                            output_buf.extend_from_slice(b" (");
+                            output_buf.extend_from_slice(filename.as_bytes());
+                            output_buf.extend_from_slice(b") = ");
+                            output_buf.extend_from_slice(h.as_bytes());
+                            output_buf.push(term);
+                        } else {
+                            let mode = if binary { b'*' } else { b' ' };
+                            let term = if cli.zero { b'\0' } else { b'\n' };
+                            if !cli.zero && needs_escape(filename) {
+                                let escaped = escape_filename(filename);
+                                output_buf.push(b'\\');
+                                output_buf.extend_from_slice(h.as_bytes());
+                                output_buf.push(b' ');
+                                output_buf.push(mode);
+                                output_buf.extend_from_slice(escaped.as_bytes());
+                                output_buf.push(term);
+                            } else {
+                                output_buf.extend_from_slice(h.as_bytes());
+                                output_buf.push(b' ');
+                                output_buf.push(mode);
+                                output_buf.extend_from_slice(filename.as_bytes());
+                                output_buf.push(term);
+                            }
+                        }
                     }
                     Err(e) => {
+                        // Flush buffered output before writing error to stderr
+                        if !output_buf.is_empty() {
+                            let _ = out.write_all(&output_buf);
+                            output_buf.clear();
+                        }
                         let _ = out.flush();
                         eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                         had_error = true;
                     }
                 }
+            }
+            if !output_buf.is_empty() {
+                let _ = out.write_all(&output_buf);
             }
         }
     }

@@ -313,7 +313,10 @@ thread_local! {
 /// Uses a reader thread that reads 4MB chunks while the main thread hashes,
 /// overlapping NVMe/SSD read latency with SHA-NI computation.
 /// For a 100MB file: I/O ~15ms from cache, hash ~40ms → pipelined ~42ms vs ~55ms sequential.
+/// Note: Currently unused — mmap + hash_bytes is faster when data is in page cache.
+/// Kept for potential future use with cold-cache workloads.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn hash_file_pipelined(algo: HashAlgorithm, mut file: File, file_size: u64) -> io::Result<String> {
     use std::os::unix::io::AsRawFd;
 
@@ -434,19 +437,20 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
         if file_size < TINY_FILE_LIMIT {
             return hash_file_tiny(algo, file, file_size as usize);
         }
-        // Large files (>=16MB): use I/O pipelining on Linux to overlap read + hash
+        // Large files (>=16MB): mmap + single-shot hash for zero-copy processing.
+        // mmap avoids pipelining overhead (thread spawn, cross-core cache transfers)
+        // that hurts when data is already in page cache (benchmark scenario).
         if file_size >= SMALL_FILE_LIMIT {
-            #[cfg(target_os = "linux")]
-            {
-                return hash_file_pipelined(algo, file, file_size);
-            }
-            // Non-Linux: mmap fallback
-            #[cfg(not(target_os = "linux"))]
-            {
-                let mmap_result = unsafe { memmap2::MmapOptions::new().map(&file) };
-                if let Ok(mmap) = mmap_result {
-                    return Ok(hash_bytes(algo, &mmap));
+            let mmap_result = unsafe { memmap2::MmapOptions::new().map(&file) };
+            if let Ok(mmap) = mmap_result {
+                #[cfg(target_os = "linux")]
+                {
+                    if file_size >= 2 * 1024 * 1024 {
+                        let _ = mmap.advise(memmap2::Advice::HugePage);
+                    }
+                    let _ = mmap.advise(memmap2::Advice::Sequential);
                 }
+                return Ok(hash_bytes(algo, &mmap));
             }
         }
         // Small files (8KB..16MB): single read into thread-local buffer, then single-shot hash.
@@ -1027,6 +1031,178 @@ pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Resu
         for handle in handles {
             for (orig_idx, result) in handle.join().unwrap() {
                 results[orig_idx] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|opt| opt.unwrap_or_else(|| Err(io::Error::other("missing result"))))
+            .collect()
+    })
+}
+
+/// Fast parallel hash for multi-file workloads. Skips the stat-all-and-sort phase
+/// of `hash_files_parallel()` and uses `hash_file_nostat()` per worker to minimize
+/// per-file syscall overhead. For 100 tiny files, this eliminates ~200 stat() calls
+/// (100 from the sort phase + 100 from open_and_stat inside each worker).
+/// Returns results in input order.
+pub fn hash_files_parallel_fast(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Result<String>> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![hash_file_nostat(algo, paths[0])];
+    }
+
+    // Issue readahead for all files (no size threshold — even tiny files benefit
+    // from batched WILLNEED hints when processing 100+ files)
+    #[cfg(target_os = "linux")]
+    readahead_files_all(paths);
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(n);
+
+    let work_idx = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        let work_idx = &work_idx;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                s.spawn(move || {
+                    let mut local_results = Vec::new();
+                    loop {
+                        let idx =
+                            work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= n {
+                            break;
+                        }
+                        let result = hash_file_nostat(algo, paths[idx]);
+                        local_results.push((idx, result));
+                    }
+                    local_results
+                })
+            })
+            .collect();
+
+        let mut results: Vec<Option<io::Result<String>>> = (0..n).map(|_| None).collect();
+        for handle in handles {
+            for (idx, result) in handle.join().unwrap() {
+                results[idx] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|opt| opt.unwrap_or_else(|| Err(io::Error::other("missing result"))))
+            .collect()
+    })
+}
+
+/// Batch-hash multiple files: pre-read all files into memory in parallel,
+/// then hash all data in parallel. Optimal for many small files where per-file
+/// overhead (open/read/close syscalls) dominates over hash computation.
+///
+/// Reuses the same parallel file loading pattern as `blake2b_hash_files_many()`.
+/// For 100 × 55-byte files: all 5500 bytes are loaded in parallel across threads,
+/// then hashed in parallel — minimizing wall-clock time for syscall-bound workloads.
+/// Returns results in input order.
+pub fn hash_files_batch(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Result<String>> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Issue readahead for all files
+    #[cfg(target_os = "linux")]
+    readahead_files_all(paths);
+
+    // Phase 1: Load all files into memory in parallel.
+    // For 20+ files, use fast path that skips fstat.
+    let use_fast = n >= 20;
+
+    let file_data: Vec<io::Result<FileContent>> = if n <= 10 {
+        // Sequential loading — avoids thread spawn overhead for small batches
+        paths
+            .iter()
+            .map(|&path| {
+                if use_fast {
+                    open_file_content_fast(path)
+                } else {
+                    open_file_content(path)
+                }
+            })
+            .collect()
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(4)
+            .min(n);
+        let chunk_size = (n + num_threads - 1) / num_threads;
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&path| {
+                                if use_fast {
+                                    open_file_content_fast(path)
+                                } else {
+                                    open_file_content(path)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    };
+
+    // Phase 2: Hash all loaded data. For tiny files hash is negligible;
+    // for larger files the parallel hashing across threads helps.
+    let num_hash_threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(4)
+        .min(n);
+    let work_idx = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        let work_idx = &work_idx;
+        let file_data = &file_data;
+
+        let handles: Vec<_> = (0..num_hash_threads)
+            .map(|_| {
+                s.spawn(move || {
+                    let mut local_results = Vec::new();
+                    loop {
+                        let idx = work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= n {
+                            break;
+                        }
+                        let result = match &file_data[idx] {
+                            Ok(content) => Ok(hash_bytes(algo, content.as_ref())),
+                            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                        };
+                        local_results.push((idx, result));
+                    }
+                    local_results
+                })
+            })
+            .collect();
+
+        let mut results: Vec<Option<io::Result<String>>> = (0..n).map(|_| None).collect();
+        for handle in handles {
+            for (idx, result) in handle.join().unwrap() {
+                results[idx] = Some(result);
             }
         }
         results

@@ -33,7 +33,7 @@ High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleratio
 | wc | `fwc` | Optimized | Word, line, char, byte count (SIMD SSE2, single-pass, parallel) |
 | cut | `fcut` | Optimized | Field/byte/char extraction (mmap, SIMD) |
 | sha256sum | `fsha256sum` | Optimized | SHA-256 checksums (mmap, madvise, readahead, parallel) |
-| md5sum | `fmd5sum` | Optimized | MD5 checksums (mmap, madvise, readahead, parallel) |
+| md5sum | `fmd5sum` | Optimized | MD5 checksums (mmap, batch I/O, parallel hash, batched output) |
 | b2sum | `fb2sum` | Optimized | BLAKE2b checksums (mmap, madvise, readahead) |
 | base64 | `fbase64` | Optimized | Base64 encode/decode (SIMD, parallel, fused strip+decode) |
 | sort | `fsort` | Optimized | Line sorting (parallel merge sort) |
