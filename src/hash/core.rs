@@ -867,15 +867,15 @@ pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::
 /// initialization (spawning N-1 threads + setting up work-stealing deques).
 /// Returns results in input order.
 pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Result<String>> {
-    // Readahead for 11-20 files only. For ≤10 files, binaries use sequential
-    // processing (never reach here). For 100+ files, per-file overhead
+    // Readahead for moderate file counts: warm page cache by opening/reading/closing
+    // before the parallel hash phase. For 100+ files, per-file overhead
     // (open+stat+fadvise+close = ~30µs/file) exceeds page cache benefit.
-    if paths.len() > 10 && paths.len() <= 20 {
+    if paths.len() <= 20 {
         readahead_files_all(paths);
     }
 
-    // For many files (100+), use nostat path that skips fstat syscall.
-    let use_fast = paths.len() >= 20;
+    // Use nostat path that skips fstat syscall — saves ~5µs/file on tiny files.
+    let use_fast = paths.len() >= 2;
 
     // Use std::thread::scope for lighter-weight parallelism than rayon.
     // Thread spawn (~30µs × 3 = ~90µs) vs rayon init (~300µs).
@@ -917,7 +917,7 @@ pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Resu
 /// Uses a two-tier buffer strategy: small stack buffer (4KB) for the initial read,
 /// then falls back to a larger stack buffer (64KB) or streaming hash for bigger files.
 /// For benchmark's 55-byte files: one read() fills the 4KB buffer, hash immediately.
-fn hash_file_nostat(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
+pub fn hash_file_nostat(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
     let mut file = open_noatime(path)?;
     // First try a small stack buffer — optimal for tiny files (< 4KB).
     // Most "many_files" benchmark files are ~55 bytes, so this completes

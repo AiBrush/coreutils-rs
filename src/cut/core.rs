@@ -970,13 +970,15 @@ fn process_single_field(
     let target_idx = target - 1;
 
     if delim != line_delim {
-        // Zero-copy writev path for field 1: no allocation, no copy.
-        // Uses two-level scan: outer memchr(newline) + inner memchr(delim).
-        // Faster than parallel+copy because field 1 is a prefix of each line,
-        // so inner scan exits immediately after the first delimiter.
-        // Also faster than memchr2 single-pass (which scans ALL delimiters
-        // on each line — for 10-column CSV that's ~9 wasted scans per line).
+        // Field 1 fast path: memchr2 single-pass + parallel for large data.
+        // memchr2(delim, newline) finds the first special byte per line in one scan.
+        // For field 1, the first delimiter IS the field boundary. Lines without
+        // delimiter are passed through unchanged. This scans ~N total bytes vs
+        // ~1.5N for the two-level (outer newline + inner delimiter) approach.
         if target_idx == 0 && !suppress {
+            if data.len() >= PARALLEL_THRESHOLD {
+                return single_field1_parallel(data, delim, line_delim, out);
+            }
             return single_field1_zerocopy(data, delim, line_delim, out);
         }
 
@@ -1885,10 +1887,87 @@ fn fields_mid_range_line(
 /// For each line: if delimiter exists, output field1 + newline; otherwise pass through.
 ///
 /// Uses a two-level scan: outer memchr(newline) for line boundaries, inner memchr(delim)
-/// for the first delimiter. This is faster than a single-pass memchr2 because field 1 is
-/// always at the start — the inner scan exits after the FIRST delimiter, skipping all
-/// subsequent delimiters on the line. For 10-column CSV, this processes ~2 SIMD hits/line
-/// instead of ~10, a 5x reduction in per-hit overhead.
+/// Parallel field-1 extraction for large data using memchr2 single-pass.
+/// Splits data into per-thread chunks, each chunk extracts field 1 using
+/// memchr2(delim, newline) which finds the first special byte in one scan.
+/// For field 1: first special byte is either the delimiter (field end) or
+/// newline (no delimiter, output line unchanged). 4 threads cut scan time ~4x.
+fn single_field1_parallel(
+    data: &[u8],
+    delim: u8,
+    line_delim: u8,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let chunks = split_into_chunks(data, line_delim);
+    let results: Vec<Vec<u8>> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut buf = Vec::with_capacity(chunk.len());
+            single_field1_to_buf(chunk, delim, line_delim, &mut buf);
+            buf
+        })
+        .collect();
+    let slices: Vec<IoSlice> = results
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| IoSlice::new(r))
+        .collect();
+    write_ioslices(out, &slices)
+}
+
+/// Extract field 1 from a chunk using memchr2 single-pass scanning.
+/// Uses memchr2(delim, line_delim) to find the first special byte per line:
+/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline
+/// - If newline: no delimiter on this line, output unchanged
+/// This scans ~N total bytes vs ~1.5N for two-level (outer newline + inner delimiter).
+#[inline]
+fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
+    use memchr::memchr2;
+    buf.reserve(data.len());
+    let mut pos = 0;
+    while pos < data.len() {
+        match memchr2(delim, line_delim, &data[pos..]) {
+            None => {
+                // Rest is a partial line, no delimiter — output as-is
+                unsafe {
+                    buf_extend(buf, &data[pos..]);
+                }
+                break;
+            }
+            Some(offset) => {
+                let actual = pos + offset;
+                if data[actual] == line_delim {
+                    // No delimiter on this line — output entire line including newline
+                    unsafe {
+                        buf_extend(buf, &data[pos..actual + 1]);
+                    }
+                    pos = actual + 1;
+                } else {
+                    // Delimiter found — output field 1 (up to delimiter) + newline
+                    unsafe {
+                        buf_extend(buf, &data[pos..actual]);
+                        buf_push(buf, line_delim);
+                    }
+                    // Skip to next newline
+                    match memchr::memchr(line_delim, &data[actual + 1..]) {
+                        None => {
+                            pos = data.len();
+                        }
+                        Some(nl_off) => {
+                            pos = actual + 1 + nl_off + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Zero-copy field 1 extraction using writev: builds IoSlice entries pointing
+/// directly into the source data. Uses two-level scan: outer memchr(newline)
+/// for the first delimiter. This is faster than memchr2 for SMALL data because
+/// the inner scan exits after the FIRST delimiter, skipping all
+/// subsequent delimiters on the line.
 ///
 /// Lines without delimiter stay in contiguous runs (zero-copy pass-through).
 /// Lines with delimiter produce two IoSlices (truncated field + newline byte).

@@ -308,8 +308,14 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         return None;
     }
 
+    let file_size = stat.st_size as usize;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().populate().map(&file) }.ok();
+    // MAP_POPULATE for files >= 4MB to prefault pages; lazy for smaller files
+    let mmap = if file_size >= 4 * 1024 * 1024 {
+        unsafe { MmapOptions::new().populate().map(&file) }.ok()
+    } else {
+        unsafe { MmapOptions::new().map(&file) }.ok()
+    };
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {

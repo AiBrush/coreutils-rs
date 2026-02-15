@@ -222,13 +222,16 @@ fn run_hash_mode(
     let has_stdin = files.iter().any(|f| f == "-");
 
     if has_stdin || files.len() <= 10 {
-        // Sequential for stdin or small file count — avoids thread::scope
-        // overhead (~120µs) and readahead double-open penalty.
+        // Sequential for stdin or small file counts.
+        // For <=10 tiny files, sequential avoids thread::scope spawn overhead
+        // (~90µs) which exceeds the parallel speedup on sub-millisecond work.
+        // Uses hash_file_nostat to skip fstat (~5µs/file) since the nostat path
+        // handles all file sizes via two-tier buffer + streaming fallback.
         for filename in files {
             let hash_result = if filename == "-" {
                 hash::hash_stdin(algo)
             } else {
-                hash::hash_file(algo, Path::new(filename))
+                hash::hash_file_nostat(algo, Path::new(filename))
             };
 
             match hash_result {
@@ -248,10 +251,7 @@ fn run_hash_mode(
             }
         }
     } else {
-        // Multi-file: always use rayon parallel hashing with readahead.
-        // Even for many small files, rayon's work-stealing overhead (~1μs/task)
-        // is negligible compared to per-file I/O (~10-50μs), and the 4-thread
-        // parallelism gives ~4x speedup on the 100-file benchmark.
+        // Multi-file (11+): use parallel hashing with thread::scope.
         let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
         let results = hash::hash_files_parallel(&paths, algo);
 

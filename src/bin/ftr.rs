@@ -9,6 +9,101 @@ use coreutils_rs::common::io::FileData;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
+/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
+/// When stdout is a pipe, vmsplice references user-space pages directly
+/// in the pipe buffer (no kernel memcpy). Falls back to regular write
+/// for non-pipe fds (files, terminals).
+#[cfg(target_os = "linux")]
+struct VmspliceWriter {
+    raw: ManuallyDrop<std::fs::File>,
+    is_pipe: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl VmspliceWriter {
+    fn new() -> Self {
+        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let is_pipe = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        Self { raw, is_pipe }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Write for VmspliceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write(buf);
+        }
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write(buf)
+        }
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write_all(buf);
+        }
+        while !buf.is_empty() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                buf = &buf[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.is_pipe = false;
+                return (&*self.raw).write_all(buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if !self.is_pipe || bufs.is_empty() {
+            return (&*self.raw).write_vectored(bufs);
+        }
+        let count = bufs.len().min(1024);
+        let iovs = bufs.as_ptr() as *const libc::iovec;
+        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write_vectored(bufs)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Raw stdin reader for zero-overhead pipe reads on Linux.
 /// Bypasses Rust's StdinLock (mutex + 8KB BufReader) to use libc::read(0) directly.
 /// Each read returns immediately with whatever data is available in the pipe,
@@ -134,8 +229,9 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
 /// Returns None if stdin is a pipe/terminal, file is too small for mmap
 /// benefit, or on non-unix platforms.
+/// `min_size` controls the minimum file size for mmap (0 = any size).
 #[cfg(unix)]
-fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+fn try_mmap_stdin_with_threshold(min_size: usize) -> Option<memmap2::Mmap> {
     use std::os::unix::io::AsRawFd;
     let stdin = io::stdin();
     let fd = stdin.as_raw_fd();
@@ -151,22 +247,21 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 
     let file_size = stat.st_size as usize;
 
-    // For files below 32MB, skip mmap entirely and use streaming read() path.
-    // read() hides page faults inside the kernel memcpy (batch TLB flush,
-    // no per-page trap), while mmap exposes each fault as a userspace event
-    // (~300ns/fault × 2560 faults = ~770µs for 10MB).
-    // Above 32MB, mmap's zero-copy advantage outweighs the page fault cost.
-    if file_size < 32 * 1024 * 1024 {
+    if file_size < min_size {
         return None;
     }
 
     // mmap the stdin file descriptor.
-    // MAP_POPULATE for large files to prefault pages during mmap() call.
+    // MAP_POPULATE for files >= 4MB to prefault pages during mmap() call.
+    // For smaller files, lazy faulting with sequential access is faster.
     // SAFETY: fd is valid, file is regular, size > 0
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap: Option<memmap2::Mmap> =
-        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
+    let mmap: Option<memmap2::Mmap> = if file_size >= 4 * 1024 * 1024 {
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok()
+    } else {
+        unsafe { memmap2::MmapOptions::new().map(&file) }.ok()
+    };
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -188,8 +283,19 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     mmap
 }
 
+/// Try to mmap stdin with default threshold (32MB) for non-translate modes.
+#[cfg(unix)]
+fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    try_mmap_stdin_with_threshold(32 * 1024 * 1024)
+}
+
 #[cfg(not(unix))]
 fn try_mmap_stdin() -> Option<memmap2::Mmap> {
+    None
+}
+
+#[cfg(not(unix))]
+fn try_mmap_stdin_with_threshold(_min_size: usize) -> Option<memmap2::Mmap> {
     None
 }
 
@@ -289,13 +395,18 @@ fn main() {
             tr::expand_set2(set2_str, set1.len())
         };
 
-        // For small-to-medium files, use read-only mmap + separate output buffer.
-        // This avoids MAP_PRIVATE COW page faults entirely. For large files (>= 32MB),
-        // MAP_PRIVATE is better because it avoids doubling memory usage.
-        let result = if let Some(mm) = try_mmap_stdin() {
+        // For translate mode, mmap any regular file (threshold=0) to avoid
+        // the kernel→userspace copy from read(). For piped input, fall through
+        // to the streaming path with VmspliceWriter for zero-copy output.
+        let result = if let Some(mm) = try_mmap_stdin_with_threshold(0) {
             if mm.len() < 64 * 1024 * 1024 {
                 // Read-only mmap: translate into separate buffer (no COW faults)
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
+                {
+                    let mut writer = VmspliceWriter::new();
+                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut writer)
+                }
+                #[cfg(all(unix, not(target_os = "linux")))]
                 {
                     tr::translate_mmap_readonly(&set1, &set2, &mm, &mut *raw)
                 }
@@ -309,7 +420,12 @@ fn main() {
                 // Large file: use MAP_PRIVATE for in-place translate
                 drop(mm);
                 if let Some(mut mm_mut) = try_mmap_stdin_mut() {
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut writer = VmspliceWriter::new();
+                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut writer)
+                    }
+                    #[cfg(all(unix, not(target_os = "linux")))]
                     {
                         tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw)
                     }
@@ -320,7 +436,8 @@ fn main() {
                         tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
                     }
                 } else {
-                    // Fallback: streaming path with raw stdin
+                    // Fallback: streaming path (no vmsplice — buffer reuse conflicts
+                    // with vmsplice's zero-copy page references)
                     #[cfg(target_os = "linux")]
                     {
                         tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
@@ -342,9 +459,10 @@ fn main() {
                 }
             }
         } else {
-            // Piped stdin: use streaming path with RawStdin for pipelining.
-            // Streaming processes each chunk immediately after read, enabling
-            // overlap with upstream cat. RawStdin bypasses StdinLock overhead.
+            // Piped stdin: streaming path with raw write (not vmsplice).
+            // vmsplice puts page references into the pipe buffer. The streaming
+            // path reuses the same buffer across iterations, so vmsplice'd pages
+            // get overwritten before the pipe reader consumes them.
             #[cfg(target_os = "linux")]
             {
                 tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
@@ -377,9 +495,14 @@ fn main() {
     let mmap = try_mmap_stdin();
 
     if let Some(m) = mmap {
-        // File-redirected stdin: use batch path with mmap data
+        // File-redirected stdin: use batch path with mmap data + VmspliceWriter
         let data = FileData::Mmap(m);
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut writer = VmspliceWriter::new();
+            run_mmap_mode(&cli, set1_str, &data, &mut writer)
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
         #[cfg(not(unix))]
         let result = {
@@ -394,12 +517,11 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: use streaming functions directly for pipelining.
-        // Streaming processes each chunk as it arrives from the pipe,
-        // overlapping with upstream cat's writes. Avoids the 16MB read_stdin
-        // pre-allocation and eliminates waiting for EOF before processing.
+        // Piped stdin: streaming path with raw write (not vmsplice — buffer reuse
+        // conflicts with vmsplice's zero-copy page references).
         #[cfg(unix)]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
+        // Note: RawStdin is handled inside run_streaming_mode (Linux-only)
         #[cfg(not(unix))]
         let result = {
             let stdout = io::stdout();

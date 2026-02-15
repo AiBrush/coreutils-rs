@@ -6,20 +6,20 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Stream buffer: 4MB — sized to fit entirely in L3 cache (~8-16MB on modern
-/// CPUs). Data passes through the buffer 3 times (read→translate→write), so
-/// keeping it cache-warm gives ~3-5x throughput vs spilling to DRAM.
-/// For 10MB file: 3 rounds × 4MB buffer at L3 speed (~100 GB/s) ≈ 300µs,
-/// vs 1 round × 16MB buffer at DRAM speed (~20 GB/s) ≈ 1000µs.
-/// For piped input with 8MB pipe buffer: 2 reads per chunk, ~5µs extra syscalls.
-const STREAM_BUF: usize = 4 * 1024 * 1024;
+/// Stream buffer: 8MB — larger buffers reduce syscall count for piped I/O.
+/// For 10MB piped input: 2 iterations (2 reads + 2 translates + 2 writes)
+/// instead of 3 at 4MB. The extra L3 spill is offset by fewer syscalls.
+/// With enlarged pipe buffers (8MB via F_SETPIPE_SZ), each read can return
+/// up to 8MB, so one iteration handles the bulk of the data.
+const STREAM_BUF: usize = 8 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
-/// AVX2 translation runs at ~10 GB/s per core. For 10MB benchmarks,
-/// rayon overhead (~100-200us for spawn+join) dominates the ~1ms
-/// single-core translate time. Only use parallel for genuinely large files
-/// where the parallel speedup outweighs rayon overhead.
-const PARALLEL_THRESHOLD: usize = 32 * 1024 * 1024;
+/// AVX2 translation runs at ~10 GB/s per core. For 10MB data:
+/// - Sequential: ~1ms translate
+/// - Parallel (4 cores): ~0.25ms translate + ~0.15ms rayon overhead = ~0.4ms
+/// Net savings: ~0.6ms per translate pass. Worth it for >= 4MB files where
+/// the multi-core speedup clearly exceeds rayon spawn+join overhead.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// 256-entry lookup table for byte compaction: for each 8-bit keep mask,
 /// stores the bit positions of set bits (indices of bytes to keep).
@@ -2605,7 +2605,16 @@ pub fn translate(
         if n == 0 {
             break;
         }
-        translate_inplace(&mut buf[..n], &table);
+        if n >= PARALLEL_THRESHOLD {
+            // Parallel in-place translate for large chunks (~4x faster on 4+ cores).
+            let nt = rayon::current_num_threads().max(1);
+            let cs = (n / nt).max(32 * 1024);
+            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
+                translate_inplace(chunk, &table);
+            });
+        } else {
+            translate_inplace(&mut buf[..n], &table);
+        }
         writer.write_all(&buf[..n])?;
     }
     Ok(())
@@ -2613,6 +2622,7 @@ pub fn translate(
 
 /// Streaming SIMD range translation — single buffer, in-place transform.
 /// Uses 16MB uninit buffer for fewer syscalls (translate is compute-light).
+/// For chunks >= PARALLEL_THRESHOLD, uses rayon par_chunks_mut for multi-core.
 fn translate_range_stream(
     lo: u8,
     hi: u8,
@@ -2626,7 +2636,15 @@ fn translate_range_stream(
         if n == 0 {
             break;
         }
-        translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+        if n >= PARALLEL_THRESHOLD {
+            let nt = rayon::current_num_threads().max(1);
+            let cs = (n / nt).max(32 * 1024);
+            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
+                translate_range_simd_inplace(chunk, lo, hi, offset);
+            });
+        } else {
+            translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+        }
         writer.write_all(&buf[..n])?;
     }
     Ok(())
@@ -2634,6 +2652,7 @@ fn translate_range_stream(
 
 /// Streaming SIMD range-to-constant translation — single buffer, in-place transform.
 /// Uses blendv instead of nibble decomposition for ~10x fewer SIMD ops per vector.
+/// For chunks >= PARALLEL_THRESHOLD, uses rayon par_chunks_mut for multi-core.
 fn translate_range_to_constant_stream(
     lo: u8,
     hi: u8,
@@ -2647,7 +2666,15 @@ fn translate_range_to_constant_stream(
         if n == 0 {
             break;
         }
-        translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
+        if n >= PARALLEL_THRESHOLD {
+            let nt = rayon::current_num_threads().max(1);
+            let cs = (n / nt).max(32 * 1024);
+            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
+                translate_range_to_constant_simd_inplace(chunk, lo, hi, replacement);
+            });
+        } else {
+            translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
+        }
         writer.write_all(&buf[..n])?;
     }
     Ok(())
@@ -2896,56 +2923,193 @@ pub fn delete(
 
     let member = build_member_set(delete_chars);
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    // Separate output buffer for SIMD compaction — keeps source data intact
+    // while compact_8bytes_simd writes to a different location.
+    let mut outbuf = alloc_uninit_vec(STREAM_BUF);
 
     loop {
         let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        let mut wp = 0;
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            let mut i = 0;
-            while i + 8 <= n {
-                let b0 = *ptr.add(i);
-                let b1 = *ptr.add(i + 1);
-                let b2 = *ptr.add(i + 2);
-                let b3 = *ptr.add(i + 3);
-                let b4 = *ptr.add(i + 4);
-                let b5 = *ptr.add(i + 5);
-                let b6 = *ptr.add(i + 6);
-                let b7 = *ptr.add(i + 7);
-
-                // Branchless: write byte then conditionally advance pointer.
-                // Avoids branch mispredictions when most bytes are kept.
-                *ptr.add(wp) = b0;
-                wp += !is_member(&member, b0) as usize;
-                *ptr.add(wp) = b1;
-                wp += !is_member(&member, b1) as usize;
-                *ptr.add(wp) = b2;
-                wp += !is_member(&member, b2) as usize;
-                *ptr.add(wp) = b3;
-                wp += !is_member(&member, b3) as usize;
-                *ptr.add(wp) = b4;
-                wp += !is_member(&member, b4) as usize;
-                *ptr.add(wp) = b5;
-                wp += !is_member(&member, b5) as usize;
-                *ptr.add(wp) = b6;
-                wp += !is_member(&member, b6) as usize;
-                *ptr.add(wp) = b7;
-                wp += !is_member(&member, b7) as usize;
-                i += 8;
-            }
-            while i < n {
-                let b = *ptr.add(i);
-                *ptr.add(wp) = b;
-                wp += !is_member(&member, b) as usize;
-                i += 1;
-            }
+        #[cfg(target_arch = "x86_64")]
+        let wp = if get_simd_level() >= 3 {
+            unsafe { delete_bitset_avx2_stream(&buf[..n], &mut outbuf, &member) }
+        } else {
+            delete_bitset_scalar(&buf[..n], &mut outbuf, &member)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let wp = delete_bitset_scalar(&buf[..n], &mut outbuf, &member);
+        if wp > 0 {
+            writer.write_all(&outbuf[..wp])?;
         }
-        writer.write_all(&buf[..wp])?;
     }
     Ok(())
+}
+
+/// Scalar bitset delete: write kept bytes to output buffer.
+#[inline]
+fn delete_bitset_scalar(src: &[u8], dst: &mut [u8], member: &[u8; 32]) -> usize {
+    let n = src.len();
+    let mut wp = 0;
+    unsafe {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut i = 0;
+        while i + 8 <= n {
+            let b0 = *sp.add(i);
+            let b1 = *sp.add(i + 1);
+            let b2 = *sp.add(i + 2);
+            let b3 = *sp.add(i + 3);
+            let b4 = *sp.add(i + 4);
+            let b5 = *sp.add(i + 5);
+            let b6 = *sp.add(i + 6);
+            let b7 = *sp.add(i + 7);
+            *dp.add(wp) = b0;
+            wp += !is_member(member, b0) as usize;
+            *dp.add(wp) = b1;
+            wp += !is_member(member, b1) as usize;
+            *dp.add(wp) = b2;
+            wp += !is_member(member, b2) as usize;
+            *dp.add(wp) = b3;
+            wp += !is_member(member, b3) as usize;
+            *dp.add(wp) = b4;
+            wp += !is_member(member, b4) as usize;
+            *dp.add(wp) = b5;
+            wp += !is_member(member, b5) as usize;
+            *dp.add(wp) = b6;
+            wp += !is_member(member, b6) as usize;
+            *dp.add(wp) = b7;
+            wp += !is_member(member, b7) as usize;
+            i += 8;
+        }
+        while i < n {
+            let b = *sp.add(i);
+            *dp.add(wp) = b;
+            wp += !is_member(member, b) as usize;
+            i += 1;
+        }
+    }
+    wp
+}
+
+/// AVX2 bitset delete for streaming: uses SIMD to check 32 bytes against the
+/// membership bitset at once, then compact_8bytes_simd to pack kept bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn delete_bitset_avx2_stream(src: &[u8], dst: &mut [u8], member: &[u8; 32]) -> usize {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let mut ri = 0;
+        let mut wp = 0;
+
+        // Load the 256-bit membership bitset into an AVX2 register.
+        // Byte i of member_v has bits set for characters in [i*8..i*8+7].
+        let member_v = _mm256_loadu_si256(member.as_ptr() as *const _);
+
+        // For each input byte B, we check: member[B >> 3] & (1 << (B & 7))
+        // Using SIMD: extract byte index (B >> 3) and bit position (B & 7).
+        let mask7 = _mm256_set1_epi8(7);
+        let mask_0x1f = _mm256_set1_epi8(0x1F_u8 as i8);
+
+        // Lookup table for (1 << (x & 7)) — pshufb gives per-byte shift
+        // that _mm256_sllv_epi32 can't do (it works on 32-bit lanes).
+        let bit_table = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128i8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, -128i8,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        );
+
+        while ri + 32 <= n {
+            let input = _mm256_loadu_si256(sp.add(ri) as *const _);
+
+            // byte_idx = input >> 3 (which byte of the 32-byte member set)
+            let byte_idx = _mm256_and_si256(_mm256_srli_epi16(input, 3), mask_0x1f);
+            // bit_pos = input & 7 (which bit within that byte)
+            let bit_pos = _mm256_and_si256(input, mask7);
+            // bit_mask = 1 << bit_pos (per-byte via shuffle lookup)
+            let bit_mask = _mm256_shuffle_epi8(bit_table, bit_pos);
+
+            // member_byte = shuffle member_v by byte_idx (pshufb)
+            // But pshufb only works within 128-bit lanes. We need cross-lane.
+            // Since member is 32 bytes and byte_idx can be 0-31, we need
+            // a different approach. Use two pshufb + blend:
+            // lo_half = pshufb(member[0..15], byte_idx)
+            // hi_half = pshufb(member[16..31], byte_idx - 16)
+            // select = byte_idx >= 16
+            let member_lo = _mm256_broadcastsi128_si256(_mm256_castsi256_si128(member_v));
+            let member_hi = _mm256_broadcastsi128_si256(_mm256_extracti128_si256(member_v, 1));
+            let lo_mask = _mm256_set1_epi8(0x0F);
+            let idx_lo = _mm256_and_si256(byte_idx, lo_mask);
+            let shuffled_lo = _mm256_shuffle_epi8(member_lo, idx_lo);
+            let shuffled_hi = _mm256_shuffle_epi8(member_hi, idx_lo);
+            // select hi when byte_idx >= 16 (bit 4 set)
+            let use_hi = _mm256_slli_epi16(byte_idx, 3); // shift bit 4 to bit 7
+            let member_byte = _mm256_blendv_epi8(shuffled_lo, shuffled_hi, use_hi);
+
+            // Check: (member_byte & bit_mask) != 0 → byte is in delete set
+            let test = _mm256_and_si256(member_byte, bit_mask);
+            let is_zero = _mm256_cmpeq_epi8(test, _mm256_setzero_si256());
+            // keep_mask: bit set = byte should be KEPT (not in delete set)
+            let keep_mask = _mm256_movemask_epi8(is_zero) as u32;
+
+            if keep_mask == 0xFFFFFFFF {
+                // All 32 bytes kept — bulk copy
+                std::ptr::copy_nonoverlapping(sp.add(ri), dp.add(wp), 32);
+                wp += 32;
+            } else if keep_mask != 0 {
+                // Partial keep — compact 8 bytes at a time
+                let m0 = keep_mask as u8;
+                let m1 = (keep_mask >> 8) as u8;
+                let m2 = (keep_mask >> 16) as u8;
+                let m3 = (keep_mask >> 24) as u8;
+
+                if m0 == 0xFF {
+                    std::ptr::copy_nonoverlapping(sp.add(ri), dp.add(wp), 8);
+                } else if m0 != 0 {
+                    compact_8bytes_simd(sp.add(ri), dp.add(wp), m0);
+                }
+                let c0 = m0.count_ones() as usize;
+
+                if m1 == 0xFF {
+                    std::ptr::copy_nonoverlapping(sp.add(ri + 8), dp.add(wp + c0), 8);
+                } else if m1 != 0 {
+                    compact_8bytes_simd(sp.add(ri + 8), dp.add(wp + c0), m1);
+                }
+                let c1 = m1.count_ones() as usize;
+
+                if m2 == 0xFF {
+                    std::ptr::copy_nonoverlapping(sp.add(ri + 16), dp.add(wp + c0 + c1), 8);
+                } else if m2 != 0 {
+                    compact_8bytes_simd(sp.add(ri + 16), dp.add(wp + c0 + c1), m2);
+                }
+                let c2 = m2.count_ones() as usize;
+
+                if m3 == 0xFF {
+                    std::ptr::copy_nonoverlapping(sp.add(ri + 24), dp.add(wp + c0 + c1 + c2), 8);
+                } else if m3 != 0 {
+                    compact_8bytes_simd(sp.add(ri + 24), dp.add(wp + c0 + c1 + c2), m3);
+                }
+                let c3 = m3.count_ones() as usize;
+                wp += c0 + c1 + c2 + c3;
+            }
+            // else: all 32 bytes deleted, wp unchanged
+            ri += 32;
+        }
+
+        // Scalar tail
+        while ri < n {
+            let b = *sp.add(ri);
+            *dp.add(wp) = b;
+            wp += !is_member(member, b) as usize;
+            ri += 1;
+        }
+
+        wp
+    }
 }
 
 fn delete_single_streaming(
