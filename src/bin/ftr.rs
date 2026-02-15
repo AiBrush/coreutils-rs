@@ -461,12 +461,12 @@ fn main() {
         } else {
             // Piped stdin: try splice+memfd for zero-copy, fall back to streaming.
             // splice() moves data from pipe → memfd in the kernel (no userspace copy),
-            // then mmap gives zero-copy access + enables VmspliceWriter output.
+            // then mmap_mut enables in-place translate (no separate output buffer).
             #[cfg(target_os = "linux")]
             {
-                if let Some(mm) = coreutils_rs::common::io::splice_stdin_to_mmap() {
+                if let Some(mut mm) = coreutils_rs::common::io::splice_stdin_to_mmap_mut() {
                     let mut writer = VmspliceWriter::new();
-                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut writer)
+                    tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut writer)
                 } else {
                     tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
                 }

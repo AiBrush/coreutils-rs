@@ -364,6 +364,64 @@ pub fn splice_stdin_to_mmap() -> Option<Mmap> {
     Some(mmap)
 }
 
+/// Like splice_stdin_to_mmap() but returns a writable MmapMut.
+/// Useful for TR translate which can modify data in-place instead of
+/// allocating a separate output buffer — saving 10MB allocation + memcpy.
+/// Since we own the memfd, MAP_SHARED writes are safe (no other users).
+#[cfg(target_os = "linux")]
+pub fn splice_stdin_to_mmap_mut() -> Option<memmap2::MmapMut> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(0, &mut stat) } != 0 {
+        return None;
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+        return None;
+    }
+
+    let name = b"fio\0";
+    let memfd = unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, 0) };
+    if memfd < 0 {
+        return None;
+    }
+
+    const SPLICE_CHUNK: usize = 16 * 1024 * 1024;
+    let mut total: usize = 0;
+    loop {
+        let n = unsafe {
+            libc::splice(
+                0,
+                std::ptr::null_mut(),
+                memfd,
+                std::ptr::null_mut(),
+                SPLICE_CHUNK,
+                0,
+            )
+        };
+        if n > 0 {
+            total += n as usize;
+        } else if n == 0 {
+            break;
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(memfd) };
+            return None;
+        }
+    }
+
+    if total == 0 {
+        unsafe { libc::close(memfd) };
+        return None;
+    }
+
+    let file = unsafe { File::from_raw_fd(memfd) };
+    let mmap = unsafe { MmapOptions::new().populate().map_mut(&file) }.ok()?;
+
+    Some(mmap)
+}
+
 /// Read as many bytes as possible into buf, retrying on partial reads.
 /// Ensures the full buffer is filled (or EOF reached), avoiding the
 /// probe-read overhead of read_to_end.
