@@ -1,4 +1,4 @@
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -13,84 +13,166 @@ use coreutils_rs::common::io::read_file;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::cut::{self, CutMode};
 
-/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
-/// When stdout is a pipe, vmsplice references user-space pages directly
-/// in the pipe buffer (no kernel memcpy). Falls back to regular write
-/// for non-pipe fds (files, terminals).
+/// Smart buffered writer with vmsplice passthrough for write_vectored.
+///
+/// Unlike BufWriter + VmspliceWriter, this writer passes write_vectored calls
+/// directly to vmsplice(2) — enabling true zero-copy from mmap pages to pipe.
+/// BufWriter copies all IoSlice data into its internal buffer first, which
+/// defeats the zero-copy benefit.
+///
+/// Small individual writes (field delimiters, newlines) are buffered internally
+/// and flushed before write_vectored or when the buffer is full.
 #[cfg(target_os = "linux")]
-struct VmspliceWriter {
+struct SmartWriter {
     raw: ManuallyDrop<std::fs::File>,
     is_pipe: bool,
+    buf: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
-impl VmspliceWriter {
+impl SmartWriter {
     fn new() -> Self {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
         let is_pipe = unsafe {
             let mut stat: libc::stat = std::mem::zeroed();
             libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
         };
-        Self { raw, is_pipe }
+        Self {
+            raw,
+            is_pipe,
+            buf: Vec::with_capacity(16 * 1024 * 1024),
+        }
+    }
+
+    /// Flush internal buffer via vmsplice (pipe) or write (file/terminal).
+    fn flush_buf(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if self.is_pipe {
+            let mut remaining = self.buf.as_slice();
+            while !remaining.is_empty() {
+                let iov = libc::iovec {
+                    iov_base: remaining.as_ptr() as *mut libc::c_void,
+                    iov_len: remaining.len(),
+                };
+                let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+                if n > 0 {
+                    remaining = &remaining[n as usize..];
+                } else if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    self.is_pipe = false;
+                    (&*self.raw).write_all(remaining)?;
+                    break;
+                }
+            }
+        } else {
+            (&*self.raw).write_all(&self.buf)?;
+        }
+        self.buf.clear();
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Write for VmspliceWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write(buf);
+impl Write for SmartWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
         }
-        let iov = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
-            }
-            self.is_pipe = false;
-            (&*self.raw).write(buf)
+        // If data fits in buffer, append
+        if self.buf.len() + data.len() <= self.buf.capacity() {
+            self.buf.extend_from_slice(data);
+            return Ok(data.len());
         }
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write_all(buf);
-        }
-        while !buf.is_empty() {
-            let iov = libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n > 0 {
-                buf = &buf[n as usize..];
-            } else if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
-            } else {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+        // Flush buffer, then either buffer or direct-write
+        self.flush_buf()?;
+        if data.len() <= self.buf.capacity() {
+            self.buf.extend_from_slice(data);
+        } else if self.is_pipe {
+            let mut remaining = data;
+            while !remaining.is_empty() {
+                let iov = libc::iovec {
+                    iov_base: remaining.as_ptr() as *mut libc::c_void,
+                    iov_len: remaining.len(),
+                };
+                let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+                if n > 0 {
+                    remaining = &remaining[n as usize..];
+                } else if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    self.is_pipe = false;
+                    (&*self.raw).write_all(remaining)?;
+                    break;
                 }
-                self.is_pipe = false;
-                return (&*self.raw).write_all(buf);
             }
+        } else {
+            (&*self.raw).write_all(data)?;
         }
-        Ok(())
+        Ok(data.len())
     }
 
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.buf.len() + data.len() <= self.buf.capacity() {
+            self.buf.extend_from_slice(data);
+            return Ok(());
+        }
+        self.flush_buf()?;
+        if data.len() <= self.buf.capacity() {
+            self.buf.extend_from_slice(data);
+            Ok(())
+        } else if self.is_pipe {
+            let mut remaining = data;
+            while !remaining.is_empty() {
+                let iov = libc::iovec {
+                    iov_base: remaining.as_ptr() as *mut libc::c_void,
+                    iov_len: remaining.len(),
+                };
+                let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+                if n > 0 {
+                    remaining = &remaining[n as usize..];
+                } else if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    self.is_pipe = false;
+                    return (&*self.raw).write_all(remaining);
+                }
+            }
+            Ok(())
+        } else {
+            (&*self.raw).write_all(data)
+        }
+    }
+
+    /// Direct vmsplice passthrough for IoSlice batches — true zero-copy from
+    /// mmap pages to pipe. Flushes internal buffer first to maintain ordering.
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        if !self.is_pipe || bufs.is_empty() {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        // Flush buffered data first to maintain write ordering
+        self.flush_buf()?;
+        if !self.is_pipe {
             return (&*self.raw).write_vectored(bufs);
         }
-        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
-        // so &[IoSlice] has the same memory layout as &[iovec].
-        // Direct pointer cast eliminates Vec allocation + copy per call.
+        // Direct vmsplice — zero-copy from mmap/buffer pages to pipe
         let count = bufs.len().min(1024);
         let iovs = bufs.as_ptr() as *const libc::iovec;
         let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
@@ -107,7 +189,7 @@ impl Write for VmspliceWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_buf()
     }
 }
 
@@ -425,22 +507,20 @@ fn main() {
         cli.files.clone()
     };
 
-    // On Linux: VmspliceWriter wrapped in BufWriter for zero-copy pipe output.
-    // BufWriter batches the many small writes from cut processing, then
-    // VmspliceWriter uses vmsplice(2) for zero-copy when flushing to pipes.
+    // On Linux: SmartWriter — buffers small writes internally but passes
+    // write_vectored directly to vmsplice for true zero-copy from mmap pages.
+    // This avoids the memcpy that BufWriter would add for IoSlice data.
     #[cfg(target_os = "linux")]
-    let mut vwriter = VmspliceWriter::new();
-    #[cfg(target_os = "linux")]
-    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut vwriter);
-    // On other Unix: raw fd stdout
+    let mut out = SmartWriter::new();
+    // On other Unix: raw fd stdout with BufWriter
     #[cfg(all(unix, not(target_os = "linux")))]
     let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
     #[cfg(all(unix, not(target_os = "linux")))]
-    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut *raw);
+    let mut out = std::io::BufWriter::with_capacity(16 * 1024 * 1024, &mut *raw);
     #[cfg(not(unix))]
     let stdout = io::stdout();
     #[cfg(not(unix))]
-    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, stdout.lock());
+    let mut out = std::io::BufWriter::with_capacity(16 * 1024 * 1024, stdout.lock());
     let mut had_error = false;
 
     let cfg = cut::CutConfig {
