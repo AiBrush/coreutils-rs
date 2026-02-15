@@ -2,11 +2,13 @@ use std::io::{self, IoSlice, Write};
 
 use rayon::prelude::*;
 
-/// Threshold for parallel processing (2MB).
-/// Rayon thread pool initialization costs ~300µs on first use but is cached
-/// after that. For files under 2MB that process in ~200-400µs, the overhead
-/// dominates. Files 2MB+ benefit from parallel memchr scanning.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Threshold for parallel processing (16MB).
+/// Rayon thread pool initialization costs ~300µs on first use. Since each
+/// benchmark/process invocation re-initializes the pool, this 300µs is per-run.
+/// For 10MB files (0.2ms sequential memchr scan), sequential is faster than
+/// parallel (0.1ms scan + 0.3ms Rayon init = 0.4ms). At 16MB+, the parallel
+/// speedup (>0.3ms) amortizes the Rayon initialization cost.
+const PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
 /// Scans for separators with SIMD memchr, then outputs records in reverse
