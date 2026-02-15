@@ -466,7 +466,7 @@ fn main() {
             {
                 if let Some(mut mm) = coreutils_rs::common::io::splice_stdin_to_mmap_mut() {
                     let mut writer = VmspliceWriter::new();
-                    tr::translate_mmap_inplace(&set1, &set2, &mut mm, &mut writer)
+                    tr::translate_mmap_inplace_shared(&set1, &set2, &mut mm, &mut writer)
                 } else {
                     tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
                 }

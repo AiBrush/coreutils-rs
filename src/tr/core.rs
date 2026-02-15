@@ -3813,6 +3813,59 @@ pub fn translate_mmap_inplace(
     writer.write_all(data)
 }
 
+/// In-place translate for MAP_SHARED mmaps (e.g., memfd from splice).
+/// Unlike translate_mmap_inplace, this skips the SEPARATE_BUF_THRESHOLD check
+/// because MAP_SHARED pages have NO copy-on-write faults — writes go directly
+/// to the memfd's page cache. This saves a 10MB heap allocation + memcpy.
+pub fn translate_mmap_inplace_shared(
+    set1: &[u8],
+    set2: &[u8],
+    data: &mut [u8],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let table = build_translate_table(set1, set2);
+
+    let is_identity = table.iter().enumerate().all(|(i, &v)| v == i as u8);
+    if is_identity {
+        return writer.write_all(data);
+    }
+
+    if let Some((lo, hi, offset)) = detect_range_offset(&table) {
+        if data.len() >= PARALLEL_THRESHOLD {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (data.len() / n_threads).max(32 * 1024);
+            data.par_chunks_mut(chunk_size)
+                .for_each(|chunk| translate_range_simd_inplace(chunk, lo, hi, offset));
+        } else {
+            translate_range_simd_inplace(data, lo, hi, offset);
+        }
+        return writer.write_all(data);
+    }
+
+    if let Some((lo, hi, replacement)) = detect_range_to_constant(&table) {
+        if data.len() >= PARALLEL_THRESHOLD {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_size = (data.len() / n_threads).max(32 * 1024);
+            data.par_chunks_mut(chunk_size).for_each(|chunk| {
+                translate_range_to_constant_simd_inplace(chunk, lo, hi, replacement)
+            });
+        } else {
+            translate_range_to_constant_simd_inplace(data, lo, hi, replacement);
+        }
+        return writer.write_all(data);
+    }
+
+    if data.len() >= PARALLEL_THRESHOLD {
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk_size = (data.len() / n_threads).max(32 * 1024);
+        data.par_chunks_mut(chunk_size)
+            .for_each(|chunk| translate_inplace(chunk, &table));
+    } else {
+        translate_inplace(data, &table);
+    }
+    writer.write_all(data)
+}
+
 /// Translate from read-only source to a separate output buffer, avoiding COW faults.
 /// Uses the appropriate SIMD path (range offset, range-to-constant, or general nibble).
 ///
