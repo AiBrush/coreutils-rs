@@ -12,13 +12,12 @@ const MAX_IOV: usize = 1024;
 /// upstream cat writes chunk N+1 to the pipe.
 const STREAM_BUF: usize = 16 * 1024 * 1024;
 
-/// Minimum data size to engage rayon parallel processing for mmap paths.
-/// AVX2 translation runs at ~10 GB/s per core. For 10MB data:
-/// - Sequential: ~1ms translate
-/// - Parallel (4 cores): ~0.25ms translate + ~0.15ms rayon overhead = ~0.4ms
-/// Net savings: ~0.6ms per translate pass. Worth it for >= 4MB files where
-/// the multi-core speedup clearly exceeds rayon spawn+join overhead.
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size to engage rayon parallel processing for mmap/batch paths.
+/// For 10MB benchmark files, parallel tr translate was a 105% REGRESSION
+/// (rayon dispatch overhead exceeds the multi-core benefit for 10MB).
+/// Set to 64MB so only genuinely large files benefit from parallelism.
+/// Single-threaded AVX2 at 16 GB/s processes 10MB in 0.6ms which is fast enough.
+const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// 256-entry lookup table for byte compaction: for each 8-bit keep mask,
 /// stores the bit positions of set bits (indices of bytes to keep).
@@ -3655,11 +3654,10 @@ pub fn translate_owned(
         return writer.write_all(data);
     }
 
-    // For owned data (piped stdin via splice/read_stdin), rayon's thread pool
-    // is already warm from other uses. At 4MB+ the parallel savings from
-    // multi-core AVX2 exceed the rayon dispatch overhead (~0.1ms).
-    // Previous 32MB threshold missed 10MB benchmark files.
-    const OWNED_PARALLEL_MIN: usize = 4 * 1024 * 1024;
+    // Parallel translate was a 105% regression at 10MB benchmark size.
+    // Single-threaded AVX2 is fast enough. Only parallelize for genuinely
+    // large files (>=64MB) where multi-core benefits clearly exceed overhead.
+    const OWNED_PARALLEL_MIN: usize = 64 * 1024 * 1024;
 
     // SIMD range fast path (in-place)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {

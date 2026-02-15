@@ -8,7 +8,7 @@ use rayon::prelude::*;
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
-/// For large data (>= 2MB): parallel scan + copy into contiguous output buffer, single write.
+/// For large data (>= 2MB): parallel forward SIMD scan + zero-copy IoSlice output.
 /// For small data: streaming IoSlice batches with write_vectored.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
