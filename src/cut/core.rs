@@ -985,28 +985,12 @@ fn process_single_field(
     const FIELD_PARALLEL_MIN: usize = 2 * 1024 * 1024;
 
     if delim != line_delim {
-        // Field 1 fast path: memchr2 single-pass scan.
-        // For field 1, the first delimiter IS the field boundary. Lines without
-        // delimiter are passed through unchanged.
-        if target_idx == 0 && !suppress {
-            if data.len() >= FIELD_PARALLEL_MIN {
-                return single_field1_parallel(data, delim, line_delim, out);
-            }
-            // Sequential: scan with memchr2 into buffer, single write_all.
-            // Faster than writev/IoSlice for moderate data because it produces
-            // one contiguous buffer → one write syscall, and avoids IoSlice
-            // allocation overhead for high-delimiter-density data.
-            let mut buf = Vec::with_capacity(data.len());
-            single_field1_to_buf(data, delim, line_delim, &mut buf);
-            if !buf.is_empty() {
-                out.write_all(&buf)?;
-            }
-            return Ok(());
-        }
-
-        // Two-level approach for field N: outer newline scan + inner delim scan
-        // with early exit at target_idx. Faster than memchr2 single-pass because
-        // we only scan delimiters up to target_idx per line (not all of them).
+        // Two-level approach for ALL fields (including field 1):
+        // outer memchr_iter(newline) scan + inner memchr(delim) per line.
+        // For field 1: inner memchr exits at the FIRST delimiter, skipping all
+        // subsequent delimiters on the line. This is faster than memchr2_iter
+        // single-pass which processes ALL delimiter hits (significant for CSV
+        // with many columns: 5-20 extra hits per line × ~4ns = 20-80ns wasted).
         if data.len() >= FIELD_PARALLEL_MIN {
             let chunks = split_for_scope(data, line_delim);
             let n = chunks.len();
@@ -2207,6 +2191,7 @@ fn fields_mid_range_line(
 /// memchr2(delim, newline) which finds the first special byte in one scan.
 /// For field 1: first special byte is either the delimiter (field end) or
 /// newline (no delimiter, output line unchanged). 4 threads cut scan time ~4x.
+#[allow(dead_code)]
 fn single_field1_parallel(
     data: &[u8],
     delim: u8,
@@ -2238,6 +2223,7 @@ fn single_field1_parallel(
 /// (~5-10ns per call × 2 calls per line) that dominates for short-field data.
 /// For 100MB with 1M lines: saves ~10-20ms of function call setup overhead.
 #[inline]
+#[allow(dead_code)]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
     buf.reserve(data.len());
     let base = data.as_ptr();
@@ -3551,6 +3537,14 @@ pub fn process_cut_data_mut(data: &mut [u8], cfg: &CutConfig) -> Option<usize> {
                 return None;
             }
             if cfg.delim == cfg.line_delim {
+                return None;
+            }
+            // Skip in-place for single field extraction — the non-in-place path
+            // (process_cut_data → process_single_field) uses a faster two-level
+            // scan approach: outer memchr(newline) + inner memchr(delim) with
+            // early exit. The in-place path uses per-line memchr2+memchr which
+            // is slower due to per-call function overhead (~250K calls for 10MB).
+            if cfg.ranges.len() == 1 && cfg.ranges[0].start == cfg.ranges[0].end {
                 return None;
             }
             Some(cut_fields_inplace_general(

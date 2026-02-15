@@ -146,62 +146,87 @@ fn tac_bytes_before_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io
     Ok(())
 }
 
-/// Zero-copy after-separator mode: streaming IoSlice directly from input data.
-/// No buffer allocation — scans backward and emits IoSlice batches of 1024.
+/// Contiguous buffer after-separator mode: scan backward with memrchr, copy each
+/// record into a pre-allocated output buffer using raw pointer writes, then single
+/// write_all. This replaces the IoSlice-per-line approach which had high syscall
+/// overhead (~122 write_vectored calls for 10MB). One memcpy pass + one write_all
+/// is faster than zero-copy with many syscalls for files under 64MB.
 fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
+    let data_len = data.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(data_len);
+    let src = data.as_ptr();
 
-    for pos in memchr::memrchr_iter(sep, data) {
-        let rec_start = pos + 1;
-        if rec_start < end {
-            slices.push(IoSlice::new(&data[rec_start..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
+    // SAFETY: We pre-allocated data_len capacity. Total bytes copied equals data_len
+    // exactly (every byte appears in exactly one record). We use raw pointer writes
+    // to skip per-copy capacity checks and Vec length updates.
+    unsafe {
+        let mut dst = buf.as_mut_ptr();
+        let mut end = data_len;
+
+        for pos in memchr::memrchr_iter(sep, data) {
+            let rec_start = pos + 1;
+            let rec_len = end - rec_start;
+            if rec_len > 0 {
+                std::ptr::copy_nonoverlapping(src.add(rec_start), dst, rec_len);
+                dst = dst.add(rec_len);
             }
+            end = rec_start;
         }
-        end = rec_start;
+
+        // First record (from beginning of data)
+        if end > 0 {
+            std::ptr::copy_nonoverlapping(src, dst, end);
+            dst = dst.add(end);
+        }
+
+        buf.set_len(dst.offset_from(buf.as_ptr()) as usize);
     }
 
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
+    if !buf.is_empty() {
+        out.write_all(&buf)?;
     }
     Ok(())
 }
 
-/// Zero-copy before-separator mode: streaming IoSlice directly from input data.
+/// Contiguous buffer before-separator mode: scan backward, copy records into
+/// pre-allocated buffer with raw pointer writes, single write_all at the end.
 fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
+    let data_len = data.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(data_len);
+    let src = data.as_ptr();
 
-    for pos in memchr::memrchr_iter(sep, data) {
-        if pos < end {
-            slices.push(IoSlice::new(&data[pos..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
+    unsafe {
+        let mut dst = buf.as_mut_ptr();
+        let mut end = data_len;
+
+        for pos in memchr::memrchr_iter(sep, data) {
+            let rec_len = end - pos;
+            if rec_len > 0 {
+                std::ptr::copy_nonoverlapping(src.add(pos), dst, rec_len);
+                dst = dst.add(rec_len);
             }
+            end = pos;
         }
-        end = pos;
+
+        // First record (from beginning of data)
+        if end > 0 {
+            std::ptr::copy_nonoverlapping(src, dst, end);
+            dst = dst.add(end);
+        }
+
+        buf.set_len(dst.offset_from(buf.as_ptr()) as usize);
     }
 
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
+    if !buf.is_empty() {
+        out.write_all(&buf)?;
     }
     Ok(())
 }
