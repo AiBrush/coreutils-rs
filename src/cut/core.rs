@@ -3396,6 +3396,255 @@ fn read_fully<R: BufRead>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
+/// In-place cut processing for mutable data buffers.
+/// Returns Some(new_length) if in-place processing succeeded, None if not supported
+/// for the given configuration (caller should fall back to regular processing).
+///
+/// In-place avoids allocating intermediate output buffers — the result is written
+/// directly into the input buffer (output is always <= input for non-complement modes
+/// with default output delimiter).
+pub fn process_cut_data_mut(data: &mut [u8], cfg: &CutConfig) -> Option<usize> {
+    if cfg.complement {
+        return None;
+    }
+
+    match cfg.mode {
+        CutMode::Fields => {
+            // Only handle when output delimiter matches input (single-byte)
+            if cfg.output_delim.len() != 1 || cfg.output_delim[0] != cfg.delim {
+                return None;
+            }
+            if cfg.delim == cfg.line_delim {
+                return None;
+            }
+            Some(cut_fields_inplace_general(
+                data,
+                cfg.delim,
+                cfg.line_delim,
+                cfg.ranges,
+                cfg.suppress_no_delim,
+            ))
+        }
+        CutMode::Bytes | CutMode::Characters => {
+            if !cfg.output_delim.is_empty() {
+                return None;
+            }
+            Some(cut_bytes_inplace_general(data, cfg.line_delim, cfg.ranges))
+        }
+    }
+}
+
+/// In-place generalized field extraction.
+/// Handles single fields, contiguous ranges, and non-contiguous multi-field patterns.
+fn cut_fields_inplace_general(
+    data: &mut [u8],
+    delim: u8,
+    line_delim: u8,
+    ranges: &[Range],
+    suppress: bool,
+) -> usize {
+    // Special case: field 1 only (existing optimized path)
+    if ranges.len() == 1 && ranges[0].start == 1 && ranges[0].end == 1 {
+        return cut_field1_inplace(data, delim, line_delim, suppress);
+    }
+
+    let len = data.len();
+    if len == 0 {
+        return 0;
+    }
+
+    let max_field = ranges.last().map_or(0, |r| r.end);
+    let max_delims = max_field.min(64);
+    let mut wp: usize = 0;
+    let mut rp: usize = 0;
+
+    while rp < len {
+        let line_end = memchr::memchr(line_delim, &data[rp..])
+            .map(|p| rp + p)
+            .unwrap_or(len);
+        let line_len = line_end - rp;
+
+        // Collect delimiter positions (relative to line start)
+        let mut delim_pos = [0usize; 64];
+        let mut num_delims: usize = 0;
+
+        for pos in memchr_iter(delim, &data[rp..line_end]) {
+            if num_delims < max_delims {
+                delim_pos[num_delims] = pos;
+                num_delims += 1;
+                if num_delims >= max_delims {
+                    break;
+                }
+            }
+        }
+
+        if num_delims == 0 {
+            // No delimiter in line
+            if !suppress {
+                if wp != rp {
+                    data.copy_within(rp..line_end, wp);
+                }
+                wp += line_len;
+                if line_end < len {
+                    data[wp] = line_delim;
+                    wp += 1;
+                }
+            }
+        } else {
+            let total_fields = num_delims + 1;
+            let mut first_output = true;
+
+            for r in ranges {
+                let range_start = r.start;
+                let range_end = r.end.min(total_fields);
+                if range_start > total_fields {
+                    break;
+                }
+                for field_num in range_start..=range_end {
+                    if field_num > total_fields {
+                        break;
+                    }
+
+                    let field_start = if field_num == 1 {
+                        0
+                    } else if field_num - 2 < num_delims {
+                        delim_pos[field_num - 2] + 1
+                    } else {
+                        continue;
+                    };
+                    let field_end = if field_num <= num_delims {
+                        delim_pos[field_num - 1]
+                    } else {
+                        line_len
+                    };
+
+                    if !first_output {
+                        data[wp] = delim;
+                        wp += 1;
+                    }
+                    let flen = field_end - field_start;
+                    if flen > 0 {
+                        data.copy_within(rp + field_start..rp + field_start + flen, wp);
+                        wp += flen;
+                    }
+                    first_output = false;
+                }
+            }
+
+            if !first_output && line_end < len {
+                data[wp] = line_delim;
+                wp += 1;
+            } else if first_output && line_end < len {
+                // No fields selected but line had delimiters — output empty line
+                data[wp] = line_delim;
+                wp += 1;
+            }
+        }
+
+        rp = if line_end < len { line_end + 1 } else { len };
+    }
+
+    wp
+}
+
+/// In-place byte/char range extraction.
+fn cut_bytes_inplace_general(data: &mut [u8], line_delim: u8, ranges: &[Range]) -> usize {
+    let len = data.len();
+    if len == 0 {
+        return 0;
+    }
+
+    // Quick check: single range from byte 1 to end = no-op
+    if ranges.len() == 1 && ranges[0].start == 1 && ranges[0].end == usize::MAX {
+        return len;
+    }
+
+    // Single range from byte 1: fast truncation path
+    if ranges.len() == 1 && ranges[0].start == 1 && ranges[0].end < usize::MAX {
+        return cut_bytes_from_start_inplace(data, line_delim, ranges[0].end);
+    }
+
+    let mut wp: usize = 0;
+    let mut rp: usize = 0;
+
+    while rp < len {
+        let line_end = memchr::memchr(line_delim, &data[rp..])
+            .map(|p| rp + p)
+            .unwrap_or(len);
+        let line_len = line_end - rp;
+
+        for r in ranges {
+            let start = r.start.saturating_sub(1);
+            let end = r.end.min(line_len);
+            if start >= line_len {
+                break;
+            }
+            let flen = end - start;
+            if flen > 0 {
+                data.copy_within(rp + start..rp + start + flen, wp);
+                wp += flen;
+            }
+        }
+
+        if line_end < len {
+            data[wp] = line_delim;
+            wp += 1;
+        }
+
+        rp = if line_end < len { line_end + 1 } else { len };
+    }
+
+    wp
+}
+
+/// In-place truncation for -b1-N: truncate each line to at most max_bytes.
+fn cut_bytes_from_start_inplace(data: &mut [u8], line_delim: u8, max_bytes: usize) -> usize {
+    let len = data.len();
+
+    // Quick check: see if all lines fit within max_bytes (common case)
+    let mut all_fit = true;
+    let mut start = 0;
+    for pos in memchr_iter(line_delim, data) {
+        if pos - start > max_bytes {
+            all_fit = false;
+            break;
+        }
+        start = pos + 1;
+    }
+    if all_fit && start < len && len - start > max_bytes {
+        all_fit = false;
+    }
+    if all_fit {
+        return len;
+    }
+
+    // Some lines need truncation
+    let mut wp: usize = 0;
+    let mut rp: usize = 0;
+
+    while rp < len {
+        let line_end = memchr::memchr(line_delim, &data[rp..])
+            .map(|p| rp + p)
+            .unwrap_or(len);
+        let line_len = line_end - rp;
+
+        let take = line_len.min(max_bytes);
+        if take > 0 && wp != rp {
+            data.copy_within(rp..rp + take, wp);
+        }
+        wp += take;
+
+        if line_end < len {
+            data[wp] = line_delim;
+            wp += 1;
+        }
+
+        rp = if line_end < len { line_end + 1 } else { len };
+    }
+
+    wp
+}
+
 /// Cut operation mode
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CutMode {
