@@ -1173,10 +1173,7 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
                             let out_offset = (start_line + sub_start) * decoded_per_line;
                             let out_size = sub_count * decoded_per_line;
                             let out_slice = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    out_base.add(out_offset),
-                                    out_size,
-                                )
+                                std::slice::from_raw_parts_mut(out_base.add(out_offset), out_size)
                             };
                             BASE64_ENGINE
                                 .decode(&local_buf[..sub_clean], out_slice.as_out())
@@ -1563,10 +1560,7 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                                 )
                             };
                             if BASE64_ENGINE
-                                .decode(
-                                    &data[in_start..in_start + line_len],
-                                    out_slice.as_out(),
-                                )
+                                .decode(&data[in_start..in_start + line_len], out_slice.as_out())
                                 .is_err()
                             {
                                 return Err(io::Error::new(
@@ -1783,9 +1777,7 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
                     };
                     let decoded = BASE64_ENGINE
                         .decode(chunk, out_slice.as_out())
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid input")
-                        })?;
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid input"))?;
                     debug_assert_eq!(decoded.len(), expected_size);
                     Ok(())
                 })

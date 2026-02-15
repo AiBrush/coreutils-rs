@@ -890,9 +890,7 @@ fn process_single_field(
         let chunks = split_into_chunks(data, line_delim);
         let results = par_process(&chunks, |chunk| {
             let mut buf = Vec::with_capacity(chunk.len() / 4);
-            process_single_field_chunk(
-                chunk, delim, target_idx, line_delim, suppress, &mut buf,
-            );
+            process_single_field_chunk(chunk, delim, target_idx, line_delim, suppress, &mut buf);
             buf
         });
         let slices: Vec<IoSlice> = results
@@ -1109,9 +1107,7 @@ fn process_complement_single_field(
         let chunks = split_into_chunks(data, line_delim);
         let results = par_process(&chunks, |chunk| {
             let mut buf = Vec::with_capacity(chunk.len());
-            complement_single_field_chunk(
-                chunk, delim, skip_idx, line_delim, suppress, &mut buf,
-            );
+            complement_single_field_chunk(chunk, delim, skip_idx, line_delim, suppress, &mut buf);
             buf
         });
         let slices: Vec<IoSlice> = results

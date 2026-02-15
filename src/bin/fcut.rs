@@ -579,7 +579,8 @@ fn main() {
                     // Bypass BufWriter for mmap data: flush any pending output, then
                     // write directly to VmspliceWriter. This eliminates one memcpy
                     // of the output through BufWriter's internal 16MB buffer.
-                    out.flush().and_then(|()| cut::process_cut_data(&data, &cfg, out.get_mut()))
+                    out.flush()
+                        .and_then(|()| cut::process_cut_data(&data, &cfg, out.get_mut()))
                 }
                 Err(e) => {
                     eprintln!("cut: {}: {}", filename, io_error_msg(&e));
