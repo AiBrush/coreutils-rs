@@ -438,9 +438,15 @@ fn main() {
                 } else {
                     // Fallback: streaming path (no vmsplice — buffer reuse conflicts
                     // with vmsplice's zero-copy page references)
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     {
                         tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+                    }
+                    #[cfg(all(unix, not(target_os = "linux")))]
+                    {
+                        let stdin = io::stdin();
+                        let mut reader = stdin.lock();
+                        tr::translate(&set1, &set2, &mut reader, &mut *raw)
                     }
                     #[cfg(not(unix))]
                     {
@@ -457,9 +463,15 @@ fn main() {
             // vmsplice puts page references into the pipe buffer. The streaming
             // path reuses the same buffer across iterations, so vmsplice'd pages
             // get overwritten before the pipe reader consumes them.
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                tr::translate(&set1, &set2, &mut reader, &mut *raw)
             }
             #[cfg(not(unix))]
             {
@@ -509,6 +521,7 @@ fn main() {
         // conflicts with vmsplice's zero-copy page references).
         #[cfg(unix)]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
+        // Note: RawStdin is handled inside run_streaming_mode (Linux-only)
         #[cfg(not(unix))]
         let result = {
             let stdout = io::stdout();
