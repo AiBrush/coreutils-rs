@@ -4,11 +4,14 @@ use base64_simd::AsOut;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Number of threads in Rayon's thread pool. Used for parallel encode/decode
-/// chunk splitting to match the actual number of worker threads.
+/// Number of available CPUs for parallel chunk splitting.
+/// Uses std::thread::available_parallelism() to avoid triggering premature
+/// rayon pool initialization (~300-500µs). Rayon pool inits on first scope() call.
 #[inline]
 fn num_cpus() -> usize {
-    rayon::current_num_threads()
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Chunk size for sequential no-wrap encoding: 8MB aligned to 3 bytes.

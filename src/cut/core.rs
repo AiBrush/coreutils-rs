@@ -202,11 +202,14 @@ fn write_ioslices_slow(
 
 // ── Chunk splitting for parallel processing ──────────────────────────────
 
-/// Number of available CPUs. Uses Rayon's thread count for consistency
-/// with the thread pool that will execute the work.
+/// Number of available CPUs for parallel chunk splitting.
+/// Uses std::thread::available_parallelism() to avoid triggering premature
+/// rayon pool initialization (~300-500µs). Rayon pool inits on first scope() call.
 #[inline]
 fn num_cpus() -> usize {
-    rayon::current_num_threads()
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Split data into chunks for rayon::scope parallel processing.
