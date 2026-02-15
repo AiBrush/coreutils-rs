@@ -14,24 +14,22 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
-/// Chunk size for sequential no-wrap encoding: 4MB aligned to 3 bytes.
-/// Smaller chunks reduce peak memory (page fault overhead for large buffers).
-/// For 10MB input, 4MB chunks = 5.3MB buffer vs 13.3MB with 32MB chunks,
-/// saving ~2000 page faults (~0.4ms). Subsequent chunks reuse hot pages.
-const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
+/// Chunk size for sequential no-wrap encoding: 8MB aligned to 3 bytes.
+/// Larger chunks reduce function call overhead per iteration while still
+/// keeping peak buffer allocation reasonable (~10.7MB for the output).
+const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel no-wrap encoding (2MB).
+/// Minimum data size for parallel no-wrap encoding (1MB).
 /// No-wrap parallel has minimal overhead: split at 3-byte boundaries,
-/// encode each chunk independently, single shared output buffer.
-/// At 2MB+ the 2-4x parallel speedup easily amortizes Rayon dispatch.
-const PARALLEL_NOWRAP_THRESHOLD: usize = 2 * 1024 * 1024;
+/// encode each chunk independently. Per-thread buffers page-fault
+/// concurrently, and writev combines output in one syscall.
+const PARALLEL_NOWRAP_THRESHOLD: usize = 1024 * 1024;
 
-/// Minimum data size for parallel wrapped encoding (4MB).
-/// Wrapped parallel uses 4 threads for SIMD encoding, providing ~3x
-/// speedup for 10MB files (1ms vs 4ms encode). The 13.5MB shared buffer
-/// allocation (~0.7ms page faults) and Rayon init (~0.3ms) are amortized
-/// by the parallel speedup at 4MB+.
-const PARALLEL_WRAPPED_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Minimum data size for parallel wrapped encoding (2MB).
+/// Wrapped parallel uses N threads for SIMD encoding, providing ~Nx
+/// speedup. Per-thread buffers (~2.5MB each for 10MB input) page-fault
+/// concurrently, and std::thread::scope avoids Rayon pool init (~300µs).
+const PARALLEL_WRAPPED_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (2MB of base64 data).
 /// Lower threshold lets parallel decode kick in earlier for medium files.
@@ -57,18 +55,18 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
         return encode_no_wrap_parallel(data, out);
     }
 
-    let actual_chunk = NOWRAP_CHUNK.min(data.len());
-    let enc_max = BASE64_ENGINE.encoded_length(actual_chunk);
-    // SAFETY: encode() writes exactly enc_len bytes before we read them.
-    let mut buf: Vec<u8> = Vec::with_capacity(enc_max);
+    // Single-buffer encode: for data that fits in one chunk, encode directly
+    // and write once. For larger data, reuse the buffer across chunks.
+    let enc_len = BASE64_ENGINE.encoded_length(data.len().min(NOWRAP_CHUNK));
+    let mut buf: Vec<u8> = Vec::with_capacity(enc_len);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        buf.set_len(enc_max);
+        buf.set_len(enc_len);
     }
 
     for chunk in data.chunks(NOWRAP_CHUNK) {
-        let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-        let encoded = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
+        let clen = BASE64_ENGINE.encoded_length(chunk.len());
+        let encoded = BASE64_ENGINE.encode(chunk, buf[..clen].as_out());
         out.write_all(encoded)?;
     }
     Ok(())
@@ -146,8 +144,8 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     if bytes_per_line.is_multiple_of(3) {
         let line_out = wrap_col + 1;
 
-        // Chunk size: 4MB of input, aligned to bytes_per_line
-        const MAX_CHUNK_INPUT: usize = 4 * 1024 * 1024;
+        // Chunk size: 8MB of input, aligned to bytes_per_line
+        const MAX_CHUNK_INPUT: usize = 8 * 1024 * 1024;
         let lines_per_chunk = MAX_CHUNK_INPUT / bytes_per_line;
         let chunk_input = lines_per_chunk * bytes_per_line;
         let chunk_output = lines_per_chunk * line_out;
