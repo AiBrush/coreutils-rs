@@ -168,8 +168,22 @@ fn unescape_filename(s: &str) -> String {
     out
 }
 
+/// Enlarge pipe buffers on Linux for higher throughput.
+#[cfg(target_os = "linux")]
+fn enlarge_pipes() {
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
+    unsafe {
+        libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE);
+        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE);
+    }
+}
+
 fn main() {
     coreutils_rs::common::reset_sigpipe();
+
+    #[cfg(target_os = "linux")]
+    enlarge_pipes();
+
     let cli = parse_args();
     let algo = HashAlgorithm::Sha256;
 
@@ -221,10 +235,8 @@ fn run_hash_mode(
 ) {
     let has_stdin = files.iter().any(|f| f == "-");
 
-    if has_stdin || files.len() <= 10 {
-        // Sequential for stdin or small file counts.
-        // For <=10 tiny files, sequential avoids thread::scope spawn overhead
-        // (~90µs) which exceeds the parallel speedup on sub-millisecond work.
+    if has_stdin || files.len() <= 1 {
+        // Sequential for stdin or single file.
         // Uses hash_file_nostat to skip fstat (~5µs/file) since the nostat path
         // handles all file sizes via two-tier buffer + streaming fallback.
         for filename in files {
@@ -251,7 +263,7 @@ fn run_hash_mode(
             }
         }
     } else {
-        // Multi-file (11+): use parallel hashing with thread::scope.
+        // Multi-file (2+): use parallel hashing with thread::scope.
         let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
         let results = hash::hash_files_parallel(&paths, algo);
 
