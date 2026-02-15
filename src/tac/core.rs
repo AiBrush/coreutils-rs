@@ -2,14 +2,16 @@ use std::io::{self, IoSlice, Write};
 
 use rayon::prelude::*;
 
-/// Threshold for parallel processing (2MB).
-/// Below 2MB, the single-threaded streaming IoSlice path handles it efficiently.
-/// Above 2MB, parallel forward scan + zero-copy IoSlice output is faster.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Threshold for parallel processing (64MB).
+/// Each benchmark invocation is a fresh process, so rayon pool init (~0.5-1ms)
+/// is paid every time. For 10MB files, single-threaded memrchr scan (0.3ms) is
+/// faster than rayon init + parallel scan. Only use parallelism for genuinely
+/// large files where multi-core scanning pays off.
+const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
-/// For large data (>= 2MB): parallel forward SIMD scan + zero-copy IoSlice output.
-/// For small data: streaming IoSlice batches with write_vectored.
+/// For large data (>= 64MB): parallel forward SIMD scan + zero-copy IoSlice output.
+/// For small data: single-threaded backward SIMD scan + IoSlice batches.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
