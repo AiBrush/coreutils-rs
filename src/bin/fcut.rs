@@ -418,6 +418,15 @@ fn main() {
         cli.files.clone()
     };
 
+    // Detect field 1 fast-path: in-place extraction avoids intermediate Vec + BufWriter copy.
+    // Saves ~10MB of memory bandwidth for 10MB input.
+    let is_field1_inplace = mode == CutMode::Fields
+        && ranges.len() == 1
+        && ranges[0].start == 1
+        && ranges[0].end == 1
+        && !cli.complement
+        && delim != line_delim;
+
     // On Linux: VmspliceWriter wrapped in BufWriter for zero-copy pipe output.
     // BufWriter batches the many small writes from cut processing, then
     // VmspliceWriter uses vmsplice(2) for zero-copy when flushing to pipes.
@@ -460,7 +469,8 @@ fn main() {
     // Uses read_stdin() on Linux for raw libc::read() with 64MB pre-alloc,
     // bypassing BufReader/read_to_end Vec growth pattern.
     #[cfg(unix)]
-    let stdin_buf: Option<Vec<u8>> = if stdin_mmap.is_none() && files.iter().any(|f| f == "-") {
+    let mut stdin_buf: Option<Vec<u8>> = if stdin_mmap.is_none() && files.iter().any(|f| f == "-")
+    {
         match coreutils_rs::common::io::read_stdin() {
             Ok(buf) => Some(buf),
             Err(e) => {
@@ -475,7 +485,7 @@ fn main() {
         None
     };
     #[cfg(not(unix))]
-    let stdin_buf: Option<Vec<u8>> = if files.iter().any(|f| f == "-") {
+    let mut stdin_buf: Option<Vec<u8>> = if files.iter().any(|f| f == "-") {
         match coreutils_rs::common::io::read_stdin() {
             Ok(buf) => Some(buf),
             Err(e) => {
@@ -490,11 +500,33 @@ fn main() {
         None
     };
 
+    // For piped stdin + field 1: in-place extraction modifies buffer directly,
+    // then writes bypassing BufWriter to avoid extra memcpy.
+    let mut stdin_field1_done = false;
+    if is_field1_inplace {
+        if let Some(ref mut data) = stdin_buf {
+            if !data.is_empty() {
+                let new_len =
+                    cut::cut_field1_inplace(data, delim, line_delim, cli.only_delimited);
+                data.truncate(new_len);
+                stdin_field1_done = true;
+            }
+        }
+    }
+
     for filename in &files {
         let result: io::Result<()> = if filename == "-" {
             #[cfg(unix)]
             {
-                if let Some(ref data) = stdin_mmap {
+                if stdin_field1_done {
+                    if let Some(ref data) = stdin_buf {
+                        // Write pre-processed data directly, bypassing BufWriter
+                        out.flush()
+                            .and_then(|()| out.get_mut().write_all(data))
+                    } else {
+                        Ok(())
+                    }
+                } else if let Some(ref data) = stdin_mmap {
                     cut::process_cut_data(data, &cfg, &mut out)
                 } else if let Some(ref data) = stdin_buf {
                     cut::process_cut_data(data, &cfg, &mut out)
@@ -505,7 +537,13 @@ fn main() {
             }
             #[cfg(not(unix))]
             {
-                if let Some(ref data) = stdin_buf {
+                if stdin_field1_done {
+                    if let Some(ref data) = stdin_buf {
+                        out.write_all(data)
+                    } else {
+                        Ok(())
+                    }
+                } else if let Some(ref data) = stdin_buf {
                     cut::process_cut_data(data, &cfg, &mut out)
                 } else {
                     let reader = BufReader::new(io::stdin().lock());

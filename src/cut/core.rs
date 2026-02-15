@@ -3059,6 +3059,74 @@ pub fn cut_bytes(
     Ok(true)
 }
 
+/// In-place field 1 extraction: modifies `data` buffer directly, returns new length.
+/// Output is always <= input (we remove everything after first delimiter per line).
+/// Avoids intermediate Vec allocation + BufWriter copy, saving ~10MB of memory
+/// bandwidth for 10MB input. Requires owned mutable data (not mmap).
+///
+/// Lines without delimiter pass through unchanged (unless suppress=true).
+/// Lines with delimiter: keep bytes before delimiter + newline.
+pub fn cut_field1_inplace(data: &mut [u8], delim: u8, line_delim: u8, suppress: bool) -> usize {
+    let len = data.len();
+    let mut wp: usize = 0;
+    let mut rp: usize = 0;
+
+    while rp < len {
+        match memchr::memchr2(delim, line_delim, &data[rp..]) {
+            None => {
+                // Rest is partial line, no delimiter
+                if suppress {
+                    // suppress: skip lines without delimiter
+                    break;
+                }
+                let remaining = len - rp;
+                if wp != rp {
+                    data.copy_within(rp..len, wp);
+                }
+                wp += remaining;
+                break;
+            }
+            Some(offset) => {
+                let actual = rp + offset;
+                if data[actual] == line_delim {
+                    // No delimiter on this line
+                    if suppress {
+                        // Skip this line entirely
+                        rp = actual + 1;
+                    } else {
+                        // Output entire line including newline
+                        let chunk_len = actual + 1 - rp;
+                        if wp != rp {
+                            data.copy_within(rp..actual + 1, wp);
+                        }
+                        wp += chunk_len;
+                        rp = actual + 1;
+                    }
+                } else {
+                    // Delimiter found: output field 1 (up to delimiter) + newline
+                    let field_len = actual - rp;
+                    if wp != rp && field_len > 0 {
+                        data.copy_within(rp..actual, wp);
+                    }
+                    wp += field_len;
+                    data[wp] = line_delim;
+                    wp += 1;
+                    // Skip to next newline
+                    match memchr::memchr(line_delim, &data[actual + 1..]) {
+                        None => {
+                            rp = len;
+                        }
+                        Some(nl_off) => {
+                            rp = actual + 1 + nl_off + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    wp
+}
+
 /// Process a full data buffer (from mmap or read) with cut operation.
 pub fn process_cut_data(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io::Result<()> {
     match cfg.mode {
