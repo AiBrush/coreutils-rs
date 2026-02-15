@@ -1,6 +1,6 @@
-use std::io::{self, BufReader, Write};
 #[cfg(not(target_os = "linux"))]
 use std::io::BufWriter;
+use std::io::{self, BufReader, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]

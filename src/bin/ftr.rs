@@ -455,9 +455,7 @@ fn main() {
             // Falls back to streaming translate if splice is not available.
             #[cfg(target_os = "linux")]
             {
-                if let Ok(Some(mut mmap)) =
-                    coreutils_rs::common::io::splice_stdin_to_mmap()
-                {
+                if let Ok(Some(mut mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
                     let mut writer = VmspliceWriter::new();
                     tr::translate_owned(&set1, &set2, &mut mmap, &mut writer)
                 } else {
@@ -508,8 +506,7 @@ fn main() {
         let data = FileData::Mmap(m);
         #[cfg(target_os = "linux")]
         let result = {
-            let mut raw_out =
-                unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+            let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
             run_mmap_mode(&cli, set1_str, &data, &mut *raw_out)
         };
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -536,9 +533,7 @@ fn main() {
         #[cfg(target_os = "linux")]
         let result = {
             let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-            if let Ok(Some(splice_mmap)) =
-                coreutils_rs::common::io::splice_stdin_to_mmap()
-            {
+            if let Ok(Some(splice_mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
                 run_mmap_mode(&cli, set1_str, &splice_mmap, &mut *raw_out)
             } else {
                 match coreutils_rs::common::io::read_stdin() {
