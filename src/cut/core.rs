@@ -1757,22 +1757,109 @@ fn fields_suffix_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_suffix_line(line, delim, line_delim, start_field, suppress, buf);
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_suffix_line(line, delim, line_delim, start_field, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_suffix_line(
+                &data[start..],
+                delim,
+                line_delim,
+                start_field,
+                suppress,
+                buf,
+            );
+        }
+        return;
     }
-    if start < data.len() {
-        fields_suffix_line(
-            &data[start..],
-            delim,
-            line_delim,
-            start_field,
-            suppress,
-            buf,
-        );
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let skip_delims = start_field - 1; // delimiters to skip before output starts
+
+    // Per-line state
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut has_delim = false;
+    let mut suffix_start: usize = 0;
+    let mut found = false; // true when we found the start of the suffix
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+
+        if byte == line_delim {
+            if found {
+                // Output suffix: from suffix_start to end of line
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(suffix_start), pos - suffix_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else if !has_delim {
+                // No delimiter in line
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                }
+            } else {
+                // Fewer delimiters than needed — output empty line
+                unsafe { buf_push(buf, line_delim) };
+            }
+
+            // Reset for next line
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            found = false;
+        } else if !found {
+            // Delimiter found
+            has_delim = true;
+            delim_count += 1;
+            if delim_count >= skip_delims {
+                suffix_start = pos + 1;
+                found = true;
+            }
+        }
+        // If found, ignore extra delimiters (they're part of the suffix)
+    }
+
+    // Handle last line without trailing line_delim
+    if line_start < data_len {
+        if found {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(suffix_start), data_len - suffix_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        } else if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+        } else {
+            unsafe { buf_push(buf, line_delim) };
+        }
     }
 }
 
