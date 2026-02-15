@@ -515,27 +515,22 @@ fn main() {
     #[cfg(target_os = "linux")]
     let mut splice_inplace_len: usize = 0;
     #[cfg(target_os = "linux")]
+    if let Some(ref mut mmap_data) = splice_mmap
+        && !mmap_data.is_empty()
+        && let Some(new_len) = cut::process_cut_data_mut(mmap_data, &cfg)
     {
-        if let Some(ref mut mmap_data) = splice_mmap {
-            if !mmap_data.is_empty() {
-                if let Some(new_len) = cut::process_cut_data_mut(mmap_data, &cfg) {
-                    splice_inplace_len = new_len;
-                    stdin_inplace_done = true;
-                }
-            }
-        }
+        splice_inplace_len = new_len;
+        stdin_inplace_done = true;
     }
 
     // Try in-place on stdin_buf (Vec<u8>) if splice didn't handle it
-    if !stdin_inplace_done {
-        if let Some(ref mut data) = stdin_buf {
-            if !data.is_empty() {
-                if let Some(new_len) = cut::process_cut_data_mut(data, &cfg) {
-                    data.truncate(new_len);
-                    stdin_inplace_done = true;
-                }
-            }
-        }
+    if !stdin_inplace_done
+        && let Some(ref mut data) = stdin_buf
+        && !data.is_empty()
+        && let Some(new_len) = cut::process_cut_data_mut(data, &cfg)
+    {
+        data.truncate(new_len);
+        stdin_inplace_done = true;
     }
 
     for filename in &files {
