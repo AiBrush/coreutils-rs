@@ -279,9 +279,8 @@ pub fn splice_stdin_to_mmap() -> io::Result<Option<memmap2::MmapMut>> {
     // Use raw syscall to avoid glibc version dependency (memfd_create added in glibc 2.27,
     // but the syscall works on any kernel >= 3.17). This fixes cross-compilation to
     // aarch64-unknown-linux-gnu with older sysroots.
-    let memfd = unsafe {
-        libc::syscall(libc::SYS_memfd_create, c"stdin_splice".as_ptr(), 0u32) as i32
-    };
+    let memfd =
+        unsafe { libc::syscall(libc::SYS_memfd_create, c"stdin_splice".as_ptr(), 0u32) as i32 };
     if memfd < 0 {
         return Ok(None); // memfd_create not supported, fallback
     }
