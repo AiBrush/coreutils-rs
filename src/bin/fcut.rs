@@ -515,15 +515,13 @@ fn main() {
     // For piped stdin + field 1: in-place extraction modifies Vec directly,
     // then writes bypassing BufWriter to avoid extra memcpy.
     let mut stdin_field1_done = false;
-    if is_field1_inplace {
-        if let Some(ref mut data) = stdin_buf {
-            if !data.is_empty() {
-                let new_len =
-                    cut::cut_field1_inplace(data, delim, line_delim, cli.only_delimited);
-                data.truncate(new_len);
-                stdin_field1_done = true;
-            }
-        }
+    if is_field1_inplace
+        && let Some(ref mut data) = stdin_buf
+        && !data.is_empty()
+    {
+        let new_len = cut::cut_field1_inplace(data, delim, line_delim, cli.only_delimited);
+        data.truncate(new_len);
+        stdin_field1_done = true;
     }
 
     for filename in &files {

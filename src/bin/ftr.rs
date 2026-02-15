@@ -109,6 +109,7 @@ impl Write for VmspliceWriter {
 /// Each read returns immediately with whatever data is available in the pipe,
 /// enabling pipelining with upstream cat: ftr processes chunk N while cat writes N+1.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 struct RawStdin;
 
 #[cfg(target_os = "linux")]
@@ -373,6 +374,7 @@ fn main() {
     let set1_str = &cli.sets[0];
 
     #[cfg(unix)]
+    #[allow(unused_mut, unused_variables)]
     let mut raw = raw_stdout();
 
     // Pure translate mode: bypass BufWriter entirely.
@@ -568,6 +570,7 @@ fn main() {
 /// incrementally for pipelining with upstream cat/pipe. RawStdin on Linux
 /// bypasses StdinLock overhead; streaming processes each chunk as it arrives
 /// instead of waiting for EOF like the batch path.
+#[allow(dead_code)]
 fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io::Result<()> {
     if cli.delete && cli.squeeze {
         if cli.sets.len() < 2 {
