@@ -5,14 +5,17 @@ use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Chunk size for no-wrap encoding: 32MB aligned to 3 bytes.
-/// Larger chunks = fewer write() syscalls for big files.
-const NOWRAP_CHUNK: usize = 32 * 1024 * 1024 - (32 * 1024 * 1024 % 3);
+/// Chunk size for no-wrap encoding: 4MB aligned to 3 bytes.
+/// Smaller chunks reduce peak memory (page fault overhead for large buffers).
+/// For 10MB input, 4MB chunks = 5.3MB buffer vs 13.3MB with 32MB chunks,
+/// saving ~2000 page faults (~0.4ms). Subsequent chunks reuse hot pages.
+const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel encoding (2MB).
-/// Rayon thread pool is cached after first use (~100µs subsequent dispatch).
-/// At 2MB+ the parallel speedup (2-4x on multi-core) amortizes this cost.
-const PARALLEL_ENCODE_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size for parallel encoding (32MB).
+/// Rayon dispatch costs ~100µs + shared output buffer allocation overhead.
+/// For files under 32MB (including the 10MB benchmark), sequential encode
+/// is faster because it avoids thread dispatch and large shared buffer alloc.
+const PARALLEL_ENCODE_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (2MB of base64 data).
 /// Lower threshold lets parallel decode kick in earlier for medium files.
@@ -122,84 +125,178 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     // Direct-to-position encode+wrap: encode each line directly to its final position
     // in the output buffer, eliminating the backward expansion pass entirely.
     // Each bytes_per_line input bytes encode to exactly wrap_col output bytes + 1 newline.
+    //
+    // For large data (>4MB), processes in chunks to reduce peak memory allocation.
+    // 4MB input → ~5.4MB buffer vs 13.5MB for 10MB all at once, saving ~2000 page
+    // faults (~0.4ms). After the first chunk, pages are hot in TLB so reuse is free.
     if bytes_per_line.is_multiple_of(3) {
         let line_out = wrap_col + 1;
-        let total_full_lines = data.len() / bytes_per_line;
-        let remainder_input = data.len() % bytes_per_line;
 
-        let remainder_encoded = if remainder_input > 0 {
-            BASE64_ENGINE.encoded_length(remainder_input) + 1
-        } else {
-            0
-        };
-        let total_output = total_full_lines * line_out + remainder_encoded;
+        // Chunk size: 4MB of input, aligned to bytes_per_line
+        const MAX_CHUNK_INPUT: usize = 4 * 1024 * 1024;
+        let lines_per_chunk = MAX_CHUNK_INPUT / bytes_per_line;
+        let chunk_input = lines_per_chunk * bytes_per_line;
+        let chunk_output = lines_per_chunk * line_out;
 
-        let mut buf: Vec<u8> = Vec::with_capacity(total_output);
+        // Allocate buffer for one chunk (reused across chunks)
+        let buf_cap = chunk_output + line_out + 8; // +line_out for remainder
+        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
         #[allow(clippy::uninit_vec)]
         unsafe {
-            buf.set_len(total_output);
+            buf.set_len(buf_cap);
         }
 
-        let dst = buf.as_mut_ptr();
-        let mut line_idx = 0;
+        let mut data_off = 0;
 
-        // 4-line unrolled loop for ILP
-        while line_idx + 4 <= total_full_lines {
-            let in_base = line_idx * bytes_per_line;
-            let out_base = line_idx * line_out;
-            unsafe {
-                let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s0.as_out());
-                *dst.add(out_base + wrap_col) = b'\n';
+        // Process full chunks
+        while data_off + chunk_input <= data.len() {
+            let chunk_data = &data[data_off..data_off + chunk_input];
+            let dst = buf.as_mut_ptr();
+            let mut line_idx = 0;
 
-                let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
-                    s1.as_out(),
-                );
-                *dst.add(out_base + line_out + wrap_col) = b'\n';
+            // 4-line unrolled loop for ILP
+            while line_idx + 4 <= lines_per_chunk {
+                let in_base = line_idx * bytes_per_line;
+                let out_base = line_idx * line_out;
+                unsafe {
+                    let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                    let _ = BASE64_ENGINE
+                        .encode(&chunk_data[in_base..in_base + bytes_per_line], s0.as_out());
+                    *dst.add(out_base + wrap_col) = b'\n';
 
-                let s2 = std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
-                    s2.as_out(),
-                );
-                *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
+                    let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &chunk_data[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
+                        s1.as_out(),
+                    );
+                    *dst.add(out_base + line_out + wrap_col) = b'\n';
 
-                let s3 = std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
-                let _ = BASE64_ENGINE.encode(
-                    &data[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
-                    s3.as_out(),
-                );
-                *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
+                    let s2 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &chunk_data[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
+                        s2.as_out(),
+                    );
+                    *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
+
+                    let s3 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &chunk_data[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
+                        s3.as_out(),
+                    );
+                    *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
+                }
+                line_idx += 4;
             }
-            line_idx += 4;
-        }
 
-        while line_idx < total_full_lines {
-            let in_base = line_idx * bytes_per_line;
-            let out_base = line_idx * line_out;
-            unsafe {
-                let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
-                let _ = BASE64_ENGINE.encode(&data[in_base..in_base + bytes_per_line], s.as_out());
-                *dst.add(out_base + wrap_col) = b'\n';
+            while line_idx < lines_per_chunk {
+                let in_base = line_idx * bytes_per_line;
+                let out_base = line_idx * line_out;
+                unsafe {
+                    let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                    let _ = BASE64_ENGINE
+                        .encode(&chunk_data[in_base..in_base + bytes_per_line], s.as_out());
+                    *dst.add(out_base + wrap_col) = b'\n';
+                }
+                line_idx += 1;
             }
-            line_idx += 1;
+
+            out.write_all(&buf[..chunk_output])?;
+            data_off += chunk_input;
         }
 
-        // Handle remainder
-        if remainder_input > 0 {
-            let in_off = total_full_lines * bytes_per_line;
-            let out_off = total_full_lines * line_out;
-            let enc_len = BASE64_ENGINE.encoded_length(remainder_input);
-            unsafe {
-                let s = std::slice::from_raw_parts_mut(dst.add(out_off), enc_len);
-                let _ = BASE64_ENGINE.encode(&data[in_off..], s.as_out());
-                *dst.add(out_off + enc_len) = b'\n';
+        // Remaining data (partial chunk)
+        let remaining = data.len() - data_off;
+        if remaining > 0 {
+            let remaining_data = &data[data_off..];
+            let full_lines = remaining / bytes_per_line;
+            let remainder_input = remaining % bytes_per_line;
+            let remainder_encoded = if remainder_input > 0 {
+                BASE64_ENGINE.encoded_length(remainder_input) + 1
+            } else {
+                0
+            };
+            let remaining_output = full_lines * line_out + remainder_encoded;
+
+            // Ensure buffer is large enough for the remainder
+            if remaining_output > buf.len() {
+                buf.reserve(remaining_output - buf.len());
+                #[allow(clippy::uninit_vec)]
+                unsafe {
+                    buf.set_len(remaining_output);
+                }
             }
+
+            let dst = buf.as_mut_ptr();
+            let mut line_idx = 0;
+
+            while line_idx + 4 <= full_lines {
+                let in_base = line_idx * bytes_per_line;
+                let out_base = line_idx * line_out;
+                unsafe {
+                    let s0 = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &remaining_data[in_base..in_base + bytes_per_line],
+                        s0.as_out(),
+                    );
+                    *dst.add(out_base + wrap_col) = b'\n';
+
+                    let s1 = std::slice::from_raw_parts_mut(dst.add(out_base + line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &remaining_data[in_base + bytes_per_line..in_base + 2 * bytes_per_line],
+                        s1.as_out(),
+                    );
+                    *dst.add(out_base + line_out + wrap_col) = b'\n';
+
+                    let s2 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 2 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &remaining_data[in_base + 2 * bytes_per_line..in_base + 3 * bytes_per_line],
+                        s2.as_out(),
+                    );
+                    *dst.add(out_base + 2 * line_out + wrap_col) = b'\n';
+
+                    let s3 =
+                        std::slice::from_raw_parts_mut(dst.add(out_base + 3 * line_out), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &remaining_data[in_base + 3 * bytes_per_line..in_base + 4 * bytes_per_line],
+                        s3.as_out(),
+                    );
+                    *dst.add(out_base + 3 * line_out + wrap_col) = b'\n';
+                }
+                line_idx += 4;
+            }
+
+            while line_idx < full_lines {
+                let in_base = line_idx * bytes_per_line;
+                let out_base = line_idx * line_out;
+                unsafe {
+                    let s = std::slice::from_raw_parts_mut(dst.add(out_base), wrap_col);
+                    let _ = BASE64_ENGINE.encode(
+                        &remaining_data[in_base..in_base + bytes_per_line],
+                        s.as_out(),
+                    );
+                    *dst.add(out_base + wrap_col) = b'\n';
+                }
+                line_idx += 1;
+            }
+
+            if remainder_input > 0 {
+                let in_off = full_lines * bytes_per_line;
+                let out_off = full_lines * line_out;
+                let enc_len = BASE64_ENGINE.encoded_length(remainder_input);
+                unsafe {
+                    let s = std::slice::from_raw_parts_mut(dst.add(out_off), enc_len);
+                    let _ = BASE64_ENGINE.encode(&remaining_data[in_off..], s.as_out());
+                    *dst.add(out_off + enc_len) = b'\n';
+                }
+            }
+
+            out.write_all(&buf[..remaining_output])?;
         }
 
-        return out.write_all(&buf[..total_output]);
+        return Ok(());
     }
 
     // Fallback for non-3-aligned bytes_per_line: chunk + in-place expansion
@@ -1995,34 +2092,40 @@ pub fn decode_stream(
 }
 
 /// Write all IoSlice entries using write_vectored (writev syscall).
-/// Falls back to write_all per slice on partial writes.
+/// Hot path: single write_vectored succeeds fully (common on Linux pipes/files).
+/// Cold path: partial write handled out-of-line to keep hot path tight.
+#[inline(always)]
 fn write_all_vectored(out: &mut impl Write, slices: &[io::IoSlice]) -> io::Result<()> {
     if slices.is_empty() {
         return Ok(());
     }
     let total: usize = slices.iter().map(|s| s.len()).sum();
+    let written = out.write_vectored(slices)?;
+    if written >= total {
+        return Ok(());
+    }
+    if written == 0 {
+        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+    }
+    write_all_vectored_slow(out, slices, written)
+}
 
-    // Try write_vectored first — often writes everything in one syscall
-    let written = match out.write_vectored(slices) {
-        Ok(n) if n >= total => return Ok(()),
-        Ok(n) => n,
-        Err(e) => return Err(e),
-    };
-
-    // Partial write fallback
-    let mut skip = written;
+/// Handle partial write (cold path, never inlined).
+#[cold]
+#[inline(never)]
+fn write_all_vectored_slow(
+    out: &mut impl Write,
+    slices: &[io::IoSlice],
+    mut skip: usize,
+) -> io::Result<()> {
     for slice in slices {
-        let slen = slice.len();
-        if skip >= slen {
-            skip -= slen;
+        let len = slice.len();
+        if skip >= len {
+            skip -= len;
             continue;
         }
-        if skip > 0 {
-            out.write_all(&slice[skip..])?;
-            skip = 0;
-        } else {
-            out.write_all(slice)?;
-        }
+        out.write_all(&slice[skip..])?;
+        skip = 0;
     }
     Ok(())
 }

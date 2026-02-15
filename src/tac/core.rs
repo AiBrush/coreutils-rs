@@ -486,25 +486,30 @@ pub fn tac_regex_separator(
     write_all_vectored(out, &slices)
 }
 
-/// Write all IoSlices, handling partial writes.
-#[inline]
+/// Write all IoSlice entries, handling partial writes.
+/// Hot path: single write_vectored succeeds fully (common on Linux pipes/files).
+/// Cold path: partial write handled out-of-line to keep hot path tight.
+#[inline(always)]
 fn write_all_vectored(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
-    if slices.is_empty() {
-        return Ok(());
-    }
-
-    let written = out.write_vectored(slices)?;
-    if written == 0 && slices.iter().any(|s| !s.is_empty()) {
-        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
-    }
-
     let total: usize = slices.iter().map(|s| s.len()).sum();
+    let written = out.write_vectored(slices)?;
     if written >= total {
         return Ok(());
     }
+    if written == 0 {
+        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+    }
+    flush_vectored_slow(out, slices, written)
+}
 
-    // Partial write: skip past fully-written slices, then write_all the rest
-    let mut skip = written;
+/// Handle partial write (cold path, never inlined).
+#[cold]
+#[inline(never)]
+fn flush_vectored_slow(
+    out: &mut impl Write,
+    slices: &[IoSlice<'_>],
+    mut skip: usize,
+) -> io::Result<()> {
     for slice in slices {
         let len = slice.len();
         if skip >= len {
