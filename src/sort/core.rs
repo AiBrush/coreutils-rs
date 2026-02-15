@@ -883,38 +883,32 @@ fn write_sorted_output(
         }
         writer.write_all_direct(&buf)?;
     } else {
-        let total_size = if data.last() == Some(&term_byte) {
-            data.len()
-        } else {
-            data.len() + 1
-        };
-        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
-        let bptr = buf.as_mut_ptr();
-        let mut pos = 0usize;
+        // Zero-copy writev from mmap data.
+        const BATCH: usize = 1024;
+        let data_len = data.len();
+        let term_sl: &[u8] = &[term_byte];
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
         for j in 0..n {
-            if j + 16 < n {
-                let (ps, _) = offsets[sorted_indices[j + 16]];
-                prefetch_read(unsafe { dp.add(ps) });
-            }
             let (s, e) = offsets[sorted_indices[j]];
-            let len = e - s;
-            unsafe {
-                std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
-                *bptr.add(pos + len) = term_byte;
+            if e < data_len {
+                slices.push(io::IoSlice::new(&data[s..e + 1]));
+            } else {
+                slices.push(io::IoSlice::new(&data[s..e]));
+                slices.push(io::IoSlice::new(term_sl));
             }
-            pos += len + 1;
+            if slices.len() >= BATCH {
+                write_all_vectored_sort(writer, &slices)?;
+                slices.clear();
+            }
         }
-        unsafe {
-            buf.set_len(pos);
+        if !slices.is_empty() {
+            write_all_vectored_sort(writer, &slices)?;
         }
-        writer.write_all_direct(&buf)?;
     }
     Ok(())
 }
 
-/// Write sorted (key, index) entries to output using contiguous buffer.
-/// Copies lines in sorted order into a buffer, then single write_all.
-/// Eliminates IoSlice per-entry overhead and writev syscall count.
+/// Write sorted (key, index) entries to output using zero-copy writev.
 fn write_sorted_entries(
     data: &[u8],
     offsets: &[(usize, usize)],
@@ -958,31 +952,27 @@ fn write_sorted_entries(
         }
         writer.write_all_direct(&buf)?;
     } else {
-        let total_size = if data.last() == Some(&term_byte) {
-            data.len()
-        } else {
-            data.len() + 1
-        };
-        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
-        let bptr = buf.as_mut_ptr();
-        let mut pos = 0usize;
+        // Zero-copy writev from mmap data.
+        const BATCH: usize = 1024;
+        let data_len = data.len();
+        let term_sl: &[u8] = &[term_byte];
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
         for j in 0..n {
-            if j + 16 < n {
-                let (ps, _) = offsets[entries[j + 16].1];
-                prefetch_read(unsafe { dp.add(ps) });
-            }
             let (s, e) = offsets[entries[j].1];
-            let len = e - s;
-            unsafe {
-                std::ptr::copy_nonoverlapping(dp.add(s), bptr.add(pos), len);
-                *bptr.add(pos + len) = term_byte;
+            if e < data_len {
+                slices.push(io::IoSlice::new(&data[s..e + 1]));
+            } else {
+                slices.push(io::IoSlice::new(&data[s..e]));
+                slices.push(io::IoSlice::new(term_sl));
             }
-            pos += len + 1;
+            if slices.len() >= BATCH {
+                write_all_vectored_sort(writer, &slices)?;
+                slices.clear();
+            }
         }
-        unsafe {
-            buf.set_len(pos);
+        if !slices.is_empty() {
+            write_all_vectored_sort(writer, &slices)?;
         }
-        writer.write_all_direct(&buf)?;
     }
     Ok(())
 }
@@ -1744,13 +1734,13 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
 
             if (!reverse && is_sorted_rev) || (reverse && is_sorted_fwd) {
-                // Reverse of desired order: output lines in reverse — contiguous buffer
+                // Reverse of desired order: zero-copy writev in reverse
                 let term_byte = terminator[0];
                 let unique = config.unique;
-                let buf_cap = data.len() + entries.len() + 1;
-                let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
-                let bptr = buf.as_mut_ptr();
-                let mut pos = 0usize;
+                const BATCH: usize = 1024;
+                let data_len = data.len();
+                let term_sl: &[u8] = &[term_byte];
+                let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
                 let mut prev_pfx = u64::MAX;
                 let mut prev_s = u32::MAX;
                 let mut prev_l = 0u32;
@@ -1774,17 +1764,22 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                         prev_s = s;
                         prev_l = l;
                     }
-                    let lu = l as usize;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(dp.add(s as usize), bptr.add(pos), lu);
-                        *bptr.add(pos + lu) = term_byte;
+                    let su = s as usize;
+                    let end = su + l as usize;
+                    if end < data_len {
+                        slices.push(io::IoSlice::new(&data[su..end + 1]));
+                    } else {
+                        slices.push(io::IoSlice::new(&data[su..end]));
+                        slices.push(io::IoSlice::new(term_sl));
                     }
-                    pos += lu + 1;
+                    if slices.len() >= BATCH {
+                        write_all_vectored_sort(&mut writer, &slices)?;
+                        slices.clear();
+                    }
                 }
-                unsafe {
-                    buf.set_len(pos);
+                if !slices.is_empty() {
+                    write_all_vectored_sort(&mut writer, &slices)?;
                 }
-                writer.write_all_direct(&buf)?;
                 writer.flush()?;
                 return Ok(());
             }
@@ -1845,23 +1840,19 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             let _ = mmap.advise(memmap2::Advice::Random);
         }
 
-        // Output sorted entries using contiguous buffer construction.
-        // Instead of IoSlice batching (which has per-entry overhead and many
-        // write_vectored calls), copy sorted lines into a contiguous buffer
-        // and write_all once. Eliminates 2*N IoSlice pushes + N/512 writev calls.
+        // Output sorted entries using zero-copy writev from mmap data.
         let dp = data.as_ptr();
         let n_sorted = sorted.len();
         let term_byte = terminator[0];
         if config.unique {
-            // Dedup output: use prefix u64 as fast rejection.
+            // Dedup output: use prefix u64 as fast rejection, zero-copy writev.
             let mut prev_prefix = u64::MAX;
             let mut prev_start = u32::MAX;
             let mut prev_len = 0u32;
-            // Upper bound on output size; actual may be smaller due to dedup.
-            let buf_cap = data.len() + n_sorted + 1;
-            let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
-            let bptr = buf.as_mut_ptr();
-            let mut pos = 0usize;
+            const BATCH: usize = 1024;
+            let data_len = data.len();
+            let term_sl: &[u8] = &[term_byte];
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
             for idx in 0..n_sorted {
                 let actual_idx = if reverse { n_sorted - 1 - idx } else { idx };
                 let (pfx, s, l) = sorted[actual_idx];
@@ -1880,20 +1871,25 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
                     }
                 };
                 if emit {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(dp.add(su), bptr.add(pos), lu);
-                        *bptr.add(pos + lu) = term_byte;
+                    let end = su + lu;
+                    if end < data_len {
+                        slices.push(io::IoSlice::new(&data[su..end + 1]));
+                    } else {
+                        slices.push(io::IoSlice::new(&data[su..end]));
+                        slices.push(io::IoSlice::new(term_sl));
                     }
-                    pos += lu + 1;
+                    if slices.len() >= BATCH {
+                        write_all_vectored_sort(&mut writer, &slices)?;
+                        slices.clear();
+                    }
                     prev_prefix = pfx;
                     prev_start = s;
                     prev_len = l;
                 }
             }
-            unsafe {
-                buf.set_len(pos);
+            if !slices.is_empty() {
+                write_all_vectored_sort(&mut writer, &slices)?;
             }
-            writer.write_all_direct(&buf)?;
         } else {
             // Non-unique output: zero-copy writev from mmap data.
             // Each line's terminator is included from original data when possible.
