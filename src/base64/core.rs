@@ -583,11 +583,7 @@ fn encode_wrapped_parallel(
     let output_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
-            .map(|chunk| {
-                s.spawn(move || {
-                    encode_chunk_l1_scatter(chunk, wrap_col, bytes_per_line)
-                })
-            })
+            .map(|chunk| s.spawn(move || encode_chunk_l1_scatter(chunk, wrap_col, bytes_per_line)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
