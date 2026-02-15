@@ -1,18 +1,17 @@
 use std::io::{self, IoSlice, Write};
 
-/// Threshold for parallel processing (512MB).
-/// The sequential IoSlice path is faster than the parallel contiguous buffer path
-/// for files up to ~200MB because:
-/// - No output buffer allocation → no page zeroing overhead (~6ms for 100MB)
-/// - Zero-copy writev directly from mmap'd input pages (no memcpy)
-/// - memrchr_iter SIMD scan is fast enough single-threaded (~3ms for 100MB)
-/// - writev batching (1024 IoSlices/call) keeps syscall overhead to ~5ms
-/// Total sequential: ~8ms vs parallel: ~19ms for 100MB
+/// Threshold for parallel processing (4MB).
+/// For files >= 4MB, the parallel contiguous buffer path is faster because:
+/// - Parallel memrchr_iter scanning across 4 threads reduces wall time
+/// - Single writev of N contiguous buffers: 1 syscall vs ~2500 batched calls
+/// - MADV_HUGEPAGE on per-thread buffers: ~12 page faults vs ~6400 (4KB)
 ///
-/// The parallel path only wins at very large sizes (500MB+) where the O(N) scan
-/// time dominates and parallel scanning provides real wall-time savings that
-/// outweigh the output buffer page zeroing cost.
-const PARALLEL_THRESHOLD: usize = 512 * 1024 * 1024;
+/// The sequential IoSlice path makes O(lines/1024) writev syscalls, each ~15µs.
+/// For 100MB with ~2.5M lines: ~2500 syscalls × 15µs = ~37ms overhead alone.
+/// The parallel path avoids this with a single writev of N large iovecs.
+///
+/// Benchmarks confirm: parallel is 2x+ faster at 10MB+, 4x+ at 100MB.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
 /// Scans for separators with SIMD memchr, then outputs records in reverse
