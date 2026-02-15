@@ -8,20 +8,20 @@
 
 High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
 
-## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.2.9, Linux, hyperfine)
+## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.3.1, Linux, hyperfine)
 
 | Tool | Speedup vs GNU | Speedup vs uutils |
 |------|---------------:|-------------------:|
-| wc | **31.2x** | 16.4x |
-| sort | **16.7x** | 14.7x |
-| uniq | **14.1x** | 4.2x |
-| cut | **8.1x** | 4.9x |
-| tr | **7.4x** | 7.1x |
-| base64 | **5.5x** | 5.8x |
-| tac | **3.8x** | 2.0x |
+| wc | **34.0x** | 18.1x |
+| sort | **17.7x** | 16.4x |
+| uniq | **14.0x** | 4.4x |
+| cut | **8.4x** | 5.1x |
+| tr | **6.7x** | 7.1x |
+| base64 | **5.6x** | 5.8x |
+| tac | **4.7x** | 2.3x |
 | md5sum | **1.4x** | 1.3x |
 | b2sum | **1.3x** | 1.2x |
-| sha256sum | **1.2x** | 4.7x |
+| sha256sum | **1.2x** | 4.6x |
 
 ## Tools
 
