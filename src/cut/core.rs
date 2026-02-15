@@ -1720,16 +1720,101 @@ fn fields_prefix_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_prefix_line(line, delim, line_delim, last_field, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_prefix_line(&data[start..], delim, line_delim, last_field, suppress, buf);
+        }
+        return;
+    }
+
+    // Write-pointer + memchr2_iter single-pass: scan for both delimiter and
+    // newline in one SIMD pass. Eliminates per-line memchr_iter setup overhead
+    // (~100K calls for 10MB CSV). Single set_len at end avoids per-copy Vec overhead.
     buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_prefix_line(line, delim, line_delim, last_field, suppress, buf);
-        start = end_pos + 1;
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = buf.len();
+    let data_len = data.len();
+
+    let mut line_start: usize = 0;
+    let mut field_count: usize = 1;
+    let mut has_delim = false;
+    let mut done = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *src.add(pos) };
+
+        if byte == line_delim {
+            if done {
+                // Already emitted — just reset
+            } else if !has_delim {
+                if !suppress {
+                    let len = pos - line_start;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                        *dst.add(wp + len) = line_delim;
+                    }
+                    wp += len + 1;
+                }
+            } else {
+                // Fewer fields than last_field — output entire line
+                let len = pos - line_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            }
+
+            line_start = pos + 1;
+            field_count = 1;
+            has_delim = false;
+            done = false;
+        } else if !done {
+            has_delim = true;
+            if field_count >= last_field {
+                let len = pos - line_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+                done = true;
+            } else {
+                field_count += 1;
+            }
+        }
     }
-    if start < data.len() {
-        fields_prefix_line(&data[start..], delim, line_delim, last_field, suppress, buf);
+
+    // Handle last line without trailing line_delim
+    if line_start < data_len && !done {
+        let len = data_len - line_start;
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            }
+        } else {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                *dst.add(wp + len) = line_delim;
+            }
+            wp += len + 1;
+        }
     }
+
+    unsafe { buf.set_len(wp) };
 }
 
 /// Extract first N fields from one line (contiguous from-start range).
@@ -1822,6 +1907,7 @@ fn process_fields_suffix(
 }
 
 /// Process a chunk for open-ended field suffix extraction.
+/// Uses memchr2_iter single-pass + write-pointer when delim != line_delim.
 fn fields_suffix_chunk(
     data: &[u8],
     delim: u8,
@@ -1830,23 +1916,104 @@ fn fields_suffix_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_suffix_line(line, delim, line_delim, start_field, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_suffix_line(
+                &data[start..],
+                delim,
+                line_delim,
+                start_field,
+                suppress,
+                buf,
+            );
+        }
+        return;
+    }
+
+    // Write-pointer + memchr2_iter single-pass
     buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_suffix_line(line, delim, line_delim, start_field, suppress, buf);
-        start = end_pos + 1;
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = buf.len();
+    let data_len = data.len();
+    let skip_delims = start_field - 1;
+
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut has_delim = false;
+    let mut suffix_start: usize = 0;
+    let mut found = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *src.add(pos) };
+
+        if byte == line_delim {
+            if found {
+                let len = pos - suffix_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(suffix_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            } else if !has_delim {
+                if !suppress {
+                    let len = pos - line_start;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                        *dst.add(wp + len) = line_delim;
+                    }
+                    wp += len + 1;
+                }
+            } else {
+                unsafe { *dst.add(wp) = line_delim };
+                wp += 1;
+            }
+
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            found = false;
+        } else if !found {
+            has_delim = true;
+            delim_count += 1;
+            if delim_count >= skip_delims {
+                suffix_start = pos + 1;
+                found = true;
+            }
+        }
     }
-    if start < data.len() {
-        fields_suffix_line(
-            &data[start..],
-            delim,
-            line_delim,
-            start_field,
-            suppress,
-            buf,
-        );
+
+    if line_start < data_len {
+        if found {
+            let len = data_len - suffix_start;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(suffix_start), dst.add(wp), len);
+                *dst.add(wp + len) = line_delim;
+            }
+            wp += len + 1;
+        } else if !has_delim {
+            if !suppress {
+                let len = data_len - line_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            }
+        } else {
+            unsafe { *dst.add(wp) = line_delim };
+            wp += 1;
+        }
     }
+
+    unsafe { buf.set_len(wp) };
 }
 
 /// Extract fields from start_field to end from one line.
@@ -1958,6 +2125,7 @@ fn process_fields_mid_range(
 }
 
 /// Process a chunk for contiguous mid-range field extraction.
+/// Uses memchr2_iter single-pass + write-pointer when delim != line_delim.
 fn fields_mid_range_chunk(
     data: &[u8],
     delim: u8,
@@ -1967,32 +2135,134 @@ fn fields_mid_range_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_mid_range_line(
+                line,
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_mid_range_line(
+                &data[start..],
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+        }
+        return;
+    }
+
+    // Write-pointer + memchr2_iter single-pass
     buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_mid_range_line(
-            line,
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
-        start = end_pos + 1;
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = buf.len();
+    let data_len = data.len();
+    let skip_before = start_field - 1;
+    let field_span = end_field - start_field;
+    let target_end_delim = skip_before + field_span + 1;
+
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut range_start: usize = 0;
+    let mut has_delim = false;
+    let mut done = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *src.add(pos) };
+
+        if byte == line_delim {
+            if done {
+                // Already emitted
+            } else if !has_delim {
+                if !suppress {
+                    let len = pos - line_start;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                        *dst.add(wp + len) = line_delim;
+                    }
+                    wp += len + 1;
+                }
+            } else if delim_count >= skip_before {
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                let len = pos - range_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(range_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            } else {
+                unsafe { *dst.add(wp) = line_delim };
+                wp += 1;
+            }
+
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            done = false;
+        } else if !done {
+            has_delim = true;
+            delim_count += 1;
+            if delim_count == skip_before {
+                range_start = pos + 1;
+            }
+            if delim_count == target_end_delim {
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                let len = pos - range_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(range_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+                done = true;
+            }
+        }
     }
-    if start < data.len() {
-        fields_mid_range_line(
-            &data[start..],
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
+
+    if line_start < data_len && !done {
+        if !has_delim {
+            if !suppress {
+                let len = data_len - line_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(line_start), dst.add(wp), len);
+                    *dst.add(wp + len) = line_delim;
+                }
+                wp += len + 1;
+            }
+        } else if delim_count >= skip_before {
+            if skip_before == 0 {
+                range_start = line_start;
+            }
+            let len = data_len - range_start;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(range_start), dst.add(wp), len);
+                *dst.add(wp + len) = line_delim;
+            }
+            wp += len + 1;
+        } else {
+            unsafe { *dst.add(wp) = line_delim };
+            wp += 1;
+        }
     }
+
+    unsafe { buf.set_len(wp) };
 }
 
 /// Extract fields start_field..=end_field from one line.
@@ -2110,40 +2380,45 @@ fn single_field1_parallel(
     write_ioslices(out, &slices)
 }
 
-/// Extract field 1 from a chunk using memchr2 single-pass scanning.
+/// Extract field 1 from a chunk using memchr2 + write-pointer pattern.
 /// Uses memchr2(delim, line_delim) to find the first special byte per line:
-/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline
+/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline via memchr
 /// - If newline: no delimiter on this line, output unchanged
-/// This scans ~N total bytes vs ~1.5N for two-level (outer newline + inner delimiter).
+/// Write-pointer: single buf.set_len at end, no per-copy Vec len/set_len overhead.
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
     use memchr::memchr2;
     buf.reserve(data.len());
+    let src = data.as_ptr();
+    let dst = buf.as_mut_ptr();
+    let mut wp = buf.len();
     let mut pos = 0;
     while pos < data.len() {
         match memchr2(delim, line_delim, &data[pos..]) {
             None => {
-                // Rest is a partial line, no delimiter — output as-is
+                let len = data.len() - pos;
                 unsafe {
-                    buf_extend(buf, &data[pos..]);
+                    std::ptr::copy_nonoverlapping(src.add(pos), dst.add(wp), len);
                 }
+                wp += len;
                 break;
             }
             Some(offset) => {
                 let actual = pos + offset;
                 if data[actual] == line_delim {
-                    // No delimiter on this line — output entire line including newline
+                    let len = actual + 1 - pos;
                     unsafe {
-                        buf_extend(buf, &data[pos..actual + 1]);
+                        std::ptr::copy_nonoverlapping(src.add(pos), dst.add(wp), len);
                     }
+                    wp += len;
                     pos = actual + 1;
                 } else {
-                    // Delimiter found — output field 1 (up to delimiter) + newline
+                    let len = actual - pos;
                     unsafe {
-                        buf_extend(buf, &data[pos..actual]);
-                        buf_push(buf, line_delim);
+                        std::ptr::copy_nonoverlapping(src.add(pos), dst.add(wp), len);
+                        *dst.add(wp + len) = line_delim;
                     }
-                    // Skip to next newline
+                    wp += len + 1;
                     match memchr::memchr(line_delim, &data[actual + 1..]) {
                         None => {
                             pos = data.len();
@@ -2156,6 +2431,7 @@ fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8
             }
         }
     }
+    unsafe { buf.set_len(wp) };
 }
 
 /// Zero-copy field 1 extraction using writev: builds IoSlice entries pointing
