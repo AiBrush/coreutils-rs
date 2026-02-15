@@ -9,7 +9,7 @@ use std::process;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::{FileData, read_file_mmap, read_file_vec, read_stdin};
+use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
 
@@ -288,33 +288,13 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         } else {
-            // For files < 16MB, use read() instead of mmap to avoid page fault
-            // overhead. mmap on 10MB = 2560 minor page faults (~0.8ms) even with
-            // warm page cache, because each new process has empty page tables.
-            // read() copies data to heap in large chunks with cheaper sequential
-            // faults. For >= 16MB, mmap enables zero-copy vmsplice output and
-            // parallel scanning benefits outweigh fault overhead.
-            let path = Path::new(filename);
-            const TAC_MMAP_THRESHOLD: u64 = 16 * 1024 * 1024;
-            match std::fs::metadata(path) {
-                Ok(ref m) if m.is_file() && m.len() > 0 && m.len() < TAC_MMAP_THRESHOLD => {
-                    match read_file_vec(path) {
-                        Ok(d) => FileData::Owned(d),
-                        Err(e) => {
-                            eprintln!("tac: {}: {}", filename, io_error_msg(&e));
-                            had_error = true;
-                            continue;
-                        }
-                    }
+            match read_file_mmap(Path::new(filename)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("tac: {}: {}", filename, io_error_msg(&e));
+                    had_error = true;
+                    continue;
                 }
-                _ => match read_file_mmap(path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("tac: {}: {}", filename, io_error_msg(&e));
-                        had_error = true;
-                        continue;
-                    }
-                },
             }
         };
 
