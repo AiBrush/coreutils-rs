@@ -153,11 +153,78 @@ fn enlarge_pipes() {
     }
 }
 
+/// Ultra-fast path for `fmd5sum <single_file>` — raw syscalls, zero allocation.
+/// Bypasses: enlarge_pipes (2 syscalls), parse_args, BufWriter, thread-local LINE_BUF.
+/// Total overhead: reset_sigpipe + raw open + fstat + read + hash + write + close.
+#[cfg(target_os = "linux")]
+fn single_file_fast(path: &Path) -> ! {
+    // Stack buffer for output: 32 hex chars + "  " + filename + "\n"
+    // Max 4096 bytes covers any reasonable filename.
+    let mut out_buf = [0u8; 4096];
+
+    match hash::hash_file_raw_to_buf(HashAlgorithm::Md5, path, &mut out_buf) {
+        Ok(hex_len) => {
+            // Build output line in-place: "<hash>  <filename>\n"
+            let filename = path.as_os_str();
+            let name_bytes = {
+                use std::os::unix::ffi::OsStrExt;
+                filename.as_bytes()
+            };
+            let mut pos = hex_len;
+            out_buf[pos] = b' ';
+            pos += 1;
+            out_buf[pos] = b' '; // text mode (space, not *)
+            pos += 1;
+            // Check if filename fits in remaining buffer
+            if pos + name_bytes.len() < out_buf.len() {
+                out_buf[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
+                pos += name_bytes.len();
+                out_buf[pos] = b'\n';
+                pos += 1;
+                // Single write syscall for entire output
+                unsafe {
+                    libc::write(1, out_buf.as_ptr() as *const libc::c_void, pos);
+                }
+            } else {
+                // Filename too long for stack buffer — fallback to heap
+                let mut v = Vec::with_capacity(pos + name_bytes.len() + 1);
+                v.extend_from_slice(&out_buf[..pos]);
+                v.extend_from_slice(name_bytes);
+                v.push(b'\n');
+                unsafe {
+                    libc::write(1, v.as_ptr() as *const libc::c_void, v.len());
+                }
+            }
+            process::exit(0);
+        }
+        Err(e) => {
+            let name = path.to_string_lossy();
+            eprintln!("{}: {}: {}", TOOL_NAME, name, io_error_msg(&e));
+            process::exit(1);
+        }
+    }
+}
+
 fn main() {
     coreutils_rs::common::reset_sigpipe();
 
+    // Ultra-fast single-file detection: fmd5sum <single_file> (no flags)
+    // Check argc == 2 and argv[1] doesn't start with '-'.
+    // This fires before parse_args, enlarge_pipes, or BufWriter creation.
     #[cfg(target_os = "linux")]
-    enlarge_pipes();
+    {
+        let mut args = std::env::args_os();
+        let _ = args.next(); // skip argv[0]
+        if let Some(arg) = args.next()
+            && args.next().is_none()
+        {
+            // Exactly 1 argument
+            let bytes = arg.as_encoded_bytes();
+            if !bytes.is_empty() && bytes[0] != b'-' {
+                single_file_fast(Path::new(&arg));
+            }
+        }
+    }
 
     let cli = parse_args();
     let algo = HashAlgorithm::Md5;
@@ -177,6 +244,13 @@ fn main() {
     } else {
         cli.files.clone()
     };
+
+    // Only enlarge pipes when stdin is involved — saves 2 fcntl syscalls (~2µs)
+    // for the common case of hashing regular files.
+    #[cfg(target_os = "linux")]
+    if files.iter().any(|f| f == "-") {
+        enlarge_pipes();
+    }
 
     // Raw fd stdout on Unix for zero-overhead writes
     #[cfg(unix)]
@@ -335,21 +409,67 @@ fn main() {
                 }
             }
         } else {
-            // Multi-file (2+): use parallel hashing with thread::scope.
+            // Multi-file (2+): choose strategy based on file count.
             let paths: Vec<_> = files.iter().map(|f| Path::new(f.as_str())).collect();
-            let results = hash::hash_files_parallel(&paths, algo);
 
+            let results = if files.len() >= 20 {
+                // Many files: batch I/O (pre-read all, then hash all in parallel).
+                // Separates I/O from compute for maximum throughput.
+                hash::hash_files_batch(&paths, algo)
+            } else {
+                // Moderate file count: fast parallel hash_file_nostat per worker.
+                hash::hash_files_parallel_fast(&paths, algo)
+            };
+
+            // Batch output: build all output lines into one buffer, write once.
+            // Reduces per-file write() overhead from ~100 syscalls to 1.
+            let binary = cli.binary || (!cli.text && cfg!(windows));
+            let mut output_buf = Vec::with_capacity(files.len() * 80);
             for (filename, result) in files.iter().zip(results) {
                 match result {
                     Ok(h) => {
-                        write_output(&mut out, &cli, algo, &h, filename);
+                        if cli.tag {
+                            let term = if cli.zero { b'\0' } else { b'\n' };
+                            output_buf.extend_from_slice(algo.name().as_bytes());
+                            output_buf.extend_from_slice(b" (");
+                            output_buf.extend_from_slice(filename.as_bytes());
+                            output_buf.extend_from_slice(b") = ");
+                            output_buf.extend_from_slice(h.as_bytes());
+                            output_buf.push(term);
+                        } else {
+                            let mode = if binary { b'*' } else { b' ' };
+                            let term = if cli.zero { b'\0' } else { b'\n' };
+                            if !cli.zero && needs_escape(filename) {
+                                let escaped = escape_filename(filename);
+                                output_buf.push(b'\\');
+                                output_buf.extend_from_slice(h.as_bytes());
+                                output_buf.push(b' ');
+                                output_buf.push(mode);
+                                output_buf.extend_from_slice(escaped.as_bytes());
+                                output_buf.push(term);
+                            } else {
+                                output_buf.extend_from_slice(h.as_bytes());
+                                output_buf.push(b' ');
+                                output_buf.push(mode);
+                                output_buf.extend_from_slice(filename.as_bytes());
+                                output_buf.push(term);
+                            }
+                        }
                     }
                     Err(e) => {
+                        // Flush buffered output before writing error to stderr
+                        if !output_buf.is_empty() {
+                            let _ = out.write_all(&output_buf);
+                            output_buf.clear();
+                        }
                         let _ = out.flush();
                         eprintln!("{}: {}: {}", TOOL_NAME, filename, io_error_msg(&e));
                         had_error = true;
                     }
                 }
+            }
+            if !output_buf.is_empty() {
+                let _ = out.write_all(&output_buf);
             }
         }
     }

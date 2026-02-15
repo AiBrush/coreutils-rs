@@ -70,6 +70,69 @@ fn bench_hash_file(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark single-file hash paths: hash_file vs hash_file_nostat vs hash_file_raw.
+/// Creates temporary files at each size tier to measure real I/O + hash performance.
+fn bench_single_file_hash(c: &mut Criterion) {
+    let sizes: Vec<(usize, &str)> = vec![
+        (55, "55B"),
+        (4096, "4KB"),
+        (65536, "64KB"),
+        (1024 * 1024, "1MB"),
+    ];
+
+    // Create temp files
+    let dir = tempfile::tempdir().unwrap();
+    let test_files: Vec<(std::path::PathBuf, &str)> = sizes
+        .iter()
+        .map(|(size, label)| {
+            let path = dir.path().join(format!("bench-{}", label));
+            let data = make_test_data(*size);
+            std::fs::write(&path, &data).unwrap();
+            (path, *label)
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("single_file_md5");
+    for (path, label) in &test_files {
+        let size = std::fs::metadata(path).unwrap().len();
+        group.throughput(Throughput::Bytes(size));
+
+        // hash_file (open_and_stat path)
+        group.bench_with_input(BenchmarkId::new("hash_file", label), path, |b, path| {
+            b.iter(|| hash::hash_file(HashAlgorithm::Md5, path).unwrap());
+        });
+
+        // hash_file_nostat (skip fstat path)
+        group.bench_with_input(
+            BenchmarkId::new("hash_file_nostat", label),
+            path,
+            |b, path| {
+                b.iter(|| hash::hash_file_nostat(HashAlgorithm::Md5, path).unwrap());
+            },
+        );
+
+        // hash_file_raw (raw syscall path — Linux only)
+        #[cfg(target_os = "linux")]
+        group.bench_with_input(BenchmarkId::new("hash_file_raw", label), path, |b, path| {
+            b.iter(|| hash::hash_file_raw(HashAlgorithm::Md5, path).unwrap());
+        });
+
+        // hash_file_raw_to_buf (zero-alloc path — Linux only)
+        #[cfg(target_os = "linux")]
+        group.bench_with_input(
+            BenchmarkId::new("hash_file_raw_to_buf", label),
+            path,
+            |b, path| {
+                let mut hex_buf = [0u8; 128];
+                b.iter(|| {
+                    hash::hash_file_raw_to_buf(HashAlgorithm::Md5, path, &mut hex_buf).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_parallel_hash(c: &mut Criterion) {
     use rayon::prelude::*;
 
@@ -126,6 +189,7 @@ criterion_group!(
     benches,
     bench_hash_bytes,
     bench_hash_file,
+    bench_single_file_hash,
     bench_parallel_hash
 );
 criterion_main!(benches);
