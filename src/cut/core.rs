@@ -1562,15 +1562,104 @@ fn fields_prefix_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_prefix_line(line, delim, line_delim, last_field, suppress, buf);
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_prefix_line(line, delim, line_delim, last_field, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_prefix_line(&data[start..], delim, line_delim, last_field, suppress, buf);
+        }
+        return;
     }
-    if start < data.len() {
-        fields_prefix_line(&data[start..], delim, line_delim, last_field, suppress, buf);
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
+
+    // Per-line state
+    let mut line_start: usize = 0;
+    let mut field_count: usize = 1;
+    let mut has_delim = false;
+    let mut done = false; // true when output already emitted for this line
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+
+        if byte == line_delim {
+            if done {
+                // Already emitted — just reset
+            } else if !has_delim {
+                // No delimiter in line
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                }
+            } else {
+                // Fewer fields than last_field — output entire line
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+
+            // Reset for next line
+            line_start = pos + 1;
+            field_count = 1;
+            has_delim = false;
+            done = false;
+        } else if !done {
+            // Delimiter found
+            has_delim = true;
+            if field_count >= last_field {
+                // Truncate at this delimiter — output fields 1..last_field
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+                done = true;
+            } else {
+                field_count += 1;
+            }
+        }
+    }
+
+    // Handle last line without trailing line_delim
+    if line_start < data_len && !done {
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+        } else {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        }
     }
 }
 
@@ -1802,31 +1891,139 @@ fn fields_mid_range_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_mid_range_line(
-            line,
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_mid_range_line(
+                line,
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_mid_range_line(
+                &data[start..],
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+        }
+        return;
     }
-    if start < data.len() {
-        fields_mid_range_line(
-            &data[start..],
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let skip_before = start_field - 1; // delimiters before start_field
+    let field_span = end_field - start_field; // additional delimiters within range
+    let target_end_delim = skip_before + field_span + 1; // delimiter that ends range
+
+    // Per-line state
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut range_start: usize = 0;
+    let mut has_delim = false;
+    let mut done = false; // true when we already emitted output for this line
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+
+        if byte == line_delim {
+            if done {
+                // Already emitted — just reset
+            } else if !has_delim {
+                // No delimiter in line
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                }
+            } else if delim_count >= skip_before {
+                // Have at least start_field, output from range_start to end of line
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(range_start), pos - range_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else {
+                // Not enough fields for start_field — output empty line
+                unsafe { buf_push(buf, line_delim) };
+            }
+
+            // Reset for next line
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            done = false;
+        } else if !done {
+            // Delimiter found
+            has_delim = true;
+            delim_count += 1;
+            if delim_count == skip_before {
+                range_start = pos + 1;
+            }
+            if delim_count == target_end_delim {
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(range_start), pos - range_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+                done = true;
+            }
+        }
+    }
+
+    // Handle last line without trailing line_delim
+    if line_start < data_len && !done {
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+        } else if delim_count >= skip_before {
+            if skip_before == 0 {
+                range_start = line_start;
+            }
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(range_start), data_len - range_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        } else {
+            unsafe { buf_push(buf, line_delim) };
+        }
     }
 }
 
