@@ -82,15 +82,20 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
             return Ok(FileData::Owned(buf));
         }
 
-        // SAFETY: Read-only mapping. MAP_POPULATE pre-faults page table entries
-        // from the page cache in one batch kernel call, avoiding scattered demand
-        // faults during the scan. For warm cache (benchmark warmup), this is faster
-        // than demand faults even with fault-around (~160 faults for 10MB → 0 faults).
-        // For cold cache, the kernel reads ahead from disk during mmap().
-        match unsafe { MmapOptions::new().populate().map(&file) } {
+        // SAFETY: Read-only mapping. No MAP_POPULATE — it synchronously faults
+        // all pages with 4KB before MADV_HUGEPAGE can take effect, causing ~25,600
+        // minor page faults for 100MB (~25ms overhead). Without it, HUGEPAGE hint
+        // is set first, then WILLNEED triggers async readahead using 2MB pages
+        // (~50 faults = ~0.1ms).
+        match unsafe { MmapOptions::new().map(&file) } {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
                 {
+                    // HUGEPAGE MUST come first: reduces 25,600 minor faults (4KB) to
+                    // ~50 faults (2MB) for 100MB files. Saves ~25ms of page fault overhead.
+                    if len >= 2 * 1024 * 1024 {
+                        let _ = mmap.advise(memmap2::Advice::HugePage);
+                    }
                     let _ = mmap.advise(memmap2::Advice::Sequential);
                     let _ = mmap.advise(memmap2::Advice::WillNeed);
                 }
