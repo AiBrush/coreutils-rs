@@ -2389,17 +2389,28 @@ fn delete_range_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // Single-buffer in-place delete: eliminates the 16MB dst allocation
-    // and its ~4000 page faults. For 10MB piped input, saves ~1.2ms.
+    // Accumulate multiple pipe reads before processing+writing.
+    // In-place delete compacts kept bytes at the front of the buffer.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = delete_range_inplace(&mut buf, total, lo, hi);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-        let wp = delete_range_inplace(&mut buf, n, lo, hi);
-        if wp > 0 {
-            writer.write_all(&buf[..wp])?;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = delete_range_inplace(&mut buf, total, lo, hi);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
         }
     }
     Ok(())
@@ -2591,37 +2602,51 @@ pub fn translate(
         return translate_range_to_constant_stream(lo, hi, replacement, reader, writer);
     }
 
-    // General case: IN-PLACE translation on a SINGLE 16MB buffer.
-    // This halves memory bandwidth vs the old separate src/dst approach:
-    // - Old: read into src, translate from src→dst (read + write), write dst = 12MB bandwidth
-    // - New: read into buf, translate in-place (read+write), write buf = 8MB bandwidth
-    // The 8x-unrolled in-place translate avoids store-to-load forwarding stalls
-    // because consecutive reads are 8 bytes apart (sequential), not aliased.
-    // Using 16MB buffer = 1 read for 10MB input, minimizing syscall count.
+    // General case: IN-PLACE translation on a SINGLE buffer.
+    // Accumulates multiple pipe reads before processing+writing to reduce
+    // write syscalls. Translate in-place halves memory bandwidth vs separate buffers.
     // SAFETY: all bytes are written by read_once before being translated.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                translate_and_write_table(&mut buf, total, &table, writer)?;
+            }
             break;
         }
-        if n >= PARALLEL_THRESHOLD {
-            // Parallel in-place translate for large chunks (~4x faster on 4+ cores).
-            let nt = rayon::current_num_threads().max(1);
-            let cs = (n / nt).max(32 * 1024);
-            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
-                translate_inplace(chunk, &table);
-            });
-        } else {
-            translate_inplace(&mut buf[..n], &table);
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            translate_and_write_table(&mut buf, total, &table, writer)?;
+            total = 0;
         }
-        writer.write_all(&buf[..n])?;
     }
     Ok(())
 }
 
+#[inline]
+fn translate_and_write_table(
+    buf: &mut [u8],
+    total: usize,
+    table: &[u8; 256],
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if total >= PARALLEL_THRESHOLD {
+        let nt = rayon::current_num_threads().max(1);
+        let cs = (total / nt).max(32 * 1024);
+        buf[..total].par_chunks_mut(cs).for_each(|chunk| {
+            translate_inplace(chunk, table);
+        });
+    } else {
+        translate_inplace(&mut buf[..total], table);
+    }
+    writer.write_all(&buf[..total])
+}
+
 /// Streaming SIMD range translation — single buffer, in-place transform.
-/// Uses 16MB uninit buffer for fewer syscalls (translate is compute-light).
+/// Accumulates multiple pipe reads before processing+writing to reduce
+/// write syscalls (e.g., 100MB with 64KB pipe: 12 writes instead of 1500).
 /// For chunks >= PARALLEL_THRESHOLD, uses rayon par_chunks_mut for multi-core.
 fn translate_range_stream(
     lo: u8,
@@ -2631,28 +2656,48 @@ fn translate_range_stream(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                translate_and_write_range(&mut buf, total, lo, hi, offset, writer)?;
+            }
             break;
         }
-        if n >= PARALLEL_THRESHOLD {
-            let nt = rayon::current_num_threads().max(1);
-            let cs = (n / nt).max(32 * 1024);
-            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
-                translate_range_simd_inplace(chunk, lo, hi, offset);
-            });
-        } else {
-            translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            translate_and_write_range(&mut buf, total, lo, hi, offset, writer)?;
+            total = 0;
         }
-        writer.write_all(&buf[..n])?;
     }
     Ok(())
 }
 
+#[inline]
+fn translate_and_write_range(
+    buf: &mut [u8],
+    total: usize,
+    lo: u8,
+    hi: u8,
+    offset: i8,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if total >= PARALLEL_THRESHOLD {
+        let nt = rayon::current_num_threads().max(1);
+        let cs = (total / nt).max(32 * 1024);
+        buf[..total].par_chunks_mut(cs).for_each(|chunk| {
+            translate_range_simd_inplace(chunk, lo, hi, offset);
+        });
+    } else {
+        translate_range_simd_inplace(&mut buf[..total], lo, hi, offset);
+    }
+    writer.write_all(&buf[..total])
+}
+
 /// Streaming SIMD range-to-constant translation — single buffer, in-place transform.
+/// Accumulates reads before processing+writing to reduce write syscalls.
 /// Uses blendv instead of nibble decomposition for ~10x fewer SIMD ops per vector.
-/// For chunks >= PARALLEL_THRESHOLD, uses rayon par_chunks_mut for multi-core.
 fn translate_range_to_constant_stream(
     lo: u8,
     hi: u8,
@@ -2661,23 +2706,43 @@ fn translate_range_to_constant_stream(
     writer: &mut impl Write,
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                translate_and_write_range_const(&mut buf, total, lo, hi, replacement, writer)?;
+            }
             break;
         }
-        if n >= PARALLEL_THRESHOLD {
-            let nt = rayon::current_num_threads().max(1);
-            let cs = (n / nt).max(32 * 1024);
-            buf[..n].par_chunks_mut(cs).for_each(|chunk| {
-                translate_range_to_constant_simd_inplace(chunk, lo, hi, replacement);
-            });
-        } else {
-            translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            translate_and_write_range_const(&mut buf, total, lo, hi, replacement, writer)?;
+            total = 0;
         }
-        writer.write_all(&buf[..n])?;
     }
     Ok(())
+}
+
+#[inline]
+fn translate_and_write_range_const(
+    buf: &mut [u8],
+    total: usize,
+    lo: u8,
+    hi: u8,
+    replacement: u8,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if total >= PARALLEL_THRESHOLD {
+        let nt = rayon::current_num_threads().max(1);
+        let cs = (total / nt).max(32 * 1024);
+        buf[..total].par_chunks_mut(cs).for_each(|chunk| {
+            translate_range_to_constant_simd_inplace(chunk, lo, hi, replacement);
+        });
+    } else {
+        translate_range_to_constant_simd_inplace(&mut buf[..total], lo, hi, replacement);
+    }
+    writer.write_all(&buf[..total])
 }
 
 /// Pure passthrough: copy stdin to stdout without transformation.
@@ -2738,71 +2803,104 @@ pub fn translate_squeeze(
 
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = translate_squeeze_process(
+                    &mut buf, total, &table, &squeeze_set,
+                    range_info, range_const_info, &mut last_squeezed,
+                );
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-        // Pass 1: translate
-        if let Some((lo, hi, offset)) = range_info {
-            translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
-        } else if let Some((lo, hi, replacement)) = range_const_info {
-            translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
-        } else {
-            translate_inplace(&mut buf[..n], &table);
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = translate_squeeze_process(
+                &mut buf, total, &table, &squeeze_set,
+                range_info, range_const_info, &mut last_squeezed,
+            );
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
         }
-        // Pass 2: squeeze in-place using 8x-unrolled loop
-        let mut wp = 0;
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            let mut i = 0;
-            while i + 8 <= n {
-                macro_rules! squeeze_byte {
-                    ($off:expr) => {
-                        let b = *ptr.add(i + $off);
-                        if is_member(&squeeze_set, b) {
-                            if last_squeezed != b as u16 {
-                                last_squeezed = b as u16;
-                                *ptr.add(wp) = b;
-                                wp += 1;
-                            }
-                        } else {
-                            last_squeezed = 256;
+    }
+    Ok(())
+}
+
+#[inline]
+fn translate_squeeze_process(
+    buf: &mut [u8],
+    n: usize,
+    table: &[u8; 256],
+    squeeze_set: &[u8; 32],
+    range_info: Option<(u8, u8, i8)>,
+    range_const_info: Option<(u8, u8, u8)>,
+    last_squeezed: &mut u16,
+) -> usize {
+    // Pass 1: translate
+    if let Some((lo, hi, offset)) = range_info {
+        translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+    } else if let Some((lo, hi, replacement)) = range_const_info {
+        translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
+    } else {
+        translate_inplace(&mut buf[..n], table);
+    }
+    // Pass 2: squeeze in-place
+    let mut wp = 0;
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        let mut i = 0;
+        while i + 8 <= n {
+            macro_rules! squeeze_byte {
+                ($off:expr) => {
+                    let b = *ptr.add(i + $off);
+                    if is_member(squeeze_set, b) {
+                        if *last_squeezed != b as u16 {
+                            *last_squeezed = b as u16;
                             *ptr.add(wp) = b;
                             wp += 1;
                         }
-                    };
-                }
-                squeeze_byte!(0);
-                squeeze_byte!(1);
-                squeeze_byte!(2);
-                squeeze_byte!(3);
-                squeeze_byte!(4);
-                squeeze_byte!(5);
-                squeeze_byte!(6);
-                squeeze_byte!(7);
-                i += 8;
-            }
-            while i < n {
-                let b = *ptr.add(i);
-                if is_member(&squeeze_set, b) {
-                    if last_squeezed == b as u16 {
-                        i += 1;
-                        continue;
+                    } else {
+                        *last_squeezed = 256;
+                        *ptr.add(wp) = b;
+                        wp += 1;
                     }
-                    last_squeezed = b as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *ptr.add(wp) = b;
-                wp += 1;
-                i += 1;
+                };
             }
+            squeeze_byte!(0);
+            squeeze_byte!(1);
+            squeeze_byte!(2);
+            squeeze_byte!(3);
+            squeeze_byte!(4);
+            squeeze_byte!(5);
+            squeeze_byte!(6);
+            squeeze_byte!(7);
+            i += 8;
         }
-        writer.write_all(&buf[..wp])?;
+        while i < n {
+            let b = *ptr.add(i);
+            if is_member(squeeze_set, b) {
+                if *last_squeezed == b as u16 {
+                    i += 1;
+                    continue;
+                }
+                *last_squeezed = b as u16;
+            } else {
+                *last_squeezed = 256;
+            }
+            *ptr.add(wp) = b;
+            wp += 1;
+            i += 1;
+        }
     }
-    Ok(())
+    wp
 }
 
 /// Optimized translate+squeeze for single squeeze character.
@@ -2826,80 +2924,111 @@ fn translate_squeeze_single_ch(
     let finder = memchr::memmem::Finder::new(&pair);
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut was_squeeze_char = false;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = translate_squeeze_single_process(
+                    &mut buf, total, table, squeeze_ch, &finder,
+                    range_info, range_const_info, &mut was_squeeze_char,
+                );
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-        // Pass 1: SIMD translate in-place
-        if let Some((lo, hi, offset)) = range_info {
-            translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
-        } else if let Some((lo, hi, replacement)) = range_const_info {
-            translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
-        } else {
-            translate_inplace(&mut buf[..n], table);
-        }
-
-        // Pass 2: in-place squeeze compaction
-        let mut i = 0;
-
-        // Handle carry-over from previous chunk
-        if was_squeeze_char {
-            while i < n && unsafe { *buf.as_ptr().add(i) } == squeeze_ch {
-                i += 1;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = translate_squeeze_single_process(
+                &mut buf, total, table, squeeze_ch, &finder,
+                range_info, range_const_info, &mut was_squeeze_char,
+            );
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
             }
-            if i >= n {
-                continue;
-            }
-        }
-
-        let ptr = buf.as_mut_ptr();
-        let mut wp = 0usize;
-
-        loop {
-            match finder.find(&buf[i..n]) {
-                Some(offset) => {
-                    let seg_end = i + offset + 1;
-                    let gap = seg_end - i;
-                    if gap > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), gap);
-                            }
-                        }
-                        wp += gap;
-                    }
-                    i = seg_end;
-                    while i < n && unsafe { *buf.as_ptr().add(i) } == squeeze_ch {
-                        i += 1;
-                    }
-                    if i >= n {
-                        was_squeeze_char = true;
-                        break;
-                    }
-                }
-                None => {
-                    let rem = n - i;
-                    if rem > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), rem);
-                            }
-                        }
-                        wp += rem;
-                    }
-                    was_squeeze_char = n > 0 && unsafe { *buf.as_ptr().add(n - 1) } == squeeze_ch;
-                    break;
-                }
-            }
-        }
-
-        if wp > 0 {
-            writer.write_all(&buf[..wp])?;
+            total = 0;
         }
     }
     Ok(())
+}
+
+#[inline]
+fn translate_squeeze_single_process(
+    buf: &mut [u8],
+    n: usize,
+    table: &[u8; 256],
+    squeeze_ch: u8,
+    finder: &memchr::memmem::Finder<'_>,
+    range_info: Option<(u8, u8, i8)>,
+    range_const_info: Option<(u8, u8, u8)>,
+    was_squeeze_char: &mut bool,
+) -> usize {
+    // Pass 1: translate in-place
+    if let Some((lo, hi, offset)) = range_info {
+        translate_range_simd_inplace(&mut buf[..n], lo, hi, offset);
+    } else if let Some((lo, hi, replacement)) = range_const_info {
+        translate_range_to_constant_simd_inplace(&mut buf[..n], lo, hi, replacement);
+    } else {
+        translate_inplace(&mut buf[..n], table);
+    }
+
+    // Pass 2: squeeze compaction
+    let mut i = 0;
+    if *was_squeeze_char {
+        while i < n && unsafe { *buf.as_ptr().add(i) } == squeeze_ch {
+            i += 1;
+        }
+        *was_squeeze_char = false;
+        if i >= n {
+            *was_squeeze_char = true;
+            return 0;
+        }
+    }
+
+    let ptr = buf.as_mut_ptr();
+    let mut wp = 0usize;
+
+    loop {
+        match finder.find(&buf[i..n]) {
+            Some(offset) => {
+                let seg_end = i + offset + 1;
+                let gap = seg_end - i;
+                if gap > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), gap);
+                        }
+                    }
+                    wp += gap;
+                }
+                i = seg_end;
+                while i < n && unsafe { *buf.as_ptr().add(i) } == squeeze_ch {
+                    i += 1;
+                }
+                if i >= n {
+                    *was_squeeze_char = true;
+                    break;
+                }
+            }
+            None => {
+                let rem = n - i;
+                if rem > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), rem);
+                        }
+                    }
+                    wp += rem;
+                }
+                *was_squeeze_char = n > 0 && unsafe { *buf.as_ptr().add(n - 1) } == squeeze_ch;
+                break;
+            }
+        }
+    }
+    wp
 }
 
 pub fn delete(
@@ -2926,25 +3055,40 @@ pub fn delete(
     // Separate output buffer for SIMD compaction — keeps source data intact
     // while compact_8bytes_simd writes to a different location.
     let mut outbuf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = delete_bitset_dispatch(&buf[..total], &mut outbuf, &member);
+                if wp > 0 {
+                    writer.write_all(&outbuf[..wp])?;
+                }
+            }
             break;
         }
-        #[cfg(target_arch = "x86_64")]
-        let wp = if get_simd_level() >= 3 {
-            unsafe { delete_bitset_avx2_stream(&buf[..n], &mut outbuf, &member) }
-        } else {
-            delete_bitset_scalar(&buf[..n], &mut outbuf, &member)
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let wp = delete_bitset_scalar(&buf[..n], &mut outbuf, &member);
-        if wp > 0 {
-            writer.write_all(&outbuf[..wp])?;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = delete_bitset_dispatch(&buf[..total], &mut outbuf, &member);
+            if wp > 0 {
+                writer.write_all(&outbuf[..wp])?;
+            }
+            total = 0;
         }
     }
     Ok(())
+}
+
+#[inline]
+fn delete_bitset_dispatch(src: &[u8], dst: &mut [u8], member: &[u8; 32]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if get_simd_level() >= 3 {
+            return unsafe { delete_bitset_avx2_stream(src, dst, member) };
+        }
+    }
+    delete_bitset_scalar(src, dst, member)
 }
 
 /// Scalar bitset delete: write kept bytes to output buffer.
@@ -3117,56 +3261,74 @@ fn delete_single_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // Single-buffer in-place delete: memchr finds delete positions,
-    // gap-copy backward in the same buffer. Saves 16MB dst allocation.
+    // Single-buffer in-place delete: accumulate reads, then memchr finds
+    // delete positions, gap-copy backward in the same buffer.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
-            break;
-        }
-        let mut wp = 0;
-        let mut i = 0;
-        while i < n {
-            match memchr::memchr(ch, &buf[i..n]) {
-                Some(offset) => {
-                    if offset > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    offset,
-                                );
-                            }
-                        }
-                        wp += offset;
-                    }
-                    i += offset + 1;
-                }
-                None => {
-                    let run_len = n - i;
-                    if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
-                        }
-                        wp += run_len;
-                    }
-                    break;
+            if total > 0 {
+                let wp = delete_single_inplace(&mut buf, total, ch);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
                 }
             }
+            break;
         }
-        if wp > 0 {
-            writer.write_all(&buf[..wp])?;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = delete_single_inplace(&mut buf, total, ch);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
         }
     }
     Ok(())
+}
+
+/// In-place single-char delete using memchr gap-copy.
+#[inline]
+fn delete_single_inplace(buf: &mut [u8], n: usize, ch: u8) -> usize {
+    let mut wp = 0;
+    let mut i = 0;
+    while i < n {
+        match memchr::memchr(ch, &buf[i..n]) {
+            Some(offset) => {
+                if offset > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(
+                                buf.as_ptr().add(i),
+                                buf.as_mut_ptr().add(wp),
+                                offset,
+                            );
+                        }
+                    }
+                    wp += offset;
+                }
+                i += offset + 1;
+            }
+            None => {
+                let run_len = n - i;
+                if run_len > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(
+                                buf.as_ptr().add(i),
+                                buf.as_mut_ptr().add(wp),
+                                run_len,
+                            );
+                        }
+                    }
+                    wp += run_len;
+                }
+                break;
+            }
+        }
+    }
+    wp
 }
 
 fn delete_multi_streaming(
@@ -3174,61 +3336,79 @@ fn delete_multi_streaming(
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> io::Result<()> {
-    // Single-buffer in-place delete: memchr2/memchr3 finds delete positions,
-    // gap-copy backward in the same buffer. Saves 16MB dst allocation.
+    // Accumulate reads, then memchr2/memchr3 finds delete positions,
+    // gap-copy backward in the same buffer.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
+    let mut total = 0;
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
-            break;
-        }
-        let mut wp = 0;
-        let mut i = 0;
-        while i < n {
-            let found = if chars.len() == 2 {
-                memchr::memchr2(chars[0], chars[1], &buf[i..n])
-            } else {
-                memchr::memchr3(chars[0], chars[1], chars[2], &buf[i..n])
-            };
-            match found {
-                Some(offset) => {
-                    if offset > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    offset,
-                                );
-                            }
-                        }
-                        wp += offset;
-                    }
-                    i += offset + 1;
-                }
-                None => {
-                    let run_len = n - i;
-                    if run_len > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(
-                                    buf.as_ptr().add(i),
-                                    buf.as_mut_ptr().add(wp),
-                                    run_len,
-                                );
-                            }
-                        }
-                        wp += run_len;
-                    }
-                    break;
+            if total > 0 {
+                let wp = delete_multi_inplace(&mut buf, total, chars);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
                 }
             }
+            break;
         }
-        if wp > 0 {
-            writer.write_all(&buf[..wp])?;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = delete_multi_inplace(&mut buf, total, chars);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
         }
     }
     Ok(())
+}
+
+/// In-place multi-char delete using memchr2/memchr3 gap-copy.
+#[inline]
+fn delete_multi_inplace(buf: &mut [u8], n: usize, chars: &[u8]) -> usize {
+    let mut wp = 0;
+    let mut i = 0;
+    while i < n {
+        let found = if chars.len() == 2 {
+            memchr::memchr2(chars[0], chars[1], &buf[i..n])
+        } else {
+            memchr::memchr3(chars[0], chars[1], chars[2], &buf[i..n])
+        };
+        match found {
+            Some(offset) => {
+                if offset > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(
+                                buf.as_ptr().add(i),
+                                buf.as_mut_ptr().add(wp),
+                                offset,
+                            );
+                        }
+                    }
+                    wp += offset;
+                }
+                i += offset + 1;
+            }
+            None => {
+                let run_len = n - i;
+                if run_len > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(
+                                buf.as_ptr().add(i),
+                                buf.as_mut_ptr().add(wp),
+                                run_len,
+                            );
+                        }
+                    }
+                    wp += run_len;
+                }
+                break;
+            }
+        }
+    }
+    wp
 }
 
 pub fn delete_squeeze(
@@ -3241,69 +3421,95 @@ pub fn delete_squeeze(
     let squeeze_set = build_member_set(squeeze_chars);
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = delete_squeeze_inplace(
+                    &mut buf, total, &delete_set, &squeeze_set, &mut last_squeezed,
+                );
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-        // Fused delete+squeeze: 8x-unrolled inner loop for better ILP.
-        // Each byte is checked against delete set first (skip if member),
-        // then squeeze set (deduplicate consecutive members).
-        let mut wp = 0;
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            let mut i = 0;
-            while i + 8 <= n {
-                macro_rules! process_byte {
-                    ($off:expr) => {
-                        let b = *ptr.add(i + $off);
-                        if !is_member(&delete_set, b) {
-                            if is_member(&squeeze_set, b) {
-                                if last_squeezed != b as u16 {
-                                    last_squeezed = b as u16;
-                                    *ptr.add(wp) = b;
-                                    wp += 1;
-                                }
-                            } else {
-                                last_squeezed = 256;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = delete_squeeze_inplace(
+                &mut buf, total, &delete_set, &squeeze_set, &mut last_squeezed,
+            );
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn delete_squeeze_inplace(
+    buf: &mut [u8],
+    n: usize,
+    delete_set: &[u8; 32],
+    squeeze_set: &[u8; 32],
+    last_squeezed: &mut u16,
+) -> usize {
+    let mut wp = 0;
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        let mut i = 0;
+        while i + 8 <= n {
+            macro_rules! process_byte {
+                ($off:expr) => {
+                    let b = *ptr.add(i + $off);
+                    if !is_member(delete_set, b) {
+                        if is_member(squeeze_set, b) {
+                            if *last_squeezed != b as u16 {
+                                *last_squeezed = b as u16;
                                 *ptr.add(wp) = b;
                                 wp += 1;
                             }
-                        }
-                    };
-                }
-                process_byte!(0);
-                process_byte!(1);
-                process_byte!(2);
-                process_byte!(3);
-                process_byte!(4);
-                process_byte!(5);
-                process_byte!(6);
-                process_byte!(7);
-                i += 8;
-            }
-            while i < n {
-                let b = *ptr.add(i);
-                if !is_member(&delete_set, b) {
-                    if is_member(&squeeze_set, b) {
-                        if last_squeezed != b as u16 {
-                            last_squeezed = b as u16;
+                        } else {
+                            *last_squeezed = 256;
                             *ptr.add(wp) = b;
                             wp += 1;
                         }
-                    } else {
-                        last_squeezed = 256;
+                    }
+                };
+            }
+            process_byte!(0);
+            process_byte!(1);
+            process_byte!(2);
+            process_byte!(3);
+            process_byte!(4);
+            process_byte!(5);
+            process_byte!(6);
+            process_byte!(7);
+            i += 8;
+        }
+        while i < n {
+            let b = *ptr.add(i);
+            if !is_member(delete_set, b) {
+                if is_member(squeeze_set, b) {
+                    if *last_squeezed != b as u16 {
+                        *last_squeezed = b as u16;
                         *ptr.add(wp) = b;
                         wp += 1;
                     }
+                } else {
+                    *last_squeezed = 256;
+                    *ptr.add(wp) = b;
+                    wp += 1;
                 }
-                i += 1;
             }
+            i += 1;
         }
-        writer.write_all(&buf[..wp])?;
     }
-    Ok(())
+    wp
 }
 
 pub fn squeeze(
@@ -3324,32 +3530,56 @@ pub fn squeeze(
     let member = build_member_set(squeeze_chars);
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = squeeze_inplace_bitset(&mut buf, total, &member, &mut last_squeezed);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-        let mut wp = 0;
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            for i in 0..n {
-                let b = *ptr.add(i);
-                if is_member(&member, b) {
-                    if last_squeezed == b as u16 {
-                        continue;
-                    }
-                    last_squeezed = b as u16;
-                } else {
-                    last_squeezed = 256;
-                }
-                *ptr.add(wp) = b;
-                wp += 1;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = squeeze_inplace_bitset(&mut buf, total, &member, &mut last_squeezed);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
             }
+            total = 0;
         }
-        writer.write_all(&buf[..wp])?;
     }
     Ok(())
+}
+
+#[inline]
+fn squeeze_inplace_bitset(
+    buf: &mut [u8],
+    n: usize,
+    member: &[u8; 32],
+    last_squeezed: &mut u16,
+) -> usize {
+    let mut wp = 0;
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        for i in 0..n {
+            let b = *ptr.add(i);
+            if is_member(member, b) {
+                if *last_squeezed == b as u16 {
+                    continue;
+                }
+                *last_squeezed = b as u16;
+            } else {
+                *last_squeezed = 256;
+            }
+            *ptr.add(wp) = b;
+            wp += 1;
+        }
+    }
+    wp
 }
 
 /// Streaming squeeze for 2-3 chars using memchr2/memchr3 SIMD scanning.
@@ -3367,86 +3597,97 @@ fn squeeze_multi_stream(
     } else {
         None
     };
-    let single_byte = [0u8; 1]; // used for the kept single byte
-    let _ = single_byte;
 
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut last_squeezed: u16 = 256;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
-            break;
-        }
-
-        // In-place compaction using memchr2/memchr3 gap-copy.
-        // For each squeezable char found, copy the gap before it,
-        // then emit one byte (if not a squeeze duplicate) and skip the run.
-        let ptr = buf.as_mut_ptr();
-        let mut wp = 0usize;
-        let mut cursor = 0usize;
-
-        macro_rules! find_next {
-            ($start:expr) => {
-                if let Some(c) = c2 {
-                    memchr::memchr3(c0, c1, c, &buf[$start..n])
-                } else {
-                    memchr::memchr2(c0, c1, &buf[$start..n])
-                }
-            };
-        }
-
-        while cursor < n {
-            match find_next!(cursor) {
-                Some(offset) => {
-                    let pos = cursor + offset;
-                    let b = unsafe { *ptr.add(pos) };
-
-                    // Copy gap before squeeze point
-                    let gap = pos - cursor;
-                    if gap > 0 {
-                        if wp != cursor {
-                            unsafe {
-                                std::ptr::copy(ptr.add(cursor), ptr.add(wp), gap);
-                            }
-                        }
-                        wp += gap;
-                        last_squeezed = 256;
-                    }
-
-                    // Emit single byte if not duplicate
-                    if last_squeezed != b as u16 {
-                        unsafe { *ptr.add(wp) = b };
-                        wp += 1;
-                        last_squeezed = b as u16;
-                    }
-
-                    // Skip the run of same byte
-                    cursor = pos + 1;
-                    while cursor < n && unsafe { *ptr.add(cursor) } == b {
-                        cursor += 1;
-                    }
-                }
-                None => {
-                    // No more squeeze chars — copy remainder
-                    let rem = n - cursor;
-                    if rem > 0 {
-                        if wp != cursor {
-                            unsafe {
-                                std::ptr::copy(ptr.add(cursor), ptr.add(wp), rem);
-                            }
-                        }
-                        wp += rem;
-                        last_squeezed = 256;
-                    }
-                    break;
+            if total > 0 {
+                let wp = squeeze_multi_compact(&mut buf, total, c0, c1, c2, &mut last_squeezed);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
                 }
             }
+            break;
         }
-
-        writer.write_all(&buf[..wp])?;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = squeeze_multi_compact(&mut buf, total, c0, c1, c2, &mut last_squeezed);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
+            }
+            total = 0;
+        }
     }
     Ok(())
+}
+
+/// In-place multi-char squeeze using memchr2/memchr3 gap-copy.
+#[inline]
+fn squeeze_multi_compact(
+    buf: &mut [u8],
+    n: usize,
+    c0: u8,
+    c1: u8,
+    c2: Option<u8>,
+    last_squeezed: &mut u16,
+) -> usize {
+    let ptr = buf.as_mut_ptr();
+    let mut wp = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < n {
+        let found = if let Some(c) = c2 {
+            memchr::memchr3(c0, c1, c, &buf[cursor..n])
+        } else {
+            memchr::memchr2(c0, c1, &buf[cursor..n])
+        };
+        match found {
+            Some(offset) => {
+                let pos = cursor + offset;
+                let b = unsafe { *ptr.add(pos) };
+
+                let gap = pos - cursor;
+                if gap > 0 {
+                    if wp != cursor {
+                        unsafe {
+                            std::ptr::copy(ptr.add(cursor), ptr.add(wp), gap);
+                        }
+                    }
+                    wp += gap;
+                    *last_squeezed = 256;
+                }
+
+                if *last_squeezed != b as u16 {
+                    unsafe { *ptr.add(wp) = b };
+                    wp += 1;
+                    *last_squeezed = b as u16;
+                }
+
+                cursor = pos + 1;
+                while cursor < n && unsafe { *ptr.add(cursor) } == b {
+                    cursor += 1;
+                }
+            }
+            None => {
+                let rem = n - cursor;
+                if rem > 0 {
+                    if wp != cursor {
+                        unsafe {
+                            std::ptr::copy(ptr.add(cursor), ptr.add(wp), rem);
+                        }
+                    }
+                    wp += rem;
+                    *last_squeezed = 256;
+                }
+                break;
+            }
+        }
+    }
+    wp
 }
 
 fn squeeze_single_stream(
@@ -3461,76 +3702,95 @@ fn squeeze_single_stream(
     let finder = memchr::memmem::Finder::new(&pair);
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     let mut was_squeeze_char = false;
+    let mut total = 0;
 
     loop {
-        let n = read_once(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf[total..])?;
         if n == 0 {
+            if total > 0 {
+                let wp = squeeze_single_compact(&mut buf, total, ch, &finder, &mut was_squeeze_char);
+                if wp > 0 {
+                    writer.write_all(&buf[..wp])?;
+                }
+            }
             break;
         }
-
-        let mut i = 0;
-
-        // Handle carry-over: if previous chunk ended with squeeze char,
-        // skip leading occurrences of that char in this chunk.
-        if was_squeeze_char {
-            while i < n && unsafe { *buf.as_ptr().add(i) } == ch {
-                i += 1;
+        total += n;
+        if buf.len() - total < 256 * 1024 {
+            let wp = squeeze_single_compact(&mut buf, total, ch, &finder, &mut was_squeeze_char);
+            if wp > 0 {
+                writer.write_all(&buf[..wp])?;
             }
-            if i >= n {
-                continue;
-            }
-        }
-
-        // In-place compaction: scan for consecutive pairs and remove duplicates.
-        let ptr = buf.as_mut_ptr();
-        let mut wp = 0usize;
-
-        loop {
-            match finder.find(&buf[i..n]) {
-                Some(offset) => {
-                    // Copy everything up to and including the first char of the pair
-                    let seg_end = i + offset + 1;
-                    let gap = seg_end - i;
-                    if gap > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), gap);
-                            }
-                        }
-                        wp += gap;
-                    }
-                    i = seg_end;
-                    // Skip all remaining consecutive ch bytes (the run)
-                    while i < n && unsafe { *buf.as_ptr().add(i) } == ch {
-                        i += 1;
-                    }
-                    if i >= n {
-                        was_squeeze_char = true;
-                        break;
-                    }
-                }
-                None => {
-                    // No more consecutive pairs — copy remainder
-                    let rem = n - i;
-                    if rem > 0 {
-                        if wp != i {
-                            unsafe {
-                                std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), rem);
-                            }
-                        }
-                        wp += rem;
-                    }
-                    was_squeeze_char = n > 0 && unsafe { *buf.as_ptr().add(n - 1) } == ch;
-                    break;
-                }
-            }
-        }
-
-        if wp > 0 {
-            writer.write_all(&buf[..wp])?;
+            total = 0;
         }
     }
     Ok(())
+}
+
+/// In-place squeeze compaction for single-char using memmem.
+#[inline]
+fn squeeze_single_compact(
+    buf: &mut [u8],
+    n: usize,
+    ch: u8,
+    finder: &memchr::memmem::Finder<'_>,
+    was_squeeze_char: &mut bool,
+) -> usize {
+    let mut i = 0;
+
+    // Handle carry-over from previous flush
+    if *was_squeeze_char {
+        while i < n && unsafe { *buf.as_ptr().add(i) } == ch {
+            i += 1;
+        }
+        *was_squeeze_char = false;
+        if i >= n {
+            *was_squeeze_char = true;
+            return 0;
+        }
+    }
+
+    let ptr = buf.as_mut_ptr();
+    let mut wp = 0usize;
+
+    loop {
+        match finder.find(&buf[i..n]) {
+            Some(offset) => {
+                let seg_end = i + offset + 1;
+                let gap = seg_end - i;
+                if gap > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), gap);
+                        }
+                    }
+                    wp += gap;
+                }
+                i = seg_end;
+                while i < n && unsafe { *buf.as_ptr().add(i) } == ch {
+                    i += 1;
+                }
+                if i >= n {
+                    *was_squeeze_char = true;
+                    break;
+                }
+            }
+            None => {
+                let rem = n - i;
+                if rem > 0 {
+                    if wp != i {
+                        unsafe {
+                            std::ptr::copy(ptr.add(i) as *const u8, ptr.add(wp), rem);
+                        }
+                    }
+                    wp += rem;
+                }
+                *was_squeeze_char = n > 0 && unsafe { *buf.as_ptr().add(n - 1) } == ch;
+                break;
+            }
+        }
+    }
+    wp
 }
 
 // ============================================================================
