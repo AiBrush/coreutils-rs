@@ -252,16 +252,16 @@ fn process_fields_multi_select(
     out: &mut impl Write,
 ) -> io::Result<()> {
     let max_field = ranges.last().map_or(0, |r| r.end);
+    let field_mask = compute_field_mask(ranges, false);
 
     if data.len() >= PARALLEL_THRESHOLD {
         let chunks = split_into_chunks(data, line_delim);
         let results: Vec<Vec<u8>> = chunks
             .par_iter()
             .map(|chunk| {
-                // Output is always <= input for field selection; use 3/4 as safe estimate
                 let mut buf = Vec::with_capacity(chunk.len() * 3 / 4);
                 multi_select_chunk(
-                    chunk, delim, line_delim, ranges, max_field, suppress, &mut buf,
+                    chunk, delim, line_delim, ranges, max_field, suppress, &mut buf, field_mask,
                 );
                 buf
             })
@@ -275,7 +275,7 @@ fn process_fields_multi_select(
     } else {
         let mut buf = Vec::with_capacity(data.len() * 3 / 4);
         multi_select_chunk(
-            data, delim, line_delim, ranges, max_field, suppress, &mut buf,
+            data, delim, line_delim, ranges, max_field, suppress, &mut buf, field_mask,
         );
         if !buf.is_empty() {
             out.write_all(&buf)?;
@@ -284,11 +284,9 @@ fn process_fields_multi_select(
     Ok(())
 }
 
-/// Process a chunk for multi-field extraction using a single-pass memchr2 scan.
-/// Scans for both delimiter and line_delim in one SIMD pass over the entire chunk,
-/// eliminating per-line memchr_iter setup overhead (significant for short lines).
-/// Delimiter positions are collected in a stack array per line.
-/// When max_field is reached on a line, remaining delimiters are ignored.
+/// Process a chunk for multi-field extraction using streaming single-pass with field_mask.
+/// Scans for both delimiter and line_delim in one SIMD pass, emitting selected fields
+/// immediately via O(1) bitmask check. No delimiter position array needed.
 fn multi_select_chunk(
     data: &[u8],
     delim: u8,
@@ -297,6 +295,7 @@ fn multi_select_chunk(
     max_field: usize,
     suppress: bool,
     buf: &mut Vec<u8>,
+    field_mask: u64,
 ) {
     // When delim == line_delim, fall back to two-level approach
     if delim == line_delim {
@@ -305,12 +304,12 @@ fn multi_select_chunk(
         let mut start = 0;
         for end_pos in memchr_iter(line_delim, data) {
             let line = unsafe { std::slice::from_raw_parts(base.add(start), end_pos - start) };
-            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
+            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf, field_mask);
             start = end_pos + 1;
         }
         if start < data.len() {
             let line = unsafe { std::slice::from_raw_parts(base.add(start), data.len() - start) };
-            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
+            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf, field_mask);
         }
         return;
     }
@@ -319,98 +318,72 @@ fn multi_select_chunk(
     let base = data.as_ptr();
     let data_len = data.len();
 
-    // Per-line state
+    // Streaming single-pass: track per-line field state, emit selected fields immediately.
     let mut line_start: usize = 0;
-    let mut delim_pos = [0usize; 64];
-    let mut num_delims: usize = 0;
-    let max_delims = max_field.min(64);
-    let mut at_max = false;
+    let mut field_num: usize = 1;
+    let mut field_start: usize = 0;
+    let mut first_output = true;
+    let mut has_delim = false;
 
-    // Single-pass scan using memchr2 for both delimiter and newline
     for pos in memchr::memchr2_iter(delim, line_delim, data) {
         let byte = unsafe { *base.add(pos) };
 
         if byte == line_delim {
-            // End of line: extract fields from collected positions
-            let line_len = pos - line_start;
-            if num_delims == 0 {
-                // No delimiter in line
+            if !has_delim {
                 if !suppress {
                     unsafe {
                         buf_extend(
                             buf,
-                            std::slice::from_raw_parts(base.add(line_start), line_len),
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
                         );
                         buf_push(buf, line_delim);
                     }
                 }
             } else {
-                // Extract fields using collected delimiter positions
-                let total_fields = num_delims + 1;
-                let mut first_output = true;
-
-                for r in ranges {
-                    let range_start = r.start;
-                    let range_end = r.end.min(total_fields);
-                    if range_start > total_fields {
-                        break;
+                if field_num <= 64 && (field_mask >> (field_num - 1)) & 1 == 1 {
+                    if !first_output {
+                        unsafe { buf_push(buf, delim) };
                     }
-                    for field_num in range_start..=range_end {
-                        if field_num > total_fields {
-                            break;
-                        }
-
-                        let field_start = if field_num == 1 {
-                            line_start
-                        } else if field_num - 2 < num_delims {
-                            delim_pos[field_num - 2] + 1
-                        } else {
-                            continue;
-                        };
-                        let field_end = if field_num <= num_delims {
-                            delim_pos[field_num - 1]
-                        } else {
-                            pos
-                        };
-
-                        if !first_output {
-                            unsafe { buf_push(buf, delim) };
-                        }
-                        unsafe {
-                            buf_extend(
-                                buf,
-                                std::slice::from_raw_parts(
-                                    base.add(field_start),
-                                    field_end - field_start,
-                                ),
-                            );
-                        }
-                        first_output = false;
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                        );
                     }
+                    first_output = false;
                 }
-
-                unsafe { buf_push(buf, line_delim) };
+                if !first_output || !suppress {
+                    unsafe { buf_push(buf, line_delim) };
+                }
             }
 
-            // Reset for next line
             line_start = pos + 1;
-            num_delims = 0;
-            at_max = false;
+            field_num = 1;
+            field_start = pos + 1;
+            first_output = true;
+            has_delim = false;
         } else {
-            // Delimiter found: collect position (up to max_field)
-            if !at_max && num_delims < max_delims {
-                delim_pos[num_delims] = pos;
-                num_delims += 1;
-                if num_delims >= max_delims {
-                    at_max = true;
+            has_delim = true;
+            if field_num <= 64 && (field_mask >> (field_num - 1)) & 1 == 1 {
+                if !first_output {
+                    unsafe { buf_push(buf, delim) };
                 }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                    );
+                }
+                first_output = false;
             }
+            field_num += 1;
+            field_start = pos + 1;
         }
     }
 
     // Handle last line without trailing line_delim
     if line_start < data_len {
-        if num_delims == 0 {
+        if !has_delim {
             if !suppress {
                 unsafe {
                     buf_extend(
@@ -421,67 +394,37 @@ fn multi_select_chunk(
                 }
             }
         } else {
-            let total_fields = num_delims + 1;
-            let mut first_output = true;
-
-            for r in ranges {
-                let range_start = r.start;
-                let range_end = r.end.min(total_fields);
-                if range_start > total_fields {
-                    break;
+            if field_num <= 64 && (field_mask >> (field_num - 1)) & 1 == 1 {
+                if !first_output {
+                    unsafe { buf_push(buf, delim) };
                 }
-                for field_num in range_start..=range_end {
-                    if field_num > total_fields {
-                        break;
-                    }
-
-                    let field_start = if field_num == 1 {
-                        line_start
-                    } else if field_num - 2 < num_delims {
-                        delim_pos[field_num - 2] + 1
-                    } else {
-                        continue;
-                    };
-                    let field_end = if field_num <= num_delims {
-                        delim_pos[field_num - 1]
-                    } else {
-                        data_len
-                    };
-
-                    if !first_output {
-                        unsafe { buf_push(buf, delim) };
-                    }
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(
-                                base.add(field_start),
-                                field_end - field_start,
-                            ),
-                        );
-                    }
-                    first_output = false;
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(field_start), data_len - field_start),
+                    );
                 }
+                first_output = false;
             }
-
-            unsafe { buf_push(buf, line_delim) };
+            if !first_output || !suppress {
+                unsafe { buf_push(buf, line_delim) };
+            }
         }
     }
 }
 
-/// Extract selected fields from a single line using delimiter position scanning.
-/// Scans delimiters only up to max_field (early exit), then extracts selected fields
-/// by indexing directly into the collected positions. Since ranges are pre-sorted and
-/// non-overlapping, every field within a range is selected — no is_selected check needed.
+/// Streaming single-pass field extraction using a precomputed bitmask.
+/// Scans delimiters once and emits selected fields immediately via O(1) bitmask check.
 #[inline(always)]
 fn multi_select_line(
     line: &[u8],
     delim: u8,
     line_delim: u8,
-    ranges: &[Range],
+    _ranges: &[Range],
     max_field: usize,
     suppress: bool,
     buf: &mut Vec<u8>,
+    field_mask: u64,
 ) {
     let len = line.len();
     if len == 0 {
@@ -491,26 +434,34 @@ fn multi_select_line(
         return;
     }
 
-    // Note: no per-line buf.reserve — multi_select_chunk already reserves data.len()
     let base = line.as_ptr();
-
-    // Collect delimiter positions up to max_field (early exit).
-    // Stack array for up to 64 delimiter positions.
-    let mut delim_pos = [0usize; 64];
-    let mut num_delims: usize = 0;
-    let max_delims = max_field.min(64);
+    let mut field_num: usize = 1;
+    let mut field_start: usize = 0;
+    let mut first_output = true;
+    let mut has_delim = false;
 
     for pos in memchr_iter(delim, line) {
-        if num_delims < max_delims {
-            delim_pos[num_delims] = pos;
-            num_delims += 1;
-            if num_delims >= max_delims {
-                break;
+        has_delim = true;
+        if field_num <= 64 && (field_mask >> (field_num - 1)) & 1 == 1 {
+            if !first_output {
+                unsafe { buf_push(buf, delim) };
             }
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                );
+            }
+            first_output = false;
+        }
+        field_num += 1;
+        field_start = pos + 1;
+        if field_num > max_field {
+            break;
         }
     }
 
-    if num_delims == 0 {
+    if !has_delim {
         if !suppress {
             unsafe {
                 buf_extend(buf, line);
@@ -520,50 +471,22 @@ fn multi_select_line(
         return;
     }
 
-    // Extract selected fields using delimiter positions.
-    // Ranges are pre-sorted and non-overlapping, so every field_num within a range
-    // is selected — skip the is_selected check entirely (saves 1 function call per field).
-    let total_fields = num_delims + 1;
-    let mut first_output = true;
-
-    for r in ranges {
-        let range_start = r.start;
-        let range_end = r.end.min(total_fields);
-        if range_start > total_fields {
-            break;
+    if field_num <= 64 && (field_mask >> (field_num - 1)) & 1 == 1 {
+        if !first_output {
+            unsafe { buf_push(buf, delim) };
         }
-        for field_num in range_start..=range_end {
-            if field_num > total_fields {
-                break;
-            }
-
-            let field_start = if field_num == 1 {
-                0
-            } else if field_num - 2 < num_delims {
-                delim_pos[field_num - 2] + 1
-            } else {
-                continue;
-            };
-            let field_end = if field_num <= num_delims {
-                delim_pos[field_num - 1]
-            } else {
-                len
-            };
-
-            if !first_output {
-                unsafe { buf_push(buf, delim) };
-            }
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(field_start), field_end - field_start),
-                );
-            }
-            first_output = false;
+        unsafe {
+            buf_extend(
+                buf,
+                std::slice::from_raw_parts(base.add(field_start), len - field_start),
+            );
         }
+        first_output = false;
     }
 
-    unsafe { buf_push(buf, line_delim) };
+    if !first_output || !suppress {
+        unsafe { buf_push(buf, line_delim) };
+    }
 }
 
 // ── Fast path: field extraction with batched output ──────────────────────
