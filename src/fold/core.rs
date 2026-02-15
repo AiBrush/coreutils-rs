@@ -33,15 +33,11 @@ pub fn fold_bytes(
     out.write_all(&output)
 }
 
-/// Width 0: GNU fold behavior — each non-newline byte gets its own newline.
+/// Width 0: GNU fold behavior — each byte becomes a newline.
 fn fold_width_zero(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
-    let mut output = Vec::with_capacity(data.len() * 2);
-    for &b in data {
-        if b == b'\n' {
-            output.push(b'\n');
-        } else {
-            output.push(b'\n');
-        }
+    let mut output = Vec::with_capacity(data.len());
+    for &_b in data {
+        output.push(b'\n');
     }
     out.write_all(&output)
 }
@@ -49,15 +45,12 @@ fn fold_width_zero(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
 /// Fold by byte count (-b flag).
 fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut Vec<u8>) {
     let mut col: usize = 0;
-    let mut line_start = output.len(); // start of current logical line in output buffer
-    let mut last_space_out_pos: Option<usize> = None; // position in output buffer of last space
-    let mut last_space_input_col: usize = 0; // col at that space
+    let mut last_space_out_pos: Option<usize> = None;
 
     for &byte in data {
         if byte == b'\n' {
             output.push(b'\n');
             col = 0;
-            line_start = output.len();
             last_space_out_pos = None;
             continue;
         }
@@ -66,32 +59,24 @@ fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut
             if break_at_spaces {
                 if let Some(sp_pos) = last_space_out_pos {
                     // Break at the last space: insert newline after the space
-                    // Move content after space to after a newline
                     let after_space = output[sp_pos + 1..].to_vec();
                     output.truncate(sp_pos + 1);
                     output.push(b'\n');
                     output.extend_from_slice(&after_space);
                     col = after_space.len();
-                    line_start = output.len() - after_space.len();
                     last_space_out_pos = None;
-                    // Now check if we still need to break
-                    // (the moved content might itself exceed width)
-                    // Don't recheck here — we'll catch it on the next byte
                 } else {
                     output.push(b'\n');
                     col = 0;
-                    line_start = output.len();
                 }
             } else {
                 output.push(b'\n');
                 col = 0;
-                line_start = output.len();
             }
         }
 
         if break_at_spaces && byte == b' ' {
             last_space_out_pos = Some(output.len());
-            last_space_input_col = col;
         }
 
         output.push(byte);
@@ -103,7 +88,6 @@ fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut
 fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut Vec<u8>) {
     let mut col: usize = 0;
     let mut last_space_out_pos: Option<usize> = None;
-    let mut last_space_col: usize = 0;
 
     for &byte in data {
         if byte == b'\n' {
@@ -160,7 +144,6 @@ fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &m
 
         if break_at_spaces && byte == b' ' {
             last_space_out_pos = Some(output.len());
-            last_space_col = col;
         }
 
         output.push(byte);

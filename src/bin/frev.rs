@@ -127,11 +127,11 @@ fn main() {
         }
     }
 
-    if let Err(e) = out.flush() {
-        if e.kind() != io::ErrorKind::BrokenPipe {
-            eprintln!("rev: write error: {}", io_error_msg(&e));
-            had_error = true;
-        }
+    if let Err(e) = out.flush()
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        eprintln!("rev: write error: {}", io_error_msg(&e));
+        had_error = true;
     }
 
     if had_error {

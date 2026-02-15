@@ -45,7 +45,7 @@ impl TabStops {
                 if *n == 0 {
                     return false;
                 }
-                column % *n == 0
+                column.is_multiple_of(*n)
             }
             TabStops::List(stops) => stops.binary_search(&column).is_ok(),
         }
@@ -76,7 +76,7 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
     // Parse as comma or space-separated list
     let mut stops: Vec<usize> = Vec::new();
     // GNU supports both comma and space as separators
-    for part in spec.split(|c: char| c == ',' || c == ' ') {
+    for part in spec.split([',', ' ']) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -101,7 +101,7 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
         match part.parse::<usize>() {
             Ok(n) => {
                 if !stops.is_empty() && n <= *stops.last().unwrap() {
-                    return Err(format!("tab sizes must be ascending"));
+                    return Err("tab sizes must be ascending".to_string());
                 }
                 stops.push(n);
             }
@@ -142,9 +142,7 @@ pub fn expand_bytes(data: &[u8], tabs: &TabStops, initial_only: bool, out: &mut 
                     column = tabs.next_tab_stop(column);
                 } else {
                     let spaces = tabs.spaces_to_next(column);
-                    for _ in 0..spaces {
-                        output.push(b' ');
-                    }
+                    output.extend(std::iter::repeat_n(b' ', spaces));
                     column += spaces;
                 }
             }
@@ -213,9 +211,7 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
             b'\n' => {
                 // Flush pending spaces literally (don't convert trailing spaces to tabs)
                 if let Some(start_col) = space_start_col.take() {
-                    for _ in start_col..column {
-                        output.push(b' ');
-                    }
+                    output.extend(std::iter::repeat_n(b' ', column - start_col));
                 }
                 output.push(b'\n');
                 column = 0;
@@ -224,9 +220,7 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
             b'\x08' => {
                 // Backspace: flush pending spaces
                 if let Some(start_col) = space_start_col.take() {
-                    for _ in start_col..column {
-                        output.push(b' ');
-                    }
+                    output.extend(std::iter::repeat_n(b' ', column - start_col));
                 }
                 output.push(b'\x08');
                 if column > 0 {
@@ -236,9 +230,7 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
             _ => {
                 // Flush pending spaces literally
                 if let Some(start_col) = space_start_col.take() {
-                    for _ in start_col..column {
-                        output.push(b' ');
-                    }
+                    output.extend(std::iter::repeat_n(b' ', column - start_col));
                 }
                 if in_initial {
                     in_initial = false;
@@ -251,9 +243,7 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
 
     // Flush trailing pending spaces
     if let Some(start_col) = space_start_col {
-        for _ in start_col..column {
-            output.push(b' ');
-        }
+        output.extend(std::iter::repeat_n(b' ', column - start_col));
     }
 
     out.write_all(&output)
