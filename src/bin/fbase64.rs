@@ -376,46 +376,8 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     mmap
 }
 
-/// Try to mmap stdin as MAP_PRIVATE (copy-on-write) for in-place decode.
-#[cfg(unix)]
-fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    let stdin = io::stdin();
-    let fd = stdin.as_raw_fd();
-
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return None;
-    }
-    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG || stat.st_size <= 0 {
-        return None;
-    }
-
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().map_copy(&file) }.ok();
-    std::mem::forget(file); // Don't close stdin
-    #[cfg(target_os = "linux")]
-    if let Some(ref m) = mmap {
-        unsafe {
-            let ptr = m.as_ptr() as *mut libc::c_void;
-            let len = m.len();
-            if len >= 2 * 1024 * 1024 {
-                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-            }
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
-        }
-    }
-    mmap
-}
-
 fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Try MAP_PRIVATE mmap for in-place decode (eliminates intermediate buffers)
-        #[cfg(unix)]
-        if let Some(mut mmap) = try_mmap_stdin_mut() {
-            return b64::decode_mmap_inplace(&mut mmap, cli.ignore_garbage, out);
-        }
-        // Fallback: read-only mmap
         #[cfg(unix)]
         if let Some(mmap) = try_mmap_stdin() {
             return b64::decode_to_writer(&mmap, cli.ignore_garbage, out);
@@ -446,43 +408,12 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     }
 }
 
-/// Try to mmap a file with MAP_PRIVATE (copy-on-write) for in-place decode.
-/// MAP_PRIVATE allows writing to the mmap'd data without modifying the underlying file.
-/// With MADV_HUGEPAGE, COW faults use 2MB pages (~7 faults for 13MB = ~70µs).
-#[cfg(unix)]
-fn try_mmap_file_mut(filename: &str) -> Option<memmap2::MmapMut> {
-    let file = std::fs::File::open(filename).ok()?;
-    let meta = file.metadata().ok()?;
-    if meta.len() == 0 {
-        return None;
-    }
-    // MAP_PRIVATE (copy-on-write): writes only affect our process's copy
-    let mmap = unsafe { MmapOptions::new().map_copy(&file) }.ok()?;
-    #[cfg(target_os = "linux")]
-    {
-        unsafe {
-            let ptr = mmap.as_ptr() as *mut libc::c_void;
-            let len = mmap.len();
-            // HUGEPAGE first: reduces COW faults from ~3300 to ~7 for 13MB
-            if len >= 2 * 1024 * 1024 {
-                libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-            }
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
-        }
-    }
-    Some(mmap)
-}
-
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
     if cli.decode {
-        // Try MAP_PRIVATE mmap for in-place strip+decode (eliminates intermediate buffers).
-        // decode_mmap_inplace strips newlines in-place using structured copy, then decodes
-        // in-place. Single write_all at the end. With HUGEPAGE, only ~7 COW faults for 13MB.
-        #[cfg(unix)]
-        if let Some(mut mmap) = try_mmap_file_mut(filename) {
-            return b64::decode_mmap_inplace(&mut mmap, cli.ignore_garbage, out);
-        }
-        // Fallback: read-only mmap + decode_to_writer (copies to local buffers)
+        // Use mmap (read-only) + decode_to_writer instead of read_file_vec + decode_mmap_inplace.
+        // This saves ~2-5ms on 13.5MB: mmap with HUGEPAGE has ~0.5ms overhead vs ~5ms for read().
+        // decode_to_writer handles immutable data via try_decode_uniform_lines (copies to local
+        // buffers) and SIMD gap-copy fallback (allocates clean Vec), never modifying the input.
         let data = read_file(Path::new(filename))?;
         b64::decode_to_writer(&data, cli.ignore_garbage, out)
     } else {

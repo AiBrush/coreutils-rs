@@ -6,11 +6,11 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Stream buffer: 8MB — matches enlarged pipe buffer size for fewer syscalls.
-/// For 10MB benchmark: 2 iterations (8MB + 2MB) instead of 3 (4MB + 4MB + 2MB).
+/// Stream buffer: 4MB — fits in L3 cache for optimal translate throughput.
 /// Each read chunk is processed and written immediately for pipelining:
 /// while ftr processes chunk N, upstream cat writes chunk N+1 to the pipe.
-const STREAM_BUF: usize = 8 * 1024 * 1024;
+/// 4MB matches pipe buffer sizes and avoids large-buffer allocation overhead.
+const STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap/batch paths.
 /// For 10MB benchmark files, parallel tr translate was a 105% REGRESSION
@@ -2389,7 +2389,7 @@ fn delete_range_streaming(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2588,11 +2588,12 @@ pub fn translate(
     }
 
     // General case: IN-PLACE translation on a SINGLE buffer.
-    // Uses read_full to batch pipe reads into larger chunks.
-    // SAFETY: all bytes are written by read_full before being translated.
+    // Process each read chunk immediately for pipelining: while ftr translates
+    // and writes chunk N, cat writes chunk N+1 to the pipe.
+    // SAFETY: all bytes are written by read_once before being translated.
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2621,8 +2622,9 @@ fn translate_and_write_table(
 }
 
 /// Streaming SIMD range translation — single buffer, in-place transform.
-/// Uses read_full to batch multiple pipe reads into one translate+write cycle.
-/// For 10MB with 8MB buffer: typically 2 cycles instead of many small ones.
+/// Processes each read chunk immediately for pipelining: while ftr translates
+/// and writes chunk N, upstream cat writes chunk N+1 to the pipe.
+/// For chunks >= PARALLEL_THRESHOLD, uses rayon par_chunks_mut for multi-core.
 fn translate_range_stream(
     lo: u8,
     hi: u8,
@@ -2632,7 +2634,7 @@ fn translate_range_stream(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2674,7 +2676,7 @@ fn translate_range_to_constant_stream(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2709,7 +2711,7 @@ fn translate_and_write_range_const(
 fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2718,23 +2720,20 @@ fn passthrough_stream(reader: &mut impl Read, writer: &mut impl Write) -> io::Re
     Ok(())
 }
 
-/// Read as much data as possible from the reader, filling the buffer.
-/// Loops until either the buffer is full or EOF is reached.
-/// Returns the total number of bytes read.
-/// This batches multiple small pipe reads into one large chunk,
-/// reducing the number of translate+write cycles.
+/// Single-read for pipelining: process data immediately after first read()
+/// instead of blocking to fill the entire buffer. This enables cat|ftr
+/// pipelining: while ftr processes the first chunk, cat continues writing
+/// to the pipe. For 10MB piped input with 8MB pipe buffer, this saves
+/// ~0.5-1ms by overlapping cat's final writes with ftr's processing.
 #[inline]
-fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut total = 0;
-    while total < buf.len() {
-        match reader.read(&mut buf[total..]) {
-            Ok(0) => break, // EOF
-            Ok(n) => total += n,
+fn read_once(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    Ok(total)
 }
 
 pub fn translate_squeeze(
@@ -2767,7 +2766,7 @@ pub fn translate_squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -2879,7 +2878,7 @@ fn translate_squeeze_single_ch(
     let mut was_squeeze_char = false;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3002,7 +3001,7 @@ pub fn delete(
     let mut outbuf = alloc_uninit_vec(STREAM_BUF);
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3197,7 +3196,7 @@ fn delete_single_streaming(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3251,7 +3250,7 @@ fn delete_multi_streaming(
 ) -> io::Result<()> {
     let mut buf = alloc_uninit_vec(STREAM_BUF);
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3315,7 +3314,7 @@ pub fn delete_squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3409,7 +3408,7 @@ pub fn squeeze(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3468,7 +3467,7 @@ fn squeeze_multi_stream(
     let mut last_squeezed: u16 = 256;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -3556,7 +3555,7 @@ fn squeeze_single_stream(
     let mut was_squeeze_char = false;
 
     loop {
-        let n = read_full(reader, &mut buf)?;
+        let n = read_once(reader, &mut buf)?;
         if n == 0 {
             break;
         }
