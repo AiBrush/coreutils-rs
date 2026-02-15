@@ -75,7 +75,6 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
 
     // Parse as comma or space-separated list
     let mut stops: Vec<usize> = Vec::new();
-    // GNU supports both comma and space as separators
     for part in spec.split([',', ' ']) {
         let part = part.trim();
         if part.is_empty() {
@@ -83,13 +82,12 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
         }
         // Handle / prefix for repeating tab stops
         if let Some(rest) = part.strip_prefix('/') {
-            let n: usize = rest.parse().map_err(|_| format!("'{}' is not a valid number", part))?;
+            let n: usize = rest
+                .parse()
+                .map_err(|_| format!("'{}' is not a valid number", part))?;
             if n == 0 {
                 return Err("tab size cannot be 0".to_string());
             }
-            // This is a repeating interval from the last stop
-            // GNU expand uses this as "every N after the last explicit stop"
-            // For now, just generate stops up to a reasonable limit
             let last = stops.last().copied().unwrap_or(0);
             let mut pos = last + n;
             while pos < 10000 {
@@ -120,29 +118,109 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
     Ok(TabStops::List(stops))
 }
 
-/// Expand tabs to spaces.
-/// If `initial_only` is true, only expand leading tabs (before any non-blank char).
-pub fn expand_bytes(data: &[u8], tabs: &TabStops, initial_only: bool, out: &mut impl Write) -> std::io::Result<()> {
+// Pre-computed spaces buffer for fast tab expansion (avoids per-tab allocation)
+const SPACES: [u8; 64] = [b' '; 64];
+
+/// Write N spaces to output efficiently using pre-computed buffer.
+#[inline]
+fn write_spaces(output: &mut Vec<u8>, n: usize) {
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(SPACES.len());
+        output.extend_from_slice(&SPACES[..chunk]);
+        remaining -= chunk;
+    }
+}
+
+/// Expand tabs to spaces using SIMD scanning.
+/// Uses memchr2 to find tabs and newlines, bulk-copying everything between them.
+pub fn expand_bytes(
+    data: &[u8],
+    tabs: &TabStops,
+    initial_only: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    // Output will be at least as large as input (tabs expand to spaces)
+    // Fast path: no tabs in data → just copy through
+    if memchr::memchr(b'\t', data).is_none() {
+        return out.write_all(data);
+    }
+
+    // For regular tab stops with no -i flag, use the fast SIMD path
+    if let TabStops::Regular(tab_size) = tabs {
+        if !initial_only {
+            return expand_regular_fast(data, *tab_size, out);
+        }
+    }
+
+    // Generic path for -i flag or tab lists
+    expand_generic(data, tabs, initial_only, out)
+}
+
+/// Fast expand for regular tab stops without -i flag.
+/// Uses memchr2 SIMD scanning to find tabs and newlines, bulk-copying runs.
+fn expand_regular_fast(data: &[u8], tab_size: usize, out: &mut impl Write) -> std::io::Result<()> {
+    // Estimate output size: each tab expands to up to tab_size spaces
+    let mut output = Vec::with_capacity(data.len() + data.len() / 4);
+    let mut column: usize = 0;
+    let mut pos: usize = 0;
+
+    while pos < data.len() {
+        // SIMD scan for next tab or newline
+        match memchr::memchr2(b'\t', b'\n', &data[pos..]) {
+            Some(offset) => {
+                // Bulk copy everything before the special byte
+                if offset > 0 {
+                    output.extend_from_slice(&data[pos..pos + offset]);
+                    column += offset;
+                }
+                let byte = data[pos + offset];
+                pos += offset + 1;
+
+                if byte == b'\n' {
+                    output.push(b'\n');
+                    column = 0;
+                } else {
+                    // Tab: expand to spaces
+                    let spaces = tab_size - (column % tab_size);
+                    write_spaces(&mut output, spaces);
+                    column += spaces;
+                }
+            }
+            None => {
+                // No more tabs or newlines: copy remainder
+                output.extend_from_slice(&data[pos..]);
+                break;
+            }
+        }
+    }
+
+    out.write_all(&output)
+}
+
+/// Generic expand with support for -i flag and tab lists.
+fn expand_generic(
+    data: &[u8],
+    tabs: &TabStops,
+    initial_only: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     let mut output = Vec::with_capacity(data.len() + data.len() / 8);
     let mut column: usize = 0;
-    let mut in_initial = true; // tracking initial blanks on current line
+    let mut in_initial = true;
 
     for &byte in data {
         match byte {
             b'\t' => {
                 if initial_only && !in_initial {
-                    // Past initial blanks: output tab literally
                     output.push(b'\t');
-                    // Tab still advances column to next stop
                     column = tabs.next_tab_stop(column);
                 } else {
                     let spaces = tabs.spaces_to_next(column);
-                    output.extend(std::iter::repeat_n(b' ', spaces));
+                    write_spaces(&mut output, spaces);
                     column += spaces;
                 }
             }
@@ -152,7 +230,6 @@ pub fn expand_bytes(data: &[u8], tabs: &TabStops, initial_only: bool, out: &mut 
                 in_initial = true;
             }
             b'\x08' => {
-                // Backspace: GNU expand decrements column
                 output.push(b'\x08');
                 if column > 0 {
                     column -= 1;
@@ -173,7 +250,12 @@ pub fn expand_bytes(data: &[u8], tabs: &TabStops, initial_only: bool, out: &mut 
 
 /// Unexpand spaces to tabs.
 /// If `all` is true, convert all sequences of spaces; otherwise only leading spaces.
-pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Write) -> std::io::Result<()> {
+pub fn unexpand_bytes(
+    data: &[u8],
+    tabs: &TabStops,
+    all: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -187,7 +269,6 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
         match byte {
             b' ' => {
                 if !all && !in_initial {
-                    // Only converting leading blanks, and we're past them
                     output.push(b' ');
                     column += 1;
                 } else {
@@ -195,7 +276,6 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
                         space_start_col = Some(column);
                     }
                     column += 1;
-                    // Check if we've reached a tab stop
                     if tabs.is_tab_stop(column) {
                         output.push(b'\t');
                         space_start_col = None;
@@ -203,24 +283,21 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
                 }
             }
             b'\t' => {
-                // Tab: flush any pending spaces as a tab
                 space_start_col = None;
                 output.push(b'\t');
                 column = tabs.next_tab_stop(column);
             }
             b'\n' => {
-                // Flush pending spaces literally (don't convert trailing spaces to tabs)
                 if let Some(start_col) = space_start_col.take() {
-                    output.extend(std::iter::repeat_n(b' ', column - start_col));
+                    write_spaces(&mut output, column - start_col);
                 }
                 output.push(b'\n');
                 column = 0;
                 in_initial = true;
             }
             b'\x08' => {
-                // Backspace: flush pending spaces
                 if let Some(start_col) = space_start_col.take() {
-                    output.extend(std::iter::repeat_n(b' ', column - start_col));
+                    write_spaces(&mut output, column - start_col);
                 }
                 output.push(b'\x08');
                 if column > 0 {
@@ -228,9 +305,8 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
                 }
             }
             _ => {
-                // Flush pending spaces literally
                 if let Some(start_col) = space_start_col.take() {
-                    output.extend(std::iter::repeat_n(b' ', column - start_col));
+                    write_spaces(&mut output, column - start_col);
                 }
                 if in_initial {
                     in_initial = false;
@@ -241,9 +317,8 @@ pub fn unexpand_bytes(data: &[u8], tabs: &TabStops, all: bool, out: &mut impl Wr
         }
     }
 
-    // Flush trailing pending spaces
     if let Some(start_col) = space_start_col {
-        output.extend(std::iter::repeat_n(b' ', column - start_col));
+        write_spaces(&mut output, column - start_col);
     }
 
     out.write_all(&output)

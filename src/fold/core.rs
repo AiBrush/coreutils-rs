@@ -14,12 +14,17 @@ pub fn fold_bytes(
     break_at_spaces: bool,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
-    if data.is_empty() || width == 0 {
-        // width 0: GNU fold outputs nothing per line but passes newlines
-        if width == 0 {
-            return fold_width_zero(data, out);
-        }
+    if data.is_empty() {
         return Ok(());
+    }
+
+    if width == 0 {
+        return fold_width_zero(data, out);
+    }
+
+    // Fast path: byte mode without -s, use SIMD-accelerated scanning
+    if count_bytes && !break_at_spaces {
+        return fold_byte_fast(data, width, out);
     }
 
     let mut output = Vec::with_capacity(data.len() + data.len() / width);
@@ -35,14 +40,60 @@ pub fn fold_bytes(
 
 /// Width 0: GNU fold behavior — each byte becomes a newline.
 fn fold_width_zero(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
-    let mut output = Vec::with_capacity(data.len());
-    for &_b in data {
-        output.push(b'\n');
-    }
+    let output = vec![b'\n'; data.len()];
     out.write_all(&output)
 }
 
-/// Fold by byte count (-b flag).
+/// Fast fold by byte count without -s flag.
+/// Uses memchr to find newlines, bulk-copies runs, inserts breaks at exact positions.
+fn fold_byte_fast(data: &[u8], width: usize, out: &mut impl Write) -> std::io::Result<()> {
+    // Each line can have at most one extra newline inserted
+    let mut output = Vec::with_capacity(data.len() + data.len() / width + 1);
+    let mut pos: usize = 0;
+
+    while pos < data.len() {
+        // Find the next newline within the remaining data
+        let remaining = &data[pos..];
+
+        match memchr::memchr(b'\n', remaining) {
+            Some(nl_offset) => {
+                // Process the segment up to (and including) the newline
+                let segment = &data[pos..pos + nl_offset + 1];
+                fold_segment_bytes(&mut output, segment, width);
+                pos += nl_offset + 1;
+            }
+            None => {
+                // No more newlines: process the rest
+                fold_segment_bytes(&mut output, &data[pos..], width);
+                break;
+            }
+        }
+    }
+
+    out.write_all(&output)
+}
+
+/// Fold a single line segment (no internal newlines except possibly trailing) by bytes.
+#[inline]
+fn fold_segment_bytes(output: &mut Vec<u8>, segment: &[u8], width: usize) {
+    let mut start = 0;
+    while start + width < segment.len() {
+        // Check if the character at start+width is a newline (end of line)
+        if segment[start + width] == b'\n' {
+            output.extend_from_slice(&segment[start..start + width + 1]);
+            return;
+        }
+        output.extend_from_slice(&segment[start..start + width]);
+        output.push(b'\n');
+        start += width;
+    }
+    // Remaining bytes
+    if start < segment.len() {
+        output.extend_from_slice(&segment[start..]);
+    }
+}
+
+/// Fold by byte count with -s (break at spaces).
 fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut Vec<u8>) {
     let mut col: usize = 0;
     let mut last_space_out_pos: Option<usize> = None;
@@ -58,7 +109,6 @@ fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut
         if col >= width {
             if break_at_spaces {
                 if let Some(sp_pos) = last_space_out_pos {
-                    // Break at the last space: insert newline after the space
                     let after_space = output[sp_pos + 1..].to_vec();
                     output.truncate(sp_pos + 1);
                     output.push(b'\n');
@@ -99,14 +149,11 @@ fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &m
 
         // Calculate display width of this byte
         let char_width = if byte == b'\t' {
-            // Tab: advance to next tab stop (every 8)
             let next_stop = ((col / 8) + 1) * 8;
             next_stop - col
         } else if byte == b'\x08' {
-            // Backspace: decrement column (can't go below 0)
             0 // handled specially below
         } else if byte < 0x20 || byte == 0x7f {
-            // Control chars: 0 width in GNU fold
             0
         } else {
             1
@@ -128,7 +175,6 @@ fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &m
                     let after_space = output[sp_pos + 1..].to_vec();
                     output.truncate(sp_pos + 1);
                     output.push(b'\n');
-                    // Recalculate column for moved content
                     col = recalc_column(&after_space);
                     output.extend_from_slice(&after_space);
                     last_space_out_pos = None;

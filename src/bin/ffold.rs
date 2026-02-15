@@ -105,7 +105,10 @@ fn parse_args() -> Cli {
                             match val[i + 1..].parse::<usize>() {
                                 Ok(w) => cli.width = w,
                                 Err(_) => {
-                                    eprintln!("fold: invalid number of columns: '{}'", &val[i + 1..]);
+                                    eprintln!(
+                                        "fold: invalid number of columns: '{}'",
+                                        &val[i + 1..]
+                                    );
                                     process::exit(1);
                                 }
                             }

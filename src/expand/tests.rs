@@ -70,12 +70,18 @@ fn test_expand_tab_size_1() {
 #[test]
 fn test_expand_initial_only() {
     // -i flag: only expand leading tabs
-    assert_eq!(expand_initial("\thello\tworld\n", 8), "        hello\tworld\n");
+    assert_eq!(
+        expand_initial("\thello\tworld\n", 8),
+        "        hello\tworld\n"
+    );
 }
 
 #[test]
 fn test_expand_initial_spaces_then_tab() {
-    assert_eq!(expand_initial("  \thello\tworld\n", 8), "        hello\tworld\n");
+    assert_eq!(
+        expand_initial("  \thello\tworld\n", 8),
+        "        hello\tworld\n"
+    );
 }
 
 #[test]
@@ -143,12 +149,18 @@ fn test_unexpand_all() {
 fn test_unexpand_default_leading_only() {
     // Default: only convert leading spaces
     // "hello" + spaces → spaces stay as-is
-    assert_eq!(unexpand_str("hello        world\n", 8, false), "hello        world\n");
+    assert_eq!(
+        unexpand_str("hello        world\n", 8, false),
+        "hello        world\n"
+    );
 }
 
 #[test]
 fn test_unexpand_multiple_tabs() {
-    assert_eq!(unexpand_str("                hello\n", 8, false), "\t\thello\n");
+    assert_eq!(
+        unexpand_str("                hello\n", 8, false),
+        "\t\thello\n"
+    );
 }
 
 #[test]

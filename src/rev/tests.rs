@@ -222,9 +222,7 @@ mod integration {
         std::fs::write(&path, data).unwrap();
 
         // Run GNU rev
-        let gnu_out = Command::new("rev")
-            .arg(path.to_str().unwrap())
-            .output();
+        let gnu_out = Command::new("rev").arg(path.to_str().unwrap()).output();
 
         // Run our frev
         let (our_out, code) = run_frev(b"", &[path.to_str().unwrap()]);
