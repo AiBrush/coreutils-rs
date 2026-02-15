@@ -436,11 +436,16 @@ fn main() {
                         tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
                     }
                 } else {
-                    // Fallback: streaming path (no vmsplice — buffer reuse conflicts
-                    // with vmsplice's zero-copy page references)
+                    // Fallback: read all stdin, translate in-place, write with vmsplice.
                     #[cfg(target_os = "linux")]
                     {
-                        tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+                        match coreutils_rs::common::io::read_stdin() {
+                            Ok(mut data) => {
+                                let mut writer = VmspliceWriter::new();
+                                tr::translate_owned(&set1, &set2, &mut data, &mut writer)
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                     #[cfg(all(unix, not(target_os = "linux")))]
                     {
@@ -459,13 +464,19 @@ fn main() {
                 }
             }
         } else {
-            // Piped stdin: streaming path with raw write (not vmsplice).
-            // vmsplice puts page references into the pipe buffer. The streaming
-            // path reuses the same buffer across iterations, so vmsplice'd pages
-            // get overwritten before the pipe reader consumes them.
+            // Piped stdin: read ALL data first, then translate in-place + vmsplice.
+            // Reading all data upfront avoids streaming overhead (fewer syscalls,
+            // full SIMD utilization on the entire buffer) AND safely enables vmsplice
+            // (no buffer reuse conflict — we write the entire buffer once).
             #[cfg(target_os = "linux")]
             {
-                tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+                match coreutils_rs::common::io::read_stdin() {
+                    Ok(mut data) => {
+                        let mut writer = VmspliceWriter::new();
+                        tr::translate_owned(&set1, &set2, &mut data, &mut writer)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -517,11 +528,18 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: streaming path with raw write (not vmsplice — buffer reuse
-        // conflicts with vmsplice's zero-copy page references).
-        #[cfg(unix)]
+        // Piped stdin: read ALL data first, then use batch path for lower overhead.
+        // This avoids streaming chunk-by-chunk overhead and enables VmspliceWriter.
+        #[cfg(target_os = "linux")]
+        let result = match coreutils_rs::common::io::read_stdin() {
+            Ok(data) => {
+                let mut writer = VmspliceWriter::new();
+                run_mmap_mode(&cli, set1_str, &data, &mut writer)
+            }
+            Err(e) => Err(e),
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
-        // Note: RawStdin is handled inside run_streaming_mode (Linux-only)
         #[cfg(not(unix))]
         let result = {
             let stdout = io::stdout();

@@ -338,18 +338,11 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
-/// Reads system max from /proc, falls back through decreasing sizes.
+/// Skips /proc read — directly tries decreasing sizes via fcntl.
+/// Saves ~50µs startup vs reading /proc/sys/fs/pipe-max-size.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    let max_size = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
     for &fd in &[0i32, 1] {
-        if let Some(max) = max_size
-            && unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, max) } > 0
-        {
-            continue;
-        }
         for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
             if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
                 break;

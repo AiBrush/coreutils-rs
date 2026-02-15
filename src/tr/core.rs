@@ -3554,9 +3554,15 @@ pub fn translate_owned(
         return writer.write_all(data);
     }
 
+    // For owned data (piped stdin), rayon's thread pool initialization cost
+    // (~0.5ms) dominates for data < 32MB. AVX2 processes ~20GB/s per core,
+    // so 10MB takes ~0.5ms single-threaded. Rayon only helps for >= 32MB
+    // where the parallel savings clearly exceed the thread pool overhead.
+    const OWNED_PARALLEL_MIN: usize = 32 * 1024 * 1024;
+
     // SIMD range fast path (in-place)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {
-        if data.len() >= PARALLEL_THRESHOLD {
+        if data.len() >= OWNED_PARALLEL_MIN {
             let n_threads = rayon::current_num_threads().max(1);
             let chunk_size = (data.len() / n_threads).max(32 * 1024);
             data.par_chunks_mut(chunk_size).for_each(|chunk| {
@@ -3570,7 +3576,7 @@ pub fn translate_owned(
 
     // SIMD range-to-constant fast path (in-place)
     if let Some((lo, hi, replacement)) = detect_range_to_constant(&table) {
-        if data.len() >= PARALLEL_THRESHOLD {
+        if data.len() >= OWNED_PARALLEL_MIN {
             let n_threads = rayon::current_num_threads().max(1);
             let chunk_size = (data.len() / n_threads).max(32 * 1024);
             data.par_chunks_mut(chunk_size).for_each(|chunk| {
@@ -3583,7 +3589,7 @@ pub fn translate_owned(
     }
 
     // General table lookup (in-place)
-    if data.len() >= PARALLEL_THRESHOLD {
+    if data.len() >= OWNED_PARALLEL_MIN {
         let n_threads = rayon::current_num_threads().max(1);
         let chunk_size = (data.len() / n_threads).max(32 * 1024);
         data.par_chunks_mut(chunk_size).for_each(|chunk| {
