@@ -789,10 +789,7 @@ pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::
 
     let file_data: Vec<io::Result<FileContent>> = if paths.len() <= 10 {
         // Sequential loading — avoids thread spawn overhead for small batches
-        paths
-            .iter()
-            .map(|&path| open_file_content(path))
-            .collect()
+        paths.iter().map(|&path| open_file_content(path)).collect()
     } else {
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
