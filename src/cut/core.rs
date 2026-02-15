@@ -1,12 +1,10 @@
 use memchr::memchr_iter;
-use rayon::prelude::*;
 use std::io::{self, BufRead, IoSlice, Write};
 
 /// Minimum file size for parallel processing (2MB).
-/// Rayon's thread pool initialization costs ~0.5ms on first use, but for data >= 2MB
-/// with 4 cores, the parallel savings (~3ms) far exceed the overhead. The 10MB
-/// benchmark regressed from ~7x to ~5.3x when this was set to 32MB because it
-/// no longer got parallelized.
+/// std::thread::scope spawns OS threads directly, avoiding Rayon's thread pool
+/// initialization overhead (~0.5ms). For data >= 2MB with 4 cores, the parallel
+/// savings (~3ms) far exceed the overhead.
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Max iovec entries per writev call (Linux default).
@@ -205,9 +203,19 @@ fn write_ioslices_slow(
 
 // ── Chunk splitting for parallel processing ──────────────────────────────
 
-/// Split data into chunks aligned to line boundaries for parallel processing.
-fn split_into_chunks<'a>(data: &'a [u8], line_delim: u8) -> Vec<&'a [u8]> {
-    let num_threads = rayon::current_num_threads().max(1);
+/// Number of available CPUs (cached by the OS). Used for std::thread::scope paths
+/// to avoid triggering Rayon's thread pool initialization.
+#[inline]
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Split data into chunks for std::thread::scope (no Rayon dependency).
+/// Uses available_parallelism instead of rayon::current_num_threads.
+fn split_for_scope<'a>(data: &'a [u8], line_delim: u8) -> Vec<&'a [u8]> {
+    let num_threads = num_cpus().max(1);
     if data.len() < PARALLEL_THRESHOLD || num_threads <= 1 {
         return vec![data];
     }
@@ -254,18 +262,19 @@ fn process_fields_multi_select(
     let max_field = ranges.last().map_or(0, |r| r.end);
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                // Output is always <= input for field selection; use 3/4 as safe estimate
-                let mut buf = Vec::with_capacity(chunk.len() * 3 / 4);
-                multi_select_chunk(
-                    chunk, delim, line_delim, ranges, max_field, suppress, &mut buf,
-                );
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len() * 3 / 4);
+                    multi_select_chunk(
+                        chunk, delim, line_delim, ranges, max_field, suppress, result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -690,27 +699,28 @@ fn process_fields_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io
     let field_mask = compute_field_mask(ranges, complement);
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                process_fields_chunk(
-                    chunk,
-                    delim,
-                    ranges,
-                    output_delim,
-                    suppress,
-                    max_field,
-                    field_mask,
-                    line_delim,
-                    complement,
-                    &mut buf,
-                );
-                buf
-            })
-            .collect();
-        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    process_fields_chunk(
+                        chunk,
+                        delim,
+                        ranges,
+                        output_delim,
+                        suppress,
+                        max_field,
+                        field_mask,
+                        line_delim,
+                        complement,
+                        result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -998,17 +1008,22 @@ fn process_single_field(
         // with early exit at target_idx. Faster than memchr2 single-pass because
         // we only scan delimiters up to target_idx per line (not all of them).
         if data.len() >= FIELD_PARALLEL_MIN {
-            let chunks = split_into_chunks(data, line_delim);
-            let results: Vec<Vec<u8>> = chunks
-                .par_iter()
-                .map(|chunk| {
-                    let mut buf = Vec::with_capacity(chunk.len() / 2);
-                    process_single_field_chunk(
-                        chunk, delim, target_idx, line_delim, suppress, &mut buf,
-                    );
-                    buf
-                })
-                .collect();
+            let chunks = split_for_scope(data, line_delim);
+            let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut buf = Vec::with_capacity(chunk.len() / 2);
+                            process_single_field_chunk(
+                                chunk, delim, target_idx, line_delim, suppress, &mut buf,
+                            );
+                            buf
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
             let slices: Vec<IoSlice> = results
                 .iter()
                 .filter(|r| !r.is_empty())
@@ -1027,17 +1042,22 @@ fn process_single_field(
 
     // Fallback for delim == line_delim: nested loop approach
     if data.len() >= FIELD_PARALLEL_MIN {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len() / 4);
-                process_single_field_chunk(
-                    chunk, delim, target_idx, line_delim, suppress, &mut buf,
-                );
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut buf = Vec::with_capacity(chunk.len() / 4);
+                        process_single_field_chunk(
+                            chunk, delim, target_idx, line_delim, suppress, &mut buf,
+                        );
+                        buf
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1066,17 +1086,19 @@ fn process_complement_range(
     out: &mut impl Write,
 ) -> io::Result<()> {
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                complement_range_chunk(
-                    chunk, delim, skip_start, skip_end, line_delim, suppress, &mut buf,
-                );
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    complement_range_chunk(
+                        chunk, delim, skip_start, skip_end, line_delim, suppress, result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1252,18 +1274,19 @@ fn process_complement_single_field(
     let skip_idx = skip_field - 1;
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                complement_single_field_chunk(
-                    chunk, delim, skip_idx, line_delim, suppress, &mut buf,
-                );
-                buf
-            })
-            .collect();
-        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    complement_single_field_chunk(
+                        chunk, delim, skip_idx, line_delim, suppress, result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1598,16 +1621,17 @@ fn process_fields_prefix(
     out: &mut impl Write,
 ) -> io::Result<()> {
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                fields_prefix_chunk(chunk, delim, line_delim, last_field, suppress, &mut buf);
-                buf
-            })
-            .collect();
-        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    fields_prefix_chunk(chunk, delim, line_delim, last_field, suppress, result);
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1795,16 +1819,17 @@ fn process_fields_suffix(
     out: &mut impl Write,
 ) -> io::Result<()> {
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                fields_suffix_chunk(chunk, delim, line_delim, start_field, suppress, &mut buf);
-                buf
-            })
-            .collect();
-        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    fields_suffix_chunk(chunk, delim, line_delim, start_field, suppress, result);
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1916,23 +1941,25 @@ fn process_fields_mid_range(
     out: &mut impl Write,
 ) -> io::Result<()> {
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                fields_mid_range_chunk(
-                    chunk,
-                    delim,
-                    line_delim,
-                    start_field,
-                    end_field,
-                    suppress,
-                    &mut buf,
-                );
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    fields_mid_range_chunk(
+                        chunk,
+                        delim,
+                        line_delim,
+                        start_field,
+                        end_field,
+                        suppress,
+                        result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -1958,6 +1985,8 @@ fn process_fields_mid_range(
 }
 
 /// Process a chunk for contiguous mid-range field extraction.
+/// Single-pass memchr2 scan over the entire chunk, tracking delimiter count
+/// per line. Avoids the double-scan (outer newline + inner delimiter).
 fn fields_mid_range_chunk(
     data: &[u8],
     delim: u8,
@@ -1967,31 +1996,128 @@ fn fields_mid_range_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        fields_mid_range_line(
-            line,
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            fields_mid_range_line(
+                line,
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            fields_mid_range_line(
+                &data[start..],
+                delim,
+                line_delim,
+                start_field,
+                end_field,
+                suppress,
+                buf,
+            );
+        }
+        return;
     }
-    if start < data.len() {
-        fields_mid_range_line(
-            &data[start..],
-            delim,
-            line_delim,
-            start_field,
-            end_field,
-            suppress,
-            buf,
-        );
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let skip_before = start_field - 1; // delimiters to skip before range
+    let target_end_delim = skip_before + (end_field - start_field) + 1;
+
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut range_start: usize = 0;
+    let mut has_delim = false;
+    let mut found_end = false; // true when we found all target fields, skip to newline
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+        if byte == line_delim {
+            // End of line
+            if found_end {
+                // Already output this line's range
+            } else if !has_delim {
+                // No delimiter on this line
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos + 1 - line_start),
+                        );
+                    }
+                }
+            } else if delim_count >= skip_before {
+                // Have enough fields for start_field; output from range_start to EOL
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(range_start), pos - range_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else {
+                // Not enough fields for start_field — output empty line
+                unsafe { buf_push(buf, line_delim) };
+            }
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            found_end = false;
+        } else if !found_end {
+            // Delimiter
+            has_delim = true;
+            delim_count += 1;
+            if delim_count == skip_before {
+                range_start = pos + 1;
+            }
+            if delim_count == target_end_delim {
+                if skip_before == 0 {
+                    range_start = line_start;
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(range_start), pos - range_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+                found_end = true;
+            }
+        }
+    }
+    // Handle trailing data without final newline
+    if line_start < data.len() && !found_end {
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), data.len() - line_start),
+                    );
+                }
+            }
+        } else if delim_count >= skip_before {
+            if skip_before == 0 {
+                range_start = line_start;
+            }
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(range_start), data.len() - range_start),
+                );
+            }
+        }
     }
 }
 
@@ -2093,15 +2219,20 @@ fn single_field1_parallel(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let chunks = split_into_chunks(data, line_delim);
-    let results: Vec<Vec<u8>> = chunks
-        .par_iter()
-        .map(|chunk| {
-            let mut buf = Vec::with_capacity(chunk.len());
-            single_field1_to_buf(chunk, delim, line_delim, &mut buf);
-            buf
-        })
-        .collect();
+    let chunks = split_for_scope(data, line_delim);
+    let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|chunk| {
+                s.spawn(move || {
+                    let mut buf = Vec::with_capacity(chunk.len());
+                    single_field1_to_buf(chunk, delim, line_delim, &mut buf);
+                    buf
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     let slices: Vec<IoSlice> = results
         .iter()
         .filter(|r| !r.is_empty())
@@ -2110,49 +2241,55 @@ fn single_field1_parallel(
     write_ioslices(out, &slices)
 }
 
-/// Extract field 1 from a chunk using memchr2 single-pass scanning.
-/// Uses memchr2(delim, line_delim) to find the first special byte per line:
-/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline
-/// - If newline: no delimiter on this line, output unchanged
-/// This scans ~N total bytes vs ~1.5N for two-level (outer newline + inner delimiter).
+/// Extract field 1 from a chunk using memchr2_iter single-pass SIMD scanning.
+/// Uses a single memchr2_iter pass over the entire chunk to find both delimiters
+/// and newlines. This eliminates the per-line memchr function call overhead
+/// (~5-10ns per call × 2 calls per line) that dominates for short-field data.
+/// For 100MB with 1M lines: saves ~10-20ms of function call setup overhead.
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
-    use memchr::memchr2;
     buf.reserve(data.len());
-    let mut pos = 0;
-    while pos < data.len() {
-        match memchr2(delim, line_delim, &data[pos..]) {
-            None => {
-                // Rest is a partial line, no delimiter — output as-is
+    let base = data.as_ptr();
+    let mut line_start: usize = 0;
+    let mut found_delim = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+        if byte == line_delim {
+            if !found_delim {
+                // No delimiter on this line — output entire line including newline
                 unsafe {
-                    buf_extend(buf, &data[pos..]);
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos + 1 - line_start),
+                    );
                 }
-                break;
+            } else {
+                // Delimiter was found earlier — just add the line terminator
+                unsafe { buf_push(buf, line_delim) };
             }
-            Some(offset) => {
-                let actual = pos + offset;
-                if data[actual] == line_delim {
-                    // No delimiter on this line — output entire line including newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual + 1]);
-                    }
-                    pos = actual + 1;
-                } else {
-                    // Delimiter found — output field 1 (up to delimiter) + newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual]);
-                        buf_push(buf, line_delim);
-                    }
-                    // Skip to next newline
-                    match memchr::memchr(line_delim, &data[actual + 1..]) {
-                        None => {
-                            pos = data.len();
-                        }
-                        Some(nl_off) => {
-                            pos = actual + 1 + nl_off + 1;
-                        }
-                    }
-                }
+            line_start = pos + 1;
+            found_delim = false;
+        } else if !found_delim {
+            // First delimiter on this line — output field 1
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                );
+            }
+            found_delim = true;
+        }
+        // Subsequent delimiters on same line: ignore
+    }
+    // Handle trailing data without final line_delim
+    if line_start < data.len() {
+        if !found_delim {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), data.len() - line_start),
+                );
             }
         }
     }
@@ -2476,21 +2613,21 @@ fn process_bytes_from_start(
     }
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                // Estimate output size without scanning: assume average line
-                // is at least (max_bytes+1) bytes (otherwise no truncation).
-                // For cut -b1-5 on 50-char lines: output ~ chunk.len() * 6/51 ~ chunk/8.
-                // Using chunk.len()/4 as initial capacity handles most cases
-                // without reallocation, while avoiding the extra memchr scan.
-                let est_out = (chunk.len() / 4).max(max_bytes + 2);
-                let mut buf = Vec::with_capacity(est_out.min(chunk.len()));
-                bytes_from_start_chunk(chunk, max_bytes, line_delim, &mut buf);
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let est_out = (chunk.len() / 4).max(max_bytes + 2);
+                        let mut buf = Vec::with_capacity(est_out.min(chunk.len()));
+                        bytes_from_start_chunk(chunk, max_bytes, line_delim, &mut buf);
+                        buf
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         // Use write_vectored (writev) to batch N writes into fewer syscalls
         let slices: Vec<IoSlice> = results
             .iter()
@@ -2631,15 +2768,20 @@ fn process_bytes_from_offset(
     out: &mut impl Write,
 ) -> io::Result<()> {
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                bytes_from_offset_chunk(chunk, skip_bytes, line_delim, &mut buf);
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut buf = Vec::with_capacity(chunk.len());
+                        bytes_from_offset_chunk(chunk, skip_bytes, line_delim, &mut buf);
+                        buf
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         // Use write_vectored (writev) to batch N writes into fewer syscalls
         let slices: Vec<IoSlice> = results
             .iter()
@@ -2748,15 +2890,17 @@ fn process_bytes_mid_range(
     let skip = start_byte.saturating_sub(1);
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                bytes_mid_range_chunk(chunk, skip, end_byte, line_delim, &mut buf);
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    bytes_mid_range_chunk(chunk, skip, end_byte, line_delim, result);
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -2835,15 +2979,17 @@ fn process_bytes_complement_mid(
 ) -> io::Result<()> {
     let prefix_bytes = skip_start - 1; // bytes before the skip region
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                bytes_complement_mid_chunk(chunk, prefix_bytes, skip_end, line_delim, &mut buf);
-                buf
-            })
-            .collect();
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    bytes_complement_mid_chunk(chunk, prefix_bytes, skip_end, line_delim, result);
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())
@@ -2998,23 +3144,24 @@ fn process_bytes_fast(data: &[u8], cfg: &CutConfig, out: &mut impl Write) -> io:
     }
 
     if data.len() >= PARALLEL_THRESHOLD {
-        let chunks = split_into_chunks(data, line_delim);
-        let results: Vec<Vec<u8>> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
-                process_bytes_chunk(
-                    chunk,
-                    ranges,
-                    complement,
-                    output_delim,
-                    line_delim,
-                    &mut buf,
-                );
-                buf
-            })
-            .collect();
-        // Use write_vectored (writev) to batch N writes into fewer syscalls
+        let chunks = split_for_scope(data, line_delim);
+        let n = chunks.len();
+        let mut results: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+        std::thread::scope(|s| {
+            for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    result.reserve(chunk.len());
+                    process_bytes_chunk(
+                        chunk,
+                        ranges,
+                        complement,
+                        output_delim,
+                        line_delim,
+                        result,
+                    );
+                });
+            }
+        });
         let slices: Vec<IoSlice> = results
             .iter()
             .filter(|r| !r.is_empty())

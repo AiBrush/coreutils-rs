@@ -34,6 +34,24 @@ const PARALLEL_WRAPPED_THRESHOLD: usize = 2 * 1024 * 1024;
 /// Lower threshold lets parallel decode kick in earlier for medium files.
 const PARALLEL_DECODE_THRESHOLD: usize = 2 * 1024 * 1024;
 
+/// Pre-fault an output buffer with HUGEPAGE + POPULATE_WRITE on Linux.
+/// MADV_HUGEPAGE must come first: tells kernel to use 2MB pages.
+/// MADV_POPULATE_WRITE (Linux 5.14+) then pre-faults all pages in one batch,
+/// eliminating demand-faulting overhead during parallel writes.
+/// This prevents VMA lock contention when multiple threads fault pages concurrently.
+#[cfg(target_os = "linux")]
+fn prefault_buffer(buf: &mut Vec<u8>) {
+    if buf.capacity() >= 2 * 1024 * 1024 {
+        unsafe {
+            let ptr = buf.as_mut_ptr() as *mut libc::c_void;
+            let len = buf.capacity();
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            // MADV_POPULATE_WRITE = 23 (Linux 5.14+). Falls back silently on older kernels.
+            libc::madvise(ptr, len, 23);
+        }
+    }
+}
+
 /// Encode data and write to output with line wrapping.
 /// Uses SIMD encoding with fused encode+wrap for maximum throughput.
 pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
@@ -71,12 +89,10 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Parallel no-wrap encoding: split at 3-byte boundaries, encode chunks in parallel.
+/// Parallel no-wrap encoding into a single shared output buffer.
+/// Split at 3-byte boundaries, pre-calculate output offsets, encode in parallel.
 /// Each chunk except possibly the last is 3-byte aligned, so no padding in intermediate chunks.
-///
-/// Uses std::thread::scope instead of Rayon to avoid pool initialization overhead (~300µs).
-/// Each scoped thread allocates its own output buffer and encodes independently.
-/// Output uses writev to combine all per-thread buffers in a single syscall.
+/// Single allocation + single write_all instead of N allocations + writev.
 fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
     let num_threads = num_cpus().max(1);
     let raw_chunk = data.len() / num_threads;
@@ -86,40 +102,39 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
     // Split input into 3-byte-aligned chunks
     let chunks: Vec<&[u8]> = data.chunks(chunk_size.max(3)).collect();
 
-    // Each scoped thread allocates its own output buffer and encodes independently.
-    let results: Vec<Vec<u8>> = std::thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .iter()
-            .map(|chunk| {
-                s.spawn(|| {
-                    let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-                    let mut buf: Vec<u8> = Vec::with_capacity(enc_len);
-                    #[allow(clippy::uninit_vec)]
-                    unsafe {
-                        buf.set_len(enc_len);
-                    }
-                    // HUGEPAGE on per-thread buffer reduces page faults
-                    #[cfg(target_os = "linux")]
-                    if enc_len >= 2 * 1024 * 1024 {
-                        unsafe {
-                            libc::madvise(
-                                buf.as_mut_ptr() as *mut libc::c_void,
-                                enc_len,
-                                libc::MADV_HUGEPAGE,
-                            );
-                        }
-                    }
-                    let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
-                    buf
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    // Pre-calculate output offsets
+    let mut offsets: Vec<usize> = Vec::with_capacity(chunks.len() + 1);
+    let mut total_out = 0usize;
+    for chunk in &chunks {
+        offsets.push(total_out);
+        total_out += BASE64_ENGINE.encoded_length(chunk.len());
+    }
+
+    // Single allocation for all threads
+    let mut output: Vec<u8> = Vec::with_capacity(total_out);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(total_out);
+    }
+    #[cfg(target_os = "linux")]
+    prefault_buffer(&mut output);
+
+    // Parallel encode: each thread writes into its pre-assigned region
+    let output_base = output.as_mut_ptr() as usize;
+    std::thread::scope(|s| {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let out_off = offsets[i];
+            let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+            let base = output_base;
+            s.spawn(move || {
+                let dest =
+                    unsafe { std::slice::from_raw_parts_mut((base + out_off) as *mut u8, enc_len) };
+                let _ = BASE64_ENGINE.encode(chunk, dest.as_out());
+            });
+        }
     });
 
-    // Single writev for all chunks in order
-    let slices: Vec<io::IoSlice> = results.iter().map(|r| io::IoSlice::new(r)).collect();
-    write_all_vectored(out, &slices)
+    out.write_all(&output[..total_out])
 }
 
 /// Encode with line wrapping using forward scatter from L1-cached temp buffer.
@@ -197,15 +212,7 @@ fn encode_wrapped_scatter(
         buf.set_len(out_len);
     }
     #[cfg(target_os = "linux")]
-    if out_len >= 2 * 1024 * 1024 {
-        unsafe {
-            libc::madvise(
-                buf.as_mut_ptr() as *mut libc::c_void,
-                out_len,
-                libc::MADV_HUGEPAGE,
-            );
-        }
-    }
+    prefault_buffer(&mut buf);
 
     // L1-cached temp buffer for encoding groups of lines.
     // 256 lines × 76 chars = 19,456 bytes — fits comfortably in L1 (32-64KB).
@@ -561,11 +568,11 @@ fn write_wrapped_iov_streaming(
     Ok(())
 }
 
-/// Parallel wrapped encoding with L1-scatter: each thread encodes groups of
-/// lines into a small L1-cached temp buffer, then scatter-copies to its output
-/// buffer with newlines. Each output byte is written exactly once per thread.
-///
-/// Main thread combines all per-thread output buffers with a single writev call.
+/// Parallel wrapped encoding with L1-scatter into a single shared output buffer.
+/// Pre-calculates each thread's output offset, allocates one buffer for all threads,
+/// and has each thread encode directly into its pre-assigned non-overlapping region.
+/// This saves N-1 buffer allocations and corresponding page faults vs per-thread Vecs,
+/// and uses a single write_all instead of writev.
 fn encode_wrapped_parallel(
     data: &[u8],
     wrap_col: usize,
@@ -579,46 +586,59 @@ fn encode_wrapped_parallel(
     // Split input at bytes_per_line boundaries (last chunk may have remainder)
     let chunks: Vec<&[u8]> = data.chunks(chunk_input.max(bytes_per_line)).collect();
 
-    // Each thread: L1-scatter encode into output buffer
-    let output_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .iter()
-            .map(|chunk| s.spawn(move || encode_chunk_l1_scatter(chunk, wrap_col, bytes_per_line)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // Pre-calculate output offsets for each chunk
+    let mut offsets: Vec<usize> = Vec::with_capacity(chunks.len() + 1);
+    let mut total_out = 0usize;
+    for chunk in &chunks {
+        offsets.push(total_out);
+        let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+        let full_lines = enc_len / wrap_col;
+        let remainder = enc_len % wrap_col;
+        total_out += full_lines * (wrap_col + 1) + if remainder > 0 { remainder + 1 } else { 0 };
+    }
 
-    // Single writev combining all thread outputs in order
-    let slices: Vec<io::IoSlice> = output_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
-    write_all_vectored(out, &slices)
-}
-
-/// Encode a chunk of data using L1-scatter approach: encode groups of lines
-/// into an L1-cached temp buffer, scatter-copy to output with newlines.
-/// Returns the ready-to-write output buffer.
-fn encode_chunk_l1_scatter(data: &[u8], wrap_col: usize, bytes_per_line: usize) -> Vec<u8> {
-    let enc_len = BASE64_ENGINE.encoded_length(data.len());
-    let full_lines = enc_len / wrap_col;
-    let remainder = enc_len % wrap_col;
-    let out_size = full_lines * (wrap_col + 1) + if remainder > 0 { remainder + 1 } else { 0 };
-
-    let mut output: Vec<u8> = Vec::with_capacity(out_size);
+    // Single allocation for all threads
+    let mut output: Vec<u8> = Vec::with_capacity(total_out);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        output.set_len(out_size);
+        output.set_len(total_out);
     }
     #[cfg(target_os = "linux")]
-    if out_size >= 2 * 1024 * 1024 {
-        unsafe {
-            libc::madvise(
-                output.as_mut_ptr() as *mut libc::c_void,
-                out_size,
-                libc::MADV_HUGEPAGE,
-            );
-        }
-    }
+    prefault_buffer(&mut output);
 
-    // L1-cached temp buffer: 256 lines × wrap_col fits in L1 cache
+    // Parallel encode: each thread writes into its pre-assigned region
+    let output_base = output.as_mut_ptr() as usize;
+    std::thread::scope(|s| {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let out_off = offsets[i];
+            let out_end = if i + 1 < offsets.len() {
+                offsets[i + 1]
+            } else {
+                total_out
+            };
+            let out_size = out_end - out_off;
+            let base = output_base;
+            s.spawn(move || {
+                let out_slice = unsafe {
+                    std::slice::from_raw_parts_mut((base + out_off) as *mut u8, out_size)
+                };
+                encode_chunk_l1_scatter_into(chunk, out_slice, wrap_col, bytes_per_line);
+            });
+        }
+    });
+
+    out.write_all(&output[..total_out])
+}
+
+/// Encode a chunk using L1-scatter, writing into a pre-allocated output slice.
+/// Encodes groups of 256 lines into L1-cached temp buffer, scatter-copy to output with newlines.
+/// The output slice must be large enough to hold the encoded+wrapped output.
+fn encode_chunk_l1_scatter_into(
+    data: &[u8],
+    output: &mut [u8],
+    wrap_col: usize,
+    bytes_per_line: usize,
+) {
     const GROUP_LINES: usize = 256;
     let group_input = GROUP_LINES * bytes_per_line;
     let temp_size = GROUP_LINES * wrap_col;
@@ -712,9 +732,6 @@ fn encode_chunk_l1_scatter(data: &[u8], wrap_col: usize, bytes_per_line: usize) 
             wp += chunk_rem + 1;
         }
     }
-
-    unsafe { output.set_len(wp) };
-    output
 }
 
 /// Fuse encoded base64 data with newlines in a single pass.
@@ -1192,12 +1209,16 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
         unsafe {
             output.set_len(total_decoded);
         }
+        #[cfg(target_os = "linux")]
+        prefault_buffer(&mut output);
 
         let out_ptr = output.as_mut_ptr() as usize;
         let src_ptr = data.as_ptr() as usize;
         let num_threads = num_cpus().max(1);
         let lines_per_thread = (full_lines + num_threads - 1) / num_threads;
-        let lines_per_sub = (256 * 1024 / line_len).max(1);
+        // 512KB sub-chunks: larger chunks give SIMD decode more contiguous data,
+        // reducing per-call overhead. 512KB fits in L2 cache (256KB-1MB typical).
+        let lines_per_sub = (512 * 1024 / line_len).max(1);
 
         let result: Result<(), io::Error> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..num_threads)
@@ -1822,6 +1843,8 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
     unsafe {
         output_buf.set_len(total_decoded);
     }
+    #[cfg(target_os = "linux")]
+    prefault_buffer(&mut output_buf);
 
     // Parallel decode: each thread decodes directly into its exact final position.
     // SAFETY: each thread writes to a non-overlapping region of the output buffer.
