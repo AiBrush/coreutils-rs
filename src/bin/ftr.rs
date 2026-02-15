@@ -1,7 +1,7 @@
 use std::io::{self, Write};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", unix))]
 use std::mem::ManuallyDrop;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", unix))]
 use std::os::unix::io::FromRawFd;
 use std::process;
 
@@ -104,29 +104,8 @@ impl Write for VmspliceWriter {
     }
 }
 
-/// Raw stdin reader for zero-overhead pipe reads on Linux.
-/// Bypasses Rust's StdinLock (mutex + 8KB BufReader) to use libc::read(0) directly.
-/// Each read returns immediately with whatever data is available in the pipe,
-/// enabling pipelining with upstream cat: ftr processes chunk N while cat writes N+1.
-#[cfg(target_os = "linux")]
-struct RawStdin;
-
-#[cfg(target_os = "linux")]
-impl io::Read for RawStdin {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let ret = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if ret >= 0 {
-                return Ok(ret as usize);
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
-    }
-}
+// Note: RawStdin removed — Linux piped path now uses splice_stdin_to_mmap
+// or read_stdin for batch processing, which is faster than streaming.
 
 struct Cli {
     complement: bool,
@@ -219,8 +198,9 @@ fn parse_args() -> Cli {
     cli
 }
 
-/// Raw fd stdout for zero-overhead writes on Unix.
-#[cfg(unix)]
+/// Raw fd stdout for zero-overhead writes on non-Linux Unix.
+/// On Linux, VmspliceWriter is used instead for zero-copy pipe output.
+#[cfg(all(unix, not(target_os = "linux")))]
 #[inline]
 fn raw_stdout() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
@@ -283,10 +263,13 @@ fn try_mmap_stdin_with_threshold(min_size: usize) -> Option<memmap2::Mmap> {
     mmap
 }
 
-/// Try to mmap stdin with default threshold (32MB) for non-translate modes.
+/// Try to mmap stdin for non-translate modes (delete, squeeze, etc.).
+/// Threshold=0: mmap any regular file for zero-copy access, just like translate mode.
+/// Previous 32MB threshold missed 10MB benchmark files, falling through to the
+/// slower streaming path with read()+write() copies.
 #[cfg(unix)]
 fn try_mmap_stdin() -> Option<memmap2::Mmap> {
-    try_mmap_stdin_with_threshold(32 * 1024 * 1024)
+    try_mmap_stdin_with_threshold(0)
 }
 
 #[cfg(not(unix))]
@@ -372,7 +355,7 @@ fn main() {
 
     let set1_str = &cli.sets[0];
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let mut raw = raw_stdout();
 
     // Pure translate mode: bypass BufWriter entirely.
@@ -436,13 +419,15 @@ fn main() {
                         tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
                     }
                 } else {
-                    // Fallback: read all stdin, translate in-place, write with vmsplice.
+                    // Fallback: read all stdin, translate in-place, write.
+                    // Vec heap pages are NOT safe for vmsplice — use raw write(2).
                     #[cfg(target_os = "linux")]
                     {
                         match coreutils_rs::common::io::read_stdin() {
                             Ok(mut data) => {
-                                let mut writer = VmspliceWriter::new();
-                                tr::translate_owned(&set1, &set2, &mut data, &mut writer)
+                                let mut raw_out =
+                                    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                                tr::translate_owned(&set1, &set2, &mut data, &mut *raw_out)
                             }
                             Err(e) => Err(e),
                         }
@@ -464,12 +449,27 @@ fn main() {
                 }
             }
         } else {
-            // Piped stdin: use streaming translate for pipelining with upstream cat.
-            // RawStdin reads chunks as they arrive; ftr processes chunk N while cat writes N+1.
-            // This is critical for `cat file | ftr` benchmarks — batch mode kills pipelining.
+            // Piped stdin: try splice+mmap for zero-copy (kernel→kernel transfer),
+            // then translate in-place + vmsplice output. This eliminates BOTH user-space
+            // copies that the streaming path requires (read copy + write copy).
+            // Falls back to streaming translate if splice is not available.
             #[cfg(target_os = "linux")]
             {
-                tr::translate(&set1, &set2, &mut RawStdin, &mut *raw)
+                if let Ok(Some(mut mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
+                    let mut writer = VmspliceWriter::new();
+                    tr::translate_owned(&set1, &set2, &mut mmap, &mut writer)
+                } else {
+                    // Fallback: read all stdin, translate in-place, raw write output.
+                    // Vec heap pages are NOT safe for vmsplice — use raw write(2).
+                    match coreutils_rs::common::io::read_stdin() {
+                        Ok(mut data) => {
+                            let mut raw_out =
+                                unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                            tr::translate_owned(&set1, &set2, &mut data, &mut *raw_out)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -499,12 +499,15 @@ fn main() {
     let mmap = try_mmap_stdin();
 
     if let Some(m) = mmap {
-        // File-redirected stdin: use batch path with mmap data + VmspliceWriter
+        // File-redirected stdin: use batch path with mmap data.
+        // Use raw write (not vmsplice) because delete/squeeze functions create
+        // intermediate heap buffers. With vmsplice, freed heap pages can be reused
+        // by the allocator before the pipe reader reads them, causing data corruption.
         let data = FileData::Mmap(m);
         #[cfg(target_os = "linux")]
         let result = {
-            let mut writer = VmspliceWriter::new();
-            run_mmap_mode(&cli, set1_str, &data, &mut writer)
+            let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+            run_mmap_mode(&cli, set1_str, &data, &mut *raw_out)
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
@@ -521,13 +524,24 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: use streaming mode for pipelining with upstream cat.
-        // Streaming processes chunks as they arrive from the pipe, enabling
-        // ftr to process chunk N while cat writes chunk N+1.
-        // Using raw write (not vmsplice) because delete/squeeze allocate temporary
-        // output buffers — vmsplice would cause use-after-free.
+        // Piped stdin: try splice+mmap for zero-copy, fall back to read_stdin batch.
+        // IMPORTANT: Use raw write(2), NOT VmspliceWriter, for non-translate modes.
+        // The mmap functions (delete_mmap, squeeze_mmap, translate_squeeze_mmap) may
+        // allocate temporary output buffers. vmsplice maps those heap pages into the
+        // pipe, but the allocator frees them before the pipe reader drains the data,
+        // causing garbage output. Raw write(2) copies data into the kernel pipe buffer.
         #[cfg(target_os = "linux")]
-        let result = run_streaming_mode(&cli, set1_str, &mut *raw);
+        let result = {
+            let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+            if let Ok(Some(splice_mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
+                run_mmap_mode(&cli, set1_str, &splice_mmap, &mut *raw_out)
+            } else {
+                match coreutils_rs::common::io::read_stdin() {
+                    Ok(data) => run_mmap_mode(&cli, set1_str, &data, &mut *raw_out),
+                    Err(e) => Err(e),
+                }
+            }
+        };
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
         #[cfg(not(unix))]
@@ -545,10 +559,9 @@ fn main() {
     }
 }
 
-/// Dispatch streaming modes for piped stdin — reads and processes chunks
-/// incrementally for pipelining with upstream cat/pipe. RawStdin on Linux
-/// bypasses StdinLock overhead; streaming processes each chunk as it arrives
-/// instead of waiting for EOF like the batch path.
+/// Dispatch streaming modes for piped stdin (non-Linux platforms only).
+/// On Linux, piped input uses splice+batch or read_stdin+batch instead.
+#[cfg(not(target_os = "linux"))]
 fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io::Result<()> {
     if cli.delete && cli.squeeze {
         if cli.sets.len() < 2 {
@@ -565,14 +578,9 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        #[cfg(target_os = "linux")]
-        return tr::delete_squeeze(&delete_set, &set2, &mut RawStdin, writer);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            tr::delete_squeeze(&delete_set, &set2, &mut reader, writer)
-        }
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        tr::delete_squeeze(&delete_set, &set2, &mut reader, writer)
     } else if cli.delete {
         if cli.sets.len() > 1 {
             eprintln!("tr: extra operand '{}'", cli.sets[1]);
@@ -586,14 +594,9 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        #[cfg(target_os = "linux")]
-        return tr::delete(&delete_set, &mut RawStdin, writer);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            tr::delete(&delete_set, &mut reader, writer)
-        }
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        tr::delete(&delete_set, &mut reader, writer)
     } else if cli.squeeze && cli.sets.len() < 2 {
         let set1 = tr::parse_set(set1_str);
         let squeeze_set = if cli.complement {
@@ -601,14 +604,9 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        #[cfg(target_os = "linux")]
-        return tr::squeeze(&squeeze_set, &mut RawStdin, writer);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            tr::squeeze(&squeeze_set, &mut reader, writer)
-        }
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        tr::squeeze(&squeeze_set, &mut reader, writer)
     } else if cli.squeeze {
         let set2_str = &cli.sets[1];
         let mut set1 = tr::parse_set(set1_str);
@@ -622,14 +620,9 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        #[cfg(target_os = "linux")]
-        return tr::translate_squeeze(&set1, &set2, &mut RawStdin, writer);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let stdin = io::stdin();
-            let mut reader = stdin.lock();
-            tr::translate_squeeze(&set1, &set2, &mut reader, writer)
-        }
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        tr::translate_squeeze(&set1, &set2, &mut reader, writer)
     } else {
         eprintln!("tr: missing operand after '{}'", set1_str);
         eprintln!("Two strings must be given when translating.");

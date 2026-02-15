@@ -3655,11 +3655,11 @@ pub fn translate_owned(
         return writer.write_all(data);
     }
 
-    // For owned data (piped stdin), rayon's thread pool initialization cost
-    // (~0.5ms) dominates for data < 32MB. AVX2 processes ~20GB/s per core,
-    // so 10MB takes ~0.5ms single-threaded. Rayon only helps for >= 32MB
-    // where the parallel savings clearly exceed the thread pool overhead.
-    const OWNED_PARALLEL_MIN: usize = 32 * 1024 * 1024;
+    // For owned data (piped stdin via splice/read_stdin), rayon's thread pool
+    // is already warm from other uses. At 4MB+ the parallel savings from
+    // multi-core AVX2 exceed the rayon dispatch overhead (~0.1ms).
+    // Previous 32MB threshold missed 10MB benchmark files.
+    const OWNED_PARALLEL_MIN: usize = 4 * 1024 * 1024;
 
     // SIMD range fast path (in-place)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {

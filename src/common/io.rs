@@ -151,7 +151,14 @@ pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
     let len = metadata.len();
 
     if len > 0 && metadata.file_type().is_file() {
-        match unsafe { MmapOptions::new().map(&file) } {
+        // Use MAP_POPULATE for files >= 4MB to prefault all pages during mmap().
+        // This avoids thousands of minor page faults during sequential access.
+        let mmap_result = if len >= 4 * 1024 * 1024 {
+            unsafe { MmapOptions::new().populate().map(&file) }
+        } else {
+            unsafe { MmapOptions::new().map(&file) }
+        };
+        match mmap_result {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
                 {
@@ -314,6 +321,14 @@ pub fn splice_stdin_to_mmap() -> io::Result<Option<memmap2::MmapMut>> {
     }
 
     if total == 0 {
+        unsafe { libc::close(memfd) };
+        return Ok(None);
+    }
+
+    // Truncate memfd to exact data size. splice() may leave the memfd larger than
+    // `total` (page-aligned), and mmap would map the full file including zero padding.
+    // Without ftruncate, callers get a mmap with garbage/zero bytes beyond `total`.
+    if unsafe { libc::ftruncate(memfd, total as libc::off_t) } != 0 {
         unsafe { libc::close(memfd) };
         return Ok(None);
     }

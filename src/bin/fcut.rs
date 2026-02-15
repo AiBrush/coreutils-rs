@@ -1,4 +1,6 @@
-use std::io::{self, BufReader, BufWriter, Write};
+#[cfg(not(target_os = "linux"))]
+use std::io::BufWriter;
+use std::io::{self, BufReader, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -9,7 +11,7 @@ use std::process;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::read_file;
+use coreutils_rs::common::io::read_file_mmap;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::cut::{self, CutMode};
 
@@ -418,23 +420,12 @@ fn main() {
         cli.files.clone()
     };
 
-    // Detect field 1 fast-path: in-place extraction avoids intermediate Vec + BufWriter copy.
-    // Saves ~10MB of memory bandwidth for 10MB input.
-    let is_field1_inplace = mode == CutMode::Fields
-        && ranges.len() == 1
-        && ranges[0].start == 1
-        && ranges[0].end == 1
-        && !cli.complement
-        && delim != line_delim;
-
-    // On Linux: VmspliceWriter wrapped in BufWriter for zero-copy pipe output.
-    // BufWriter batches the many small writes from cut processing, then
-    // VmspliceWriter uses vmsplice(2) for zero-copy when flushing to pipes.
+    // On Linux: VmspliceWriter directly — no BufWriter wrapper.
+    // cut's batch processing already produces large output buffers (Vec<u8> or IoSlice),
+    // so BufWriter's internal buffering is pure overhead (extra memcpy for output < 16MB).
     #[cfg(target_os = "linux")]
-    let mut vwriter = VmspliceWriter::new();
-    #[cfg(target_os = "linux")]
-    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, &mut vwriter);
-    // On other Unix: raw fd stdout
+    let mut out = VmspliceWriter::new();
+    // On other Unix: raw fd stdout with BufWriter
     #[cfg(all(unix, not(target_os = "linux")))]
     let mut raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -513,28 +504,62 @@ fn main() {
         None
     };
 
-    // For piped stdin + field 1: in-place extraction modifies Vec directly,
-    // then writes bypassing BufWriter to avoid extra memcpy.
-    let mut stdin_field1_done = false;
-    if is_field1_inplace
+    // For piped stdin with mutable data: try in-place extraction.
+    // In-place avoids allocating intermediate Vec output buffers entirely.
+    // Generalizes the old field-1-only path to all field and byte patterns.
+    let mut stdin_inplace_done = false;
+
+    // Try in-place on splice_mmap first (Linux: zero-copy pipe→memfd→mmap)
+    #[cfg(target_os = "linux")]
+    let mut splice_mmap = splice_mmap;
+    #[cfg(target_os = "linux")]
+    let mut splice_inplace_len: usize = 0;
+    #[cfg(target_os = "linux")]
+    if let Some(ref mut mmap_data) = splice_mmap
+        && !mmap_data.is_empty()
+        && let Some(new_len) = cut::process_cut_data_mut(mmap_data, &cfg)
+    {
+        splice_inplace_len = new_len;
+        stdin_inplace_done = true;
+    }
+
+    // Try in-place on stdin_buf (Vec<u8>) if splice didn't handle it
+    if !stdin_inplace_done
         && let Some(ref mut data) = stdin_buf
         && !data.is_empty()
+        && let Some(new_len) = cut::process_cut_data_mut(data, &cfg)
     {
-        let new_len = cut::cut_field1_inplace(data, delim, line_delim, cli.only_delimited);
         data.truncate(new_len);
-        stdin_field1_done = true;
+        stdin_inplace_done = true;
     }
 
     for filename in &files {
         let result: io::Result<()> = if filename == "-" {
             #[cfg(unix)]
             {
-                if stdin_field1_done {
-                    if let Some(ref data) = stdin_buf {
-                        // Write pre-processed data directly, bypassing BufWriter
-                        out.flush().and_then(|()| out.get_mut().write_all(data))
-                    } else {
-                        Ok(())
+                if stdin_inplace_done {
+                    // Write in-place processed data directly to output
+                    #[cfg(target_os = "linux")]
+                    {
+                        if splice_inplace_len > 0 {
+                            if let Some(ref mmap_data) = splice_mmap {
+                                out.write_all(&mmap_data[..splice_inplace_len])
+                            } else {
+                                Ok(())
+                            }
+                        } else if let Some(ref data) = stdin_buf {
+                            out.write_all(data)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        if let Some(ref data) = stdin_buf {
+                            out.flush().and_then(|()| out.get_mut().write_all(data))
+                        } else {
+                            Ok(())
+                        }
                     }
                 } else if let Some(ref data) = stdin_mmap {
                     cut::process_cut_data(data, &cfg, &mut out)
@@ -560,7 +585,7 @@ fn main() {
             }
             #[cfg(not(unix))]
             {
-                if stdin_field1_done {
+                if stdin_inplace_done {
                     if let Some(ref data) = stdin_buf {
                         out.write_all(data)
                     } else {
@@ -574,7 +599,7 @@ fn main() {
                 }
             }
         } else {
-            match read_file(Path::new(filename)) {
+            match read_file_mmap(Path::new(filename)) {
                 Ok(data) => cut::process_cut_data(&data, &cfg, &mut out),
                 Err(e) => {
                     eprintln!("cut: {}: {}", filename, io_error_msg(&e));

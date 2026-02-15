@@ -238,8 +238,16 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         return None;
     }
 
+    let file_size = stat.st_size as usize;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
+    // Use MAP_POPULATE for files >= 4MB to prefault all pages during mmap() call.
+    // This avoids ~25,600 minor page faults (4KB pages) during the backward scan.
+    // For smaller files, lazy faulting is fast enough and avoids wasting memory.
+    let mmap = if file_size >= 4 * 1024 * 1024 {
+        unsafe { MmapOptions::new().populate().map(&file) }.ok()
+    } else {
+        unsafe { MmapOptions::new().map(&file) }.ok()
+    };
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -268,14 +276,33 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             {
                 match try_mmap_stdin() {
                     Some(mmap) => FileData::Mmap(mmap),
-                    None => match read_stdin() {
-                        Ok(d) => FileData::Owned(d),
-                        Err(e) => {
-                            eprintln!("tac: standard input: {}", io_error_msg(&e));
-                            had_error = true;
-                            continue;
+                    None => {
+                        // Try splice for zero-copy pipe→mmap transfer (Linux only),
+                        // then fall back to read_stdin.
+                        #[cfg(target_os = "linux")]
+                        {
+                            match coreutils_rs::common::io::splice_stdin_to_mmap() {
+                                Ok(Some(mmap)) => FileData::Owned(mmap.to_vec()),
+                                _ => match read_stdin() {
+                                    Ok(d) => FileData::Owned(d),
+                                    Err(e) => {
+                                        eprintln!("tac: standard input: {}", io_error_msg(&e));
+                                        had_error = true;
+                                        continue;
+                                    }
+                                },
+                            }
                         }
-                    },
+                        #[cfg(not(target_os = "linux"))]
+                        match read_stdin() {
+                            Ok(d) => FileData::Owned(d),
+                            Err(e) => {
+                                eprintln!("tac: standard input: {}", io_error_msg(&e));
+                                had_error = true;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
             #[cfg(not(unix))]
