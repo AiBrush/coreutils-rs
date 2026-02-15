@@ -161,7 +161,8 @@ unsafe fn buf_push(buf: &mut Vec<u8>, b: u8) {
 }
 
 /// Write multiple IoSlice buffers using write_vectored (writev syscall).
-/// Batches into MAX_IOV-sized groups. Falls back to write_all per slice for partial writes.
+/// Batches into MAX_IOV-sized groups. Hot path: single write_vectored succeeds.
+/// Cold path (partial write) is out-of-line to keep the hot loop tight.
 #[inline]
 fn write_ioslices(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
     if slices.is_empty() {
@@ -169,26 +170,34 @@ fn write_ioslices(out: &mut impl Write, slices: &[IoSlice]) -> io::Result<()> {
     }
     for batch in slices.chunks(MAX_IOV) {
         let total: usize = batch.iter().map(|s| s.len()).sum();
-        match out.write_vectored(batch) {
-            Ok(n) if n >= total => continue,
-            Ok(mut written) => {
-                // Partial write: fall back to write_all per remaining slice
-                for slice in batch {
-                    let slen = slice.len();
-                    if written >= slen {
-                        written -= slen;
-                        continue;
-                    }
-                    if written > 0 {
-                        out.write_all(&slice[written..])?;
-                        written = 0;
-                    } else {
-                        out.write_all(slice)?;
-                    }
-                }
-            }
-            Err(e) => return Err(e),
+        let written = out.write_vectored(batch)?;
+        if written >= total {
+            continue;
         }
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+        }
+        write_ioslices_slow(out, batch, written)?;
+    }
+    Ok(())
+}
+
+/// Handle partial write_vectored (cold path, never inlined).
+#[cold]
+#[inline(never)]
+fn write_ioslices_slow(
+    out: &mut impl Write,
+    slices: &[IoSlice],
+    mut skip: usize,
+) -> io::Result<()> {
+    for slice in slices {
+        let len = slice.len();
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        out.write_all(&slice[skip..])?;
+        skip = 0;
     }
     Ok(())
 }
