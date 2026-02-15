@@ -88,14 +88,12 @@ impl Write for VmspliceWriter {
         if !self.is_pipe || bufs.is_empty() {
             return (&*self.raw).write_vectored(bufs);
         }
-        let iovs: Vec<libc::iovec> = bufs
-            .iter()
-            .map(|b| libc::iovec {
-                iov_base: b.as_ptr() as *mut libc::c_void,
-                iov_len: b.len(),
-            })
-            .collect();
-        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), iovs.len(), 0) };
+        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
+        // so &[IoSlice] has the same memory layout as &[iovec].
+        // Direct pointer cast eliminates Vec allocation + copy per call.
+        let count = bufs.len().min(1024);
+        let iovs = bufs.as_ptr() as *const libc::iovec;
+        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
         if n >= 0 {
             Ok(n as usize)
         } else {

@@ -87,18 +87,13 @@ impl Write for VmspliceWriter {
         if !self.is_pipe || bufs.is_empty() {
             return (&*self.raw).write_vectored(bufs);
         }
-        // Stack-allocated iovec array: avoids Vec heap allocation on every call.
-        // 1024 matches UIO_MAXIOV (Linux max iovecs per syscall) and the batch
-        // size used by the core tac functions.
+        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
+        // so &[IoSlice] has the same memory layout as &[iovec].
+        // Direct pointer cast eliminates the per-call copy loop (1024 iterations)
+        // and 16KB memset that the stack-allocated array approach required.
         let count = bufs.len().min(1024);
-        let mut iovs: [libc::iovec; 1024] = unsafe { std::mem::zeroed() };
-        for i in 0..count {
-            iovs[i] = libc::iovec {
-                iov_base: bufs[i].as_ptr() as *mut libc::c_void,
-                iov_len: bufs[i].len(),
-            };
-        }
-        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), count, 0) };
+        let iovs = bufs.as_ptr() as *const libc::iovec;
+        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
         if n >= 0 {
             Ok(n as usize)
         } else {
