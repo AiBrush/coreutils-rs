@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::io::{self, Read, Write};
 
 use rayon::prelude::*;
@@ -21,40 +20,6 @@ const STREAM_BUF: usize = 16 * 1024 * 1024;
 /// single-core translate time. Only use parallel for genuinely large files
 /// where the parallel speedup outweighs rayon overhead.
 const PARALLEL_THRESHOLD: usize = 32 * 1024 * 1024;
-
-// Thread-local reusable buffer for streaming operations.
-// Avoids allocating a new 16MB buffer per tr invocation.
-// Allocated lazily on first use.
-thread_local! {
-    static TR_STREAM_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Get a streaming buffer of at least STREAM_BUF bytes from thread-local storage.
-/// On first call, allocates via alloc_uninit_vec. On subsequent calls, reuses.
-#[inline]
-fn get_stream_buf() -> Vec<u8> {
-    TR_STREAM_BUF.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.capacity() >= STREAM_BUF {
-            // Take the buffer, leaving an empty Vec in the cell
-            std::mem::take(&mut *buf)
-        } else {
-            // First call: allocate
-            alloc_uninit_vec(STREAM_BUF)
-        }
-    })
-}
-
-/// Return a streaming buffer to thread-local storage for reuse.
-#[inline]
-fn return_stream_buf(buf: Vec<u8>) {
-    TR_STREAM_BUF.with(|cell| {
-        let mut stored = cell.borrow_mut();
-        if buf.capacity() >= stored.capacity() {
-            *stored = buf;
-        }
-    });
-}
 
 /// 256-entry lookup table for byte compaction: for each 8-bit keep mask,
 /// stores the bit positions of set bits (indices of bytes to keep).

@@ -131,8 +131,18 @@ fn raw_stdout() -> ManuallyDrop<std::fs::File> {
     unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) }
 }
 
+/// Minimum file size to use mmap instead of streaming read().
+/// Below this, the streaming path is faster: read() hides page faults inside
+/// the kernel memcpy (batch TLB flush, no per-page trap), while mmap exposes
+/// each page fault as a userspace event (~300ns/fault × 2560 faults = ~770µs
+/// for 10MB). For 10MB: streaming ~500µs vs mmap ~1200µs.
+/// Above 32MB, mmap's zero-copy advantage outweighs the page fault cost,
+/// and parallel processing (rayon) requires the full data in memory.
+const MMAP_MIN_SIZE: usize = 32 * 1024 * 1024;
+
 /// Try to mmap stdin if it's a regular file (e.g., shell redirect `< file`).
-/// Returns None if stdin is a pipe/terminal, or on non-unix platforms.
+/// Returns None if stdin is a pipe/terminal, file is too small for mmap
+/// benefit, or on non-unix platforms.
 #[cfg(unix)]
 fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     use std::os::unix::io::AsRawFd;
@@ -148,20 +158,22 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         return None;
     }
 
+    let file_size = stat.st_size as usize;
+
+    // For files below MMAP_MIN_SIZE, skip mmap entirely.
+    // The streaming read() path is faster: kernel memcpy hides page faults
+    // inside the syscall, avoiding per-page userspace traps.
+    if file_size < MMAP_MIN_SIZE {
+        return None;
+    }
+
     // mmap the stdin file descriptor.
-    // For small files (< 4MB), skip MAP_POPULATE — the upfront page table walk
-    // costs ~0.5ms for 10MB which is significant relative to total time.
-    // Instead use MADV_WILLNEED to trigger async readahead without blocking.
-    // For large files (>= 4MB), MAP_POPULATE amortizes the upfront cost.
+    // MAP_POPULATE for large files to prefault pages during mmap() call.
     // SAFETY: fd is valid, file is regular, size > 0
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let file_size = stat.st_size as usize;
-    let mmap: Option<memmap2::Mmap> = if file_size >= 4 * 1024 * 1024 {
-        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok()
-    } else {
-        unsafe { memmap2::MmapOptions::new().map(&file) }.ok()
-    };
+    let mmap: Option<memmap2::Mmap> =
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
@@ -190,9 +202,8 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
 
 /// Try to create a MAP_PRIVATE (copy-on-write) mmap of stdin for in-place translate.
 /// MAP_PRIVATE means writes only affect our process's copy — the underlying file
-/// is unmodified. The kernel uses COW: only pages we actually modify get physically
-/// copied, so for sparse translations (e.g., `tr 'aeiou' 'AEIOU'` where only ~40%
-/// of bytes change), this is significantly cheaper than allocating a full copy.
+/// is unmodified. Only used for files >= MMAP_MIN_SIZE (called after try_mmap_stdin
+/// returns a read-only mmap that's >= 64MB and dropped).
 #[cfg(unix)]
 fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
     use std::os::unix::io::AsRawFd;
@@ -209,14 +220,10 @@ fn try_mmap_stdin_mut() -> Option<memmap2::MmapMut> {
 
     use std::os::unix::io::FromRawFd;
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let file_size = stat.st_size as usize;
     // map_copy creates MAP_PRIVATE mapping — writes are COW, file untouched
-    // Skip MAP_POPULATE for small files to avoid upfront page table walk overhead
-    let mmap = if file_size >= 4 * 1024 * 1024 {
-        unsafe { memmap2::MmapOptions::new().populate().map_copy(&file) }.ok()
-    } else {
-        unsafe { memmap2::MmapOptions::new().map_copy(&file) }.ok()
-    };
+    // Always use MAP_POPULATE here since this path is only reached for large files
+    let mmap =
+        unsafe { memmap2::MmapOptions::new().populate().map_copy(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
