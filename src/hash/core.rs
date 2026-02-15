@@ -1158,8 +1158,7 @@ pub fn blake2b_hash_files_parallel(
                 s.spawn(move || {
                     let mut local_results = Vec::new();
                     loop {
-                        let idx =
-                            work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let idx = work_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if idx >= indexed.len() {
                             break;
                         }
