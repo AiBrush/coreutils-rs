@@ -5,6 +5,15 @@ use rayon::prelude::*;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
+/// Number of available CPUs (cached by the OS). Used for encode parallel thresholds
+/// to avoid triggering Rayon's thread pool initialization for encode paths.
+#[inline]
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 /// Chunk size for sequential no-wrap encoding: 4MB aligned to 3 bytes.
 /// Smaller chunks reduce peak memory (page fault overhead for large buffers).
 /// For 10MB input, 4MB chunks = 5.3MB buffer vs 13.3MB with 32MB chunks,
@@ -44,7 +53,7 @@ pub fn encode_to_writer(data: &[u8], wrap_col: usize, out: &mut impl Write) -> i
 
 /// Encode without wrapping — parallel SIMD encoding for large data, sequential for small.
 fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    if data.len() >= PARALLEL_NOWRAP_THRESHOLD && rayon::current_num_threads() > 1 {
+    if data.len() >= PARALLEL_NOWRAP_THRESHOLD && num_cpus() > 1 {
         return encode_no_wrap_parallel(data, out);
     }
 
@@ -68,13 +77,11 @@ fn encode_no_wrap(data: &[u8], out: &mut impl Write) -> io::Result<()> {
 /// Parallel no-wrap encoding: split at 3-byte boundaries, encode chunks in parallel.
 /// Each chunk except possibly the last is 3-byte aligned, so no padding in intermediate chunks.
 ///
-/// Uses per-thread output buffers instead of a single shared buffer. For 10MB input,
-/// the shared approach allocates ~13.3MB upfront → ~3300 page faults (~3.3ms).
-/// Per-thread buffers (~3.3MB each) page-fault concurrently on separate threads,
-/// reducing wall-clock page fault time to ~0.8ms. Output uses writev to combine
-/// all per-thread buffers in a single syscall.
+/// Uses std::thread::scope instead of Rayon to avoid pool initialization overhead (~300µs).
+/// Each scoped thread allocates its own output buffer and encodes independently.
+/// Output uses writev to combine all per-thread buffers in a single syscall.
 fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> {
-    let num_threads = rayon::current_num_threads().max(1);
+    let num_threads = num_cpus().max(1);
     let raw_chunk = data.len() / num_threads;
     // Align to 3 bytes so each chunk encodes without padding (except the last)
     let chunk_size = ((raw_chunk + 2) / 3) * 3;
@@ -82,20 +89,28 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
     // Split input into 3-byte-aligned chunks
     let chunks: Vec<&[u8]> = data.chunks(chunk_size.max(3)).collect();
 
-    // Each thread allocates its own output buffer and encodes independently.
-    let results: Vec<Vec<u8>> = chunks
-        .par_iter()
-        .map(|chunk| {
-            let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-            let mut buf: Vec<u8> = Vec::with_capacity(enc_len);
-            #[allow(clippy::uninit_vec)]
-            unsafe {
-                buf.set_len(enc_len);
-            }
-            let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
-            buf
-        })
-        .collect();
+    // Each scoped thread allocates its own output buffer and encodes independently.
+    let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|chunk| {
+                s.spawn(|| {
+                    let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
+                    let mut buf: Vec<u8> = Vec::with_capacity(enc_len);
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        buf.set_len(enc_len);
+                    }
+                    let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
+                    buf
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
 
     // Single writev for all chunks in order
     let slices: Vec<io::IoSlice> = results.iter().map(|r| io::IoSlice::new(r)).collect();
@@ -478,7 +493,7 @@ fn encode_wrapped_parallel(
     let total_full_lines = data.len() / bytes_per_line;
 
     // Split work at line boundaries for parallel processing
-    let num_threads = rayon::current_num_threads().max(1);
+    let num_threads = num_cpus().max(1);
     let lines_per_chunk = (total_full_lines / num_threads).max(1);
 
     // Build per-thread input ranges aligned to bytes_per_line
@@ -498,10 +513,12 @@ fn encode_wrapped_parallel(
         in_off += aligned_input;
     }
 
-    // Each thread encodes into its own buffer with interleaved newlines.
-    let results: Vec<Vec<u8>> = tasks
-        .par_iter()
-        .map(|&(in_off, chunk_len)| {
+    // Each scoped thread encodes into its own buffer with interleaved newlines.
+    let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = tasks
+            .iter()
+            .map(|&(in_off, chunk_len)| {
+                s.spawn(move || {
             let input = &data[in_off..in_off + chunk_len];
             let full_lines = chunk_len / bytes_per_line;
             let rem = chunk_len % bytes_per_line;
@@ -589,8 +606,14 @@ fn encode_wrapped_parallel(
             }
 
             buf
-        })
-        .collect();
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
 
     // Single writev for all per-thread buffers in order
     let slices: Vec<io::IoSlice> = results.iter().map(|r| io::IoSlice::new(r)).collect();

@@ -41,19 +41,6 @@ pub fn tac_bytes_owned(
     tac_bytes(data, separator, before, out)
 }
 
-/// Collect separator positions with pre-allocated Vec.
-/// Used by parallel paths where all positions are needed before chunked output.
-#[inline]
-#[allow(dead_code)]
-fn collect_positions_byte(data: &[u8], sep: u8) -> Vec<usize> {
-    let estimated = data.len() / 40 + 64; // ~40 bytes per line, conservative
-    let mut positions = Vec::with_capacity(estimated);
-    for pos in memchr::memchr_iter(sep, data) {
-        positions.push(pos);
-    }
-    positions
-}
-
 /// Collect multi-byte separator positions with pre-allocated Vec.
 #[inline]
 fn collect_positions_str(data: &[u8], separator: &[u8]) -> Vec<usize> {
@@ -232,7 +219,7 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
     let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
 
     // Reusable positions buffer — allocated once, pages hot after first chunk.
-    let est = CHUNK / 40 + 64;
+    let est = CHUNK / 16 + 64;
     let mut positions: Vec<usize> = Vec::with_capacity(est);
 
     let mut record_end = data.len();
@@ -282,7 +269,7 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
     const BATCH: usize = 1024;
     let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
 
-    let est = CHUNK / 40 + 64;
+    let est = CHUNK / 16 + 64;
     let mut positions: Vec<usize> = Vec::with_capacity(est);
 
     let mut record_end = data.len();

@@ -9,7 +9,7 @@ use std::process;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::{FileData, read_file, read_stdin};
+use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
 
@@ -286,7 +286,7 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         } else {
-            match read_file(Path::new(filename)) {
+            match read_file_mmap(Path::new(filename)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("tac: {}: {}", filename, io_error_msg(&e));
@@ -295,23 +295,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         };
-
-        // Override MADV_SEQUENTIAL from read_file: tac reads forward (memchr scan)
-        // then outputs in reverse. SEQUENTIAL tells the kernel to drop pages behind
-        // the scan cursor, but we need those pages for the reverse output phase.
-        // MADV_NORMAL resets to default (no drop-behind), and WILLNEED pre-faults
-        // all pages so parallel threads don't stall on page faults.
-        #[cfg(target_os = "linux")]
-        {
-            let ptr = data.as_ptr() as *mut libc::c_void;
-            let len = data.len();
-            if len > 0 {
-                unsafe {
-                    libc::madvise(ptr, len, libc::MADV_NORMAL);
-                    libc::madvise(ptr, len, libc::MADV_WILLNEED);
-                }
-            }
-        }
 
         let result = if cli.regex {
             let bytes: &[u8] = &data;

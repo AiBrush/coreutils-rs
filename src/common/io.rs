@@ -134,6 +134,49 @@ pub fn read_file_vec(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read a file always using mmap, with MADV_WILLNEED (no MADV_SEQUENTIAL).
+/// Used by tac which scans forward then outputs in reverse, and benefits
+/// from zero-copy vmsplice output from mmap pages.
+/// Skips the MMAP_THRESHOLD — even small files benefit from mmap since:
+///   - No memcpy from page cache to userspace (zero-copy)
+///   - vmsplice can reference mmap pages directly in the pipe
+///   - mmap setup cost for small files (~25 pages) is comparable to read()
+pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
+    let file = open_noatime(path)?;
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+
+    if len > 0 && metadata.file_type().is_file() {
+        match unsafe { MmapOptions::new().populate().map(&file) } {
+            Ok(mmap) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+                    if len >= 2 * 1024 * 1024 {
+                        let _ = mmap.advise(memmap2::Advice::HugePage);
+                    }
+                }
+                return Ok(FileData::Mmap(mmap));
+            }
+            Err(_) => {
+                // mmap failed — fall back to read
+                let mut buf = vec![0u8; len as usize];
+                let n = read_full(&mut &file, &mut buf)?;
+                buf.truncate(n);
+                return Ok(FileData::Owned(buf));
+            }
+        }
+    } else if len > 0 {
+        // Non-regular file (special files) — read from open fd
+        let mut buf = Vec::new();
+        let mut reader = file;
+        reader.read_to_end(&mut buf)?;
+        Ok(FileData::Owned(buf))
+    } else {
+        Ok(FileData::Owned(Vec::new()))
+    }
+}
+
 /// Get file size without reading it (for byte-count-only optimization).
 pub fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())
