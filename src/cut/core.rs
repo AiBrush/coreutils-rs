@@ -248,7 +248,8 @@ fn process_fields_multi_select(
         let results: Vec<Vec<u8>> = chunks
             .par_iter()
             .map(|chunk| {
-                let mut buf = Vec::with_capacity(chunk.len());
+                // Output is always <= input for field selection; use 3/4 as safe estimate
+                let mut buf = Vec::with_capacity(chunk.len() * 3 / 4);
                 multi_select_chunk(
                     chunk, delim, line_delim, ranges, max_field, suppress, &mut buf,
                 );
@@ -262,7 +263,7 @@ fn process_fields_multi_select(
             .collect();
         write_ioslices(out, &slices)?;
     } else {
-        let mut buf = Vec::with_capacity(data.len());
+        let mut buf = Vec::with_capacity(data.len() * 3 / 4);
         multi_select_chunk(
             data, delim, line_delim, ranges, max_field, suppress, &mut buf,
         );
@@ -1870,120 +1871,20 @@ fn fields_mid_range_line(
     }
 }
 
-/// Combined SIMD scan for arbitrary single field extraction.
-/// Uses memchr2_iter(delim, line_delim) to scan for both bytes in a single SIMD pass.
-/// This is faster than the nested approach (outer: find newlines, inner: find delimiters)
-/// because it eliminates one full SIMD scan and improves cache locality.
-///
-/// For target_idx == 0 (field 1), after finding the target field we skip remaining
-/// delimiters on the line by scanning directly for line_delim.
-fn process_nth_field_combined(
-    data: &[u8],
-    delim: u8,
-    line_delim: u8,
-    target_idx: usize,
-    suppress: bool,
-    buf: &mut Vec<u8>,
-) {
-    buf.reserve(data.len());
 
-    let data_len = data.len();
-    let base = data.as_ptr();
-    let mut line_start: usize = 0;
-    let mut field_start: usize = 0;
-    let mut field_idx: usize = 0;
-    let mut has_delim = false;
-    let mut emitted = false;
-
-    for pos in memchr::memchr2_iter(delim, line_delim, data) {
-        let byte = unsafe { *base.add(pos) };
-
-        if byte == line_delim {
-            // End of line
-            if !emitted {
-                if has_delim && field_idx == target_idx {
-                    // Last field matches target
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(field_start), pos - field_start),
-                        );
-                        buf_push(buf, line_delim);
-                    }
-                } else if has_delim {
-                    // Target field doesn't exist (fewer fields)
-                    unsafe {
-                        buf_push(buf, line_delim);
-                    }
-                } else if !suppress {
-                    // No delimiter in line — output unchanged
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
-                        );
-                        buf_push(buf, line_delim);
-                    }
-                }
-            }
-            // Reset for next line
-            line_start = pos + 1;
-            field_start = pos + 1;
-            field_idx = 0;
-            has_delim = false;
-            emitted = false;
-        } else {
-            // Delimiter found
-            has_delim = true;
-            if field_idx == target_idx {
-                unsafe {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(field_start), pos - field_start),
-                    );
-                    buf_push(buf, line_delim);
-                }
-                emitted = true;
-            }
-            field_idx += 1;
-            field_start = pos + 1;
-        }
-    }
-
-    // Handle last line without trailing newline
-    if line_start < data_len && !emitted {
-        if has_delim && field_idx == target_idx {
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(field_start), data_len - field_start),
-                );
-                buf_push(buf, line_delim);
-            }
-        } else if has_delim {
-            unsafe {
-                buf_push(buf, line_delim);
-            }
-        } else if !suppress {
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
-                );
-                buf_push(buf, line_delim);
-            }
-        }
-    }
-}
 
 /// Zero-copy field-1 extraction using writev: builds IoSlice entries pointing
 /// directly into the source data, flushing in MAX_IOV-sized batches.
 /// For each line: if delimiter exists, output field1 + newline; otherwise pass through.
-/// Uses memchr2 to scan for both delimiter and line terminator in a single SIMD pass.
 ///
-/// For lines without delimiter: the entire line (including its newline) is a single
-/// contiguous IoSlice. For lines with delimiter: two IoSlices (field1 data + newline byte).
-/// Contiguous runs of unmodified lines are coalesced into a single IoSlice.
+/// Uses a two-level scan: outer memchr(newline) for line boundaries, inner memchr(delim)
+/// for the first delimiter. This is faster than a single-pass memchr2 because field 1 is
+/// always at the start — the inner scan exits after the FIRST delimiter, skipping all
+/// subsequent delimiters on the line. For 10-column CSV, this processes ~2 SIMD hits/line
+/// instead of ~10, a 5x reduction in per-hit overhead.
+///
+/// Lines without delimiter stay in contiguous runs (zero-copy pass-through).
+/// Lines with delimiter produce two IoSlices (truncated field + newline byte).
 #[inline]
 fn single_field1_zerocopy(
     data: &[u8],
@@ -1991,53 +1892,41 @@ fn single_field1_zerocopy(
     line_delim: u8,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    // Static newline byte for IoSlice references
     let newline_buf: [u8; 1] = [line_delim];
 
     let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
-    let mut line_start: usize = 0;
     let mut run_start: usize = 0;
-    let mut first_delim: Option<usize> = None;
+    let mut start = 0;
 
-    for pos in memchr::memchr2_iter(delim, line_delim, data) {
-        let byte = unsafe { *data.get_unchecked(pos) };
-
-        if byte == line_delim {
-            // End of line
-            if let Some(dp) = first_delim {
-                // Line has delimiter — truncate at first delimiter.
-                // Flush current contiguous run, then add truncated line + newline.
-                if run_start < line_start {
-                    iov.push(IoSlice::new(&data[run_start..line_start]));
-                }
-                iov.push(IoSlice::new(&data[line_start..dp]));
-                iov.push(IoSlice::new(&newline_buf));
-                run_start = pos + 1;
-
-                // Flush when we're near the iovec limit
-                if iov.len() >= MAX_IOV - 2 {
-                    write_ioslices(out, &iov)?;
-                    iov.clear();
-                }
+    for end_pos in memchr_iter(line_delim, data) {
+        let line = &data[start..end_pos];
+        if let Some(dp) = memchr::memchr(delim, line) {
+            // Line has delimiter — truncate at first delimiter.
+            // Flush current contiguous run, then add truncated field + newline.
+            if run_start < start {
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            // else: no delimiter in line, output unchanged (stays in run)
-            line_start = pos + 1;
-            first_delim = None;
-        } else {
-            // Delimiter found
-            if first_delim.is_none() {
-                first_delim = Some(pos);
+            iov.push(IoSlice::new(&data[start..start + dp]));
+            iov.push(IoSlice::new(&newline_buf));
+            run_start = end_pos + 1;
+
+            if iov.len() >= MAX_IOV - 2 {
+                write_ioslices(out, &iov)?;
+                iov.clear();
             }
         }
+        // else: no delimiter in line, output unchanged (stays in contiguous run)
+        start = end_pos + 1;
     }
 
-    // Handle last line (no trailing line_delim)
-    if line_start < data.len() {
-        if let Some(dp) = first_delim {
-            if run_start < line_start {
-                iov.push(IoSlice::new(&data[run_start..line_start]));
+    // Handle last line (no trailing newline)
+    if start < data.len() {
+        let line = &data[start..];
+        if let Some(dp) = memchr::memchr(delim, line) {
+            if run_start < start {
+                iov.push(IoSlice::new(&data[run_start..start]));
             }
-            iov.push(IoSlice::new(&data[line_start..dp]));
+            iov.push(IoSlice::new(&data[start..start + dp]));
             iov.push(IoSlice::new(&newline_buf));
             if !iov.is_empty() {
                 write_ioslices(out, &iov)?;
