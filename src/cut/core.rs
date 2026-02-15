@@ -1105,24 +1105,163 @@ fn complement_range_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    // Pre-reserve entire chunk capacity to eliminate per-line reserve overhead.
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        complement_range_line(line, delim, skip_start, skip_end, line_delim, suppress, buf);
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            complement_range_line(line, delim, skip_start, skip_end, line_delim, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            complement_range_line(
+                &data[start..],
+                delim,
+                skip_start,
+                skip_end,
+                line_delim,
+                suppress,
+                buf,
+            );
+        }
+        return;
     }
-    if start < data.len() {
-        complement_range_line(
-            &data[start..],
-            delim,
-            skip_start,
-            skip_end,
-            line_delim,
-            suppress,
-            buf,
-        );
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let prefix_delims = skip_start - 1;
+    let skip_end_delims = skip_end;
+
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut has_delim = false;
+    let mut prefix_end: usize = 0;
+    let mut suffix_start: usize = 0;
+    let mut found_prefix = prefix_delims == 0;
+    let mut found_suffix = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+
+        if byte == line_delim {
+            if !has_delim {
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                }
+            } else if found_suffix {
+                if prefix_delims > 0 {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(
+                                base.add(line_start),
+                                prefix_end - line_start,
+                            ),
+                        );
+                        buf_push(buf, delim);
+                    }
+                }
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(suffix_start), pos - suffix_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else if found_prefix && prefix_delims > 0 {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), prefix_end - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else if found_prefix {
+                unsafe { buf_push(buf, line_delim) };
+            } else {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+
+            line_start = pos + 1;
+            delim_count = 0;
+            has_delim = false;
+            found_prefix = prefix_delims == 0;
+            found_suffix = false;
+        } else {
+            has_delim = true;
+            delim_count += 1;
+            if delim_count == prefix_delims {
+                prefix_end = pos;
+                found_prefix = true;
+            }
+            if delim_count == skip_end_delims {
+                suffix_start = pos + 1;
+                found_suffix = true;
+            }
+        }
+    }
+
+    if line_start < data_len {
+        if !has_delim {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+        } else if found_suffix {
+            if prefix_delims > 0 {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), prefix_end - line_start),
+                    );
+                    buf_push(buf, delim);
+                }
+            }
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(suffix_start), data_len - suffix_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        } else if found_prefix && prefix_delims > 0 {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), prefix_end - line_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        } else if found_prefix {
+            unsafe { buf_push(buf, line_delim) };
+        } else {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        }
     }
 }
 
