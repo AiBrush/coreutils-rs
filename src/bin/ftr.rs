@@ -104,8 +104,8 @@ impl Write for VmspliceWriter {
     }
 }
 
-// Note: RawStdin removed — Linux piped path now uses splice_stdin_to_mmap
-// or read_stdin for batch processing, which is faster than streaming.
+// Note: RawStdin removed — Linux piped path now uses streaming translate
+// for pipeline parallelism with upstream cat.
 
 struct Cli {
     complement: bool,
@@ -486,23 +486,13 @@ fn main() {
             process::exit(1);
         }
     } else {
-        // Piped stdin: try splice+mmap for zero-copy, fall back to read_stdin batch.
-        // IMPORTANT: Use raw write(2), NOT VmspliceWriter, for non-translate modes.
-        // The mmap functions (delete_mmap, squeeze_mmap, translate_squeeze_mmap) may
-        // allocate temporary output buffers. vmsplice maps those heap pages into the
-        // pipe, but the allocator frees them before the pipe reader drains the data,
-        // causing garbage output. Raw write(2) copies data into the kernel pipe buffer.
+        // Piped stdin: streaming mode for pipeline parallelism with upstream cat.
+        // Process chunks as they arrive instead of batching all data first.
+        // Use raw write (not vmsplice) since streaming buffers are reused.
         #[cfg(target_os = "linux")]
         let result = {
             let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-            if let Ok(Some(splice_mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
-                run_mmap_mode(&cli, set1_str, &splice_mmap, &mut *raw_out)
-            } else {
-                match coreutils_rs::common::io::read_stdin() {
-                    Ok(data) => run_mmap_mode(&cli, set1_str, &data, &mut *raw_out),
-                    Err(e) => Err(e),
-                }
-            }
+            run_streaming_mode(&cli, set1_str, &mut *raw_out)
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_streaming_mode(&cli, set1_str, &mut *raw);
@@ -521,9 +511,8 @@ fn main() {
     }
 }
 
-/// Dispatch streaming modes for piped stdin (non-Linux platforms only).
-/// On Linux, piped input uses splice+batch or read_stdin+batch instead.
-#[cfg(not(target_os = "linux"))]
+/// Dispatch streaming modes for piped stdin.
+/// Processes data chunk-by-chunk for pipeline parallelism with upstream cat.
 fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io::Result<()> {
     if cli.delete && cli.squeeze {
         if cli.sets.len() < 2 {
