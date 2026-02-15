@@ -306,11 +306,13 @@ fn process_fields_multi_select(
     Ok(())
 }
 
-/// Process a chunk for multi-field extraction using a single-pass memchr2 scan.
-/// Scans for both delimiter and line_delim in one SIMD pass over the entire chunk,
-/// eliminating per-line memchr_iter setup overhead (significant for short lines).
-/// Delimiter positions are collected in a stack array per line.
-/// When max_field is reached on a line, remaining delimiters are ignored.
+/// Process a chunk for multi-field extraction using two-level scanning.
+/// Outer: memchr_iter for newlines (one SIMD scan).
+/// Inner: memchr_iter for delimiters with early exit at max_field.
+/// This avoids processing excess delimiters on wide CSV data (e.g., 20 columns
+/// but only selecting -f1,3,5 → only scans 5 of 19 delimiters per line).
+/// Also eliminates delimiter/newline branching in the hot loop — inner loop
+/// is 100% delimiters (no mispredictions).
 fn multi_select_chunk(
     data: &[u8],
     delim: u8,
@@ -320,174 +322,17 @@ fn multi_select_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    // When delim == line_delim, fall back to two-level approach
-    if delim == line_delim {
-        buf.reserve(data.len());
-        let base = data.as_ptr();
-        let mut start = 0;
-        for end_pos in memchr_iter(line_delim, data) {
-            let line = unsafe { std::slice::from_raw_parts(base.add(start), end_pos - start) };
-            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
-            start = end_pos + 1;
-        }
-        if start < data.len() {
-            let line = unsafe { std::slice::from_raw_parts(base.add(start), data.len() - start) };
-            multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
-        }
-        return;
-    }
-
     buf.reserve(data.len());
     let base = data.as_ptr();
-    let data_len = data.len();
-
-    // Per-line state
-    let mut line_start: usize = 0;
-    let mut delim_pos = [0usize; 64];
-    let mut num_delims: usize = 0;
-    let max_delims = max_field.min(64);
-    let mut at_max = false;
-
-    // Single-pass scan using memchr2 for both delimiter and newline
-    for pos in memchr::memchr2_iter(delim, line_delim, data) {
-        let byte = unsafe { *base.add(pos) };
-
-        if byte == line_delim {
-            // End of line: extract fields from collected positions
-            let line_len = pos - line_start;
-            if num_delims == 0 {
-                // No delimiter in line
-                if !suppress {
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(line_start), line_len),
-                        );
-                        buf_push(buf, line_delim);
-                    }
-                }
-            } else {
-                // Extract fields using collected delimiter positions
-                let total_fields = num_delims + 1;
-                let mut first_output = true;
-
-                for r in ranges {
-                    let range_start = r.start;
-                    let range_end = r.end.min(total_fields);
-                    if range_start > total_fields {
-                        break;
-                    }
-                    for field_num in range_start..=range_end {
-                        if field_num > total_fields {
-                            break;
-                        }
-
-                        let field_start = if field_num == 1 {
-                            line_start
-                        } else if field_num - 2 < num_delims {
-                            delim_pos[field_num - 2] + 1
-                        } else {
-                            continue;
-                        };
-                        let field_end = if field_num <= num_delims {
-                            delim_pos[field_num - 1]
-                        } else {
-                            pos
-                        };
-
-                        if !first_output {
-                            unsafe { buf_push(buf, delim) };
-                        }
-                        unsafe {
-                            buf_extend(
-                                buf,
-                                std::slice::from_raw_parts(
-                                    base.add(field_start),
-                                    field_end - field_start,
-                                ),
-                            );
-                        }
-                        first_output = false;
-                    }
-                }
-
-                unsafe { buf_push(buf, line_delim) };
-            }
-
-            // Reset for next line
-            line_start = pos + 1;
-            num_delims = 0;
-            at_max = false;
-        } else {
-            // Delimiter found: collect position (up to max_field)
-            if !at_max && num_delims < max_delims {
-                delim_pos[num_delims] = pos;
-                num_delims += 1;
-                if num_delims >= max_delims {
-                    at_max = true;
-                }
-            }
-        }
+    let mut start = 0;
+    for end_pos in memchr_iter(line_delim, data) {
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), end_pos - start) };
+        multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
+        start = end_pos + 1;
     }
-
-    // Handle last line without trailing line_delim
-    if line_start < data_len {
-        if num_delims == 0 {
-            if !suppress {
-                unsafe {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(line_start), data_len - line_start),
-                    );
-                    buf_push(buf, line_delim);
-                }
-            }
-        } else {
-            let total_fields = num_delims + 1;
-            let mut first_output = true;
-
-            for r in ranges {
-                let range_start = r.start;
-                let range_end = r.end.min(total_fields);
-                if range_start > total_fields {
-                    break;
-                }
-                for field_num in range_start..=range_end {
-                    if field_num > total_fields {
-                        break;
-                    }
-
-                    let field_start = if field_num == 1 {
-                        line_start
-                    } else if field_num - 2 < num_delims {
-                        delim_pos[field_num - 2] + 1
-                    } else {
-                        continue;
-                    };
-                    let field_end = if field_num <= num_delims {
-                        delim_pos[field_num - 1]
-                    } else {
-                        data_len
-                    };
-
-                    if !first_output {
-                        unsafe { buf_push(buf, delim) };
-                    }
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(
-                                base.add(field_start),
-                                field_end - field_start,
-                            ),
-                        );
-                    }
-                    first_output = false;
-                }
-            }
-
-            unsafe { buf_push(buf, line_delim) };
-        }
+    if start < data.len() {
+        let line = unsafe { std::slice::from_raw_parts(base.add(start), data.len() - start) };
+        multi_select_line(line, delim, line_delim, ranges, max_field, suppress, buf);
     }
 }
 
