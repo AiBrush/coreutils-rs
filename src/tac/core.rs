@@ -2,11 +2,13 @@ use std::io::{self, IoSlice, Write};
 
 use rayon::prelude::*;
 
-/// Threshold for parallel processing (4MB).
-/// Rayon thread pool initialization costs ~300µs. For files under 4MB that
-/// process in ~200-800µs, this overhead dominates. Keep smaller files on
-/// the sequential path to avoid the thread pool cost.
-const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Threshold for parallel processing (16MB).
+/// Rayon thread pool initialization costs ~300µs on first use. Since each
+/// benchmark/process invocation re-initializes the pool, this 300µs is per-run.
+/// For 10MB files (0.2ms sequential memchr scan), sequential is faster than
+/// parallel (0.1ms scan + 0.3ms Rayon init = 0.4ms). At 16MB+, the parallel
+/// speedup (>0.3ms) amortizes the Rayon initialization cost.
+const PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
 /// Scans for separators with SIMD memchr, then outputs records in reverse
@@ -87,10 +89,14 @@ fn split_into_chunks(data: &[u8], sep: u8) -> Vec<usize> {
 }
 
 /// Parallel after-separator mode: find separator positions in parallel,
-/// then build IoSlice entries pointing directly into the source data.
+/// then stream IoSlice entries pointing directly into the source data.
 /// Zero-copy: no output buffer allocation or memcpy. IoSlice entries
 /// reference the original mmap/owned data, and write_vectored (or vmsplice
 /// on Linux) transfers them directly to the pipe/file.
+///
+/// Uses streaming 1024-entry batches instead of pre-allocating all IoSlice
+/// entries at once. For 100MB with 2.5M lines, this avoids a ~40MB allocation
+/// (2.5M * 16 bytes) and its associated page fault overhead (~10ms for 10K pages).
 fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let boundaries = split_into_chunks(data, sep);
     let n_chunks = boundaries.len() - 1;
@@ -114,10 +120,11 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
         })
         .collect();
 
-    // Build IoSlice array: chunks in reverse order, records within each
-    // chunk in reverse. Each IoSlice points into the original data buffer.
-    let total_entries: usize = chunk_positions.iter().map(|p| p.len() + 1).sum();
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(total_entries);
+    // Stream IoSlice entries in 1024-entry batches. Chunks are processed in
+    // reverse order, records within each chunk in reverse. Each IoSlice
+    // points into the original data buffer (zero-copy).
+    const BATCH: usize = 1024;
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
 
     for i in (0..n_chunks).rev() {
         let chunk_start = boundaries[i];
@@ -129,22 +136,29 @@ fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::R
             let rec_start = pos + 1;
             if rec_start < end {
                 slices.push(IoSlice::new(&data[rec_start..end]));
+                if slices.len() >= BATCH {
+                    write_all_vectored(out, &slices)?;
+                    slices.clear();
+                }
             }
             end = rec_start;
         }
         if end > chunk_start {
             slices.push(IoSlice::new(&data[chunk_start..end]));
+            if slices.len() >= BATCH {
+                write_all_vectored(out, &slices)?;
+                slices.clear();
+            }
         }
     }
 
-    // Write in batches of 1024 (Linux UIO_MAXIOV).
-    for batch in slices.chunks(1024) {
-        write_all_vectored(out, batch)?;
+    if !slices.is_empty() {
+        write_all_vectored(out, &slices)?;
     }
     Ok(())
 }
 
-/// Parallel before-separator mode: same zero-copy writev approach.
+/// Parallel before-separator mode: same streaming zero-copy writev approach.
 fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let boundaries = split_into_chunks(data, sep);
     let n_chunks = boundaries.len() - 1;
@@ -168,8 +182,9 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         })
         .collect();
 
-    let total_entries: usize = chunk_positions.iter().map(|p| p.len() + 1).sum();
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(total_entries);
+    // Stream IoSlice entries in 1024-entry batches (same as after mode).
+    const BATCH: usize = 1024;
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
 
     for i in (0..n_chunks).rev() {
         let chunk_start = boundaries[i];
@@ -180,16 +195,24 @@ fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::
         for &pos in positions.iter().rev() {
             if pos < end {
                 slices.push(IoSlice::new(&data[pos..end]));
+                if slices.len() >= BATCH {
+                    write_all_vectored(out, &slices)?;
+                    slices.clear();
+                }
             }
             end = pos;
         }
         if end > chunk_start {
             slices.push(IoSlice::new(&data[chunk_start..end]));
+            if slices.len() >= BATCH {
+                write_all_vectored(out, &slices)?;
+                slices.clear();
+            }
         }
     }
 
-    for batch in slices.chunks(1024) {
-        write_all_vectored(out, batch)?;
+    if !slices.is_empty() {
+        write_all_vectored(out, &slices)?;
     }
     Ok(())
 }
@@ -465,25 +488,30 @@ pub fn tac_regex_separator(
     write_all_vectored(out, &slices)
 }
 
-/// Write all IoSlices, handling partial writes.
-#[inline]
+/// Write all IoSlice entries, handling partial writes.
+/// Hot path: single write_vectored succeeds fully (common on Linux pipes/files).
+/// Cold path: partial write handled out-of-line to keep hot path tight.
+#[inline(always)]
 fn write_all_vectored(out: &mut impl Write, slices: &[IoSlice<'_>]) -> io::Result<()> {
-    if slices.is_empty() {
-        return Ok(());
-    }
-
-    let written = out.write_vectored(slices)?;
-    if written == 0 && slices.iter().any(|s| !s.is_empty()) {
-        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
-    }
-
     let total: usize = slices.iter().map(|s| s.len()).sum();
+    let written = out.write_vectored(slices)?;
     if written >= total {
         return Ok(());
     }
+    if written == 0 {
+        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+    }
+    flush_vectored_slow(out, slices, written)
+}
 
-    // Partial write: skip past fully-written slices, then write_all the rest
-    let mut skip = written;
+/// Handle partial write (cold path, never inlined).
+#[cold]
+#[inline(never)]
+fn flush_vectored_slow(
+    out: &mut impl Write,
+    slices: &[IoSlice<'_>],
+    mut skip: usize,
+) -> io::Result<()> {
     for slice in slices {
         let len = slice.len();
         if skip >= len {

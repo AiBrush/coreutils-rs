@@ -221,8 +221,9 @@ fn run_hash_mode(
 ) {
     let has_stdin = files.iter().any(|f| f == "-");
 
-    if has_stdin || files.len() == 1 {
-        // Sequential for stdin or single file
+    if has_stdin || files.len() <= 10 {
+        // Sequential for stdin or small file count — avoids thread::scope
+        // overhead (~120µs) and readahead double-open penalty.
         for filename in files {
             let hash_result = if filename == "-" {
                 hash::hash_stdin(algo)

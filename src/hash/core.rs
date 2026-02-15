@@ -290,16 +290,20 @@ const FADVISE_MIN_SIZE: u64 = 1024 * 1024;
 
 /// Maximum file size for single-read hash optimization.
 /// Files up to this size are read entirely into a thread-local buffer and hashed
-/// with single-shot hash (avoids Hasher allocation + streaming overhead).
-const SMALL_FILE_LIMIT: u64 = 1024 * 1024;
+/// with single-shot hash. This avoids mmap/munmap overhead (~100µs each) and
+/// MAP_POPULATE page faults (~300ns/page). The thread-local buffer is reused
+/// across files in sequential mode, saving re-allocation.
+/// 16MB covers typical benchmark files (10MB) while keeping memory usage bounded.
+const SMALL_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Threshold for tiny files that can be read into a stack buffer.
 /// Below this size, we use a stack-allocated buffer + single read() syscall,
 /// completely avoiding any heap allocation for the data path.
 const TINY_FILE_LIMIT: u64 = 8 * 1024;
 
-// Thread-local reusable buffer for small-file single-read hash.
-// Avoids repeated allocation for many small files (e.g., 100 files of 1KB each).
+// Thread-local reusable buffer for single-read hash.
+// Grows lazily up to SMALL_FILE_LIMIT (16MB). Initial 64KB allocation
+// handles tiny files; larger files trigger one grow that persists for reuse.
 thread_local! {
     static SMALL_FILE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
 }
@@ -332,7 +336,15 @@ pub fn hash_file(algo: HashAlgorithm, path: &Path) -> io::Result<String> {
                     );
                 }
             }
-            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+            // Skip MAP_POPULATE for files < 4MB: on VMs (CI, cloud), eager page
+            // faulting is expensive (~300ns/page × 1024 pages = ~300µs for 4MB).
+            // Lazy faults + sequential access are faster for moderate files.
+            let mmap_result = if file_size >= 4 * 1024 * 1024 {
+                unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+            } else {
+                unsafe { memmap2::MmapOptions::new().map(&file) }
+            };
+            if let Ok(mmap) = mmap_result {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -528,7 +540,13 @@ pub fn blake2b_hash_file(path: &Path, output_bytes: usize) -> io::Result<String>
                     );
                 }
             }
-            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+            // Skip MAP_POPULATE for files < 4MB (same rationale as hash_file)
+            let mmap_result = if file_size >= 4 * 1024 * 1024 {
+                unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+            } else {
+                unsafe { memmap2::MmapOptions::new().map(&file) }
+            };
+            if let Ok(mmap) = mmap_result {
                 #[cfg(target_os = "linux")]
                 {
                     let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -660,7 +678,13 @@ fn open_file_content(path: &Path) -> io::Result<FileContent> {
             buf.truncate(total);
             return Ok(FileContent::Buf(buf));
         }
-        if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+        // Skip MAP_POPULATE for files < 4MB (same rationale as hash_file)
+        let mmap_result = if size >= 4 * 1024 * 1024 {
+            unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+        } else {
+            unsafe { memmap2::MmapOptions::new().map(&file) }
+        };
+        if let Ok(mmap) = mmap_result {
             #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -757,40 +781,47 @@ fn open_file_content_fast(path: &Path) -> io::Result<FileContent> {
 pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::Result<String>> {
     use blake2b_simd::many::{HashManyJob, hash_many};
 
-    // Phase 1: Read all files into memory in parallel using std::thread::scope.
-    // Avoids rayon thread pool init (~300µs) — lightweight OS threads instead.
-    // For many files (100+), use fast path that skips fstat.
+    // Phase 1: Read all files into memory.
+    // For small file counts (≤10), load sequentially to avoid thread::scope
+    // overhead (~120µs). For many files, use parallel loading with lightweight
+    // OS threads. For 100+ files, use fast path that skips fstat.
     let use_fast = paths.len() >= 20;
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(paths.len());
-    let chunk_size = (paths.len() + num_threads - 1) / num_threads;
 
-    let file_data: Vec<io::Result<FileContent>> = std::thread::scope(|s| {
-        let handles: Vec<_> = paths
-            .chunks(chunk_size)
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&path| {
-                            if use_fast {
-                                open_file_content_fast(path)
-                            } else {
-                                open_file_content(path)
-                            }
-                        })
-                        .collect::<Vec<_>>()
+    let file_data: Vec<io::Result<FileContent>> = if paths.len() <= 10 {
+        // Sequential loading — avoids thread spawn overhead for small batches
+        paths.iter().map(|&path| open_file_content(path)).collect()
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(paths.len());
+        let chunk_size = (paths.len() + num_threads - 1) / num_threads;
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&path| {
+                                if use_fast {
+                                    open_file_content_fast(path)
+                                } else {
+                                    open_file_content(path)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
-    });
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    };
 
     // Phase 2: Build hash_many jobs for successful reads
     let hash_results = {
@@ -836,11 +867,10 @@ pub fn blake2b_hash_files_many(paths: &[&Path], output_bytes: usize) -> Vec<io::
 /// initialization (spawning N-1 threads + setting up work-stealing deques).
 /// Returns results in input order.
 pub fn hash_files_parallel(paths: &[&Path], algo: HashAlgorithm) -> Vec<io::Result<String>> {
-    // Only issue readahead for modest file counts (likely larger files).
-    // For 100+ tiny files, readahead's per-file overhead (open+stat+fadvise+close
-    // = ~30µs/file = ~3ms for 100 files) exceeds its benefit since tiny files
-    // are already served from page cache after warmup.
-    if paths.len() <= 20 {
+    // Readahead for 11-20 files only. For ≤10 files, binaries use sequential
+    // processing (never reach here). For 100+ files, per-file overhead
+    // (open+stat+fadvise+close = ~30µs/file) exceeds page cache benefit.
+    if paths.len() > 10 && paths.len() <= 20 {
         readahead_files_all(paths);
     }
 

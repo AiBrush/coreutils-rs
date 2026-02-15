@@ -87,18 +87,13 @@ impl Write for VmspliceWriter {
         if !self.is_pipe || bufs.is_empty() {
             return (&*self.raw).write_vectored(bufs);
         }
-        // Stack-allocated iovec array: avoids Vec heap allocation on every call.
-        // 1024 matches UIO_MAXIOV (Linux max iovecs per syscall) and the batch
-        // size used by the core tac functions.
+        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
+        // so &[IoSlice] has the same memory layout as &[iovec].
+        // Direct pointer cast eliminates the per-call copy loop (1024 iterations)
+        // and 16KB memset that the stack-allocated array approach required.
         let count = bufs.len().min(1024);
-        let mut iovs: [libc::iovec; 1024] = unsafe { std::mem::zeroed() };
-        for i in 0..count {
-            iovs[i] = libc::iovec {
-                iov_base: bufs[i].as_ptr() as *mut libc::c_void,
-                iov_len: bufs[i].len(),
-            };
-        }
-        let n = unsafe { libc::vmsplice(1, iovs.as_ptr(), count, 0) };
+        let iovs = bufs.as_ptr() as *const libc::iovec;
+        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
         if n >= 0 {
             Ok(n as usize)
         } else {
@@ -301,17 +296,18 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             }
         };
 
-        // Override MADV_SEQUENTIAL from read_file: the contiguous buffer
-        // parallel approach scans forward in chunks (memchr) then copies records
-        // to the output buffer. WILLNEED pre-faults all pages so the parallel
-        // threads don't stall on page faults. Don't use SEQUENTIAL since
-        // multiple threads access different regions concurrently.
+        // Override MADV_SEQUENTIAL from read_file: tac reads forward (memchr scan)
+        // then outputs in reverse. SEQUENTIAL tells the kernel to drop pages behind
+        // the scan cursor, but we need those pages for the reverse output phase.
+        // MADV_NORMAL resets to default (no drop-behind), and WILLNEED pre-faults
+        // all pages so parallel threads don't stall on page faults.
         #[cfg(target_os = "linux")]
         {
             let ptr = data.as_ptr() as *mut libc::c_void;
             let len = data.len();
             if len > 0 {
                 unsafe {
+                    libc::madvise(ptr, len, libc::MADV_NORMAL);
                     libc::madvise(ptr, len, libc::MADV_WILLNEED);
                 }
             }
@@ -345,18 +341,10 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
 }
 
 /// Enlarge pipe buffers on Linux for higher throughput.
-/// Reads system max from /proc, falls back through decreasing sizes.
+/// Skips /proc read (~50µs) — directly tries decreasing sizes via fcntl.
 #[cfg(target_os = "linux")]
 fn enlarge_pipes() {
-    let max_size = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
     for &fd in &[0i32, 1] {
-        if let Some(max) = max_size
-            && unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, max) } > 0
-        {
-            continue;
-        }
         for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
             if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
                 break;

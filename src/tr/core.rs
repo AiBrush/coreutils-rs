@@ -6,14 +6,13 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Stream buffer: 32MB — tr streaming operations (translate, delete, squeeze)
-/// are compute-light (single table lookup or bitset check per byte), so the
-/// bottleneck is I/O syscalls, not cache pressure. 32MB buffer ensures even
-/// large piped inputs require minimal syscall pairs, and the kernel can
-/// transfer the maximum pipe buffer size per read/write call.
-/// For piped input, read_once processes data immediately for pipelining.
-/// This applies to ALL streaming modes (delete, squeeze, translate).
-const STREAM_BUF: usize = 32 * 1024 * 1024;
+/// Stream buffer: 4MB — sized to fit entirely in L3 cache (~8-16MB on modern
+/// CPUs). Data passes through the buffer 3 times (read→translate→write), so
+/// keeping it cache-warm gives ~3-5x throughput vs spilling to DRAM.
+/// For 10MB file: 3 rounds × 4MB buffer at L3 speed (~100 GB/s) ≈ 300µs,
+/// vs 1 round × 16MB buffer at DRAM speed (~20 GB/s) ≈ 1000µs.
+/// For piped input with 8MB pipe buffer: 2 reads per chunk, ~5µs extra syscalls.
+const STREAM_BUF: usize = 4 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap paths.
 /// AVX2 translation runs at ~10 GB/s per core. For 10MB benchmarks,
