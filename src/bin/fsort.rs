@@ -112,6 +112,17 @@ fn main() {
     // to stderr and exits with code 2, rather than being killed by signal 13.
     // Keeping SIGPIPE as SIG_IGN (Rust's default) lets us receive BrokenPipe
     // errors in write() calls and handle them ourselves.
+
+    // Enlarge pipe buffers on Linux for higher throughput.
+    #[cfg(target_os = "linux")]
+    for &fd in &[0i32, 1] {
+        for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
+            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
+                break;
+            }
+        }
+    }
+
     let cli = Cli::parse();
 
     // Parse key definitions

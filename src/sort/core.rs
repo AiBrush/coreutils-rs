@@ -88,6 +88,18 @@ impl SortOutput {
             }
         }
     }
+
+    /// Write IoSlice batch directly to underlying fd, bypassing BufWriter.
+    /// Flushes pending data first, then calls write_vectored on the raw fd.
+    #[inline]
+    fn write_vectored_direct(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            SortOutput::Stdout(w) | SortOutput::File(w) => {
+                w.flush()?;
+                w.get_mut().write_vectored(bufs)
+            }
+        }
+    }
 }
 
 impl Write for SortOutput {
@@ -648,6 +660,31 @@ impl Ord for MergeEntryOrd {
 }
 
 /// Extract an 8-byte prefix from a line for cache-friendly comparison.
+/// Write IoSlice batch via SortOutput, handling partial writes.
+#[inline]
+fn write_all_vectored_sort(writer: &mut SortOutput, slices: &[io::IoSlice<'_>]) -> io::Result<()> {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let written = writer.write_vectored_direct(slices)?;
+    if written >= total {
+        return Ok(());
+    }
+    if written == 0 {
+        return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+    }
+    // Cold path: handle partial write
+    let mut skip = written;
+    for slice in slices {
+        let len = slice.len();
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        writer.write_all_direct(&slice[skip..])?;
+        skip = 0;
+    }
+    Ok(())
+}
+
 /// Software prefetch a cache line for reading.
 /// Hides memory latency by loading data into L1 cache before it's needed.
 #[inline(always)]
@@ -1858,39 +1895,35 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
             }
             writer.write_all_direct(&buf)?;
         } else {
-            // Non-unique output: build contiguous buffer with prefetch.
-            // Total output = data.len() (if trailing newline) or data.len()+1.
-            let total_size = if data.last() == Some(&term_byte) {
-                data.len()
-            } else {
-                data.len() + 1
-            };
-            let mut buf: Vec<u8> = Vec::with_capacity(total_size);
-            let bptr = buf.as_mut_ptr();
-            let mut pos = 0usize;
+            // Non-unique output: zero-copy writev from mmap data.
+            // Each line's terminator is included from original data when possible.
+            // Eliminates ~100MB buffer allocation + memcpy for large files.
+            const BATCH: usize = 1024;
+            let data_len = data.len();
+            let term_slice: &[u8] = &[term_byte];
+            let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
             let iter_reverse = reverse;
             for j in 0..n_sorted {
-                if j + 16 < n_sorted {
-                    let ahead = if iter_reverse {
-                        n_sorted - 1 - (j + 16)
-                    } else {
-                        j + 16
-                    };
-                    prefetch_read(unsafe { dp.add(sorted[ahead].1 as usize) });
-                }
                 let actual = if iter_reverse { n_sorted - 1 - j } else { j };
                 let (_, s, l) = sorted[actual];
-                let len = l as usize;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(dp.add(s as usize), bptr.add(pos), len);
-                    *bptr.add(pos + len) = term_byte;
+                let su = s as usize;
+                let lu = l as usize;
+                let end = su + lu;
+                if end < data_len {
+                    // Include terminator from original data (zero-copy)
+                    slices.push(io::IoSlice::new(&data[su..end + 1]));
+                } else {
+                    slices.push(io::IoSlice::new(&data[su..end]));
+                    slices.push(io::IoSlice::new(term_slice));
                 }
-                pos += len + 1;
+                if slices.len() >= BATCH {
+                    write_all_vectored_sort(&mut writer, &slices)?;
+                    slices.clear();
+                }
             }
-            unsafe {
-                buf.set_len(pos);
+            if !slices.is_empty() {
+                write_all_vectored_sort(&mut writer, &slices)?;
             }
-            writer.write_all_direct(&buf)?;
         }
     } else if is_fold_case_lex && num_lines > 256 {
         // FAST PATH 1b: Case-insensitive prefix sort (sort -f)
