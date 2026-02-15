@@ -289,24 +289,52 @@ fn write_wrapped_iov(encoded: &[u8], wrap_col: usize, out: &mut impl Write) -> i
         return write_all_vectored(out, &iov);
     }
 
-    // Large output: write in batches
-    let mut iov: Vec<io::IoSlice> = Vec::with_capacity(MAX_IOV);
-    let mut pos = 0;
-    for _ in 0..num_full_lines {
-        iov.push(io::IoSlice::new(&encoded[pos..pos + wrap_col]));
-        iov.push(io::IoSlice::new(&NEWLINE));
-        pos += wrap_col;
-        if iov.len() >= MAX_IOV {
-            write_all_vectored(out, &iov)?;
-            iov.clear();
-        }
+    // Large output: fuse batches of lines into a reusable L1-cached buffer.
+    // Each batch copies ~39KB (512 lines × 77 bytes) from the encoded buffer
+    // with newlines inserted, then writes as a single contiguous write(2).
+    // This is faster than writev with 1024 IoSlice entries because:
+    // - One kernel memcpy per batch vs 1024 separate copies
+    // - Fused buffer (39KB) stays hot in L1 cache across batches
+    let line_out = wrap_col + 1;
+    const BATCH_LINES: usize = 512;
+    let batch_fused_size = BATCH_LINES * line_out;
+    let mut fused: Vec<u8> = Vec::with_capacity(batch_fused_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        fused.set_len(batch_fused_size);
     }
+
+    let mut rp = 0;
+    let mut lines_done = 0;
+
+    // Process full batches using 8-line unrolled fuse_wrap
+    while lines_done + BATCH_LINES <= num_full_lines {
+        let n = fuse_wrap(
+            &encoded[rp..rp + BATCH_LINES * wrap_col],
+            wrap_col,
+            &mut fused,
+        );
+        out.write_all(&fused[..n])?;
+        rp += BATCH_LINES * wrap_col;
+        lines_done += BATCH_LINES;
+    }
+
+    // Remaining full lines (partial batch)
+    let remaining_lines = num_full_lines - lines_done;
+    if remaining_lines > 0 {
+        let n = fuse_wrap(
+            &encoded[rp..rp + remaining_lines * wrap_col],
+            wrap_col,
+            &mut fused,
+        );
+        out.write_all(&fused[..n])?;
+        rp += remaining_lines * wrap_col;
+    }
+
+    // Partial last line
     if remainder > 0 {
-        iov.push(io::IoSlice::new(&encoded[pos..pos + remainder]));
-        iov.push(io::IoSlice::new(&NEWLINE));
-    }
-    if !iov.is_empty() {
-        write_all_vectored(out, &iov)?;
+        out.write_all(&encoded[rp..rp + remainder])?;
+        out.write_all(b"\n")?;
     }
     Ok(())
 }
@@ -423,7 +451,6 @@ fn encode_wrapped_parallel(
 /// Uses ptr::copy_nonoverlapping with 8-line unrolling for max throughput.
 /// Returns number of bytes written.
 #[inline]
-#[allow(dead_code)]
 fn fuse_wrap(encoded: &[u8], wrap_col: usize, out_buf: &mut [u8]) -> usize {
     let line_out = wrap_col + 1; // wrap_col data bytes + 1 newline
     let mut rp = 0;
