@@ -3869,17 +3869,10 @@ pub fn translate_mmap_inplace(
         return writer.write_all(data);
     }
 
-    // For data that's being translated in a MAP_PRIVATE mmap, every modified page
-    // triggers a COW fault. For small-to-medium files where most bytes change,
-    // reading from mmap (read-only) + writing to a separate heap buffer is faster
-    // because it avoids COW faults entirely. The output buffer is fresh memory
-    // (no COW), and the input mmap stays read-only (MADV_SEQUENTIAL).
-    // Threshold: 64MB. For benchmark-sized files (10MB), avoid COW entirely.
-    const SEPARATE_BUF_THRESHOLD: usize = 64 * 1024 * 1024;
-
-    if data.len() < SEPARATE_BUF_THRESHOLD {
-        return translate_to_separate_buf(data, &table, writer);
-    }
+    // Always translate in-place. With MAP_PRIVATE + MADV_HUGEPAGE, COW faults
+    // use 2MB pages — even for 10MB files only ~5 COW faults (~10µs), which is
+    // far cheaper than allocating a separate 10MB output buffer (~300µs).
+    // This eliminates the output buffer allocation + data copy entirely.
 
     // Try SIMD fast path for single-range constant-offset translations (e.g., a-z -> A-Z)
     if let Some((lo, hi, offset)) = detect_range_offset(&table) {

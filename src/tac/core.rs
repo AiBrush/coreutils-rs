@@ -3,22 +3,21 @@ use std::io::{self, IoSlice, Write};
 /// Threshold for parallel processing (2MB).
 /// With contiguous per-thread output buffers and std::thread::scope (no rayon overhead),
 /// the parallel path amortizes thread creation (~100us) at 2MB+. Below 2MB, the
-/// contiguous sequential buffer path handles it efficiently.
+/// streaming IoSlice path handles it efficiently.
 const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Reverse records separated by a single byte.
-/// Scans for separators with SIMD memchr, then outputs records in reverse
-/// order directly from the input buffer. Expects the caller to provide
-/// a buffered writer (e.g., BufWriter) for efficient syscall batching.
+/// For large data (>= 2MB): parallel scan + copy into contiguous output buffer, single write.
+/// For small data: streaming IoSlice batches with write_vectored.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
     if data.len() >= PARALLEL_THRESHOLD {
         if !before {
-            tac_bytes_after_parallel(data, separator, out)
+            tac_bytes_after_contiguous(data, separator, out)
         } else {
-            tac_bytes_before_parallel(data, separator, out)
+            tac_bytes_before_contiguous(data, separator, out)
         }
     } else if !before {
         tac_bytes_after(data, separator, out)
@@ -73,107 +72,150 @@ fn split_into_chunks(data: &[u8], sep: u8) -> Vec<usize> {
     boundaries
 }
 
-/// Zero-copy parallel after-separator mode: each thread finds record boundaries
-/// in its chunk, returning (offset, length) pairs. No data is copied — output
-/// uses IoSlice entries pointing directly into the original mmap data.
+/// Contiguous buffer parallel after-separator mode: each thread scans its chunk
+/// backward with SIMD memrchr and copies reversed records into a contiguous output
+/// buffer. Then a single write_all outputs the entire reversed data.
 ///
-/// For 100MB input: eliminates ~100MB buffer allocation + ~100MB memcpy.
-/// Instead allocates ~40MB of (offset, len) metadata for ~2.5M records.
-fn tac_bytes_after_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+/// For 100MB: eliminates ~2500 writev/vmsplice syscalls → 1 write_all call.
+/// Trades metadata allocation (~40MB Vec<(usize,usize)>) for a same-sized output
+/// buffer but with much faster output (1 syscall vs ~2500).
+fn tac_bytes_after_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let boundaries = split_into_chunks(data, sep);
     let n_chunks = boundaries.len() - 1;
     if n_chunks == 0 {
         return out.write_all(data);
     }
 
-    // Each thread scans its chunk backward with memrchr_iter to find record
-    // boundaries. Returns (absolute_offset, length) pairs in reverse line order.
-    // Zero data copy — only metadata is allocated.
-    let results: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n_chunks)
-            .map(|i| {
-                let start = boundaries[i];
-                let end = boundaries[i + 1];
+    let mut buf = alloc_uninit_buf(data.len());
+
+    // Split buf into per-chunk output slices, chunks in reverse order.
+    // Each thread gets its own exclusive &mut [u8] slice — no data races.
+    {
+        let mut remaining = buf.as_mut_slice();
+        let mut slices: Vec<(usize, &mut [u8])> = Vec::with_capacity(n_chunks);
+
+        for i in (0..n_chunks).rev() {
+            let chunk_size = boundaries[i + 1] - boundaries[i];
+            let (slice, rest) = remaining.split_at_mut(chunk_size);
+            slices.push((i, slice));
+            remaining = rest;
+        }
+
+        std::thread::scope(|s| {
+            for (chunk_idx, dst) in slices {
+                let start = boundaries[chunk_idx];
+                let end = boundaries[chunk_idx + 1];
                 s.spawn(move || {
-                    let chunk = &data[start..end];
-                    let chunk_len = chunk.len();
-                    // Estimate capacity instead of counting separators: avoids a full
-                    // O(n) SIMD forward pass. Over-estimates ~2x for typical text;
-                    // under-estimates cause cheap amortized Vec reallocation.
-                    let estimated = chunk_len / 32 + 64;
-                    let mut records: Vec<(usize, usize)> = Vec::with_capacity(estimated);
+                    tac_copy_after(&data[start..end], sep, dst);
+                });
+            }
+        });
+    } // mutable borrows end here
 
-                    let mut rec_end = chunk_len;
-                    for pos in memchr::memrchr_iter(sep, chunk) {
-                        let rec_start = pos + 1;
-                        let rec_len = rec_end - rec_start;
-                        if rec_len > 0 {
-                            records.push((start + rec_start, rec_len));
-                        }
-                        rec_end = rec_start;
-                    }
-                    if rec_end > 0 {
-                        records.push((start, rec_end));
-                    }
-                    records
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Output in reverse chunk order, each chunk's records already reversed.
-    // Batch into groups of 1024 iovecs to match kernel UIO_MAXIOV limit.
-    write_records_batched(out, data, results.iter().rev().flat_map(|r| r.iter()))
+    out.write_all(&buf)
 }
 
-/// Zero-copy parallel before-separator mode: each thread finds record boundaries
-/// in its chunk, returning (offset, length) pairs. No data is copied.
-fn tac_bytes_before_parallel(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
+/// Contiguous buffer parallel before-separator mode.
+fn tac_bytes_before_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let mut boundaries = split_into_chunks(data, sep);
     let n_chunks = boundaries.len() - 1;
     if n_chunks == 0 {
         return out.write_all(data);
     }
 
-    // split_into_chunks places boundaries at sep+1 (after separator) for "after" mode.
-    // For "before" mode, boundaries must be AT the separator so it stays with its
-    // record in the next chunk.
+    // Adjust boundaries for before mode: boundary at sep, not sep+1
     let last = boundaries.len() - 1;
     for b in boundaries[1..last].iter_mut() {
         *b -= 1;
     }
 
-    let results: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n_chunks)
-            .map(|i| {
-                let start = boundaries[i];
-                let end = boundaries[i + 1];
+    let mut buf = alloc_uninit_buf(data.len());
+
+    {
+        let mut remaining = buf.as_mut_slice();
+        let mut slices: Vec<(usize, &mut [u8])> = Vec::with_capacity(n_chunks);
+
+        for i in (0..n_chunks).rev() {
+            let chunk_size = boundaries[i + 1] - boundaries[i];
+            let (slice, rest) = remaining.split_at_mut(chunk_size);
+            slices.push((i, slice));
+            remaining = rest;
+        }
+
+        std::thread::scope(|s| {
+            for (chunk_idx, dst) in slices {
+                let start = boundaries[chunk_idx];
+                let end = boundaries[chunk_idx + 1];
                 s.spawn(move || {
-                    let chunk = &data[start..end];
-                    let chunk_len = chunk.len();
-                    let estimated = chunk_len / 32 + 64;
-                    let mut records: Vec<(usize, usize)> = Vec::with_capacity(estimated);
+                    tac_copy_before(&data[start..end], sep, dst);
+                });
+            }
+        });
+    }
 
-                    let mut rec_end = chunk_len;
-                    for pos in memchr::memrchr_iter(sep, chunk) {
-                        let rec_len = rec_end - pos;
-                        if rec_len > 0 {
-                            records.push((start + pos, rec_len));
-                        }
-                        rec_end = pos;
-                    }
-                    if rec_end > 0 {
-                        records.push((start, rec_end));
-                    }
-                    records
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    out.write_all(&buf)
+}
 
-    write_records_batched(out, data, results.iter().rev().flat_map(|r| r.iter()))
+/// Copy reversed records (after-separator mode) from src into dst.
+/// Scans backward with SIMD memrchr, copies each record forward into dst.
+#[inline]
+fn tac_copy_after(src: &[u8], sep: u8, dst: &mut [u8]) {
+    let mut end = src.len();
+    let mut wp = 0;
+
+    for pos in memchr::memrchr_iter(sep, src) {
+        let rec_start = pos + 1;
+        if rec_start < end {
+            let len = end - rec_start;
+            dst[wp..wp + len].copy_from_slice(&src[rec_start..end]);
+            wp += len;
+        }
+        end = rec_start;
+    }
+
+    if end > 0 {
+        dst[wp..wp + end].copy_from_slice(&src[..end]);
+    }
+}
+
+/// Copy reversed records (before-separator mode) from src into dst.
+#[inline]
+fn tac_copy_before(src: &[u8], sep: u8, dst: &mut [u8]) {
+    let mut end = src.len();
+    let mut wp = 0;
+
+    for pos in memchr::memrchr_iter(sep, src) {
+        if pos < end {
+            let len = end - pos;
+            dst[wp..wp + len].copy_from_slice(&src[pos..end]);
+            wp += len;
+        }
+        end = pos;
+    }
+
+    if end > 0 {
+        dst[wp..wp + end].copy_from_slice(&src[..end]);
+    }
+}
+
+/// Allocate a Vec<u8> of given length without zero-initialization.
+/// Uses MADV_HUGEPAGE on Linux for buffers >= 2MB to reduce TLB misses.
+#[inline]
+#[allow(clippy::uninit_vec)]
+fn alloc_uninit_buf(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    #[cfg(target_os = "linux")]
+    if len >= 2 * 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                v.as_mut_ptr() as *mut libc::c_void,
+                len,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+    v
 }
 
 /// Zero-copy after-separator mode: streaming IoSlice directly from input data.
@@ -434,29 +476,6 @@ pub fn tac_regex_separator(
     }
 
     write_all_vectored(out, &slices)
-}
-
-/// Write (offset, length) record pairs from parallel results as batched IoSlice.
-/// Batches into groups of 1024 iovecs to match kernel UIO_MAXIOV limit.
-fn write_records_batched<'a>(
-    out: &mut impl Write,
-    data: &[u8],
-    records: impl Iterator<Item = &'a (usize, usize)>,
-) -> io::Result<()> {
-    const BATCH: usize = 1024;
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(BATCH);
-
-    for &(offset, len) in records {
-        slices.push(IoSlice::new(&data[offset..offset + len]));
-        if slices.len() >= BATCH {
-            write_all_vectored(out, &slices)?;
-            slices.clear();
-        }
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
 }
 
 /// Write all IoSlice entries, handling partial writes.

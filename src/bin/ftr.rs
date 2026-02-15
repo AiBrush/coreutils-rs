@@ -378,89 +378,55 @@ fn main() {
             tr::expand_set2(set2_str, set1.len())
         };
 
-        // For translate mode, mmap any regular file (threshold=0) to avoid
-        // the kernel→userspace copy from read(). For piped input, fall through
-        // to the streaming path with VmspliceWriter for zero-copy output.
-        let result = if let Some(mm) = try_mmap_stdin_with_threshold(0) {
-            if mm.len() < 64 * 1024 * 1024 {
-                // Read-only mmap: translate into separate buffer (no COW faults)
-                #[cfg(target_os = "linux")]
-                {
-                    let mut writer = VmspliceWriter::new();
-                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut writer)
-                }
-                #[cfg(all(unix, not(target_os = "linux")))]
-                {
-                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut *raw)
-                }
-                #[cfg(not(unix))]
-                {
-                    let stdout = io::stdout();
-                    let mut lock = stdout.lock();
-                    tr::translate_mmap_readonly(&set1, &set2, &mm, &mut lock)
-                }
-            } else {
-                // Large file: use MAP_PRIVATE for in-place translate
-                drop(mm);
-                if let Some(mut mm_mut) = try_mmap_stdin_mut() {
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut writer = VmspliceWriter::new();
-                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut writer)
-                    }
-                    #[cfg(all(unix, not(target_os = "linux")))]
-                    {
-                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let stdout = io::stdout();
-                        let mut lock = stdout.lock();
-                        tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
-                    }
-                } else {
-                    // Fallback: read all stdin, translate in-place, write.
-                    // Vec heap pages are NOT safe for vmsplice — use raw write(2).
-                    #[cfg(target_os = "linux")]
-                    {
-                        match coreutils_rs::common::io::read_stdin() {
-                            Ok(mut data) => {
-                                let mut raw_out =
-                                    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                                tr::translate_owned(&set1, &set2, &mut data, &mut *raw_out)
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    #[cfg(all(unix, not(target_os = "linux")))]
-                    {
-                        let stdin = io::stdin();
-                        let mut reader = stdin.lock();
-                        tr::translate(&set1, &set2, &mut reader, &mut *raw)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let stdin = io::stdin();
-                        let mut reader = stdin.lock();
-                        let stdout = io::stdout();
-                        let mut lock = stdout.lock();
-                        tr::translate(&set1, &set2, &mut reader, &mut lock)
-                    }
-                }
+        // Try MAP_PRIVATE mmap first for in-place translate (avoids separate buffer
+        // allocation). With MADV_HUGEPAGE, COW faults use 2MB pages — even for 10MB
+        // files, only ~5 COW faults (~10µs). This is faster than allocating a 10MB
+        // separate output buffer (~300µs) + copying translated data into it.
+        let result = if let Some(mut mm_mut) = try_mmap_stdin_mut() {
+            // MAP_PRIVATE mmap: translate in-place, then write the mmap data.
+            // vmsplice is safe: get_user_pages() pins the COW pages, keeping them
+            // alive even after the mmap is unmapped. Pages are only freed after
+            // the pipe reader releases its references.
+            #[cfg(target_os = "linux")]
+            {
+                let mut writer = VmspliceWriter::new();
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut writer)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw)
+            }
+            #[cfg(not(unix))]
+            {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
+            }
+        } else if let Some(mm) = try_mmap_stdin_with_threshold(0) {
+            // Fallback: read-only mmap + separate buffer translate
+            #[cfg(target_os = "linux")]
+            {
+                let mut writer = VmspliceWriter::new();
+                tr::translate_mmap_readonly(&set1, &set2, &mm, &mut writer)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                tr::translate_mmap_readonly(&set1, &set2, &mm, &mut *raw)
+            }
+            #[cfg(not(unix))]
+            {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                tr::translate_mmap_readonly(&set1, &set2, &mm, &mut lock)
             }
         } else {
-            // Piped stdin: try splice+mmap for zero-copy (kernel→kernel transfer),
-            // then translate in-place + vmsplice output. This eliminates BOTH user-space
-            // copies that the streaming path requires (read copy + write copy).
-            // Falls back to streaming translate if splice is not available.
+            // Piped stdin: try splice+mmap for zero-copy, then translate in-place.
             #[cfg(target_os = "linux")]
             {
                 if let Ok(Some(mut mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
                     let mut writer = VmspliceWriter::new();
                     tr::translate_owned(&set1, &set2, &mut mmap, &mut writer)
                 } else {
-                    // Fallback: read all stdin, translate in-place, raw write output.
-                    // Vec heap pages are NOT safe for vmsplice — use raw write(2).
                     match coreutils_rs::common::io::read_stdin() {
                         Ok(mut data) => {
                             let mut raw_out =
