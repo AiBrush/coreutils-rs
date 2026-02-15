@@ -1280,7 +1280,11 @@ fn process_complement_single_field(
     Ok(())
 }
 
-/// Process a chunk for complement single-field extraction.
+/// Process a chunk for complement single-field extraction using memchr2 single-pass.
+/// Scans for both delimiter and line_delim in one SIMD pass, tracking delimiter count
+/// per line. When the skip field's bounding delimiters are found, copies prefix + suffix.
+/// This eliminates the per-line memchr_iter setup overhead and reduces from two SIMD
+/// passes (outer newline scan + inner delimiter scan) to one.
 fn complement_single_field_chunk(
     data: &[u8],
     delim: u8,
@@ -1289,24 +1293,212 @@ fn complement_single_field_chunk(
     suppress: bool,
     buf: &mut Vec<u8>,
 ) {
-    // Pre-reserve entire chunk capacity to eliminate per-line reserve overhead.
-    // Complement output is always <= input size (skipping one field).
-    buf.reserve(data.len());
-    let mut start = 0;
-    for end_pos in memchr_iter(line_delim, data) {
-        let line = &data[start..end_pos];
-        complement_single_field_line(line, delim, skip_idx, line_delim, suppress, buf);
-        start = end_pos + 1;
+    // When delim == line_delim, fall back to per-line approach
+    if delim == line_delim {
+        buf.reserve(data.len());
+        let mut start = 0;
+        for end_pos in memchr_iter(line_delim, data) {
+            let line = &data[start..end_pos];
+            complement_single_field_line(line, delim, skip_idx, line_delim, suppress, buf);
+            start = end_pos + 1;
+        }
+        if start < data.len() {
+            complement_single_field_line(
+                &data[start..],
+                delim,
+                skip_idx,
+                line_delim,
+                suppress,
+                buf,
+            );
+        }
+        return;
     }
-    if start < data.len() {
-        complement_single_field_line(&data[start..], delim, skip_idx, line_delim, suppress, buf);
+
+    buf.reserve(data.len());
+    let base = data.as_ptr();
+    let data_len = data.len();
+    let need_before = skip_idx; // delimiters before skip field
+    let need_total = skip_idx + 1; // delimiters to find end of skip field
+
+    // Per-line state
+    let mut line_start: usize = 0;
+    let mut delim_count: usize = 0;
+    let mut skip_start_pos: usize = 0;
+    let mut skip_end_pos: usize = 0;
+    let mut found_start = need_before == 0; // skip_idx==0 means skip starts at line start
+    let mut found_end = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+
+        if byte == line_delim {
+            // End of line: emit based on what we found
+            if delim_count == 0 {
+                // No delimiter in line
+                if !suppress {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                }
+            } else if !found_start || delim_count < need_before {
+                // Not enough delimiters to reach skip field — output entire line
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else {
+                let has_prefix = skip_idx > 0;
+                let has_suffix = found_end && skip_end_pos < pos;
+
+                if has_prefix && has_suffix {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(
+                                base.add(line_start),
+                                skip_start_pos - 1 - line_start,
+                            ),
+                        );
+                        buf_push(buf, delim);
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(
+                                base.add(skip_end_pos + 1),
+                                pos - skip_end_pos - 1,
+                            ),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                } else if has_prefix {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(
+                                base.add(line_start),
+                                skip_start_pos - 1 - line_start,
+                            ),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                } else if has_suffix {
+                    unsafe {
+                        buf_extend(
+                            buf,
+                            std::slice::from_raw_parts(
+                                base.add(skip_end_pos + 1),
+                                pos - skip_end_pos - 1,
+                            ),
+                        );
+                        buf_push(buf, line_delim);
+                    }
+                } else {
+                    unsafe { buf_push(buf, line_delim) };
+                }
+            }
+
+            // Reset for next line
+            line_start = pos + 1;
+            delim_count = 0;
+            skip_start_pos = 0;
+            skip_end_pos = 0;
+            found_start = need_before == 0;
+            found_end = false;
+        } else {
+            // Delimiter found
+            delim_count += 1;
+            if delim_count == need_before {
+                skip_start_pos = pos + 1;
+                found_start = true;
+            }
+            if delim_count == need_total {
+                skip_end_pos = pos;
+                found_end = true;
+            }
+        }
+    }
+
+    // Handle last line without trailing line_delim
+    if line_start < data_len {
+        let pos = data_len;
+        if delim_count == 0 {
+            if !suppress {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            }
+        } else if !found_start || delim_count < need_before {
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                );
+                buf_push(buf, line_delim);
+            }
+        } else {
+            let has_prefix = skip_idx > 0;
+            let has_suffix = found_end && skip_end_pos < pos;
+
+            if has_prefix && has_suffix {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(
+                            base.add(line_start),
+                            skip_start_pos - 1 - line_start,
+                        ),
+                    );
+                    buf_push(buf, delim);
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(
+                            base.add(skip_end_pos + 1),
+                            pos - skip_end_pos - 1,
+                        ),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else if has_prefix {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(
+                            base.add(line_start),
+                            skip_start_pos - 1 - line_start,
+                        ),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else if has_suffix {
+                unsafe {
+                    buf_extend(
+                        buf,
+                        std::slice::from_raw_parts(
+                            base.add(skip_end_pos + 1),
+                            pos - skip_end_pos - 1,
+                        ),
+                    );
+                    buf_push(buf, line_delim);
+                }
+            } else {
+                unsafe { buf_push(buf, line_delim) };
+            }
+        }
     }
 }
 
-/// Extract all fields except skip_idx from one line.
-/// Optimized: finds only the delimiters bounding the skip field (skip_idx-th
-/// and (skip_idx+1)-th delimiters), then copies prefix + suffix in 2 bulk
-/// copies instead of iterating through all fields.
+/// Fallback per-line complement single-field extraction (for delim == line_delim).
 #[inline(always)]
 fn complement_single_field_line(
     line: &[u8],
@@ -1324,20 +1516,13 @@ fn complement_single_field_line(
         return;
     }
 
-    // Note: no per-line buf.reserve — complement_single_field_chunk already reserves data.len()
     let base = line.as_ptr();
-
-    // Find the delimiters bounding the skip field:
-    // - We need skip_idx delimiters to find where the skip field starts
-    // - We need one more delimiter to find where it ends
-    // For skip_idx == 0 (skip field 1): skip field starts at 0, ends at first delimiter
-    // For skip_idx == 1 (skip field 2): skip field starts after 1st delim, ends at 2nd delim
-    let need_before = skip_idx; // delimiters before skip field
-    let need_total = skip_idx + 1; // delimiters to find end of skip field
+    let need_before = skip_idx;
+    let need_total = skip_idx + 1;
 
     let mut delim_count: usize = 0;
-    let mut skip_start_pos: usize = 0; // byte start of skip field
-    let mut skip_end_pos: usize = len; // byte position of delimiter after skip field (or EOL)
+    let mut skip_start_pos: usize = 0;
+    let mut skip_end_pos: usize = len;
     let mut found_end = false;
 
     for pos in memchr_iter(delim, line) {
@@ -1353,7 +1538,6 @@ fn complement_single_field_line(
     }
 
     if delim_count == 0 {
-        // No delimiter in line
         if !suppress {
             unsafe {
                 buf_extend(buf, line);
@@ -1363,7 +1547,6 @@ fn complement_single_field_line(
         return;
     }
 
-    // Not enough delimiters to reach the skip field: output entire line
     if delim_count < need_before {
         unsafe {
             buf_extend(buf, line);
@@ -1372,14 +1555,10 @@ fn complement_single_field_line(
         return;
     }
 
-    // skip field is at positions skip_start_pos..skip_end_pos
-    // Output prefix (before skip field) + suffix (after skip field)
     let has_prefix = skip_idx > 0 && skip_start_pos > 0;
     let has_suffix = found_end && skip_end_pos < len;
 
     if has_prefix && has_suffix {
-        // prefix = line[0..skip_start_pos-1] (before the delimiter that starts skip field)
-        // suffix = line[skip_end_pos+1..] (after the delimiter that ends skip field)
         unsafe {
             buf_extend(buf, std::slice::from_raw_parts(base, skip_start_pos - 1));
             buf_push(buf, delim);
@@ -1390,13 +1569,11 @@ fn complement_single_field_line(
             buf_push(buf, line_delim);
         }
     } else if has_prefix {
-        // Only prefix (skip field is the last field)
         unsafe {
             buf_extend(buf, std::slice::from_raw_parts(base, skip_start_pos - 1));
             buf_push(buf, line_delim);
         }
     } else if has_suffix {
-        // No prefix (skip field is the first field)
         unsafe {
             buf_extend(
                 buf,
@@ -1405,7 +1582,6 @@ fn complement_single_field_line(
             buf_push(buf, line_delim);
         }
     } else {
-        // Skip field is the only field (or entire line)
         unsafe { buf_push(buf, line_delim) };
     }
 }
