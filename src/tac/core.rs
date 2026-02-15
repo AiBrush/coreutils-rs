@@ -160,11 +160,12 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
     let mut buf: Vec<u8> = Vec::with_capacity(data_len);
     let src = data.as_ptr();
 
-    // SAFETY: We pre-allocated data_len capacity. Total bytes copied equals data_len
-    // exactly (every byte appears in exactly one record). We use raw pointer writes
-    // to skip per-copy capacity checks and Vec length updates.
+    // SAFETY: We pre-allocated data_len capacity. Total bytes copied is <= data_len
+    // (records excluding separator bytes). Each byte appears in at most one record.
+    // We use raw pointer writes to skip per-copy capacity checks and Vec length updates.
     unsafe {
-        let mut dst = buf.as_mut_ptr();
+        let buf_start = buf.as_mut_ptr();
+        let mut dst = buf_start;
         let mut end = data_len;
 
         for pos in memchr::memrchr_iter(sep, data) {
@@ -183,7 +184,7 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
             dst = dst.add(end);
         }
 
-        buf.set_len(dst.offset_from(buf.as_ptr()) as usize);
+        buf.set_len(dst as usize - buf_start as usize);
     }
 
     if !buf.is_empty() {
@@ -204,7 +205,8 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
     let src = data.as_ptr();
 
     unsafe {
-        let mut dst = buf.as_mut_ptr();
+        let buf_start = buf.as_mut_ptr();
+        let mut dst = buf_start;
         let mut end = data_len;
 
         for pos in memchr::memrchr_iter(sep, data) {
@@ -222,7 +224,7 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
             dst = dst.add(end);
         }
 
-        buf.set_len(dst.offset_from(buf.as_ptr()) as usize);
+        buf.set_len(dst as usize - buf_start as usize);
     }
 
     if !buf.is_empty() {
