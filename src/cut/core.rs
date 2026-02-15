@@ -2110,49 +2110,46 @@ fn single_field1_parallel(
     write_ioslices(out, &slices)
 }
 
-/// Extract field 1 from a chunk using memchr2 single-pass scanning.
-/// Uses memchr2(delim, line_delim) to find the first special byte per line:
-/// - If delimiter: field 1 = data[line_start..delim_pos], skip to next newline
-/// - If newline: no delimiter on this line, output unchanged
-/// This scans ~N total bytes vs ~1.5N for two-level (outer newline + inner delimiter).
+/// Extract field 1 from a chunk using memchr2_iter single-pass SIMD scanning.
+/// Uses a single memchr2_iter pass over the entire chunk to find both delimiters
+/// and newlines. This eliminates the per-line memchr function call overhead
+/// (~5-10ns per call × 2 calls per line) that dominates for short-field data.
+/// For 100MB with 1M lines: saves ~10-20ms of function call setup overhead.
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
-    use memchr::memchr2;
     buf.reserve(data.len());
-    let mut pos = 0;
-    while pos < data.len() {
-        match memchr2(delim, line_delim, &data[pos..]) {
-            None => {
-                // Rest is a partial line, no delimiter — output as-is
+    let base = data.as_ptr();
+    let mut line_start: usize = 0;
+    let mut found_delim = false;
+
+    for pos in memchr::memchr2_iter(delim, line_delim, data) {
+        let byte = unsafe { *base.add(pos) };
+        if byte == line_delim {
+            if !found_delim {
+                // No delimiter on this line — output entire line including newline
                 unsafe {
-                    buf_extend(buf, &data[pos..]);
+                    buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), pos + 1 - line_start));
                 }
-                break;
+            } else {
+                // Delimiter was found earlier — just add the line terminator
+                unsafe { buf_push(buf, line_delim) };
             }
-            Some(offset) => {
-                let actual = pos + offset;
-                if data[actual] == line_delim {
-                    // No delimiter on this line — output entire line including newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual + 1]);
-                    }
-                    pos = actual + 1;
-                } else {
-                    // Delimiter found — output field 1 (up to delimiter) + newline
-                    unsafe {
-                        buf_extend(buf, &data[pos..actual]);
-                        buf_push(buf, line_delim);
-                    }
-                    // Skip to next newline
-                    match memchr::memchr(line_delim, &data[actual + 1..]) {
-                        None => {
-                            pos = data.len();
-                        }
-                        Some(nl_off) => {
-                            pos = actual + 1 + nl_off + 1;
-                        }
-                    }
-                }
+            line_start = pos + 1;
+            found_delim = false;
+        } else if !found_delim {
+            // First delimiter on this line — output field 1
+            unsafe {
+                buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), pos - line_start));
+            }
+            found_delim = true;
+        }
+        // Subsequent delimiters on same line: ignore
+    }
+    // Handle trailing data without final line_delim
+    if line_start < data.len() {
+        if !found_delim {
+            unsafe {
+                buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), data.len() - line_start));
             }
         }
     }
