@@ -356,6 +356,14 @@ fn enlarge_pipes() {
 fn main() {
     coreutils_rs::common::reset_sigpipe();
 
+    // Pre-warm rayon's global thread pool in background (opportunistic).
+    // Overlaps pool creation (~200-500µs) with arg parsing and file I/O.
+    // Race with first rayon::scope() is safe: build_global() is internally
+    // synchronized — whichever call wins initializes the pool, the other is a no-op.
+    std::thread::spawn(|| {
+        let _ = rayon::ThreadPoolBuilder::new().build_global();
+    });
+
     #[cfg(target_os = "linux")]
     enlarge_pipes();
 
