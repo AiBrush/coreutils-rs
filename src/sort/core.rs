@@ -249,6 +249,7 @@ fn compare_lines_inner(
 /// Parallel line boundary detection for large files (>4MB).
 /// Splits data into thread-count chunks aligned at delimiter boundaries,
 /// then scans each chunk concurrently with SIMD memchr.
+#[allow(clippy::type_complexity)]
 fn find_lines_parallel(data: &[u8], delimiter: u8) -> (Vec<(usize, usize)>, bool) {
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = data.len() / num_threads;
@@ -330,6 +331,7 @@ fn find_lines_parallel(data: &[u8], delimiter: u8) -> (Vec<(usize, usize)>, bool
 /// Read all input into a single contiguous buffer and compute line offsets.
 /// Uses mmap for single-file input (zero-copy), Vec for stdin/multi-file.
 /// Returns (buffer, offsets, has_cr) where has_cr indicates CRLF line endings were found.
+#[allow(clippy::type_complexity)]
 fn read_all_input(
     inputs: &[String],
     zero_terminated: bool,
