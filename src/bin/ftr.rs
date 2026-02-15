@@ -429,8 +429,7 @@ fn main() {
             {
                 let stdin = io::stdin();
                 let mut reader = stdin.lock();
-                let mut raw_out =
-                    unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
                 tr::translate(&set1, &set2, &mut reader, &mut *raw_out)
             }
             #[cfg(all(unix, not(target_os = "linux")))]
