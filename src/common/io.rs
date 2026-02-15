@@ -84,20 +84,26 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
 
         // SAFETY: Read-only mapping. No MAP_POPULATE — it synchronously faults
         // all pages with 4KB before MADV_HUGEPAGE can take effect, causing ~25,600
-        // minor page faults for 100MB (~25ms overhead). Without it, HUGEPAGE hint
-        // is set first, then WILLNEED triggers async readahead using 2MB pages
-        // (~50 faults = ~0.1ms).
+        // minor page faults for 100MB (~12.5ms overhead). Without it, HUGEPAGE hint
+        // is set first, then POPULATE_READ prefaults using 2MB pages (~50 faults).
         match unsafe { MmapOptions::new().map(&file) } {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
                 {
                     // HUGEPAGE MUST come first: reduces 25,600 minor faults (4KB) to
-                    // ~50 faults (2MB) for 100MB files. Saves ~25ms of page fault overhead.
+                    // ~50 faults (2MB) for 100MB files. Saves ~12ms of page fault overhead.
                     if len >= 2 * 1024 * 1024 {
                         let _ = mmap.advise(memmap2::Advice::HugePage);
                     }
                     let _ = mmap.advise(memmap2::Advice::Sequential);
-                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+                    // POPULATE_READ (5.14+): prefault with huge pages. Fall back to WillNeed.
+                    if len >= 4 * 1024 * 1024 {
+                        if mmap.advise(memmap2::Advice::PopulateRead).is_err() {
+                            let _ = mmap.advise(memmap2::Advice::WillNeed);
+                        }
+                    } else {
+                        let _ = mmap.advise(memmap2::Advice::WillNeed);
+                    }
                 }
                 Ok(FileData::Mmap(mmap))
             }
@@ -136,28 +142,23 @@ pub fn read_file_vec(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read a file always using mmap, with MADV_HUGEPAGE + WILLNEED.
-/// Used by tac for large files (>= 16MB) that benefit from zero-copy
-/// vmsplice output and parallel scanning. Callers should use read_file_vec()
-/// for smaller files to avoid mmap page fault overhead.
+/// Read a file always using mmap, with optimal page fault strategy.
+/// Used by tac for zero-copy output and parallel scanning.
 ///
-/// No MAP_POPULATE: it synchronously faults all pages with 4KB BEFORE
-/// MADV_HUGEPAGE can take effect, causing ~25,600 minor faults for 100MB
-/// (~25ms). Without it, HUGEPAGE is set first, then WILLNEED triggers
-/// async readahead using 2MB pages (~50 faults = ~0.1ms).
+/// Strategy: mmap WITHOUT MAP_POPULATE, then MADV_HUGEPAGE + MADV_POPULATE_READ.
+/// MAP_POPULATE synchronously faults all pages with 4KB BEFORE MADV_HUGEPAGE
+/// can take effect, causing ~25,600 minor faults for 100MB (~12.5ms overhead).
+/// MADV_POPULATE_READ (Linux 5.14+) prefaults pages AFTER HUGEPAGE is set,
+/// using 2MB huge pages (~50 faults = ~0.1ms). Falls back to WILLNEED on
+/// older kernels.
 pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
     let file = open_noatime(path)?;
     let metadata = file.metadata()?;
     let len = metadata.len();
 
     if len > 0 && metadata.file_type().is_file() {
-        // Use MAP_POPULATE for files >= 4MB to prefault all pages during mmap().
-        // This avoids thousands of minor page faults during sequential access.
-        let mmap_result = if len >= 4 * 1024 * 1024 {
-            unsafe { MmapOptions::new().populate().map(&file) }
-        } else {
-            unsafe { MmapOptions::new().map(&file) }
-        };
+        // No MAP_POPULATE: let MADV_HUGEPAGE take effect before page faults.
+        let mmap_result = unsafe { MmapOptions::new().map(&file) };
         match mmap_result {
             Ok(mmap) => {
                 #[cfg(target_os = "linux")]
@@ -167,7 +168,15 @@ pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
                     if len >= 2 * 1024 * 1024 {
                         let _ = mmap.advise(memmap2::Advice::HugePage);
                     }
-                    let _ = mmap.advise(memmap2::Advice::WillNeed);
+                    // POPULATE_READ (Linux 5.14+): synchronously prefaults all pages
+                    // using huge pages. Falls back to WILLNEED on older kernels.
+                    if len >= 4 * 1024 * 1024 {
+                        if mmap.advise(memmap2::Advice::PopulateRead).is_err() {
+                            let _ = mmap.advise(memmap2::Advice::WillNeed);
+                        }
+                    } else {
+                        let _ = mmap.advise(memmap2::Advice::WillNeed);
+                    }
                 }
                 return Ok(FileData::Mmap(mmap));
             }

@@ -1,109 +1,340 @@
 use std::process;
 
-use clap::Parser;
-
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::sort::{
     CheckMode, KeyDef, KeyOpts, SortConfig, parse_buffer_size, sort_and_output,
 };
 
-#[derive(Parser)]
-#[command(name = "sort", about = "Sort lines of text files")]
 struct Cli {
-    /// Ignore leading blanks
-    #[arg(short = 'b', long = "ignore-leading-blanks")]
     ignore_leading_blanks: bool,
-
-    /// Consider only blanks and alphanumeric characters
-    #[arg(short = 'd', long = "dictionary-order")]
     dictionary_order: bool,
-
-    /// Fold lower case to upper case characters
-    #[arg(short = 'f', long = "ignore-case")]
     ignore_case: bool,
-
-    /// Compare according to general numerical value
-    #[arg(short = 'g', long = "general-numeric-sort")]
     general_numeric: bool,
-
-    /// Compare human readable numbers (e.g., 2K 1G)
-    #[arg(short = 'h', long = "human-numeric-sort")]
     human_numeric: bool,
-
-    /// Consider only printable characters
-    #[arg(short = 'i', long = "ignore-nonprinting")]
     ignore_nonprinting: bool,
-
-    /// Compare (unknown) < 'JAN' < ... < 'DEC'
-    #[arg(short = 'M', long = "month-sort")]
     month_sort: bool,
-
-    /// Compare according to string numerical value
-    #[arg(short = 'n', long = "numeric-sort")]
     numeric_sort: bool,
-
-    /// Shuffle, but group identical keys
-    #[arg(short = 'R', long = "random-sort")]
     random_sort: bool,
-
-    /// Reverse the result of comparisons
-    #[arg(short = 'r', long = "reverse")]
     reverse: bool,
-
-    /// Natural sort of (version) numbers within text
-    #[arg(short = 'V', long = "version-sort")]
     version_sort: bool,
-
-    /// Sort via a key; KEYDEF gives location and type
-    #[arg(short = 'k', long = "key", value_name = "KEYDEF")]
     keys: Vec<String>,
-
-    /// Use SEP instead of non-blank to blank transition
-    #[arg(short = 't', long = "field-separator", value_name = "SEP")]
     field_separator: Option<String>,
-
-    /// Output only the first of an equal run
-    #[arg(short = 'u', long = "unique")]
     unique: bool,
-
-    /// Stabilize sort by disabling last-resort comparison
-    #[arg(short = 's', long = "stable")]
     stable: bool,
-
-    /// Check for sorted input; do not sort
-    #[arg(short = 'c', long = "check", default_missing_value = "diagnose", num_args = 0..=1, require_equals = true)]
     check: Option<String>,
-
-    /// Like -c, but do not report first bad line
-    #[arg(short = 'C')]
     check_quiet: bool,
-
-    /// Merge already sorted files; do not sort
-    #[arg(short = 'm', long = "merge")]
     merge: bool,
-
-    /// Write result to FILE instead of standard output
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<String>,
-
-    /// Use DIR for temporaries, not $TMPDIR or /tmp
-    #[arg(short = 'T', long = "temporary-directory", value_name = "DIR")]
     temp_dir: Option<String>,
-
-    /// Change the number of sorts run concurrently to N
-    #[arg(long = "parallel", value_name = "N")]
     parallel: Option<usize>,
-
-    /// Use SIZE for main memory buffer
-    #[arg(short = 'S', long = "buffer-size", value_name = "SIZE")]
     buffer_size: Option<String>,
-
-    /// Line delimiter is NUL, not newline
-    #[arg(short = 'z', long = "zero-terminated")]
     zero_terminated: bool,
-
-    /// Files to sort
     files: Vec<String>,
+}
+
+/// Take the next value for an option: rest of current arg (after pos) or next arg.
+fn take_value(
+    bytes: &[u8],
+    pos: usize,
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+) -> String {
+    if pos < bytes.len() {
+        // Rest of this arg is the value (e.g., -k1,3 or -ofile)
+        let full = String::from_utf8_lossy(bytes).into_owned();
+        full[pos..].to_string()
+    } else {
+        // Next arg is the value
+        args.next()
+            .unwrap_or_else(|| {
+                eprintln!("sort: option requires an argument -- '{}'", flag);
+                process::exit(2);
+            })
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Hand-rolled argument parser — eliminates clap's ~200-300µs initialization.
+fn parse_args() -> Cli {
+    let mut cli = Cli {
+        ignore_leading_blanks: false,
+        dictionary_order: false,
+        ignore_case: false,
+        general_numeric: false,
+        human_numeric: false,
+        ignore_nonprinting: false,
+        month_sort: false,
+        numeric_sort: false,
+        random_sort: false,
+        reverse: false,
+        version_sort: false,
+        keys: Vec::new(),
+        field_separator: None,
+        unique: false,
+        stable: false,
+        check: None,
+        check_quiet: false,
+        merge: false,
+        output: None,
+        temp_dir: None,
+        parallel: None,
+        buffer_size: None,
+        zero_terminated: false,
+        files: Vec::new(),
+    };
+
+    let mut args = std::env::args_os().skip(1);
+    #[allow(clippy::while_let_on_iterator)]
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_encoded_bytes();
+
+        if bytes == b"--" {
+            // Everything after -- is a file
+            for a in args {
+                cli.files.push(a.to_string_lossy().into_owned());
+            }
+            break;
+        }
+
+        if bytes.starts_with(b"--") {
+            // Long option
+            let s = arg.to_string_lossy();
+            let opt = &s[2..];
+
+            // Check for --option=value form
+            let (name, eq_val) = if let Some(eq) = opt.find('=') {
+                (&opt[..eq], Some(&opt[eq + 1..]))
+            } else {
+                (opt, None)
+            };
+
+            match name {
+                "ignore-leading-blanks" => cli.ignore_leading_blanks = true,
+                "dictionary-order" => cli.dictionary_order = true,
+                "ignore-case" => cli.ignore_case = true,
+                "general-numeric-sort" => cli.general_numeric = true,
+                "human-numeric-sort" => cli.human_numeric = true,
+                "ignore-nonprinting" => cli.ignore_nonprinting = true,
+                "month-sort" => cli.month_sort = true,
+                "numeric-sort" => cli.numeric_sort = true,
+                "random-sort" => cli.random_sort = true,
+                "reverse" => cli.reverse = true,
+                "version-sort" => cli.version_sort = true,
+                "unique" => cli.unique = true,
+                "stable" => cli.stable = true,
+                "merge" => cli.merge = true,
+                "zero-terminated" => cli.zero_terminated = true,
+                "check" => {
+                    cli.check = Some(eq_val.unwrap_or("diagnose").to_string());
+                }
+                "key" => {
+                    let val = eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("sort: option '--key' requires an argument");
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    cli.keys.push(val);
+                }
+                "field-separator" => {
+                    cli.field_separator =
+                        Some(eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                            args.next()
+                                .unwrap_or_else(|| {
+                                    eprintln!(
+                                        "sort: option '--field-separator' requires an argument"
+                                    );
+                                    process::exit(2);
+                                })
+                                .to_string_lossy()
+                                .into_owned()
+                        }));
+                }
+                "output" => {
+                    cli.output = Some(eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("sort: option '--output' requires an argument");
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    }));
+                }
+                "temporary-directory" => {
+                    cli.temp_dir = Some(eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!(
+                                    "sort: option '--temporary-directory' requires an argument"
+                                );
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    }));
+                }
+                "parallel" => {
+                    let val = eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("sort: option '--parallel' requires an argument");
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    cli.parallel = Some(val.parse().unwrap_or_else(|_| {
+                        eprintln!("sort: invalid number of parallel jobs: '{}'", val);
+                        process::exit(2);
+                    }));
+                }
+                "buffer-size" => {
+                    cli.buffer_size = Some(eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("sort: option '--buffer-size' requires an argument");
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    }));
+                }
+                "sort" => {
+                    let val = eq_val.map(|v| v.to_string()).unwrap_or_else(|| {
+                        args.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("sort: option '--sort' requires an argument");
+                                process::exit(2);
+                            })
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    match val.as_str() {
+                        "general-numeric" => cli.general_numeric = true,
+                        "human-numeric" => cli.human_numeric = true,
+                        "month" => cli.month_sort = true,
+                        "numeric" => cli.numeric_sort = true,
+                        "random" => cli.random_sort = true,
+                        "version" => cli.version_sort = true,
+                        _ => {
+                            eprintln!("sort: unknown sort type: '{}'", val);
+                            process::exit(2);
+                        }
+                    }
+                }
+                "help" => {
+                    print!(
+                        "Usage: sort [OPTION]... [FILE]...\n\
+                         Write sorted concatenation of all FILE(s) to standard output.\n\n\
+                         With no FILE, or when FILE is -, read standard input.\n\n\
+                         Ordering options:\n\
+                         \x20 -b, --ignore-leading-blanks  ignore leading blanks\n\
+                         \x20 -d, --dictionary-order       consider only blanks and alphanumeric characters\n\
+                         \x20 -f, --ignore-case            fold lower case to upper case characters\n\
+                         \x20 -g, --general-numeric-sort   compare according to general numerical value\n\
+                         \x20 -i, --ignore-nonprinting     consider only printable characters\n\
+                         \x20 -M, --month-sort             compare (unknown) < 'JAN' < ... < 'DEC'\n\
+                         \x20 -h, --human-numeric-sort     compare human readable numbers (e.g., 2K 1G)\n\
+                         \x20 -n, --numeric-sort           compare according to string numerical value\n\
+                         \x20 -R, --random-sort            shuffle, but group identical keys\n\
+                         \x20 -r, --reverse                reverse the result of comparisons\n\
+                         \x20 -V, --version-sort           natural sort of (version) numbers within text\n\n\
+                         Other options:\n\
+                         \x20 -c, --check                  check for sorted input; do not sort\n\
+                         \x20 -C                           like -c, but do not report first bad line\n\
+                         \x20 -k, --key=KEYDEF             sort via a key; KEYDEF gives location and type\n\
+                         \x20 -m, --merge                  merge already sorted files; do not sort\n\
+                         \x20 -o, --output=FILE            write result to FILE instead of standard output\n\
+                         \x20 -s, --stable                 stabilize sort by disabling last-resort comparison\n\
+                         \x20 -S, --buffer-size=SIZE       use SIZE for main memory buffer\n\
+                         \x20 -t, --field-separator=SEP    use SEP instead of non-blank to blank transition\n\
+                         \x20 -T, --temporary-directory=DIR  use DIR for temporaries, not $TMPDIR or /tmp\n\
+                         \x20 -u, --unique                 output only the first of an equal run\n\
+                         \x20 -z, --zero-terminated        line delimiter is NUL, not newline\n\
+                         \x20     --parallel=N             change the number of sorts run concurrently to N\n\
+                         \x20     --help                   display this help and exit\n\
+                         \x20     --version                output version information and exit\n"
+                    );
+                    process::exit(0);
+                }
+                "version" => {
+                    println!("sort (fcoreutils) {}", env!("CARGO_PKG_VERSION"));
+                    process::exit(0);
+                }
+                _ => {
+                    eprintln!("sort: unrecognized option '--{}'", name);
+                    eprintln!("Try 'sort --help' for more information.");
+                    process::exit(2);
+                }
+            }
+        } else if bytes.len() > 1 && bytes[0] == b'-' {
+            // Short option(s): -b, -bnr, -k1,3, -ofile, etc.
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'b' => cli.ignore_leading_blanks = true,
+                    b'd' => cli.dictionary_order = true,
+                    b'f' => cli.ignore_case = true,
+                    b'g' => cli.general_numeric = true,
+                    b'h' => cli.human_numeric = true,
+                    b'i' => cli.ignore_nonprinting = true,
+                    b'M' => cli.month_sort = true,
+                    b'n' => cli.numeric_sort = true,
+                    b'R' => cli.random_sort = true,
+                    b'r' => cli.reverse = true,
+                    b'V' => cli.version_sort = true,
+                    b'u' => cli.unique = true,
+                    b's' => cli.stable = true,
+                    b'm' => cli.merge = true,
+                    b'z' => cli.zero_terminated = true,
+                    b'c' => {
+                        cli.check = Some("diagnose".to_string());
+                    }
+                    b'C' => cli.check_quiet = true,
+                    b'k' => {
+                        let val = take_value(bytes, i + 1, &mut args, "k");
+                        cli.keys.push(val);
+                        break;
+                    }
+                    b't' => {
+                        let val = take_value(bytes, i + 1, &mut args, "t");
+                        cli.field_separator = Some(val);
+                        break;
+                    }
+                    b'o' => {
+                        let val = take_value(bytes, i + 1, &mut args, "o");
+                        cli.output = Some(val);
+                        break;
+                    }
+                    b'T' => {
+                        let val = take_value(bytes, i + 1, &mut args, "T");
+                        cli.temp_dir = Some(val);
+                        break;
+                    }
+                    b'S' => {
+                        let val = take_value(bytes, i + 1, &mut args, "S");
+                        cli.buffer_size = Some(val);
+                        break;
+                    }
+                    _ => {
+                        eprintln!("sort: invalid option -- '{}'", bytes[i] as char);
+                        eprintln!("Try 'sort --help' for more information.");
+                        process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            cli.files.push(arg.to_string_lossy().into_owned());
+        }
+    }
+
+    cli
 }
 
 fn main() {
@@ -112,7 +343,18 @@ fn main() {
     // to stderr and exits with code 2, rather than being killed by signal 13.
     // Keeping SIGPIPE as SIG_IGN (Rust's default) lets us receive BrokenPipe
     // errors in write() calls and handle them ourselves.
-    let cli = Cli::parse();
+
+    // Enlarge pipe buffers on Linux for higher throughput.
+    #[cfg(target_os = "linux")]
+    for &fd in &[0i32, 1] {
+        for &size in &[8 * 1024 * 1024i32, 1024 * 1024, 256 * 1024] {
+            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) } > 0 {
+                break;
+            }
+        }
+    }
+
+    let cli = parse_args();
 
     // Parse key definitions
     let mut keys: Vec<KeyDef> = Vec::new();
