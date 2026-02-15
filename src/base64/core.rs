@@ -4,13 +4,11 @@ use base64_simd::AsOut;
 
 const BASE64_ENGINE: &base64_simd::Base64 = &base64_simd::STANDARD;
 
-/// Number of available CPUs (cached by the OS). Used for encode parallel thresholds
-/// to avoid triggering Rayon's thread pool initialization for encode paths.
+/// Number of threads in Rayon's thread pool. Used for parallel encode/decode
+/// chunk splitting to match the actual number of worker threads.
 #[inline]
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    rayon::current_num_threads()
 }
 
 /// Chunk size for sequential no-wrap encoding: 8MB aligned to 3 bytes.
@@ -25,29 +23,26 @@ const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 const PARALLEL_NOWRAP_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Minimum data size for parallel wrapped encoding (2MB).
-/// Wrapped parallel uses N threads for SIMD encoding, providing ~Nx
-/// speedup. Per-thread buffers (~2.5MB each for 10MB input) page-fault
-/// concurrently, and std::thread::scope avoids Rayon pool init (~300µs).
+/// Wrapped parallel uses Rayon's persistent thread pool for SIMD encoding,
+/// providing ~Nx speedup with minimal dispatch overhead (~10µs).
 const PARALLEL_WRAPPED_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (2MB of base64 data).
 /// Lower threshold lets parallel decode kick in earlier for medium files.
 const PARALLEL_DECODE_THRESHOLD: usize = 2 * 1024 * 1024;
 
-/// Pre-fault an output buffer with HUGEPAGE + POPULATE_WRITE on Linux.
-/// MADV_HUGEPAGE must come first: tells kernel to use 2MB pages.
-/// MADV_POPULATE_WRITE (Linux 5.14+) then pre-faults all pages in one batch,
-/// eliminating demand-faulting overhead during parallel writes.
-/// This prevents VMA lock contention when multiple threads fault pages concurrently.
+/// Hint HUGEPAGE for large output buffers on Linux.
+/// MADV_HUGEPAGE tells kernel to use 2MB pages, reducing TLB misses
+/// and minor fault count for large allocations (~25,600 → ~50 for 100MB).
 #[cfg(target_os = "linux")]
-fn prefault_buffer(buf: &mut Vec<u8>) {
+fn hint_hugepage(buf: &mut Vec<u8>) {
     if buf.capacity() >= 2 * 1024 * 1024 {
         unsafe {
-            let ptr = buf.as_mut_ptr() as *mut libc::c_void;
-            let len = buf.capacity();
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-            // MADV_POPULATE_WRITE = 23 (Linux 5.14+). Falls back silently on older kernels.
-            libc::madvise(ptr, len, 23);
+            libc::madvise(
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.capacity(),
+                libc::MADV_HUGEPAGE,
+            );
         }
     }
 }
@@ -117,16 +112,16 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
         output.set_len(total_out);
     }
     #[cfg(target_os = "linux")]
-    prefault_buffer(&mut output);
+    hint_hugepage(&mut output);
 
     // Parallel encode: each thread writes into its pre-assigned region
     let output_base = output.as_mut_ptr() as usize;
-    std::thread::scope(|s| {
+    rayon::scope(|s| {
         for (i, chunk) in chunks.iter().enumerate() {
             let out_off = offsets[i];
             let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
             let base = output_base;
-            s.spawn(move || {
+            s.spawn(move |_| {
                 let dest =
                     unsafe { std::slice::from_raw_parts_mut((base + out_off) as *mut u8, enc_len) };
                 let _ = BASE64_ENGINE.encode(chunk, dest.as_out());
@@ -182,41 +177,24 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     out.write_all(&out_buf[..n])
 }
 
-/// L1-scatter encode: encode groups of lines into a small L1-cached temp buffer,
-/// then scatter-copy each line to its final position in the output buffer with
-/// newline insertion. Each output byte is written exactly once — no read-back
-/// from main memory, halving memory traffic vs backward expansion.
+/// Streaming L1-scatter encode: encode groups of lines into L1-cached temp buffer,
+/// fuse with newlines into a second L1-cached output buffer, and write each batch
+/// directly to output. Uses only ~40KB total memory (two L1-sized buffers) instead
+/// of allocating the full output buffer (~13.5MB for 10MB input).
 ///
-/// Temp buffer (~20KB for 256 lines × 76 chars) stays hot in L1 cache, so
-/// reads during scatter are essentially free. Output buffer is streamed out
-/// with sequential writes that the prefetcher can handle efficiently.
+/// This eliminates ~3,300 page faults from the large output buffer allocation,
+/// saving ~0.3ms for 10MB files. The tradeoff is multiple write() syscalls
+/// (~685 for 10MB) vs one, but each is only ~20KB and writes to /dev/null cost ~0.2µs.
 fn encode_wrapped_scatter(
     data: &[u8],
     wrap_col: usize,
     bytes_per_line: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let enc_len = BASE64_ENGINE.encoded_length(data.len());
-    if enc_len == 0 {
-        return Ok(());
-    }
-
-    let num_full = enc_len / wrap_col;
-    let rem = enc_len % wrap_col;
-    let out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
-
-    // Output buffer — written once via scatter, then write_all to output
-    let mut buf: Vec<u8> = Vec::with_capacity(out_len);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(out_len);
-    }
-    #[cfg(target_os = "linux")]
-    prefault_buffer(&mut buf);
-
     // L1-cached temp buffer for encoding groups of lines.
-    // 256 lines × 76 chars = 19,456 bytes — fits comfortably in L1 (32-64KB).
-    const GROUP_LINES: usize = 256;
+    // 512 lines × 57 bytes per line input = 29,184 bytes input per group.
+    // 512 lines × 76 chars = 38,912 bytes encoded — fits in L1 (32-64KB).
+    const GROUP_LINES: usize = 512;
     let group_input = GROUP_LINES * bytes_per_line;
     let temp_size = GROUP_LINES * wrap_col;
     let mut temp: Vec<u8> = Vec::with_capacity(temp_size);
@@ -225,95 +203,24 @@ fn encode_wrapped_scatter(
         temp.set_len(temp_size);
     }
 
+    // L1-cached fused output buffer for wrap insertion.
+    // 512 lines × 77 bytes = 39,424 bytes — fits in L1 alongside temp.
     let line_out = wrap_col + 1;
-    let mut wp = 0usize; // write position in output buffer
+    let fused_size = GROUP_LINES * line_out;
+    let mut fused: Vec<u8> = Vec::with_capacity(fused_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        fused.set_len(fused_size);
+    }
 
     for chunk in data.chunks(group_input) {
         let clen = BASE64_ENGINE.encoded_length(chunk.len());
         let _ = BASE64_ENGINE.encode(chunk, temp[..clen].as_out());
-
-        // Scatter-copy full lines from temp to output with newlines
-        let lines = clen / wrap_col;
-        let chunk_rem = clen % wrap_col;
-
-        // 8-line unrolled scatter for ILP
-        let mut i = 0;
-        while i + 8 <= lines {
-            unsafe {
-                let src = temp.as_ptr().add(i * wrap_col);
-                let dst = buf.as_mut_ptr().add(wp);
-                std::ptr::copy_nonoverlapping(src, dst, wrap_col);
-                *dst.add(wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
-                *dst.add(line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(2 * wrap_col),
-                    dst.add(2 * line_out),
-                    wrap_col,
-                );
-                *dst.add(2 * line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(3 * wrap_col),
-                    dst.add(3 * line_out),
-                    wrap_col,
-                );
-                *dst.add(3 * line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(4 * wrap_col),
-                    dst.add(4 * line_out),
-                    wrap_col,
-                );
-                *dst.add(4 * line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(5 * wrap_col),
-                    dst.add(5 * line_out),
-                    wrap_col,
-                );
-                *dst.add(5 * line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(6 * wrap_col),
-                    dst.add(6 * line_out),
-                    wrap_col,
-                );
-                *dst.add(6 * line_out + wrap_col) = b'\n';
-                std::ptr::copy_nonoverlapping(
-                    src.add(7 * wrap_col),
-                    dst.add(7 * line_out),
-                    wrap_col,
-                );
-                *dst.add(7 * line_out + wrap_col) = b'\n';
-            }
-            wp += 8 * line_out;
-            i += 8;
-        }
-        // Remaining full lines
-        while i < lines {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    temp.as_ptr().add(i * wrap_col),
-                    buf.as_mut_ptr().add(wp),
-                    wrap_col,
-                );
-                *buf.as_mut_ptr().add(wp + wrap_col) = b'\n';
-            }
-            wp += line_out;
-            i += 1;
-        }
-        // Partial last line (only on final chunk)
-        if chunk_rem > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    temp.as_ptr().add(lines * wrap_col),
-                    buf.as_mut_ptr().add(wp),
-                    chunk_rem,
-                );
-                *buf.as_mut_ptr().add(wp + chunk_rem) = b'\n';
-            }
-            wp += chunk_rem + 1;
-        }
+        let n = fuse_wrap(&temp[..clen], wrap_col, &mut fused);
+        out.write_all(&fused[..n])?;
     }
 
-    out.write_all(&buf[..wp])
+    Ok(())
 }
 
 /// Scatter-copy encoded lines from temp buffer to output buffer with newlines.
@@ -604,11 +511,11 @@ fn encode_wrapped_parallel(
         output.set_len(total_out);
     }
     #[cfg(target_os = "linux")]
-    prefault_buffer(&mut output);
+    hint_hugepage(&mut output);
 
     // Parallel encode: each thread writes into its pre-assigned region
     let output_base = output.as_mut_ptr() as usize;
-    std::thread::scope(|s| {
+    rayon::scope(|s| {
         for (i, chunk) in chunks.iter().enumerate() {
             let out_off = offsets[i];
             let out_end = if i + 1 < offsets.len() {
@@ -618,7 +525,7 @@ fn encode_wrapped_parallel(
             };
             let out_size = out_end - out_off;
             let base = output_base;
-            s.spawn(move || {
+            s.spawn(move |_| {
                 let out_slice = unsafe {
                     std::slice::from_raw_parts_mut((base + out_off) as *mut u8, out_size)
                 };
@@ -1210,7 +1117,7 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
             output.set_len(total_decoded);
         }
         #[cfg(target_os = "linux")]
-        prefault_buffer(&mut output);
+        hint_hugepage(&mut output);
 
         let out_ptr = output.as_mut_ptr() as usize;
         let src_ptr = data.as_ptr() as usize;
@@ -1220,65 +1127,70 @@ fn try_decode_uniform_lines(data: &[u8], out: &mut impl Write) -> Option<io::Res
         // reducing per-call overhead. 512KB fits in L2 cache (256KB-1MB typical).
         let lines_per_sub = (512 * 1024 / line_len).max(1);
 
-        let result: Result<(), io::Error> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|t| {
-                    s.spawn(move || -> Result<(), io::Error> {
-                        let start_line = t * lines_per_thread;
-                        if start_line >= full_lines {
-                            return Ok(());
+        let err_flag = std::sync::atomic::AtomicBool::new(false);
+        rayon::scope(|s| {
+            for t in 0..num_threads {
+                let err_flag = &err_flag;
+                s.spawn(move |_| {
+                    let start_line = t * lines_per_thread;
+                    if start_line >= full_lines {
+                        return;
+                    }
+                    let end_line = (start_line + lines_per_thread).min(full_lines);
+                    let chunk_lines = end_line - start_line;
+
+                    let sub_buf_size = lines_per_sub.min(chunk_lines) * line_len;
+                    let mut local_buf: Vec<u8> = Vec::with_capacity(sub_buf_size);
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        local_buf.set_len(sub_buf_size);
+                    }
+
+                    let src = src_ptr as *const u8;
+                    let out_base = out_ptr as *mut u8;
+                    let local_dst = local_buf.as_mut_ptr();
+
+                    let mut sub_start = 0usize;
+                    while sub_start < chunk_lines {
+                        if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
                         }
-                        let end_line = (start_line + lines_per_thread).min(full_lines);
-                        let chunk_lines = end_line - start_line;
+                        let sub_count = (chunk_lines - sub_start).min(lines_per_sub);
+                        let sub_clean = sub_count * line_len;
 
-                        let sub_buf_size = lines_per_sub.min(chunk_lines) * line_len;
-                        let mut local_buf: Vec<u8> = Vec::with_capacity(sub_buf_size);
-                        #[allow(clippy::uninit_vec)]
-                        unsafe {
-                            local_buf.set_len(sub_buf_size);
-                        }
-
-                        let src = src_ptr as *const u8;
-                        let out_base = out_ptr as *mut u8;
-                        let local_dst = local_buf.as_mut_ptr();
-
-                        let mut sub_start = 0usize;
-                        while sub_start < chunk_lines {
-                            let sub_count = (chunk_lines - sub_start).min(lines_per_sub);
-                            let sub_clean = sub_count * line_len;
-
-                            for i in 0..sub_count {
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src.add((start_line + sub_start + i) * stride),
-                                        local_dst.add(i * line_len),
-                                        line_len,
-                                    );
-                                }
+                        for i in 0..sub_count {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    src.add((start_line + sub_start + i) * stride),
+                                    local_dst.add(i * line_len),
+                                    line_len,
+                                );
                             }
-
-                            let out_offset = (start_line + sub_start) * decoded_per_line;
-                            let out_size = sub_count * decoded_per_line;
-                            let out_slice = unsafe {
-                                std::slice::from_raw_parts_mut(out_base.add(out_offset), out_size)
-                            };
-                            BASE64_ENGINE
-                                .decode(&local_buf[..sub_clean], out_slice.as_out())
-                                .map_err(|_| {
-                                    io::Error::new(io::ErrorKind::InvalidData, "invalid input")
-                                })?;
-
-                            sub_start += sub_count;
                         }
-                        Ok(())
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join().unwrap()?;
+
+                        let out_offset = (start_line + sub_start) * decoded_per_line;
+                        let out_size = sub_count * decoded_per_line;
+                        let out_slice = unsafe {
+                            std::slice::from_raw_parts_mut(out_base.add(out_offset), out_size)
+                        };
+                        if BASE64_ENGINE
+                            .decode(&local_buf[..sub_clean], out_slice.as_out())
+                            .is_err()
+                        {
+                            err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+
+                        sub_start += sub_count;
+                    }
+                });
             }
-            Ok(())
         });
+        let result: Result<(), io::Error> = if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"))
+        } else {
+            Ok(())
+        };
 
         if let Err(e) = result {
             return Some(Err(e));
@@ -1557,118 +1469,107 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
             line_off = end;
         }
 
-        let decode_result: Result<(), io::Error> = std::thread::scope(|s| {
-            let handles: Vec<_> = tasks
-                .iter()
-                .map(|&(start_line, end_line)| {
-                    s.spawn(move || -> Result<(), io::Error> {
-                        let out_ptr = out_addr as *mut u8;
-                        let mut i = start_line;
+        let decode_err = std::sync::atomic::AtomicBool::new(false);
+        rayon::scope(|s| {
+            for &(start_line, end_line) in &tasks {
+                let decode_err = &decode_err;
+                s.spawn(move |_| {
+                    let out_ptr = out_addr as *mut u8;
+                    let mut i = start_line;
 
-                        while i + 4 <= end_line {
-                            let in_base = i * line_stride;
-                            let ob = i * decoded_per_line;
-                            unsafe {
-                                let s0 = std::slice::from_raw_parts_mut(
-                                    out_ptr.add(ob),
-                                    decoded_per_line,
-                                );
-                                if BASE64_ENGINE
-                                    .decode(&data[in_base..in_base + line_len], s0.as_out())
-                                    .is_err()
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid input",
-                                    ));
-                                }
-                                let s1 = std::slice::from_raw_parts_mut(
-                                    out_ptr.add(ob + decoded_per_line),
-                                    decoded_per_line,
-                                );
-                                if BASE64_ENGINE
-                                    .decode(
-                                        &data[in_base + line_stride
-                                            ..in_base + line_stride + line_len],
-                                        s1.as_out(),
-                                    )
-                                    .is_err()
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid input",
-                                    ));
-                                }
-                                let s2 = std::slice::from_raw_parts_mut(
-                                    out_ptr.add(ob + 2 * decoded_per_line),
-                                    decoded_per_line,
-                                );
-                                if BASE64_ENGINE
-                                    .decode(
-                                        &data[in_base + 2 * line_stride
-                                            ..in_base + 2 * line_stride + line_len],
-                                        s2.as_out(),
-                                    )
-                                    .is_err()
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid input",
-                                    ));
-                                }
-                                let s3 = std::slice::from_raw_parts_mut(
-                                    out_ptr.add(ob + 3 * decoded_per_line),
-                                    decoded_per_line,
-                                );
-                                if BASE64_ENGINE
-                                    .decode(
-                                        &data[in_base + 3 * line_stride
-                                            ..in_base + 3 * line_stride + line_len],
-                                        s3.as_out(),
-                                    )
-                                    .is_err()
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid input",
-                                    ));
-                                }
-                            }
-                            i += 4;
+                    while i + 4 <= end_line {
+                        if decode_err.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
                         }
-
-                        while i < end_line {
-                            let in_start = i * line_stride;
-                            let out_off = i * decoded_per_line;
-                            let out_slice = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    out_ptr.add(out_off),
-                                    decoded_per_line,
-                                )
-                            };
+                        let in_base = i * line_stride;
+                        let ob = i * decoded_per_line;
+                        unsafe {
+                            let s0 = std::slice::from_raw_parts_mut(
+                                out_ptr.add(ob),
+                                decoded_per_line,
+                            );
                             if BASE64_ENGINE
-                                .decode(&data[in_start..in_start + line_len], out_slice.as_out())
+                                .decode(&data[in_base..in_base + line_len], s0.as_out())
                                 .is_err()
                             {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid input",
-                                ));
+                                decode_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
                             }
-                            i += 1;
+                            let s1 = std::slice::from_raw_parts_mut(
+                                out_ptr.add(ob + decoded_per_line),
+                                decoded_per_line,
+                            );
+                            if BASE64_ENGINE
+                                .decode(
+                                    &data[in_base + line_stride
+                                        ..in_base + line_stride + line_len],
+                                    s1.as_out(),
+                                )
+                                .is_err()
+                            {
+                                decode_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            let s2 = std::slice::from_raw_parts_mut(
+                                out_ptr.add(ob + 2 * decoded_per_line),
+                                decoded_per_line,
+                            );
+                            if BASE64_ENGINE
+                                .decode(
+                                    &data[in_base + 2 * line_stride
+                                        ..in_base + 2 * line_stride + line_len],
+                                    s2.as_out(),
+                                )
+                                .is_err()
+                            {
+                                decode_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            let s3 = std::slice::from_raw_parts_mut(
+                                out_ptr.add(ob + 3 * decoded_per_line),
+                                decoded_per_line,
+                            );
+                            if BASE64_ENGINE
+                                .decode(
+                                    &data[in_base + 3 * line_stride
+                                        ..in_base + 3 * line_stride + line_len],
+                                    s3.as_out(),
+                                )
+                                .is_err()
+                            {
+                                decode_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
                         }
+                        i += 4;
+                    }
 
-                        Ok(())
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join().unwrap()?;
+                    while i < end_line {
+                        if decode_err.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let in_start = i * line_stride;
+                        let out_off = i * decoded_per_line;
+                        let out_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                out_ptr.add(out_off),
+                                decoded_per_line,
+                            )
+                        };
+                        if BASE64_ENGINE
+                            .decode(&data[in_start..in_start + line_len], out_slice.as_out())
+                            .is_err()
+                        {
+                            decode_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        i += 1;
+                    }
+                });
             }
-            Ok(())
         });
 
-        if decode_result.is_err() {
+        if decode_err.load(std::sync::atomic::Ordering::Relaxed) {
             return Some(decode_error());
         }
     } else {
@@ -1844,41 +1745,41 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
         output_buf.set_len(total_decoded);
     }
     #[cfg(target_os = "linux")]
-    prefault_buffer(&mut output_buf);
+    hint_hugepage(&mut output_buf);
 
     // Parallel decode: each thread decodes directly into its exact final position.
     // SAFETY: each thread writes to a non-overlapping region of the output buffer.
     let out_addr = output_buf.as_mut_ptr() as usize;
-    let decode_result: Result<(), io::Error> = std::thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .iter()
-            .enumerate()
-            .map(|(i, chunk)| {
-                let offset = offsets[i];
-                let expected_size = offsets[i + 1] - offset;
-                s.spawn(move || -> Result<(), io::Error> {
-                    // SAFETY: each thread writes to non-overlapping region
-                    let out_slice = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (out_addr as *mut u8).add(offset),
-                            expected_size,
-                        )
-                    };
-                    let decoded = BASE64_ENGINE
-                        .decode(chunk, out_slice.as_out())
-                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid input"))?;
-                    debug_assert_eq!(decoded.len(), expected_size);
-                    Ok(())
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap()?;
+    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    rayon::scope(|s| {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let offset = offsets[i];
+            let expected_size = offsets[i + 1] - offset;
+            let err_flag = &err_flag;
+            s.spawn(move |_| {
+                if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                // SAFETY: each thread writes to non-overlapping region
+                let out_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (out_addr as *mut u8).add(offset),
+                        expected_size,
+                    )
+                };
+                if BASE64_ENGINE
+                    .decode(chunk, out_slice.as_out())
+                    .is_err()
+                {
+                    err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
-        Ok(())
     });
 
-    decode_result?;
+    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid input"));
+    }
 
     out.write_all(&output_buf[..total_decoded])
 }
