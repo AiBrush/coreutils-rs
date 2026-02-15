@@ -17,12 +17,12 @@ const NOWRAP_CHUNK: usize = 4 * 1024 * 1024 - (4 * 1024 * 1024 % 3);
 /// At 2MB+ the 2-4x parallel speedup easily amortizes Rayon dispatch.
 const PARALLEL_NOWRAP_THRESHOLD: usize = 2 * 1024 * 1024;
 
-/// Minimum data size for parallel wrapped encoding (32MB).
-/// Wrapped parallel requires line-boundary alignment and a large shared
-/// output buffer. For files under 32MB (including the 10MB benchmark),
-/// sequential chunked encode is faster because it avoids the large shared
-/// buffer allocation (13.5MB for 10MB input = ~3400 page faults).
-const PARALLEL_WRAPPED_THRESHOLD: usize = 32 * 1024 * 1024;
+/// Minimum data size for parallel wrapped encoding (4MB).
+/// Wrapped parallel uses 4 threads for SIMD encoding, providing ~3x
+/// speedup for 10MB files (1ms vs 4ms encode). The 13.5MB shared buffer
+/// allocation (~0.7ms page faults) and Rayon init (~0.3ms) are amortized
+/// by the parallel speedup at 4MB+.
+const PARALLEL_WRAPPED_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (2MB of base64 data).
 /// Lower threshold lets parallel decode kick in earlier for medium files.
