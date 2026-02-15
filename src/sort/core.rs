@@ -1377,13 +1377,22 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
         }
     }
 
-    if let Some(n) = config.parallel {
-        let n = n.max(1);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok();
-    }
+    // Pre-initialize rayon thread pool in background thread.
+    // Overlaps ~300-500µs thread pool creation with file open + mmap (which
+    // takes ~1-2ms for MAP_POPULATE on cached files). Without this, the first
+    // par_iter call pays the full initialization penalty synchronously.
+    let parallel_count = config.parallel;
+    std::thread::spawn(move || match parallel_count {
+        Some(n) => {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n.max(1))
+                .build_global()
+                .ok();
+        }
+        None => {
+            rayon::ThreadPoolBuilder::new().build_global().ok();
+        }
+    });
 
     if config.check != CheckMode::None {
         let sorted = check_sorted(inputs, config)?;
@@ -1644,9 +1653,9 @@ pub fn sort_and_output(inputs: &[String], config: &SortConfig) -> io::Result<()>
     }
 
     // Switch to random access for sort phase (comparisons jump to arbitrary lines).
-    // Only advise for truly large files (>10MB) where the prefetch pattern matters.
+    // Advise for files >4MB where the prefetch pattern matters.
     #[cfg(target_os = "linux")]
-    if data.len() > 10 * 1024 * 1024 {
+    if data.len() > 4 * 1024 * 1024 {
         if let FileData::Mmap(ref mmap) = buffer {
             let _ = mmap.advise(memmap2::Advice::Random);
         }
