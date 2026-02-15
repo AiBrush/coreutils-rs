@@ -2991,8 +2991,8 @@ unsafe fn delete_bitset_avx2_stream(src: &[u8], dst: &mut [u8], member: &[u8; 32
         // Lookup table for (1 << (x & 7)) — pshufb gives per-byte shift
         // that _mm256_sllv_epi32 can't do (it works on 32-bit lanes).
         let bit_table = _mm256_setr_epi8(
-            1, 2, 4, 8, 16, 32, 64, -128i8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64,
-            -128i8, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 2, 4, 8, 16, 32, 64, -128i8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, -128i8,
+            0, 0, 0, 0, 0, 0, 0, 0,
         );
 
         while ri + 32 <= n {
@@ -3012,8 +3012,7 @@ unsafe fn delete_bitset_avx2_stream(src: &[u8], dst: &mut [u8], member: &[u8; 32
             // lo_half = pshufb(member[0..15], byte_idx)
             // hi_half = pshufb(member[16..31], byte_idx - 16)
             // select = byte_idx >= 16
-            let member_lo =
-                _mm256_broadcastsi128_si256(_mm256_castsi256_si128(member_v));
+            let member_lo = _mm256_broadcastsi128_si256(_mm256_castsi256_si128(member_v));
             let member_hi = _mm256_broadcastsi128_si256(_mm256_extracti128_si256(member_v, 1));
             let lo_mask = _mm256_set1_epi8(0x0F);
             let idx_lo = _mm256_and_si256(byte_idx, lo_mask);
@@ -3062,11 +3061,7 @@ unsafe fn delete_bitset_avx2_stream(src: &[u8], dst: &mut [u8], member: &[u8; 32
                 let c2 = m2.count_ones() as usize;
 
                 if m3 == 0xFF {
-                    std::ptr::copy_nonoverlapping(
-                        sp.add(ri + 24),
-                        dp.add(wp + c0 + c1 + c2),
-                        8,
-                    );
+                    std::ptr::copy_nonoverlapping(sp.add(ri + 24), dp.add(wp + c0 + c1 + c2), 8);
                 } else if m3 != 0 {
                     compact_8bytes_simd(sp.add(ri + 24), dp.add(wp + c0 + c1 + c2), m3);
                 }
