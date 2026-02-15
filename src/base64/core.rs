@@ -437,7 +437,8 @@ fn write_wrapped_iov_streaming(
 /// Each thread encodes its chunk of input lines into its own buffer (with newlines),
 /// then writev combines all buffers in order. This avoids the single ~13.5MB shared
 /// buffer allocation whose page faults (~3400 faults = ~3.4ms) dominate encoding time.
-/// Per-thread buffers (~3.4MB each) page-fault concurrently, reducing wall-clock to ~0.8ms.
+/// Single shared output buffer with MADV_HUGEPAGE — threads write directly to
+/// computed offsets, eliminating per-thread allocations and page faults.
 fn encode_wrapped_parallel(
     data: &[u8],
     wrap_col: usize,
@@ -468,41 +469,58 @@ fn encode_wrapped_parallel(
         in_off += aligned_input;
     }
 
-    // Each scoped thread uses forward scatter: encode groups of lines into
-    // a small L1-cached temp buffer (~24KB), then scatter-copy to the output
-    // buffer with newlines. This writes each byte exactly once (no backward
-    // expansion double-write) and reads encoded data from L1 cache.
-    let results: Vec<Vec<u8>> = std::thread::scope(|s| {
+    // Compute per-task output sizes and cumulative offsets
+    let mut task_out: Vec<(usize, usize)> = Vec::with_capacity(tasks.len()); // (out_offset, out_size)
+    let mut total_out = 0usize;
+    for &(_, chunk_len) in &tasks {
+        let full_lines = chunk_len / bytes_per_line;
+        let rem = chunk_len % bytes_per_line;
+        let remainder_encoded = if rem > 0 {
+            BASE64_ENGINE.encoded_length(rem) + 1
+        } else {
+            0
+        };
+        let out_size = full_lines * line_out + remainder_encoded;
+        task_out.push((total_out, out_size));
+        total_out += out_size;
+    }
+
+    // Single shared output buffer — one allocation, one MADV_HUGEPAGE
+    let mut shared_buf: Vec<u8> = Vec::with_capacity(total_out);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        shared_buf.set_len(total_out);
+    }
+    #[cfg(target_os = "linux")]
+    if total_out >= 2 * 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                shared_buf.as_mut_ptr() as *mut libc::c_void,
+                total_out,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+
+    // Parallel encoding: each thread writes to its pre-computed offset
+    let shared_ptr = shared_buf.as_mut_ptr() as usize;
+    std::thread::scope(|s| {
         let handles: Vec<_> = tasks
             .iter()
-            .map(|&(in_off, chunk_len)| {
+            .zip(task_out.iter())
+            .map(|(&(in_off, chunk_len), &(out_off, out_size))| {
                 s.spawn(move || {
                     let input = &data[in_off..in_off + chunk_len];
                     let full_lines = chunk_len / bytes_per_line;
                     let rem = chunk_len % bytes_per_line;
 
-                    let remainder_encoded = if rem > 0 {
-                        BASE64_ENGINE.encoded_length(rem) + 1
-                    } else {
-                        0
+                    // Get our slice of the shared buffer (non-overlapping regions)
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (shared_ptr as *mut u8).add(out_off),
+                            out_size,
+                        )
                     };
-                    let buf_size = full_lines * line_out + remainder_encoded;
-
-                    let mut buf: Vec<u8> = Vec::with_capacity(buf_size);
-                    #[allow(clippy::uninit_vec)]
-                    unsafe {
-                        buf.set_len(buf_size);
-                    }
-                    #[cfg(target_os = "linux")]
-                    if buf_size >= 2 * 1024 * 1024 {
-                        unsafe {
-                            libc::madvise(
-                                buf.as_mut_ptr() as *mut libc::c_void,
-                                buf_size,
-                                libc::MADV_HUGEPAGE,
-                            );
-                        }
-                    }
 
                     if full_lines > 0 {
                         // Forward scatter from L1-cached temp buffer
@@ -526,14 +544,7 @@ fn encode_wrapped_parallel(
                                 let _ = BASE64_ENGINE
                                     .encode(&input[i_off..i_off + group_input], s.as_out());
                             }
-                            scatter_lines(
-                                &temp,
-                                &mut buf,
-                                line_idx,
-                                group_lines,
-                                wrap_col,
-                                line_out,
-                            );
+                            scatter_lines(&temp, buf, line_idx, group_lines, wrap_col, line_out);
                             line_idx += group_lines;
                         }
 
@@ -548,7 +559,7 @@ fn encode_wrapped_parallel(
                                 let _ = BASE64_ENGINE
                                     .encode(&input[i_off..i_off + r_input], s.as_out());
                             }
-                            scatter_lines(&temp, &mut buf, line_idx, rem_lines, wrap_col, line_out);
+                            scatter_lines(&temp, buf, line_idx, rem_lines, wrap_col, line_out);
                         }
                     }
 
@@ -563,17 +574,16 @@ fn encode_wrapped_parallel(
                             *buf.as_mut_ptr().add(woff + enc_len) = b'\n';
                         }
                     }
-
-                    buf
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        for h in handles {
+            h.join().unwrap();
+        }
     });
 
-    // Single writev for all per-thread buffers in order
-    let slices: Vec<io::IoSlice> = results.iter().map(|r| io::IoSlice::new(r)).collect();
-    write_all_vectored(out, &slices)
+    // Single write_all — no writev needed, data is already contiguous
+    out.write_all(&shared_buf)
 }
 
 /// Fuse encoded base64 data with newlines in a single pass.
