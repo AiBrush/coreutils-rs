@@ -244,17 +244,20 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     }
 
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mmap = unsafe { MmapOptions::new().populate().map(&file) }.ok();
+    // No MAP_POPULATE: it synchronously faults all pages with 4KB,
+    // defeating MADV_HUGEPAGE which must be set before faults occur.
+    let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
     std::mem::forget(file);
     #[cfg(target_os = "linux")]
     if let Some(ref m) = mmap {
         unsafe {
             let ptr = m.as_ptr() as *mut libc::c_void;
             let len = m.len();
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
+            // HUGEPAGE first: reduces ~25,600 minor faults to ~50 for 100MB.
             if len >= 2 * 1024 * 1024 {
                 libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
+            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
         }
     }
     mmap

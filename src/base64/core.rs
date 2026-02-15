@@ -99,6 +99,17 @@ fn encode_no_wrap_parallel(data: &[u8], out: &mut impl Write) -> io::Result<()> 
                     unsafe {
                         buf.set_len(enc_len);
                     }
+                    // HUGEPAGE on per-thread buffer reduces page faults
+                    #[cfg(target_os = "linux")]
+                    if enc_len >= 2 * 1024 * 1024 {
+                        unsafe {
+                            libc::madvise(
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                enc_len,
+                                libc::MADV_HUGEPAGE,
+                            );
+                        }
+                    }
                     let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
                     buf
                 })
@@ -156,6 +167,17 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         #[allow(clippy::uninit_vec)]
         unsafe {
             buf.set_len(buf_cap);
+        }
+        // HUGEPAGE reduces page faults for the ~10MB output buffer
+        #[cfg(target_os = "linux")]
+        if buf_cap >= 2 * 1024 * 1024 {
+            unsafe {
+                libc::madvise(
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf_cap,
+                    libc::MADV_HUGEPAGE,
+                );
+            }
         }
 
         let mut data_off = 0;
@@ -529,6 +551,17 @@ fn encode_wrapped_parallel(
                     #[allow(clippy::uninit_vec)]
                     unsafe {
                         buf.set_len(buf_size);
+                    }
+                    // HUGEPAGE on per-thread buffer reduces page faults
+                    #[cfg(target_os = "linux")]
+                    if buf_size >= 2 * 1024 * 1024 {
+                        unsafe {
+                            libc::madvise(
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                buf_size,
+                                libc::MADV_HUGEPAGE,
+                            );
+                        }
                     }
 
                     if full_lines > 0 {

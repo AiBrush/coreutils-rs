@@ -246,12 +246,14 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         unsafe {
             let ptr = m.as_ptr() as *mut libc::c_void;
             let len = m.len();
-            // WILLNEED pre-faults all pages. Don't use SEQUENTIAL since tac
-            // accesses data in reverse order during the output phase.
-            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+            // HUGEPAGE first: must be set before any page faults occur.
+            // Reduces ~25,600 minor faults to ~50 for 100MB.
             if len >= 2 * 1024 * 1024 {
                 libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
+            // WILLNEED after: async readahead will use 2MB huge pages.
+            // Don't use SEQUENTIAL since tac accesses data in reverse order.
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }
     }
     mmap
