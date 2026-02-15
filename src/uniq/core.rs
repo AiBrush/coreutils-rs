@@ -418,13 +418,13 @@ pub fn process_uniq_bytes(
 ) -> io::Result<()> {
     let term = if config.zero_terminated { b'\0' } else { b'\n' };
 
-    // Zero-copy fast path: bypass BufWriter for modes with run/IoSlice output.
-    // Default mode: writes contiguous runs directly from mmap data.
-    // Filter modes (-d/-u): use IoSlice batching (512 lines per writev).
-    // Without BufWriter, writes go directly via writev/vmsplice (zero-copy).
+    // Zero-copy fast path: bypass BufWriter for standard modes with IoSlice output.
+    // Default mode: writes contiguous runs directly from mmap data via writev.
+    // Filter modes (-d/-u): IoSlice batching (512 lines per writev).
+    // Count mode (-c): IoSlice batching (340 groups per writev, prefix arena + mmap data).
+    // Without BufWriter, writes go directly via writev/vmsplice (zero-copy for data slices).
     let fast = !needs_key_extraction(config) && !config.ignore_case;
     if fast
-        && !config.count
         && matches!(
             config.mode,
             OutputMode::Default | OutputMode::RepeatedOnly | OutputMode::UniqueOnly
@@ -775,7 +775,11 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
     };
 
     // run_start tracks the beginning of the current contiguous output region.
-    // When a duplicate is found, we flush the run up to the duplicate and skip it.
+    // When a duplicate is found, we save the run as an IoSlice and skip the dup.
+    // Runs are batched and written with writev to reduce syscall overhead.
+    const BATCH: usize = 256;
+    let term_byte: [u8; 1] = [term];
+    let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(BATCH);
     let mut run_start: usize = 0;
     let mut cur_start = first_end + 1;
     let mut last_output_end = first_end + 1; // exclusive end including terminator
@@ -898,9 +902,13 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
         };
 
         if is_dup {
-            // Duplicate — flush the current run up to this line, then skip it
+            // Duplicate — save the current run up to this line, then skip it
             if run_start < cur_start {
-                writer.write_all(&data[run_start..cur_start])?;
+                slices.push(io::IoSlice::new(&data[run_start..cur_start]));
+                if slices.len() >= BATCH {
+                    write_all_vectored(writer, &slices)?;
+                    slices.clear();
+                }
             }
             // Start new run after this duplicate
             run_start = if cur_end < data_len {
@@ -933,12 +941,18 @@ fn process_default_sequential(data: &[u8], writer: &mut impl Write, term: u8) ->
 
     // Flush remaining run
     if run_start < data_len {
-        writer.write_all(&data[run_start..last_output_end.max(run_start)])?;
+        slices.push(io::IoSlice::new(
+            &data[run_start..last_output_end.max(run_start)],
+        ));
     }
 
     // Ensure trailing terminator
     if data_len > 0 && unsafe { *base.add(data_len - 1) } != term {
-        writer.write_all(&[term])?;
+        slices.push(io::IoSlice::new(&term_byte));
+    }
+
+    if !slices.is_empty() {
+        write_all_vectored(writer, &slices)?;
     }
 
     Ok(())

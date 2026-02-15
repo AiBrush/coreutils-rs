@@ -144,67 +144,41 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
         return encode_wrapped_scatter(data, wrap_col, bytes_per_line, out);
     }
 
-    // Fallback for non-3-aligned bytes_per_line: chunk + in-place expansion
-    let lines_per_chunk = (32 * 1024 * 1024) / bytes_per_line;
-    let max_input_chunk = (lines_per_chunk * bytes_per_line).max(bytes_per_line);
+    // Fallback for non-3-aligned bytes_per_line: use fuse_wrap approach
+    let enc_max = BASE64_ENGINE.encoded_length(data.len());
+    let num_full = enc_max / wrap_col;
+    let rem = enc_max % wrap_col;
+    let out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
 
-    let enc_max = BASE64_ENGINE.encoded_length(max_input_chunk.min(data.len()));
-    let num_lines_max = enc_max / wrap_col + 1;
-    let out_max = num_lines_max * (wrap_col + 1) + wrap_col + 1;
-    let mut buf: Vec<u8> = Vec::with_capacity(out_max);
+    // Encode full data, then fuse with newlines
+    let mut enc_buf: Vec<u8> = Vec::with_capacity(enc_max);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        buf.set_len(out_max);
+        enc_buf.set_len(enc_max);
     }
+    let _ = BASE64_ENGINE.encode(data, enc_buf[..enc_max].as_out());
 
-    for chunk in data.chunks(max_input_chunk.max(1)) {
-        let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-        let _ = BASE64_ENGINE.encode(chunk, buf[..enc_len].as_out());
-        let num_full = enc_len / wrap_col;
-        let rem = enc_len % wrap_col;
-        let chunk_out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
-
-        // Expand backwards
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            let mut rp = enc_len;
-            let mut wp = chunk_out_len;
-            if rem > 0 {
-                wp -= 1;
-                *ptr.add(wp) = b'\n';
-                wp -= rem;
-                rp -= rem;
-                if rp != wp {
-                    std::ptr::copy(ptr.add(rp), ptr.add(wp), rem);
-                }
-            }
-            for _ in 0..num_full {
-                wp -= 1;
-                *ptr.add(wp) = b'\n';
-                wp -= wrap_col;
-                rp -= wrap_col;
-                if rp != wp {
-                    std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
-                }
-            }
-        }
-        out.write_all(&buf[..chunk_out_len])?;
+    let mut out_buf: Vec<u8> = Vec::with_capacity(out_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out_buf.set_len(out_len);
     }
-
-    Ok(())
+    let n = fuse_wrap(&enc_buf, wrap_col, &mut out_buf);
+    out.write_all(&out_buf[..n])
 }
 
-/// Bulk SIMD encode + IoSlice writev: encode entire input into a contiguous buffer,
-/// then write with wrapping using writev with IoSlice entries.
+/// L1-scatter encode: encode groups of lines into a small L1-cached temp buffer,
+/// then scatter-copy each line to its final position in the output buffer with
+/// newline insertion. Each output byte is written exactly once — no read-back
+/// from main memory, halving memory traffic vs backward expansion.
 ///
-/// This eliminates the output buffer allocation, scatter copy, and associated page
-/// faults vs the previous L1-scatter approach. The encoded buffer is the only
-/// allocation; writev interleaves 76-byte data slices with newline slices directly
-/// from the encoded buffer to the output fd.
+/// Temp buffer (~20KB for 256 lines × 76 chars) stays hot in L1 cache, so
+/// reads during scatter are essentially free. Output buffer is streamed out
+/// with sequential writes that the prefetcher can handle efficiently.
 fn encode_wrapped_scatter(
     data: &[u8],
     wrap_col: usize,
-    _bytes_per_line: usize,
+    bytes_per_line: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
     let enc_len = BASE64_ENGINE.encoded_length(data.len());
@@ -212,24 +186,127 @@ fn encode_wrapped_scatter(
         return Ok(());
     }
 
-    let mut encoded: Vec<u8> = Vec::with_capacity(enc_len);
+    let num_full = enc_len / wrap_col;
+    let rem = enc_len % wrap_col;
+    let out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
+
+    // Output buffer — written once via scatter, then write_all to output
+    let mut buf: Vec<u8> = Vec::with_capacity(out_len);
     #[allow(clippy::uninit_vec)]
     unsafe {
-        encoded.set_len(enc_len);
+        buf.set_len(out_len);
     }
     #[cfg(target_os = "linux")]
-    if enc_len >= 2 * 1024 * 1024 {
+    if out_len >= 2 * 1024 * 1024 {
         unsafe {
             libc::madvise(
-                encoded.as_mut_ptr() as *mut libc::c_void,
-                enc_len,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                out_len,
                 libc::MADV_HUGEPAGE,
             );
         }
     }
-    let _ = BASE64_ENGINE.encode(data, encoded[..enc_len].as_out());
 
-    write_wrapped_iov(&encoded, wrap_col, out)
+    // L1-cached temp buffer for encoding groups of lines.
+    // 256 lines × 76 chars = 19,456 bytes — fits comfortably in L1 (32-64KB).
+    const GROUP_LINES: usize = 256;
+    let group_input = GROUP_LINES * bytes_per_line;
+    let temp_size = GROUP_LINES * wrap_col;
+    let mut temp: Vec<u8> = Vec::with_capacity(temp_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        temp.set_len(temp_size);
+    }
+
+    let line_out = wrap_col + 1;
+    let mut wp = 0usize; // write position in output buffer
+
+    for chunk in data.chunks(group_input) {
+        let clen = BASE64_ENGINE.encoded_length(chunk.len());
+        let _ = BASE64_ENGINE.encode(chunk, temp[..clen].as_out());
+
+        // Scatter-copy full lines from temp to output with newlines
+        let lines = clen / wrap_col;
+        let chunk_rem = clen % wrap_col;
+
+        // 8-line unrolled scatter for ILP
+        let mut i = 0;
+        while i + 8 <= lines {
+            unsafe {
+                let src = temp.as_ptr().add(i * wrap_col);
+                let dst = buf.as_mut_ptr().add(wp);
+                std::ptr::copy_nonoverlapping(src, dst, wrap_col);
+                *dst.add(wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
+                *dst.add(line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(2 * wrap_col),
+                    dst.add(2 * line_out),
+                    wrap_col,
+                );
+                *dst.add(2 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(3 * wrap_col),
+                    dst.add(3 * line_out),
+                    wrap_col,
+                );
+                *dst.add(3 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(4 * wrap_col),
+                    dst.add(4 * line_out),
+                    wrap_col,
+                );
+                *dst.add(4 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(5 * wrap_col),
+                    dst.add(5 * line_out),
+                    wrap_col,
+                );
+                *dst.add(5 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(6 * wrap_col),
+                    dst.add(6 * line_out),
+                    wrap_col,
+                );
+                *dst.add(6 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(7 * wrap_col),
+                    dst.add(7 * line_out),
+                    wrap_col,
+                );
+                *dst.add(7 * line_out + wrap_col) = b'\n';
+            }
+            wp += 8 * line_out;
+            i += 8;
+        }
+        // Remaining full lines
+        while i < lines {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    temp.as_ptr().add(i * wrap_col),
+                    buf.as_mut_ptr().add(wp),
+                    wrap_col,
+                );
+                *buf.as_mut_ptr().add(wp + wrap_col) = b'\n';
+            }
+            wp += line_out;
+            i += 1;
+        }
+        // Partial last line (only on final chunk)
+        if chunk_rem > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    temp.as_ptr().add(lines * wrap_col),
+                    buf.as_mut_ptr().add(wp),
+                    chunk_rem,
+                );
+                *buf.as_mut_ptr().add(wp + chunk_rem) = b'\n';
+            }
+            wp += chunk_rem + 1;
+        }
+    }
+
+    out.write_all(&buf[..wp])
 }
 
 /// Scatter-copy encoded lines from temp buffer to output buffer with newlines.
@@ -256,6 +333,103 @@ fn scatter_lines(
     }
 }
 
+/// Expand encoded data in-place by inserting newlines at wrap_col boundaries.
+/// buf[0..enc_len] contains contiguous encoded data; buf has capacity for out_len.
+/// After expansion, buf[0..out_len] contains wrapped output with newlines.
+///
+/// Processes backward so shifted data never overwrites unread source data.
+/// For wrap_col=76: shift is ~1.3% (1 byte per 76), so most copies are
+/// non-overlapping and the memmove fast-path (memcpy) is used.
+#[inline]
+#[allow(dead_code)]
+fn expand_backward(ptr: *mut u8, enc_len: usize, out_len: usize, wrap_col: usize) {
+    let num_full = enc_len / wrap_col;
+    let rem = enc_len % wrap_col;
+
+    unsafe {
+        let mut rp = enc_len;
+        let mut wp = out_len;
+
+        // Handle partial last line (remainder)
+        if rem > 0 {
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            wp -= rem;
+            rp -= rem;
+            if rp != wp {
+                std::ptr::copy(ptr.add(rp), ptr.add(wp), rem);
+            }
+        }
+
+        // Process full lines backward
+        let mut lines_left = num_full;
+        while lines_left >= 8 {
+            // Unrolled: 8 lines per iteration
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+
+            lines_left -= 8;
+        }
+
+        // Remaining lines (0-7)
+        while lines_left > 0 {
+            wp -= 1;
+            *ptr.add(wp) = b'\n';
+            rp -= wrap_col;
+            wp -= wrap_col;
+            if rp != wp {
+                std::ptr::copy(ptr.add(rp), ptr.add(wp), wrap_col);
+            }
+            lines_left -= 1;
+        }
+    }
+}
+
 /// Static newline byte for IoSlice references in writev calls.
 static NEWLINE: [u8; 1] = [b'\n'];
 
@@ -264,6 +438,7 @@ static NEWLINE: [u8; 1] = [b'\n'];
 /// interleaved with newline IoSlices, then writes in batches of MAX_WRITEV_IOV.
 /// This is zero-copy: no fused output buffer needed.
 #[inline]
+#[allow(dead_code)]
 fn write_wrapped_iov(encoded: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Result<()> {
     // Max IoSlice entries per writev batch. Linux UIO_MAXIOV is 1024.
     // Each line needs 2 entries (data + newline), so 512 lines per batch.
@@ -386,12 +561,11 @@ fn write_wrapped_iov_streaming(
     Ok(())
 }
 
-/// Parallel wrapped encoding: each thread does bulk SIMD encode + fuse with newlines.
+/// Parallel wrapped encoding with L1-scatter: each thread encodes groups of
+/// lines into a small L1-cached temp buffer, then scatter-copies to its output
+/// buffer with newlines. Each output byte is written exactly once per thread.
 ///
-/// Threads produce ready-to-write output buffers (encoded data + newlines).
-/// Main thread combines them with a single writev call.
-/// This fully parallelizes both encoding and newline insertion, leaving
-/// only the final I/O on the critical path.
+/// Main thread combines all per-thread output buffers with a single writev call.
 fn encode_wrapped_parallel(
     data: &[u8],
     wrap_col: usize,
@@ -405,45 +579,13 @@ fn encode_wrapped_parallel(
     // Split input at bytes_per_line boundaries (last chunk may have remainder)
     let chunks: Vec<&[u8]> = data.chunks(chunk_input.max(bytes_per_line)).collect();
 
-    // Each thread: bulk SIMD encode + fuse newlines into output buffer
-    let fused_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
+    // Each thread: L1-scatter encode into output buffer
+    let output_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
             .map(|chunk| {
                 s.spawn(move || {
-                    // Step 1: SIMD encode into contiguous buffer
-                    let enc_len = BASE64_ENGINE.encoded_length(chunk.len());
-                    let mut encoded: Vec<u8> = Vec::with_capacity(enc_len);
-                    #[allow(clippy::uninit_vec)]
-                    unsafe {
-                        encoded.set_len(enc_len);
-                    }
-                    let _ = BASE64_ENGINE.encode(chunk, encoded[..enc_len].as_out());
-
-                    // Step 2: Fuse with newlines into output buffer
-                    let line_out = wrap_col + 1;
-                    let full_lines = enc_len / wrap_col;
-                    let remainder = enc_len % wrap_col;
-                    let out_size =
-                        full_lines * line_out + if remainder > 0 { remainder + 1 } else { 0 };
-                    let mut output: Vec<u8> = Vec::with_capacity(out_size);
-                    #[allow(clippy::uninit_vec)]
-                    unsafe {
-                        output.set_len(out_size);
-                    }
-                    #[cfg(target_os = "linux")]
-                    if out_size >= 2 * 1024 * 1024 {
-                        unsafe {
-                            libc::madvise(
-                                output.as_mut_ptr() as *mut libc::c_void,
-                                out_size,
-                                libc::MADV_HUGEPAGE,
-                            );
-                        }
-                    }
-                    // fuse_wrap handles full lines + partial last line
-                    let _n = fuse_wrap(&encoded, wrap_col, &mut output);
-                    output
+                    encode_chunk_l1_scatter(chunk, wrap_col, bytes_per_line)
                 })
             })
             .collect();
@@ -451,8 +593,132 @@ fn encode_wrapped_parallel(
     });
 
     // Single writev combining all thread outputs in order
-    let slices: Vec<io::IoSlice> = fused_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
+    let slices: Vec<io::IoSlice> = output_chunks.iter().map(|c| io::IoSlice::new(c)).collect();
     write_all_vectored(out, &slices)
+}
+
+/// Encode a chunk of data using L1-scatter approach: encode groups of lines
+/// into an L1-cached temp buffer, scatter-copy to output with newlines.
+/// Returns the ready-to-write output buffer.
+fn encode_chunk_l1_scatter(data: &[u8], wrap_col: usize, bytes_per_line: usize) -> Vec<u8> {
+    let enc_len = BASE64_ENGINE.encoded_length(data.len());
+    let full_lines = enc_len / wrap_col;
+    let remainder = enc_len % wrap_col;
+    let out_size = full_lines * (wrap_col + 1) + if remainder > 0 { remainder + 1 } else { 0 };
+
+    let mut output: Vec<u8> = Vec::with_capacity(out_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        output.set_len(out_size);
+    }
+    #[cfg(target_os = "linux")]
+    if out_size >= 2 * 1024 * 1024 {
+        unsafe {
+            libc::madvise(
+                output.as_mut_ptr() as *mut libc::c_void,
+                out_size,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+
+    // L1-cached temp buffer: 256 lines × wrap_col fits in L1 cache
+    const GROUP_LINES: usize = 256;
+    let group_input = GROUP_LINES * bytes_per_line;
+    let temp_size = GROUP_LINES * wrap_col;
+    let mut temp: Vec<u8> = Vec::with_capacity(temp_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        temp.set_len(temp_size);
+    }
+
+    let line_out = wrap_col + 1;
+    let mut wp = 0usize;
+
+    for chunk in data.chunks(group_input) {
+        let clen = BASE64_ENGINE.encoded_length(chunk.len());
+        let _ = BASE64_ENGINE.encode(chunk, temp[..clen].as_out());
+
+        let lines = clen / wrap_col;
+        let chunk_rem = clen % wrap_col;
+
+        // 8-line unrolled scatter
+        let mut i = 0;
+        while i + 8 <= lines {
+            unsafe {
+                let src = temp.as_ptr().add(i * wrap_col);
+                let dst = output.as_mut_ptr().add(wp);
+                std::ptr::copy_nonoverlapping(src, dst, wrap_col);
+                *dst.add(wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(src.add(wrap_col), dst.add(line_out), wrap_col);
+                *dst.add(line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(2 * wrap_col),
+                    dst.add(2 * line_out),
+                    wrap_col,
+                );
+                *dst.add(2 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(3 * wrap_col),
+                    dst.add(3 * line_out),
+                    wrap_col,
+                );
+                *dst.add(3 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(4 * wrap_col),
+                    dst.add(4 * line_out),
+                    wrap_col,
+                );
+                *dst.add(4 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(5 * wrap_col),
+                    dst.add(5 * line_out),
+                    wrap_col,
+                );
+                *dst.add(5 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(6 * wrap_col),
+                    dst.add(6 * line_out),
+                    wrap_col,
+                );
+                *dst.add(6 * line_out + wrap_col) = b'\n';
+                std::ptr::copy_nonoverlapping(
+                    src.add(7 * wrap_col),
+                    dst.add(7 * line_out),
+                    wrap_col,
+                );
+                *dst.add(7 * line_out + wrap_col) = b'\n';
+            }
+            wp += 8 * line_out;
+            i += 8;
+        }
+        while i < lines {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    temp.as_ptr().add(i * wrap_col),
+                    output.as_mut_ptr().add(wp),
+                    wrap_col,
+                );
+                *output.as_mut_ptr().add(wp + wrap_col) = b'\n';
+            }
+            wp += line_out;
+            i += 1;
+        }
+        if chunk_rem > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    temp.as_ptr().add(lines * wrap_col),
+                    output.as_mut_ptr().add(wp),
+                    chunk_rem,
+                );
+                *output.as_mut_ptr().add(wp + chunk_rem) = b'\n';
+            }
+            wp += chunk_rem + 1;
+        }
+    }
+
+    unsafe { output.set_len(wp) };
+    output
 }
 
 /// Fuse encoded base64 data with newlines in a single pass.
