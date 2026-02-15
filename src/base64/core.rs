@@ -1577,10 +1577,8 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                         let in_base = i * line_stride;
                         let ob = i * decoded_per_line;
                         unsafe {
-                            let s0 = std::slice::from_raw_parts_mut(
-                                out_ptr.add(ob),
-                                decoded_per_line,
-                            );
+                            let s0 =
+                                std::slice::from_raw_parts_mut(out_ptr.add(ob), decoded_per_line);
                             if BASE64_ENGINE
                                 .decode(&data[in_base..in_base + line_len], s0.as_out())
                                 .is_err()
@@ -1594,8 +1592,7 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                             );
                             if BASE64_ENGINE
                                 .decode(
-                                    &data[in_base + line_stride
-                                        ..in_base + line_stride + line_len],
+                                    &data[in_base + line_stride..in_base + line_stride + line_len],
                                     s1.as_out(),
                                 )
                                 .is_err()
@@ -1644,10 +1641,7 @@ fn try_line_decode(data: &[u8], out: &mut impl Write) -> Option<io::Result<()>> 
                         let in_start = i * line_stride;
                         let out_off = i * decoded_per_line;
                         let out_slice = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                out_ptr.add(out_off),
-                                decoded_per_line,
-                            )
+                            std::slice::from_raw_parts_mut(out_ptr.add(out_off), decoded_per_line)
                         };
                         if BASE64_ENGINE
                             .decode(&data[in_start..in_start + line_len], out_slice.as_out())
@@ -1855,15 +1849,9 @@ fn decode_borrowed_clean_parallel(out: &mut impl Write, data: &[u8]) -> io::Resu
                 }
                 // SAFETY: each thread writes to non-overlapping region
                 let out_slice = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (out_addr as *mut u8).add(offset),
-                        expected_size,
-                    )
+                    std::slice::from_raw_parts_mut((out_addr as *mut u8).add(offset), expected_size)
                 };
-                if BASE64_ENGINE
-                    .decode(chunk, out_slice.as_out())
-                    .is_err()
-                {
+                if BASE64_ENGINE.decode(chunk, out_slice.as_out()).is_err() {
                     err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             });
