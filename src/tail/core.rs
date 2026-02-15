@@ -3,7 +3,7 @@ use std::path::Path;
 
 use memchr::{memchr_iter, memrchr_iter};
 
-use crate::common::io::{read_file, read_stdin, FileData};
+use crate::common::io::{FileData, read_file, read_stdin};
 
 /// Mode for tail operation
 #[derive(Clone, Debug)]
@@ -85,12 +85,7 @@ pub fn tail_lines(data: &[u8], n: u64, delimiter: u8, out: &mut impl Write) -> i
 }
 
 /// Output from line N onward (1-indexed)
-pub fn tail_lines_from(
-    data: &[u8],
-    n: u64,
-    delimiter: u8,
-    out: &mut impl Write,
-) -> io::Result<()> {
+pub fn tail_lines_from(data: &[u8], n: u64, delimiter: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -393,11 +388,7 @@ pub fn tail_file(
     out: &mut impl Write,
     tool_name: &str,
 ) -> io::Result<bool> {
-    let delimiter = if config.zero_terminated {
-        b'\0'
-    } else {
-        b'\n'
-    };
+    let delimiter = if config.zero_terminated { b'\0' } else { b'\n' };
 
     if filename != "-" {
         let path = Path::new(filename);
@@ -548,11 +539,7 @@ fn sendfile_tail_bytes_from(path: &Path, n: u64, out_fd: i32) -> io::Result<bool
 
 /// Follow a file for new data (basic implementation)
 #[cfg(target_os = "linux")]
-pub fn follow_file(
-    filename: &str,
-    config: &TailConfig,
-    out: &mut impl Write,
-) -> io::Result<()> {
+pub fn follow_file(filename: &str, config: &TailConfig, out: &mut impl Write) -> io::Result<()> {
     use std::thread;
     use std::time::Duration;
 
@@ -621,11 +608,7 @@ pub fn follow_file(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn follow_file(
-    filename: &str,
-    config: &TailConfig,
-    out: &mut impl Write,
-) -> io::Result<()> {
+pub fn follow_file(filename: &str, config: &TailConfig, out: &mut impl Write) -> io::Result<()> {
     use std::io::{Read, Seek};
     use std::thread;
     use std::time::Duration;

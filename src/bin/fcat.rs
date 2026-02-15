@@ -2,8 +2,8 @@ use std::io::{self, BufWriter, Write};
 use std::mem::ManuallyDrop;
 use std::process;
 
-use coreutils_rs::common::{reset_sigpipe, io_error_msg};
 use coreutils_rs::cat::{self, CatConfig};
+use coreutils_rs::common::{io_error_msg, reset_sigpipe};
 
 struct Cli {
     config: CatConfig,

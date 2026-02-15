@@ -205,10 +205,7 @@ fn test_squeeze_blank() {
 fn test_squeeze_no_consecutive() {
     let input = b"one\n\ntwo\n\nthree\n";
     let result = run_cat(input, &squeeze_blank_config());
-    assert_eq!(
-        String::from_utf8_lossy(&result),
-        "one\n\ntwo\n\nthree\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&result), "one\n\ntwo\n\nthree\n");
 }
 
 // ---- Flag combinations ----

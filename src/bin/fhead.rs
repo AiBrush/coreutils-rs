@@ -1,7 +1,7 @@
 use std::io::{self, BufWriter, Write};
 use std::process;
 
-use coreutils_rs::common::{reset_sigpipe, io_error_msg};
+use coreutils_rs::common::{io_error_msg, reset_sigpipe};
 use coreutils_rs::head::{self, HeadConfig, HeadMode};
 
 struct Cli {

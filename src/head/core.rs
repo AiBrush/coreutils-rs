@@ -3,7 +3,7 @@ use std::path::Path;
 
 use memchr::memchr_iter;
 
-use crate::common::io::{read_file, read_stdin, FileData};
+use crate::common::io::{FileData, read_file, read_stdin};
 
 /// Mode for head operation
 #[derive(Clone, Debug)]
@@ -261,11 +261,7 @@ pub fn head_file(
     out: &mut impl Write,
     tool_name: &str,
 ) -> io::Result<bool> {
-    let delimiter = if config.zero_terminated {
-        b'\0'
-    } else {
-        b'\n'
-    };
+    let delimiter = if config.zero_terminated { b'\0' } else { b'\n' };
 
     if filename != "-" {
         let path = Path::new(filename);
@@ -354,11 +350,7 @@ pub fn head_file(
 
 /// Streaming head for positive byte count on non-Linux.
 #[cfg(not(target_os = "linux"))]
-fn head_bytes_streaming_file(
-    path: &Path,
-    n: u64,
-    out: &mut impl Write,
-) -> io::Result<bool> {
+fn head_bytes_streaming_file(path: &Path, n: u64, out: &mut impl Write) -> io::Result<bool> {
     let mut file = std::fs::File::open(path)?;
     let mut remaining = n as usize;
     let mut buf = [0u8; 65536];
@@ -380,11 +372,7 @@ fn head_bytes_streaming_file(
 
 /// Process head for stdin streaming (line mode, positive count)
 /// Reads chunks and counts lines, stopping early once count reached.
-pub fn head_stdin_lines_streaming(
-    n: u64,
-    delimiter: u8,
-    out: &mut impl Write,
-) -> io::Result<()> {
+pub fn head_stdin_lines_streaming(n: u64, delimiter: u8, out: &mut impl Write) -> io::Result<()> {
     if n == 0 {
         return Ok(());
     }

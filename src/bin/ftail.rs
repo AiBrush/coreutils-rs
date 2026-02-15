@@ -1,8 +1,8 @@
 use std::io::{self, BufWriter, Write};
 use std::process;
 
-use coreutils_rs::common::{reset_sigpipe, io_error_msg};
-use coreutils_rs::tail::{self, TailConfig, TailMode, FollowMode};
+use coreutils_rs::common::{io_error_msg, reset_sigpipe};
+use coreutils_rs::tail::{self, FollowMode, TailConfig, TailMode};
 
 struct Cli {
     config: TailConfig,
@@ -107,17 +107,12 @@ fn parse_args() -> Cli {
                     }
                     b"--max-unchanged-stats" => {
                         let val = args.next().unwrap_or_else(|| {
-                            eprintln!(
-                                "tail: option '--max-unchanged-stats' requires an argument"
-                            );
+                            eprintln!("tail: option '--max-unchanged-stats' requires an argument");
                             process::exit(1);
                         });
                         cli.config.max_unchanged_stats =
                             val.to_string_lossy().parse().unwrap_or_else(|_| {
-                                eprintln!(
-                                    "tail: invalid number: '{}'",
-                                    val.to_string_lossy()
-                                );
+                                eprintln!("tail: invalid number: '{}'", val.to_string_lossy());
                                 process::exit(1);
                             });
                     }
