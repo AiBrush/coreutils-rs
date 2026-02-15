@@ -9,7 +9,7 @@ use std::process;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
+use coreutils_rs::common::io::{FileData, read_file, read_file_mmap, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
 
@@ -288,7 +288,17 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         } else {
-            match read_file_mmap(Path::new(filename)) {
+            // Use read_file for small files (<1MB) to avoid mmap page table overhead.
+            // For large files, use read_file_mmap which skips Sequential advice
+            // (tac accesses data backward, not sequentially).
+            let path = Path::new(filename);
+            let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+            let reader = if len >= 1024 * 1024 {
+                read_file_mmap(path)
+            } else {
+                read_file(path)
+            };
+            match reader {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("tac: {}: {}", filename, io_error_msg(&e));
