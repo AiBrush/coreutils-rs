@@ -212,8 +212,22 @@ fn unescape_filename(s: &str) -> String {
     out
 }
 
+/// Enlarge pipe buffers on Linux for higher throughput.
+#[cfg(target_os = "linux")]
+fn enlarge_pipes() {
+    const PIPE_SIZE: i32 = 8 * 1024 * 1024;
+    unsafe {
+        libc::fcntl(0, libc::F_SETPIPE_SZ, PIPE_SIZE);
+        libc::fcntl(1, libc::F_SETPIPE_SZ, PIPE_SIZE);
+    }
+}
+
 fn main() {
     coreutils_rs::common::reset_sigpipe();
+
+    #[cfg(target_os = "linux")]
+    enlarge_pipes();
+
     let cli = parse_args();
 
     // -l 0 means use default (512), matching GNU behavior
