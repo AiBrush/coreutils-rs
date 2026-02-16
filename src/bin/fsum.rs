@@ -1,6 +1,6 @@
 // fsum — checksum and count the blocks in a file (GNU sum replacement)
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::process;
 
 const TOOL_NAME: &str = "sum";
@@ -87,39 +87,51 @@ fn parse_args() -> Cli {
     cli
 }
 
-/// BSD checksum: 16-bit rotating checksum.
-/// For each byte, rotate the checksum right by 1 bit, then add the byte.
-fn bsd_checksum(data: &[u8]) -> (u32, u64) {
-    let mut checksum: u32 = 0;
-    for &byte in data {
-        // Rotate right by 1 within 16 bits
-        checksum = (checksum >> 1) + ((checksum & 1) << 15);
-        checksum = (checksum + u32::from(byte)) & 0xFFFF;
-    }
-    let blocks = (data.len() as u64).div_ceil(1024);
-    (checksum, blocks)
-}
+/// Streaming checksum using BufReader with 8MB buffer.
+/// Avoids loading entire file into memory.
+fn process_streaming<R: io::Read>(reader: R, algorithm: Algorithm) -> io::Result<(u32, u64)> {
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
+    let mut total_bytes: u64 = 0;
 
-/// System V checksum: sum of all bytes mod 65535.
-/// Blocks = ceil(bytes / 512).
-fn sysv_checksum(data: &[u8]) -> (u32, u64) {
-    let mut sum: u32 = 0;
-    for &byte in data {
-        sum += u32::from(byte);
-    }
-    // Fold 32-bit sum into 16-bit range using the GNU sum algorithm:
-    // r = (r & 0xffff) + (r >> 16)
-    let mut r = sum;
-    r = (r & 0xFFFF) + (r >> 16);
-    r = (r & 0xFFFF) + (r >> 16);
-    let blocks = (data.len() as u64).div_ceil(512);
-    (r, blocks)
-}
-
-fn process_input(data: &[u8], algorithm: Algorithm) -> (u32, u64) {
     match algorithm {
-        Algorithm::Bsd => bsd_checksum(data),
-        Algorithm::SysV => sysv_checksum(data),
+        Algorithm::Bsd => {
+            let mut checksum: u32 = 0;
+            loop {
+                let buf = reader.fill_buf()?;
+                if buf.is_empty() {
+                    break;
+                }
+                let n = buf.len();
+                total_bytes += n as u64;
+                for &byte in buf {
+                    checksum = (checksum >> 1) + ((checksum & 1) << 15);
+                    checksum = (checksum + u32::from(byte)) & 0xFFFF;
+                }
+                reader.consume(n);
+            }
+            let blocks = total_bytes.div_ceil(1024);
+            Ok((checksum, blocks))
+        }
+        Algorithm::SysV => {
+            let mut sum: u32 = 0;
+            loop {
+                let buf = reader.fill_buf()?;
+                if buf.is_empty() {
+                    break;
+                }
+                let n = buf.len();
+                total_bytes += n as u64;
+                for &byte in buf {
+                    sum += u32::from(byte);
+                }
+                reader.consume(n);
+            }
+            let mut r = sum;
+            r = (r & 0xFFFF) + (r >> 16);
+            r = (r & 0xFFFF) + (r >> 16);
+            let blocks = total_bytes.div_ceil(512);
+            Ok((r, blocks))
+        }
     }
 }
 
@@ -133,21 +145,11 @@ fn main() {
     let mut exit_code = 0;
 
     for filename in &cli.files {
-        let data = if filename == "-" {
-            let mut buf = Vec::new();
-            if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-                eprintln!(
-                    "{}: -: {}",
-                    TOOL_NAME,
-                    coreutils_rs::common::io_error_msg(&e)
-                );
-                exit_code = 1;
-                continue;
-            }
-            buf
+        let result = if filename == "-" {
+            process_streaming(io::stdin().lock(), cli.algorithm)
         } else {
-            match std::fs::read(filename) {
-                Ok(data) => data,
+            match std::fs::File::open(filename) {
+                Ok(file) => process_streaming(file, cli.algorithm),
                 Err(e) => {
                     eprintln!(
                         "{}: {}: {}",
@@ -161,7 +163,20 @@ fn main() {
             }
         };
 
-        let (checksum, blocks) = process_input(&data, cli.algorithm);
+        let (checksum, blocks) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let name = if filename == "-" { "-" } else { filename.as_str() };
+                eprintln!(
+                    "{}: {}: {}",
+                    TOOL_NAME,
+                    name,
+                    coreutils_rs::common::io_error_msg(&e)
+                );
+                exit_code = 1;
+                continue;
+            }
+        };
 
         let result = if cli.algorithm == Algorithm::Bsd {
             // GNU sum BSD mode: checksum zero-padded to 5 digits, blocks right-aligned to 5 chars

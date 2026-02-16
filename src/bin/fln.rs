@@ -44,9 +44,9 @@ fn main() {
     let mut suffix = DEFAULT_BACKUP_SUFFIX.to_string();
     let mut target_dir: Option<String> = None;
     let mut no_target_dir = false;
-    let mut logical = false;
-    let mut physical = false;
-    let mut interactive = false;
+    let mut _logical = false;
+    let mut _physical = false;
+    let mut _interactive = false;
     let mut operands: Vec<String> = Vec::new();
     let mut saw_dashdash = false;
 
@@ -74,14 +74,14 @@ fn main() {
             "-v" | "--verbose" => verbose = true,
             "-r" | "--relative" => relative = true,
             "-b" | "--backup" => backup = BackupMode::Simple,
-            "-i" | "--interactive" => interactive = true,
+            "-i" | "--interactive" => _interactive = true,
             "-L" | "--logical" => {
-                logical = true;
-                physical = false;
+                _logical = true;
+                _physical = false;
             }
             "-P" | "--physical" => {
-                physical = true;
-                logical = false;
+                _physical = true;
+                _logical = false;
             }
             "-T" | "--no-target-directory" => no_target_dir = true,
             "-t" => {
@@ -130,14 +130,14 @@ fn main() {
                         'v' => verbose = true,
                         'r' => relative = true,
                         'b' => backup = BackupMode::Simple,
-                        'i' => interactive = true,
+                        'i' => _interactive = true,
                         'L' => {
-                            logical = true;
-                            physical = false;
+                            _logical = true;
+                            _physical = false;
                         }
                         'P' => {
-                            physical = true;
-                            logical = false;
+                            _physical = true;
+                            _logical = false;
                         }
                         'T' => no_target_dir = true,
                         'S' => {
@@ -184,14 +184,6 @@ fn main() {
         }
         i += 1;
     }
-
-    // These flags are parsed for CLI compatibility but not fully implemented:
-    // -L/--logical: dereference TARGETs that are symlinks (default hard link behavior)
-    // -P/--physical: make hard links directly to symlinks (less common)
-    // -i/--interactive: prompt before overwrite (requires tty interaction)
-    let _ = logical;
-    let _ = physical;
-    let _ = interactive;
 
     if operands.is_empty() {
         eprintln!("{}: missing file operand", TOOL_NAME);

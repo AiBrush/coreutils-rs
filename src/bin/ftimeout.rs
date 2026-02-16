@@ -244,6 +244,13 @@ fn main() {
             }
         }
 
+        // Close inherited file descriptors to prevent leaks
+        for fd in 3..1024 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+
         let c_command =
             std::ffi::CString::new(command.as_str()).unwrap_or_else(|_| process::exit(EXIT_ENOENT));
         let mut c_args: Vec<std::ffi::CString> = Vec::with_capacity(command_args.len() + 1);
@@ -318,8 +325,13 @@ fn main() {
                     TOOL_NAME, signal_name, command
                 );
             }
-            unsafe {
-                libc::kill(target_pid, sig);
+            let ret = unsafe { libc::kill(target_pid, sig) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    // Process already exited before we could signal it
+                    timed_out = false;
+                }
             }
             break;
         }
@@ -348,12 +360,12 @@ fn main() {
                             TOOL_NAME, command
                         );
                     }
-                    unsafe {
-                        libc::kill(target_pid, libc::SIGKILL);
-                    }
-                    // Wait for the killed process
-                    unsafe {
-                        libc::waitpid(child_pid, &mut status, 0);
+                    let ret = unsafe { libc::kill(target_pid, libc::SIGKILL) };
+                    if ret == 0 {
+                        // Wait for the killed process
+                        unsafe {
+                            libc::waitpid(child_pid, &mut status, 0);
+                        }
                     }
                     break;
                 }
@@ -369,9 +381,11 @@ fn main() {
                 }
                 // Give it a reasonable time to die
                 if wait_start.elapsed().as_secs() > 5 {
-                    unsafe {
-                        libc::kill(target_pid, libc::SIGKILL);
-                        libc::waitpid(child_pid, &mut status, 0);
+                    let ret = unsafe { libc::kill(target_pid, libc::SIGKILL) };
+                    if ret == 0 {
+                        unsafe {
+                            libc::waitpid(child_pid, &mut status, 0);
+                        }
                     }
                     break;
                 }

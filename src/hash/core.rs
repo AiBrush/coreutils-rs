@@ -213,13 +213,47 @@ fn sha1_reader(reader: impl Read) -> io::Result<String> {
 
 // ── SHA-224 ───────────────────────────────────────────────────────────
 
-/// Single-shot SHA-224 using sha2 crate (all platforms).
+/// Single-shot SHA-224 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha224_bytes(data: &[u8]) -> String {
+    if data.len() < TINY_FILE_LIMIT as usize {
+        use digest::Digest;
+        return hex_encode(&sha2::Sha224::digest(data));
+    }
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha224(), data)
+        .expect("SHA224 hash failed");
+    hex_encode(&digest)
+}
+
+/// Single-shot SHA-224 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha224_bytes(data: &[u8]) -> String {
     use digest::Digest;
     hex_encode(&sha2::Sha224::digest(data))
 }
 
-/// Streaming SHA-224 using sha2 crate (all platforms).
+/// Streaming SHA-224 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha224_reader(mut reader: impl Read) -> io::Result<String> {
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
+        let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha224())
+            .map_err(|e| io::Error::other(e))?;
+        loop {
+            let n = read_full(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
+        }
+        let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
+        Ok(hex_encode(&digest))
+    })
+}
+
+/// Streaming SHA-224 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha224_reader(reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -239,13 +273,47 @@ fn sha224_reader(reader: impl Read) -> io::Result<String> {
 
 // ── SHA-384 ───────────────────────────────────────────────────────────
 
-/// Single-shot SHA-384 using sha2 crate (all platforms).
+/// Single-shot SHA-384 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha384_bytes(data: &[u8]) -> String {
+    if data.len() < TINY_FILE_LIMIT as usize {
+        use digest::Digest;
+        return hex_encode(&sha2::Sha384::digest(data));
+    }
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha384(), data)
+        .expect("SHA384 hash failed");
+    hex_encode(&digest)
+}
+
+/// Single-shot SHA-384 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha384_bytes(data: &[u8]) -> String {
     use digest::Digest;
     hex_encode(&sha2::Sha384::digest(data))
 }
 
-/// Streaming SHA-384 using sha2 crate (all platforms).
+/// Streaming SHA-384 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha384_reader(mut reader: impl Read) -> io::Result<String> {
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
+        let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha384())
+            .map_err(|e| io::Error::other(e))?;
+        loop {
+            let n = read_full(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
+        }
+        let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
+        Ok(hex_encode(&digest))
+    })
+}
+
+/// Streaming SHA-384 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha384_reader(reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -265,13 +333,47 @@ fn sha384_reader(reader: impl Read) -> io::Result<String> {
 
 // ── SHA-512 ───────────────────────────────────────────────────────────
 
-/// Single-shot SHA-512 using sha2 crate (all platforms).
+/// Single-shot SHA-512 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha512_bytes(data: &[u8]) -> String {
+    if data.len() < TINY_FILE_LIMIT as usize {
+        use digest::Digest;
+        return hex_encode(&sha2::Sha512::digest(data));
+    }
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha512(), data)
+        .expect("SHA512 hash failed");
+    hex_encode(&digest)
+}
+
+/// Single-shot SHA-512 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha512_bytes(data: &[u8]) -> String {
     use digest::Digest;
     hex_encode(&sha2::Sha512::digest(data))
 }
 
-/// Streaming SHA-512 using sha2 crate (all platforms).
+/// Streaming SHA-512 using OpenSSL's optimized assembly (Linux).
+#[cfg(target_os = "linux")]
+fn sha512_reader(mut reader: impl Read) -> io::Result<String> {
+    STREAM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        ensure_stream_buf(&mut buf);
+        let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha512())
+            .map_err(|e| io::Error::other(e))?;
+        loop {
+            let n = read_full(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
+        }
+        let digest = hasher.finish().map_err(|e| io::Error::other(e))?;
+        Ok(hex_encode(&digest))
+    })
+}
+
+/// Streaming SHA-512 using sha2 crate (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
 fn sha512_reader(reader: impl Read) -> io::Result<String> {
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -1284,23 +1386,28 @@ fn read_remaining_to_vec(prefix: &[u8], mut file: File) -> io::Result<FileConten
 /// then falls back to larger buffer or read_to_end for bigger files.
 fn open_file_content_fast(path: &Path) -> io::Result<FileContent> {
     let mut file = open_noatime(path)?;
-    // Try small buffer first — optimal for benchmark's ~55 byte files.
-    // Single read() + to_vec() with exact size for minimal allocation.
+    // Try small stack buffer first — optimal for benchmark's ~55 byte files.
+    // For tiny files, allocate exact-size Vec to avoid waste.
     let mut small_buf = [0u8; 4096];
     match file.read(&mut small_buf) {
         Ok(0) => return Ok(FileContent::Buf(Vec::new())),
         Ok(n) if n < small_buf.len() => {
-            // File fits in small buffer — done (common case for tiny files)
-            return Ok(FileContent::Buf(small_buf[..n].to_vec()));
+            // File fits in small buffer — allocate exact size
+            let mut vec = Vec::with_capacity(n);
+            vec.extend_from_slice(&small_buf[..n]);
+            return Ok(FileContent::Buf(vec));
         }
         Ok(n) => {
-            // Might be more data — fall back to larger buffer
-            let mut buf = [0u8; 65536];
+            // Might be more data — allocate heap buffer and read into it directly
+            let mut buf = vec![0u8; 65536];
             buf[..n].copy_from_slice(&small_buf[..n]);
             let mut total = n;
             loop {
                 match file.read(&mut buf[total..]) {
-                    Ok(0) => return Ok(FileContent::Buf(buf[..total].to_vec())),
+                    Ok(0) => {
+                        buf.truncate(total);
+                        return Ok(FileContent::Buf(buf));
+                    }
                     Ok(n) => {
                         total += n;
                         if total >= buf.len() {
@@ -1314,11 +1421,14 @@ fn open_file_content_fast(path: &Path) -> io::Result<FileContent> {
             }
         }
         Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-            let mut buf = [0u8; 65536];
+            let mut buf = vec![0u8; 65536];
             let mut total = 0;
             loop {
                 match file.read(&mut buf[total..]) {
-                    Ok(0) => return Ok(FileContent::Buf(buf[..total].to_vec())),
+                    Ok(0) => {
+                        buf.truncate(total);
+                        return Ok(FileContent::Buf(buf));
+                    }
                     Ok(n) => {
                         total += n;
                         if total >= buf.len() {
