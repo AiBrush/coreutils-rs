@@ -121,15 +121,27 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
 // Pre-computed spaces buffer for fast tab expansion (avoids per-tab allocation)
 const SPACES: [u8; 64] = [b' '; 64];
 
-/// Write N spaces to output efficiently using pre-computed buffer.
+/// Write N spaces to a Vec efficiently using pre-computed buffer.
 #[inline]
-fn write_spaces(output: &mut Vec<u8>, n: usize) {
+fn push_spaces(output: &mut Vec<u8>, n: usize) {
     let mut remaining = n;
     while remaining > 0 {
         let chunk = remaining.min(SPACES.len());
         output.extend_from_slice(&SPACES[..chunk]);
         remaining -= chunk;
     }
+}
+
+/// Write N spaces to a writer efficiently using pre-computed buffer.
+#[inline]
+fn write_spaces(out: &mut impl Write, n: usize) -> std::io::Result<()> {
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(SPACES.len());
+        out.write_all(&SPACES[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
 }
 
 /// Expand tabs to spaces using SIMD scanning.
@@ -151,7 +163,7 @@ pub fn expand_bytes(
 
     // For regular tab stops with no -i flag, use the fast SIMD path
     if let TabStops::Regular(tab_size) = tabs {
-        if !initial_only {
+        if !initial_only && memchr::memchr(b'\x08', data).is_none() {
             return expand_regular_fast(data, *tab_size, out);
         }
     }
@@ -161,44 +173,41 @@ pub fn expand_bytes(
 }
 
 /// Fast expand for regular tab stops without -i flag.
-/// Uses memchr2 SIMD scanning to find tabs and newlines, bulk-copying runs.
+/// Streams directly to writer using memchr2 SIMD to find tabs and newlines.
+/// Avoids allocating a large intermediate buffer.
 fn expand_regular_fast(data: &[u8], tab_size: usize, out: &mut impl Write) -> std::io::Result<()> {
-    // Estimate output size: each tab expands to up to tab_size spaces
-    let mut output = Vec::with_capacity(data.len() + data.len() / 4);
     let mut column: usize = 0;
     let mut pos: usize = 0;
 
     while pos < data.len() {
-        // SIMD scan for next tab or newline
         match memchr::memchr2(b'\t', b'\n', &data[pos..]) {
             Some(offset) => {
-                // Bulk copy everything before the special byte
+                // Bulk write everything before the special byte
                 if offset > 0 {
-                    output.extend_from_slice(&data[pos..pos + offset]);
+                    out.write_all(&data[pos..pos + offset])?;
                     column += offset;
                 }
                 let byte = data[pos + offset];
                 pos += offset + 1;
 
                 if byte == b'\n' {
-                    output.push(b'\n');
+                    out.write_all(b"\n")?;
                     column = 0;
                 } else {
-                    // Tab: expand to spaces
+                    // Tab: write spaces directly to output
                     let spaces = tab_size - (column % tab_size);
-                    write_spaces(&mut output, spaces);
+                    write_spaces(out, spaces)?;
                     column += spaces;
                 }
             }
             None => {
-                // No more tabs or newlines: copy remainder
-                output.extend_from_slice(&data[pos..]);
+                out.write_all(&data[pos..])?;
                 break;
             }
         }
     }
 
-    out.write_all(&output)
+    Ok(())
 }
 
 /// Generic expand with support for -i flag and tab lists.
@@ -220,7 +229,7 @@ fn expand_generic(
                     column = tabs.next_tab_stop(column);
                 } else {
                     let spaces = tabs.spaces_to_next(column);
-                    write_spaces(&mut output, spaces);
+                    push_spaces(&mut output, spaces);
                     column += spaces;
                 }
             }
@@ -289,7 +298,7 @@ pub fn unexpand_bytes(
             }
             b'\n' => {
                 if let Some(start_col) = space_start_col.take() {
-                    write_spaces(&mut output, column - start_col);
+                    push_spaces(&mut output, column - start_col);
                 }
                 output.push(b'\n');
                 column = 0;
@@ -297,7 +306,7 @@ pub fn unexpand_bytes(
             }
             b'\x08' => {
                 if let Some(start_col) = space_start_col.take() {
-                    write_spaces(&mut output, column - start_col);
+                    push_spaces(&mut output, column - start_col);
                 }
                 output.push(b'\x08');
                 if column > 0 {
@@ -306,7 +315,7 @@ pub fn unexpand_bytes(
             }
             _ => {
                 if let Some(start_col) = space_start_col.take() {
-                    write_spaces(&mut output, column - start_col);
+                    push_spaces(&mut output, column - start_col);
                 }
                 if in_initial {
                     in_initial = false;
@@ -318,7 +327,7 @@ pub fn unexpand_bytes(
     }
 
     if let Some(start_col) = space_start_col {
-        write_spaces(&mut output, column - start_col);
+        push_spaces(&mut output, column - start_col);
     }
 
     out.write_all(&output)

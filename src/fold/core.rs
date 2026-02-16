@@ -151,9 +151,8 @@ fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &m
         let char_width = if byte == b'\t' {
             let next_stop = ((col / 8) + 1) * 8;
             next_stop - col
-        } else if byte == b'\x08' {
-            0 // handled specially below
-        } else if byte < 0x20 || byte == 0x7f {
+        } else if byte == b'\x08' || byte < 0x20 || byte == 0x7f {
+            // Backspace and other control chars: 0 width
             0
         } else {
             1
