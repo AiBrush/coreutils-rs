@@ -81,12 +81,13 @@ fn topological_sort(
     }
 
     if result.len() != in_degree.len() {
-        // Cycle detected -- find the nodes in the cycle
-        let cycle_members: Vec<String> = in_degree
+        // Cycle detected -- find the nodes in the cycle, preserving input order
+        let mut cycle_members: Vec<String> = nodes
             .iter()
-            .filter(|(n, _)| !result.contains(n))
-            .map(|(n, _)| n.clone())
+            .filter(|n| !result.contains(n))
+            .cloned()
             .collect();
+        cycle_members.dedup();
         Err(cycle_members)
     } else {
         Ok(result)
