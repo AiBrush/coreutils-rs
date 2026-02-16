@@ -1,15 +1,17 @@
 // fcksum — compute POSIX CRC-32 checksum and byte count (GNU cksum replacement)
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process;
 
 const TOOL_NAME: &str = "cksum";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// POSIX CRC-32 lookup table using polynomial 0x04C11DB7.
-/// This is the standard table used by GNU cksum.
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
+/// POSIX CRC-32 slicing-by-4 lookup tables using polynomial 0x04C11DB7.
+/// Table 0 is the standard byte-at-a-time table; tables 1-3 enable processing
+/// 4 bytes per iteration for ~4x throughput improvement.
+const CRC_TABLES: [[u32; 256]; 4] = {
+    let mut tables = [[0u32; 256]; 4];
+    // Build the base table (table 0)
     let mut i = 0u32;
     while i < 256 {
         let mut crc = i << 24;
@@ -22,30 +24,103 @@ const CRC_TABLE: [u32; 256] = {
             }
             j += 1;
         }
-        table[i as usize] = crc;
+        tables[0][i as usize] = crc;
         i += 1;
     }
-    table
+    // Build extended tables for slicing-by-4
+    let mut t = 1;
+    while t < 4 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = (prev << 8) ^ tables[0][(prev >> 24) as usize];
+            i += 1;
+        }
+        t += 1;
+    }
+    tables
 };
 
-/// Compute the POSIX CRC-32 checksum.
-/// Algorithm: for each byte, crc = (crc << 8) ^ table[((crc >> 24) ^ byte) & 0xFF]
-/// Then feed the length bytes (big-endian), then complement.
+/// Backward-compatible alias for tests that reference CRC_TABLE
+#[cfg(test)]
+const CRC_TABLE: [u32; 256] = CRC_TABLES[0];
+
+/// Compute the POSIX CRC-32 checksum using slicing-by-4 for high throughput.
+/// Processes 4 bytes per iteration in the main loop (~4x faster than byte-at-a-time).
+#[cfg(test)]
 fn posix_cksum(data: &[u8]) -> u32 {
     let mut crc: u32 = 0;
 
-    for &byte in data {
-        crc = (crc << 8) ^ CRC_TABLE[((crc >> 24) ^ u32::from(byte)) as usize];
+    // Slicing-by-4: process 4 bytes per iteration
+    let chunks = data.chunks_exact(4);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        let b3 = chunk[3];
+        crc = CRC_TABLES[3][((crc >> 24) ^ u32::from(b0)) as usize]
+            ^ CRC_TABLES[2][((crc >> 16) as u8 ^ b1) as usize]
+            ^ CRC_TABLES[1][((crc >> 8) as u8 ^ b2) as usize]
+            ^ CRC_TABLES[0][(crc as u8 ^ b3) as usize];
+    }
+
+    // Process remaining bytes one at a time
+    for &byte in remainder {
+        crc = (crc << 8) ^ CRC_TABLES[0][((crc >> 24) ^ u32::from(byte)) as usize];
     }
 
     // Feed length bytes (big-endian, only the significant bytes)
     let mut len = data.len() as u64;
     while len > 0 {
-        crc = (crc << 8) ^ CRC_TABLE[((crc >> 24) ^ (len & 0xFF) as u32) as usize];
+        crc = (crc << 8) ^ CRC_TABLES[0][((crc >> 24) ^ (len & 0xFF) as u32) as usize];
         len >>= 8;
     }
 
     !crc
+}
+
+/// Streaming POSIX CRC-32: process data from a reader without loading everything into memory.
+/// Uses 8MB buffer and slicing-by-4 for maximum throughput.
+fn posix_cksum_streaming<R: Read>(reader: R) -> io::Result<(u32, u64)> {
+    let mut reader = io::BufReader::with_capacity(8 * 1024 * 1024, reader);
+    let mut crc: u32 = 0;
+    let mut total_bytes: u64 = 0;
+
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let n = buf.len();
+        total_bytes += n as u64;
+
+        // Slicing-by-4 on the buffer
+        let chunks = buf.chunks_exact(4);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            crc = CRC_TABLES[3][((crc >> 24) ^ u32::from(chunk[0])) as usize]
+                ^ CRC_TABLES[2][((crc >> 16) as u8 ^ chunk[1]) as usize]
+                ^ CRC_TABLES[1][((crc >> 8) as u8 ^ chunk[2]) as usize]
+                ^ CRC_TABLES[0][(crc as u8 ^ chunk[3]) as usize];
+        }
+        for &byte in remainder {
+            crc = (crc << 8) ^ CRC_TABLES[0][((crc >> 24) ^ u32::from(byte)) as usize];
+        }
+
+        reader.consume(n);
+    }
+
+    // Feed length bytes
+    let mut len = total_bytes;
+    while len > 0 {
+        crc = (crc << 8) ^ CRC_TABLES[0][((crc >> 24) ^ (len & 0xFF) as u32) as usize];
+        len >>= 8;
+    }
+
+    Ok((!crc, total_bytes))
 }
 
 struct Cli {
@@ -118,25 +193,38 @@ fn main() {
 
     let cli = parse_args();
     let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::with_capacity(256 * 1024, stdout.lock());
     let mut exit_code = 0;
 
     for filename in &cli.files {
-        let data = if filename == "-" {
-            let mut buf = Vec::new();
-            if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-                eprintln!(
-                    "{}: -: {}",
-                    TOOL_NAME,
-                    coreutils_rs::common::io_error_msg(&e)
-                );
-                exit_code = 1;
-                continue;
+        let (crc, byte_count) = if filename == "-" {
+            match posix_cksum_streaming(io::stdin().lock()) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "{}: -: {}",
+                        TOOL_NAME,
+                        coreutils_rs::common::io_error_msg(&e)
+                    );
+                    exit_code = 1;
+                    continue;
+                }
             }
-            buf
         } else {
-            match std::fs::read(filename) {
-                Ok(data) => data,
+            match std::fs::File::open(filename) {
+                Ok(file) => match posix_cksum_streaming(file) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {}: {}",
+                            TOOL_NAME,
+                            filename,
+                            coreutils_rs::common::io_error_msg(&e)
+                        );
+                        exit_code = 1;
+                        continue;
+                    }
+                },
                 Err(e) => {
                     eprintln!(
                         "{}: {}: {}",
@@ -149,9 +237,6 @@ fn main() {
                 }
             }
         };
-
-        let crc = posix_cksum(&data);
-        let byte_count = data.len();
 
         let result = if filename == "-" {
             writeln!(out, "{} {}", crc, byte_count)

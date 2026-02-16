@@ -301,6 +301,7 @@ pub fn cat_with_options(
 
     let mut prev_blank = false;
     let mut pos = 0;
+    let mut itoa_buf = itoa::Buffer::new();
 
     while pos < data.len() {
         // Find end of this line
@@ -318,14 +319,23 @@ pub fn cat_with_options(
         }
         prev_blank = is_blank;
 
-        // Line numbering
+        // Line numbering - use itoa for fast integer formatting
         if config.number_nonblank {
             if !is_blank {
-                let _ = write!(buf, "{:6}\t", line_num);
+                let s = itoa_buf.format(*line_num);
+                // Right-align in 6-char field
+                let pad = if s.len() < 6 { 6 - s.len() } else { 0 };
+                buf.extend(std::iter::repeat_n(b' ', pad));
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(b'\t');
                 *line_num += 1;
             }
         } else if config.number {
-            let _ = write!(buf, "{:6}\t", line_num);
+            let s = itoa_buf.format(*line_num);
+            let pad = if s.len() < 6 { 6 - s.len() } else { 0 };
+            buf.extend(std::iter::repeat_n(b' ', pad));
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(b'\t');
             *line_num += 1;
         }
 

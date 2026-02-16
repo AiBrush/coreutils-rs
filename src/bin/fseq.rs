@@ -476,76 +476,172 @@ fn main() {
     };
 
     let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut out = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
     let mut is_first = true;
+    let sep_bytes = separator.as_bytes();
+    let sep_is_newline = separator == "\n";
 
     if use_int && fmt.is_empty() {
-        // Fast integer path
+        // Ultra-fast integer path: use itoa + batched buffer to minimize syscalls.
+        // itoa is 3-5x faster than write!() for integer formatting.
         let first_i = first as i64;
         let inc_i = increment as i64;
         let last_i = last as i64;
 
+        let mut itoa_buf = itoa::Buffer::new();
+        // Use a 256KB internal buffer to batch output, reducing write syscalls
+        let mut buf = Vec::with_capacity(256 * 1024);
+        let flush_threshold = 240 * 1024; // Flush when buffer is ~94% full
+
         let mut current = first_i;
-        if inc_i > 0 {
+        if inc_i > 0 && sep_is_newline {
+            // Most common case: seq 1 N with newline separator
+            while current <= last_i {
+                let s = itoa_buf.format(current);
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(b'\n');
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
+                }
+                current += inc_i;
+            }
+            // For newline separator the trailing \n is included
+            if !buf.is_empty() {
+                let _ = out.write_all(&buf);
+            }
+            let _ = out.flush();
+            return;
+        } else if inc_i > 0 {
             while current <= last_i {
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
-                let _ = write!(out, "{current}");
+                let s = itoa_buf.format(current);
+                buf.extend_from_slice(s.as_bytes());
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
+                }
                 current += inc_i;
             }
         } else {
             while current >= last_i {
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
-                let _ = write!(out, "{current}");
+                let s = itoa_buf.format(current);
+                buf.extend_from_slice(s.as_bytes());
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
+                }
                 current += inc_i;
             }
         }
+        if !is_first {
+            buf.push(b'\n');
+        }
+        if !buf.is_empty() {
+            let _ = out.write_all(&buf);
+        }
+        let _ = out.flush();
     } else if use_int && !fmt.is_empty() {
         // Integer values with format string (e.g., equal-width)
         let first_i = first as i64;
         let inc_i = increment as i64;
         let last_i = last as i64;
 
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut buf = Vec::with_capacity(256 * 1024);
+        let flush_threshold = 240 * 1024;
+
         let mut current = first_i;
         if inc_i > 0 {
             while current <= last_i {
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
                 if int_pad_width > 0 {
-                    // Native Rust integer zero-padding (correct for all integer sizes)
-                    let _ = write!(out, "{:0width$}", current, width = int_pad_width);
+                    // Zero-padded integer using itoa + manual padding
+                    let s = itoa_buf.format(current);
+                    let s_bytes = s.as_bytes();
+                    if current < 0 {
+                        buf.push(b'-');
+                        let digits = &s_bytes[1..]; // skip '-'
+                        if digits.len() < int_pad_width - 1 {
+                            let pad = int_pad_width - 1 - digits.len();
+                            buf.extend(std::iter::repeat_n(b'0', pad));
+                        }
+                        buf.extend_from_slice(digits);
+                    } else if s_bytes.len() < int_pad_width {
+                        let pad = int_pad_width - s_bytes.len();
+                        buf.extend(std::iter::repeat_n(b'0', pad));
+                        buf.extend_from_slice(s_bytes);
+                    } else {
+                        buf.extend_from_slice(s_bytes);
+                    }
                 } else {
                     let s = format_number(&fmt, current as f64);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
                 }
                 current += inc_i;
             }
         } else {
             while current >= last_i {
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
                 if int_pad_width > 0 {
-                    let _ = write!(out, "{:0width$}", current, width = int_pad_width);
+                    let s = itoa_buf.format(current);
+                    let s_bytes = s.as_bytes();
+                    if current < 0 {
+                        buf.push(b'-');
+                        let digits = &s_bytes[1..];
+                        if digits.len() < int_pad_width - 1 {
+                            let pad = int_pad_width - 1 - digits.len();
+                            buf.extend(std::iter::repeat_n(b'0', pad));
+                        }
+                        buf.extend_from_slice(digits);
+                    } else if s_bytes.len() < int_pad_width {
+                        let pad = int_pad_width - s_bytes.len();
+                        buf.extend(std::iter::repeat_n(b'0', pad));
+                        buf.extend_from_slice(s_bytes);
+                    } else {
+                        buf.extend_from_slice(s_bytes);
+                    }
                 } else {
                     let s = format_number(&fmt, current as f64);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
                 }
                 current += inc_i;
             }
         }
+        if !is_first {
+            buf.push(b'\n');
+        }
+        if !buf.is_empty() {
+            let _ = out.write_all(&buf);
+        }
+        let _ = out.flush();
     } else {
         // Float path
         // Use a step counter to avoid accumulation errors
         let mut step: u64 = 0;
+        let mut buf = Vec::with_capacity(256 * 1024);
+        let flush_threshold = 240 * 1024;
         if increment > 0.0 {
             loop {
                 let val = first + step as f64 * increment;
@@ -553,15 +649,19 @@ fn main() {
                     break;
                 }
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
                 if fmt.is_empty() {
                     let s = format_fixed(val, prec);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
                 } else {
                     let s = format_number(&fmt, val);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
                 }
                 step += 1;
             }
@@ -572,25 +672,33 @@ fn main() {
                     break;
                 }
                 if !is_first {
-                    let _ = out.write_all(separator.as_bytes());
+                    buf.extend_from_slice(sep_bytes);
                 }
                 is_first = false;
                 if fmt.is_empty() {
                     let s = format_fixed(val, prec);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
                 } else {
                     let s = format_number(&fmt, val);
-                    let _ = out.write_all(s.as_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                if buf.len() >= flush_threshold {
+                    let _ = out.write_all(&buf);
+                    buf.clear();
                 }
                 step += 1;
             }
         }
-    }
 
-    if !is_first {
-        let _ = out.write_all(b"\n");
+        // Flush remaining data in the float path buffer
+        if !is_first {
+            buf.push(b'\n');
+        }
+        if !buf.is_empty() {
+            let _ = out.write_all(&buf);
+        }
+        let _ = out.flush();
     }
-    let _ = out.flush();
 }
 
 fn format_int_value(v: i64) -> String {

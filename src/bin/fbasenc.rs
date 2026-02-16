@@ -629,25 +629,26 @@ fn z85_decode(input: &[u8], ignore_garbage: bool) -> Result<Vec<u8>, String> {
 
 // ======================== Common ========================
 
-fn wrap_output(encoded: &str, wrap: usize) -> String {
+/// Write encoded output with line wrapping directly to writer, avoiding
+/// intermediate String allocation.
+fn write_wrapped(out: &mut impl Write, encoded: &str, wrap: usize) -> io::Result<()> {
     if encoded.is_empty() {
-        return String::new();
+        return Ok(());
     }
     if wrap == 0 {
         // GNU basenc with -w 0 does NOT add a trailing newline
-        return encoded.to_string();
+        return out.write_all(encoded.as_bytes());
     }
 
-    let mut result = String::with_capacity(encoded.len() + encoded.len() / wrap + 1);
     let bytes = encoded.as_bytes();
     let mut pos = 0;
     while pos < bytes.len() {
         let end = (pos + wrap).min(bytes.len());
-        result.push_str(&encoded[pos..end]);
-        result.push('\n');
+        out.write_all(&bytes[pos..end])?;
+        out.write_all(b"\n")?;
         pos = end;
     }
-    result
+    Ok(())
 }
 
 fn encode_data(data: &[u8], encoding: Encoding) -> Result<String, String> {
@@ -715,7 +716,7 @@ fn main() {
     };
 
     let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
 
     if cli.decode {
         match decode_data(&data, encoding, cli.ignore_garbage) {
@@ -736,8 +737,7 @@ fn main() {
     } else {
         match encode_data(&data, encoding) {
             Ok(encoded) => {
-                let wrapped = wrap_output(&encoded, cli.wrap);
-                if let Err(e) = out.write_all(wrapped.as_bytes()) {
+                if let Err(e) = write_wrapped(&mut out, &encoded, cli.wrap) {
                     if e.kind() == io::ErrorKind::BrokenPipe {
                         process::exit(0);
                     }

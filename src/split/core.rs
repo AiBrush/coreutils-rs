@@ -168,7 +168,7 @@ impl FileChunkWriter {
     fn create(path: &str) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self {
-            writer: BufWriter::with_capacity(128 * 1024, file),
+            writer: BufWriter::with_capacity(1024 * 1024, file), // 1MB output buffer
         })
     }
 }
@@ -343,7 +343,7 @@ fn split_by_bytes(
     let mut bytes_in_chunk: u64 = 0;
     let mut writer: Option<Box<dyn ChunkWriter>> = None;
 
-    let mut read_buf = vec![0u8; 128 * 1024];
+    let mut read_buf = vec![0u8; 1024 * 1024]; // 1MB read buffer for fewer syscalls
     loop {
         let bytes_read = match reader.read(&mut read_buf) {
             Ok(0) => break,
