@@ -24,93 +24,6 @@ fn print_version() {
     println!("{} (fcoreutils) {}", TOOL_NAME, VERSION);
 }
 
-/// Perform topological sort using FIFO queue with reverse successor push.
-/// This matches GNU tsort's output ordering exactly.
-/// Returns Ok(sorted) if successful, or Err with cycle members if a cycle exists.
-fn topological_sort(
-    nodes: &[String],
-    edges: &[(String, String)],
-) -> Result<Vec<String>, Vec<String>> {
-    // Build adjacency list and in-degree map
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-
-    // Deduplicate nodes preserving input order
-    let mut unique_nodes: Vec<String> = Vec::new();
-    {
-        let mut seen = HashSet::new();
-        for node in nodes {
-            if seen.insert(node.clone()) {
-                unique_nodes.push(node.clone());
-            }
-        }
-    }
-
-    // Initialize all nodes
-    for node in &unique_nodes {
-        adj.entry(node.clone()).or_default();
-        in_degree.entry(node.clone()).or_insert(0);
-    }
-
-    // Add edges, deduplicating (matches GNU behavior)
-    let mut edge_set: HashSet<(String, String)> = HashSet::new();
-    for (from, to) in edges {
-        if from != to && edge_set.insert((from.clone(), to.clone())) {
-            adj.entry(from.clone()).or_default().push(to.clone());
-            *in_degree.entry(to.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let total = unique_nodes.len();
-
-    // FIFO queue-based Kahn's algorithm with reverse successor push
-    // to match GNU tsort's exact output ordering
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut result: Vec<String> = Vec::new();
-
-    // Add initial zero-degree nodes in input order (FIFO: first in = first out)
-    for node in &unique_nodes {
-        if in_degree.get(node).copied().unwrap_or(0) == 0 {
-            queue.push_back(node.clone());
-        }
-    }
-
-    while let Some(node) = queue.pop_front() {
-        result.push(node.clone());
-        if let Some(neighbors) = adj.get(&node) {
-            // Collect newly freed successors, then enqueue in REVERSE order
-            // so the last-listed successor is dequeued first (matching GNU)
-            let mut new_zeros = Vec::new();
-            for neighbor in neighbors {
-                if let Some(deg) = in_degree.get_mut(neighbor)
-                    && *deg > 0
-                {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        new_zeros.push(neighbor.clone());
-                    }
-                }
-            }
-            for n in new_zeros.into_iter().rev() {
-                queue.push_back(n);
-            }
-        }
-    }
-
-    if result.len() != total {
-        // Cycle detected -- find the nodes in the cycle, preserving input order
-        let result_set: HashSet<&String> = result.iter().collect();
-        let cycle_members: Vec<String> = unique_nodes
-            .iter()
-            .filter(|n| !result_set.contains(n))
-            .cloned()
-            .collect();
-        Err(cycle_members)
-    } else {
-        Ok(result)
-    }
-}
-
 fn run(input: &str, source_name: &str) -> i32 {
     let mut all_nodes: Vec<String> = Vec::new();
     let mut edges: Vec<(String, String)> = Vec::new();
@@ -120,7 +33,10 @@ fn run(input: &str, source_name: &str) -> i32 {
     let tokens: Vec<&str> = input.split_whitespace().collect();
 
     if !tokens.len().is_multiple_of(2) {
-        eprintln!("{}: input contains an odd number of tokens", TOOL_NAME);
+        eprintln!(
+            "{}: {}: input contains an odd number of tokens",
+            TOOL_NAME, source_name
+        );
         return 1;
     }
 
@@ -140,87 +56,139 @@ fn run(input: &str, source_name: &str) -> i32 {
         edges.push((from, to));
     }
 
+    // Build graph
+    let mut unique_nodes: Vec<String> = Vec::new();
+    {
+        let mut seen = HashSet::new();
+        for node in &all_nodes {
+            if seen.insert(node.clone()) {
+                unique_nodes.push(node.clone());
+            }
+        }
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_deg: HashMap<String, usize> = HashMap::new();
+
+    for node in &unique_nodes {
+        adj.entry(node.clone()).or_default();
+        in_deg.entry(node.clone()).or_insert(0);
+    }
+
+    let mut edge_set: HashSet<(String, String)> = HashSet::new();
+    for (from, to) in &edges {
+        if from != to && edge_set.insert((from.clone(), to.clone())) {
+            adj.entry(from.clone()).or_default().push(to.clone());
+            *in_deg.entry(to.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let total = unique_nodes.len();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    match topological_sort(&all_nodes, &edges) {
-        Ok(sorted) => {
-            for node in &sorted {
-                let _ = writeln!(out, "{node}");
-            }
-            0
+    // Incremental Kahn's algorithm with cycle breaking (matches GNU behavior)
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut processed = 0usize;
+    let mut has_cycle = false;
+    let mut removed: HashSet<String> = HashSet::new();
+
+    // Seed queue with initial zero-degree nodes
+    for node in &unique_nodes {
+        if in_deg.get(node).copied().unwrap_or(0) == 0 {
+            queue.push_back(node.clone());
         }
-        Err(cycle_members) => {
-            // Print what we can, then report cycle
-            // GNU tsort outputs nodes as it can, reporting loops inline
-            eprintln!("{}: {}: input contains a loop:", TOOL_NAME, source_name);
-            for member in &cycle_members {
-                eprintln!("{}: {member}", TOOL_NAME);
-            }
+    }
 
-            // Output partial results using stack-based Kahn's, then cycle members
-            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-            let mut in_deg: HashMap<String, usize> = HashMap::new();
-            let mut unique: Vec<String> = Vec::new();
-            {
-                let mut seen = HashSet::new();
-                for node in &all_nodes {
-                    if seen.insert(node.clone()) {
-                        unique.push(node.clone());
+    loop {
+        // Phase 1: process all zero-degree nodes
+        while let Some(node) = queue.pop_front() {
+            processed += 1;
+            removed.insert(node.clone());
+            let _ = writeln!(out, "{node}");
+            if let Some(neighbors) = adj.get(&node).cloned() {
+                let mut new_zeros = Vec::new();
+                for nb in &neighbors {
+                    if removed.contains(nb) {
+                        continue;
                     }
-                }
-            }
-            for node in &unique {
-                adj.entry(node.clone()).or_default();
-                in_deg.entry(node.clone()).or_insert(0);
-            }
-            let mut edge_set: HashSet<(String, String)> = HashSet::new();
-            for (from, to) in &edges {
-                if from != to && edge_set.insert((from.clone(), to.clone())) {
-                    adj.entry(from.clone()).or_default().push(to.clone());
-                    *in_deg.entry(to.clone()).or_insert(0) += 1;
-                }
-            }
-
-            let mut queue: VecDeque<String> = VecDeque::new();
-            for n in &unique {
-                if in_deg.get(n).copied().unwrap_or(0) == 0 {
-                    queue.push_back(n.clone());
-                }
-            }
-            let mut resolved: Vec<String> = Vec::new();
-            while let Some(node) = queue.pop_front() {
-                resolved.push(node.clone());
-                if let Some(neighbors) = adj.get(&node) {
-                    let mut new_zeros = Vec::new();
-                    for nb in neighbors {
-                        if let Some(d) = in_deg.get_mut(nb)
-                            && *d > 0
-                        {
+                    if let Some(d) = in_deg.get_mut(nb) {
+                        if *d > 0 {
                             *d -= 1;
                             if *d == 0 {
                                 new_zeros.push(nb.clone());
                             }
                         }
                     }
-                    for n in new_zeros.into_iter().rev() {
-                        queue.push_back(n);
-                    }
+                }
+                for n in new_zeros.into_iter().rev() {
+                    queue.push_back(n);
                 }
             }
+        }
 
-            for node in &resolved {
-                let _ = writeln!(out, "{node}");
-            }
+        if processed >= total {
+            break;
+        }
 
-            // Output remaining cycle nodes in input order
-            let resolved_set: HashSet<&String> = resolved.iter().collect();
-            for node in &unique {
-                if !resolved_set.contains(node) {
-                    let _ = writeln!(out, "{node}");
-                }
+        // Phase 2: cycle detected — find and report one cycle, then break it
+        has_cycle = true;
+
+        // Find the first unprocessed node in input order
+        let start = unique_nodes
+            .iter()
+            .find(|n| !removed.contains(*n))
+            .unwrap()
+            .clone();
+
+        // Find the cycle by following edges from start using DFS
+        let cycle = find_cycle(&start, &adj, &removed);
+
+        eprintln!("{}: {}: input contains a loop:", TOOL_NAME, source_name);
+        for member in &cycle {
+            eprintln!("{}: {member}", TOOL_NAME);
+        }
+
+        // Break the cycle: force the first cycle member's in-degree to 0
+        if let Some(d) = in_deg.get_mut(&cycle[0]) {
+            *d = 0;
+        }
+        queue.push_back(cycle[0].clone());
+    }
+
+    if has_cycle { 1 } else { 0 }
+}
+
+/// Find a cycle starting from `start` by following edges via DFS.
+/// Returns the cycle members in order.
+fn find_cycle(
+    start: &str,
+    adj: &HashMap<String, Vec<String>>,
+    removed: &HashSet<String>,
+) -> Vec<String> {
+    // Follow edges from start to find a cycle
+    let mut visited: HashMap<String, usize> = HashMap::new();
+    let mut path: Vec<String> = Vec::new();
+
+    let mut current = start.to_string();
+    loop {
+        if let Some(&idx) = visited.get(&current) {
+            // Found the cycle: extract from idx to end of path
+            return path[idx..].to_vec();
+        }
+        visited.insert(current.clone(), path.len());
+        path.push(current.clone());
+
+        // Follow the first non-removed successor
+        let next = adj
+            .get(&current)
+            .and_then(|neighbors| neighbors.iter().find(|n| !removed.contains(*n)));
+        match next {
+            Some(n) => current = n.clone(),
+            None => {
+                // No successor — shouldn't happen in a cycle, return just the node
+                return vec![start.to_string()];
             }
-            1
         }
     }
 }
