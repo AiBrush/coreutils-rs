@@ -95,6 +95,14 @@ path = "src/bin/ftail.rs"
 name = "fcat"
 path = "src/bin/fcat.rs"
 
+[[bin]]
+name = "fcomm"
+path = "src/bin/fcomm.rs"
+
+[[bin]]
+name = "fjoin"
+path = "src/bin/fjoin.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "cargo"] }

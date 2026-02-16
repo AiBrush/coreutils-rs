@@ -12,6 +12,7 @@
     clippy::implicit_saturating_sub,
     clippy::manual_div_ceil,
     clippy::manual_range_contains,
+    clippy::needless_borrows_for_generic_args,
     clippy::needless_lifetimes,
     clippy::needless_return,
     clippy::too_many_arguments
@@ -26,12 +27,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod base64;
 pub mod cat;
+pub mod comm;
 pub mod common;
 pub mod cut;
 pub mod expand;
 pub mod fold;
 pub mod hash;
 pub mod head;
+pub mod join;
 pub mod rev;
 pub mod sort;
 pub mod tac;
