@@ -232,7 +232,7 @@ pub fn parse_dd_args(args: &[String]) -> Result<DdConfig, String> {
                 "status" => {
                     config.status = match value {
                         "none" => StatusLevel::None,
-                        "noerrror" | "noerror" => StatusLevel::NoError,
+                        "noerror" => StatusLevel::NoError,
                         "progress" => StatusLevel::Progress,
                         _ => return Err(format!("invalid status level: '{}'", value)),
                     };
@@ -292,30 +292,25 @@ fn read_full_block(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-/// Apply conversion options to a data block.
-/// Returns a new Vec with the conversions applied.
-pub fn apply_conversions(data: &[u8], conv: &DdConv) -> Vec<u8> {
-    let mut result = data.to_vec();
-
+/// Apply conversion options to a data block in-place.
+pub fn apply_conversions(data: &mut [u8], conv: &DdConv) {
     if conv.swab {
         // Swap every pair of bytes
-        let pairs = result.len() / 2;
+        let pairs = data.len() / 2;
         for i in 0..pairs {
-            result.swap(i * 2, i * 2 + 1);
+            data.swap(i * 2, i * 2 + 1);
         }
     }
 
     if conv.lcase {
-        for b in &mut result {
+        for b in data.iter_mut() {
             b.make_ascii_lowercase();
         }
     } else if conv.ucase {
-        for b in &mut result {
+        for b in data.iter_mut() {
             b.make_ascii_uppercase();
         }
     }
-
-    result
 }
 
 /// Skip input blocks by reading and discarding them.
@@ -327,6 +322,13 @@ fn skip_input(reader: &mut dyn Read, blocks: u64, block_size: usize) -> io::Resu
             break;
         }
     }
+    Ok(())
+}
+
+/// Skip input blocks by seeking (for seekable file inputs).
+fn skip_input_seek(file: &mut File, blocks: u64, block_size: usize) -> io::Result<()> {
+    let offset = blocks * block_size as u64;
+    file.seek(SeekFrom::Start(offset))?;
     Ok(())
 }
 
@@ -352,10 +354,13 @@ fn seek_output_file(file: &mut File, seek_blocks: u64, block_size: usize) -> io:
 pub fn dd_copy(config: &DdConfig) -> io::Result<DdStats> {
     let start_time = Instant::now();
 
+    let mut input_file: Option<File> = None;
     let mut input: Box<dyn Read> = if let Some(ref path) = config.input {
-        Box::new(File::open(path).map_err(|e| {
+        let file = File::open(path).map_err(|e| {
             io::Error::new(e.kind(), format!("failed to open '{}': {}", path, e))
-        })?)
+        })?;
+        input_file = Some(file.try_clone()?);
+        Box::new(file)
     } else {
         Box::new(io::stdin())
     };
@@ -393,9 +398,16 @@ pub fn dd_copy(config: &DdConfig) -> io::Result<DdStats> {
         Box::new(io::stdout())
     };
 
-    // Skip input blocks
+    // Skip input blocks — use seek() for file inputs to avoid reading and discarding data
     if config.skip > 0 {
-        skip_input(&mut input, config.skip, config.ibs)?;
+        if let Some(ref mut f) = input_file {
+            skip_input_seek(f, config.skip, config.ibs)?;
+            // Rebuild the input Box with a clone at the seeked position
+            let seeked = f.try_clone()?;
+            input = Box::new(seeked);
+        } else {
+            skip_input(&mut input, config.skip, config.ibs)?;
+        }
     }
 
     // Seek output blocks
@@ -458,12 +470,12 @@ pub fn dd_copy(config: &DdConfig) -> io::Result<DdStats> {
             }
         }
 
-        // Determine the data slice to use
+        // Determine the data slice to use and apply conversions in-place
         let effective_len = if config.conv.sync { config.ibs } else { n };
-        let data = apply_conversions(&ibuf[..effective_len], &config.conv);
+        apply_conversions(&mut ibuf[..effective_len], &config.conv);
 
         // Buffer output and flush when we have enough for a full output block
-        obuf.extend_from_slice(&data);
+        obuf.extend_from_slice(&ibuf[..effective_len]);
         while obuf.len() >= config.obs {
             output.write_all(&obuf[..config.obs])?;
             stats.records_out_full += 1;
@@ -566,7 +578,7 @@ Copy a file, converting and formatting according to the operands.
   skip=N          skip N ibs-sized blocks at start of input
   status=LEVEL    LEVEL of information to print to stderr;
                   'none' suppresses everything but error messages,
-                  'noerrror' suppresses the final transfer statistics,
+                  'noerror' suppresses the final transfer statistics,
                   'progress' shows periodic transfer statistics
 
   BLOCKS and BYTES may be followed by the following multiplicative suffixes:

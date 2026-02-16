@@ -436,8 +436,9 @@ fn test_apply_conversions_ucase() {
         ucase: true,
         ..Default::default()
     };
-    let result = apply_conversions(b"hello 123", &conv);
-    assert_eq!(&result, b"HELLO 123");
+    let mut data = b"hello 123".to_vec();
+    apply_conversions(&mut data, &conv);
+    assert_eq!(&data, b"HELLO 123");
 }
 
 #[test]
@@ -446,8 +447,9 @@ fn test_apply_conversions_lcase() {
         lcase: true,
         ..Default::default()
     };
-    let result = apply_conversions(b"HELLO 123", &conv);
-    assert_eq!(&result, b"hello 123");
+    let mut data = b"HELLO 123".to_vec();
+    apply_conversions(&mut data, &conv);
+    assert_eq!(&data, b"hello 123");
 }
 
 #[test]
@@ -456,10 +458,12 @@ fn test_apply_conversions_swab() {
         swab: true,
         ..Default::default()
     };
-    let result = apply_conversions(b"abcdef", &conv);
-    assert_eq!(&result, b"badcfe");
+    let mut data = b"abcdef".to_vec();
+    apply_conversions(&mut data, &conv);
+    assert_eq!(&data, b"badcfe");
 
     // Odd length: last byte stays
-    let result = apply_conversions(b"abcde", &conv);
-    assert_eq!(&result, b"badce");
+    let mut data = b"abcde".to_vec();
+    apply_conversions(&mut data, &conv);
+    assert_eq!(&data, b"badce");
 }
