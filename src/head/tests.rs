@@ -446,3 +446,218 @@ fn test_gnu_compat_bytes_suffix() {
 
     assert_eq!(our_output.stdout, gnu_output.stdout);
 }
+
+// ---- Additional edge case and GNU compat tests ----
+
+#[test]
+fn test_stdin_integration() {
+    use std::io::Write;
+    let mut child = std::process::Command::new(bin_path("fhead"))
+        .arg("-n")
+        .arg("3")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"1\n2\n3\n4\n5\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n3\n");
+}
+
+#[test]
+fn test_verbose_flag_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fhead"))
+        .arg("-v")
+        .arg("-n")
+        .arg("1")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("==> "));
+}
+
+#[test]
+fn test_long_form_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "line 1\nline 2\nline 3\nline 4\nline 5\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fhead"))
+        .arg("--lines=3")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "line 1\nline 2\nline 3\n"
+    );
+}
+
+#[test]
+fn test_long_form_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "hello world").unwrap();
+
+    let output = std::process::Command::new(bin_path("fhead"))
+        .arg("--bytes=5")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+}
+
+#[test]
+fn test_empty_file_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("empty.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let output = std::process::Command::new(bin_path("fhead"))
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"");
+}
+
+#[test]
+fn test_file_with_only_newlines() {
+    let mut out = Vec::new();
+    head_lines(b"\n\n\n", 2, b'\n', &mut out).unwrap();
+    assert_eq!(out, b"\n\n");
+}
+
+#[test]
+fn test_multiple_files_bytes_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let file1 = dir.path().join("a.txt");
+    let file2 = dir.path().join("b.txt");
+    std::fs::write(&file1, "abcdef").unwrap();
+    std::fs::write(&file2, "ghijkl").unwrap();
+
+    let output = std::process::Command::new(bin_path("fhead"))
+        .arg("-c")
+        .arg("3")
+        .arg(file1.to_str().unwrap())
+        .arg(file2.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("==> "));
+    assert!(stdout.contains("abc"));
+    assert!(stdout.contains("ghi"));
+}
+
+#[test]
+fn test_zero_terminated_with_n() {
+    let mut out = Vec::new();
+    head_lines(b"a\0b\0c\0d\0", 2, b'\0', &mut out).unwrap();
+    assert_eq!(out, b"a\0b\0");
+}
+
+#[test]
+fn test_no_trailing_newline_from_end() {
+    // Input "one\ntwo\nthree" has 2 newlines, so 2 complete lines.
+    // With n=1, we drop the last 1 complete line ("two\n") and the trailing
+    // fragment ("three"), leaving only "one\n".
+    let mut out = Vec::new();
+    head_lines_from_end(b"one\ntwo\nthree", 1, b'\n', &mut out).unwrap();
+    assert_eq!(out, b"one\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_negative_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "1\n2\n3\n4\n5\n").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fhead"))
+        .arg("-n")
+        .arg("-2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("head")
+        .arg("-n")
+        .arg("-2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_negative_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "hello world").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fhead"))
+        .arg("-c")
+        .arg("-5")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("head")
+        .arg("-c")
+        .arg("-5")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_zero_terminated() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.bin");
+    std::fs::write(&file_path, b"a\0b\0c\0d\0").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fhead"))
+        .arg("-z")
+        .arg("-n")
+        .arg("2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("head")
+        .arg("-z")
+        .arg("-n")
+        .arg("2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}

@@ -270,6 +270,34 @@ fn test_large_file_common() {
     }
 }
 
+#[test]
+fn test_duplicate_lines() {
+    // GNU comm matches duplicates one-at-a-time:
+    // file1: a, a, b    file2: a, b, b
+    // first 'a' matches (col3), second 'a' from file1 is unique (col1),
+    // 'b' from file1 matches first 'b' from file2 (col3),
+    // second 'b' from file2 is unique (col2).
+    let result = comm_str("a\na\nb\n", "a\nb\nb\n", &default_config());
+    assert_eq!(result, "\t\ta\na\n\t\tb\n\tb\n");
+}
+
+#[test]
+fn test_very_long_lines() {
+    let long_a = "a".repeat(10_001);
+    let long_b = "b".repeat(10_001);
+    let input1 = format!("{}\n", long_a);
+    let input2 = format!("{}\n{}\n", long_a, long_b);
+    let result = comm_str(&input1, &input2, &default_config());
+    let expected = format!("\t\t{}\n\t{}\n", long_a, long_b);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_lines_with_tabs() {
+    let result = comm_str("a\tb\n", "a\tb\nc\td\n", &default_config());
+    assert_eq!(result, "\t\ta\tb\n\tc\td\n");
+}
+
 // === Integration Tests ===
 
 #[cfg(test)]
@@ -473,6 +501,54 @@ mod integration {
         assert_eq!(lines.len(), 50_000);
     }
 
+    #[test]
+    fn test_case_insensitive_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        std::fs::write(&f1, "Apple\n").unwrap();
+        std::fs::write(&f2, "apple\n").unwrap();
+        let (out, _, code) = run_fcomm(&["-i", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&out), "\t\tApple\n");
+    }
+
+    #[test]
+    fn test_zero_terminated_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        std::fs::write(&f1, "a\0b\0").unwrap();
+        std::fs::write(&f2, "b\0c\0").unwrap();
+        let (out, _, code) = run_fcomm(&["-z", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"a\0\t\tb\0\tc\0");
+    }
+
+    #[test]
+    fn test_both_empty_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        std::fs::write(&f1, "").unwrap();
+        std::fs::write(&f2, "").unwrap();
+        let (out, _, code) = run_fcomm(&[f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&out), "");
+    }
+
+    #[test]
+    fn test_single_line_files_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        std::fs::write(&f1, "hello\n").unwrap();
+        std::fs::write(&f2, "hello\n").unwrap();
+        let (out, _, code) = run_fcomm(&[f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&out), "\t\thello\n");
+    }
+
     // GNU comparison tests
     #[cfg(target_os = "linux")]
     mod gnu_compat {
@@ -548,6 +624,52 @@ mod integration {
                     "Output differs from GNU comm (empty file)"
                 );
             }
+        }
+
+        #[test]
+        fn test_gnu_compat_output_delimiter() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "a\nb\nc\n").unwrap();
+            std::fs::write(&f2, "b\nc\nd\n").unwrap();
+            let args = [
+                "--output-delimiter=,",
+                f1.to_str().unwrap(),
+                f2.to_str().unwrap(),
+            ];
+
+            let (our_out, _, our_code) = run_fcomm(&args);
+            if let Some((gnu_out, gnu_code)) = run_gnu_comm(&args) {
+                assert_eq!(
+                    our_out, gnu_out,
+                    "Output differs from GNU comm --output-delimiter"
+                );
+                assert_eq!(our_code, gnu_code, "Exit code differs");
+            }
+        }
+
+        #[test]
+        fn test_gnu_compat_total() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "a\nb\nc\n").unwrap();
+            std::fs::write(&f2, "b\nc\nd\n").unwrap();
+            let args = ["--total", f1.to_str().unwrap(), f2.to_str().unwrap()];
+
+            let (our_out, _, our_code) = run_fcomm(&args);
+            // --total may not be supported in all GNU comm versions, so use soft matching
+            if let Some((gnu_out, gnu_code)) = run_gnu_comm(&args) {
+                if gnu_code == 0 {
+                    assert_eq!(our_out, gnu_out, "Output differs from GNU comm --total");
+                    assert_eq!(our_code, gnu_code, "Exit code differs");
+                }
+                // If GNU comm returned non-zero, --total is not supported in this version;
+                // just verify our implementation runs successfully.
+            }
+            // Always verify our implementation handles --total without error
+            assert_eq!(our_code, 0, "fcomm --total should succeed");
         }
     }
 }

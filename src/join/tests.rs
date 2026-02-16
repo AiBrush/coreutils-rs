@@ -272,6 +272,41 @@ fn test_order_check_none() {
     assert!(!had_error);
 }
 
+#[test]
+fn test_field_beyond_available() {
+    let mut config = default_config();
+    config.field1 = 5; // 0-indexed field 6, but lines only have 2 fields
+    let result = join_str("a 1\nb 2\n", "a x\nb y\n", &config);
+    // Field index 5 is beyond available fields, so the join field is empty.
+    // Nothing should match between the two files.
+    assert_eq!(result, "");
+}
+
+#[test]
+fn test_empty_lines_input() {
+    // Empty lines as input records: lines with no content should have empty join field.
+    let result = join_str("\n\n", "\n\n", &default_config());
+    // Empty lines have an empty join field; they match each other.
+    // Two empty lines in each file → 2×2 = 4 matched output lines.
+    assert_eq!(result, "\n\n\n\n");
+}
+
+#[test]
+fn test_whitespace_collapsing() {
+    // Without explicit separator, GNU join collapses leading whitespace.
+    let result = join_str("  a  1\n  b  2\n", "a x\nb y\n", &default_config());
+    // With default (whitespace) separator, leading spaces are skipped
+    // and consecutive spaces are treated as a single delimiter.
+    assert_eq!(result, "a 1 x\nb 2 y\n");
+}
+
+#[test]
+fn test_single_field_lines_only() {
+    // Lines containing only the join field, no other fields.
+    let result = join_str("a\nb\n", "a\nb\n", &default_config());
+    assert_eq!(result, "a\nb\n");
+}
+
 // === Integration Tests ===
 
 #[cfg(test)]
@@ -513,6 +548,52 @@ mod integration {
         assert_eq!(lines.len(), 10_000);
     }
 
+    #[test]
+    fn test_o_auto_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        // Files with different field counts
+        std::fs::write(&f1, "a 1 2\nb 3 4\n").unwrap();
+        std::fs::write(&f2, "a x\nb y\n").unwrap();
+        let (out, _, code) = run_fjoin(&["-o", "auto", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let output = String::from_utf8_lossy(&out);
+        // -o auto should produce output based on the field counts from the first lines
+        assert!(!output.is_empty(), "Expected non-empty output with -o auto");
+    }
+
+    #[test]
+    fn test_zero_terminated_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        // NUL-terminated records
+        std::fs::write(&f1, "a 1\0b 2\0").unwrap();
+        std::fs::write(&f2, "a x\0b y\0").unwrap();
+        let (out, _, code) = run_fjoin(&["-z", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&out), "a 1 x\0b 2 y\0");
+    }
+
+    #[test]
+    fn test_check_order_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        // Unsorted input
+        std::fs::write(&f1, "b 1\na 2\n").unwrap();
+        std::fs::write(&f2, "a x\nb y\n").unwrap();
+        let (_, err, code) =
+            run_fjoin(&["--check-order", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+        // --check-order with unsorted input should produce an error/warning on stderr
+        let stderr = String::from_utf8_lossy(&err);
+        assert!(
+            code != 0 || !stderr.is_empty(),
+            "Expected error or warning on stderr for unsorted input with --check-order"
+        );
+    }
+
     // GNU comparison tests
     #[cfg(target_os = "linux")]
     mod gnu_compat {
@@ -599,6 +680,98 @@ mod integration {
                     our_out, gnu_out,
                     "Output differs from GNU join (many-to-many)"
                 );
+            }
+        }
+
+        #[test]
+        fn test_gnu_compat_e_with_o() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "a 1\nb 2\nc 3\n").unwrap();
+            std::fs::write(&f2, "a x\nc z\n").unwrap();
+            let args = [
+                "-e",
+                "EMPTY",
+                "-o",
+                "0,1.2,2.2",
+                "-a",
+                "1",
+                f1.to_str().unwrap(),
+                f2.to_str().unwrap(),
+            ];
+
+            let (our_out, _, our_code) = run_fjoin(&args);
+            if let Some((gnu_out, gnu_code)) = run_gnu_join(&args) {
+                assert_eq!(
+                    String::from_utf8_lossy(&our_out),
+                    String::from_utf8_lossy(&gnu_out),
+                    "Output differs from GNU join with -e EMPTY -o 0,1.2,2.2"
+                );
+                assert_eq!(our_code, gnu_code, "Exit code differs");
+            }
+        }
+
+        #[test]
+        fn test_gnu_compat_header() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "KEY VAL1\na 1\nb 2\n").unwrap();
+            std::fs::write(&f2, "KEY VAL2\na x\nb y\n").unwrap();
+            let args = ["--header", f1.to_str().unwrap(), f2.to_str().unwrap()];
+
+            let (our_out, _, our_code) = run_fjoin(&args);
+            if let Some((gnu_out, gnu_code)) = run_gnu_join(&args) {
+                assert_eq!(
+                    String::from_utf8_lossy(&our_out),
+                    String::from_utf8_lossy(&gnu_out),
+                    "Output differs from GNU join --header"
+                );
+                assert_eq!(our_code, gnu_code, "Exit code differs");
+            }
+        }
+
+        #[test]
+        fn test_gnu_compat_o_auto() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "a 1 2\nb 3 4\n").unwrap();
+            std::fs::write(&f2, "a x\nb y\n").unwrap();
+            let args = ["-o", "auto", f1.to_str().unwrap(), f2.to_str().unwrap()];
+
+            let (our_out, _, _) = run_fjoin(&args);
+            // GNU join may or may not support -o auto depending on version.
+            // Use a soft comparison: only assert if GNU join succeeds.
+            if let Some((gnu_out, gnu_code)) = run_gnu_join(&args) {
+                if gnu_code == 0 {
+                    assert_eq!(
+                        String::from_utf8_lossy(&our_out),
+                        String::from_utf8_lossy(&gnu_out),
+                        "Output differs from GNU join -o auto"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_gnu_compat_case_insensitive() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("a.txt");
+            let f2 = dir.path().join("b.txt");
+            std::fs::write(&f1, "A 1\nB 2\n").unwrap();
+            std::fs::write(&f2, "a x\nb y\n").unwrap();
+            let args = ["-i", f1.to_str().unwrap(), f2.to_str().unwrap()];
+
+            let (our_out, _, our_code) = run_fjoin(&args);
+            if let Some((gnu_out, gnu_code)) = run_gnu_join(&args) {
+                assert_eq!(
+                    String::from_utf8_lossy(&our_out),
+                    String::from_utf8_lossy(&gnu_out),
+                    "Output differs from GNU join -i"
+                );
+                assert_eq!(our_code, gnu_code, "Exit code differs");
             }
         }
     }

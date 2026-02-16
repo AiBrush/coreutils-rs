@@ -276,6 +276,47 @@ fn test_all_empty_files() {
     assert_eq!(result, b"");
 }
 
+#[test]
+fn test_serial_delimiter_cycling_multifile() {
+    let config = PasteConfig {
+        serial: true,
+        delimiters: vec![b',', b':'],
+        ..default_config()
+    };
+    // First input: lines joined with cycling delimiters ,: -> a,b:c,d
+    // Second input: lines joined with cycling delimiters ,: -> 1,2:3
+    let result = paste_helper(&[b"a\nb\nc\nd\n", b"1\n2\n3\n"], &config);
+    assert_eq!(result, b"a,b:c,d\n1,2:3\n");
+}
+
+#[test]
+fn test_serial_empty_delimiter() {
+    let config = PasteConfig {
+        serial: true,
+        delimiters: Vec::new(),
+        ..default_config()
+    };
+    let result = paste_helper(&[b"a\nb\nc\n"], &config);
+    assert_eq!(result, b"abc\n");
+}
+
+#[test]
+fn test_single_file_no_newline() {
+    let result = paste_helper(&[b"abc"], &default_config());
+    assert_eq!(result, b"abc\n");
+}
+
+#[test]
+fn test_delimiter_longer_than_files() {
+    let config = PasteConfig {
+        delimiters: vec![b',', b':', b';', b'!', b'+'],
+        ..default_config()
+    };
+    // Only 2 files, so only the first delimiter ',' is used between columns
+    let result = paste_helper(&[b"a\nb\n", b"1\n2\n"], &config);
+    assert_eq!(result, b"a,1\nb,2\n");
+}
+
 // --- Integration tests ---
 
 #[cfg(test)]
@@ -530,6 +571,95 @@ mod integration {
                 assert_eq!(
                     our_out, gnu.stdout,
                     "Custom-delimiter output differs from GNU paste"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_zero_flag_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("z1.txt");
+        let p2 = dir.path().join("z2.txt");
+        std::fs::write(&p1, b"a\x00b\x00").unwrap();
+        std::fs::write(&p2, b"c\x00d\x00").unwrap();
+        let (out, _, code) = run_fpaste(b"", &["-z", p1.to_str().unwrap(), p2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"a\tc\x00b\td\x00");
+    }
+
+    #[test]
+    fn test_stdin_mixed_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("mixed.txt");
+        std::fs::write(&p1, b"x\ny\nz\n").unwrap();
+        let (out, _, code) = run_fpaste(b"a\nb\nc\n", &["-s", "-", p1.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        // Serial mode: stdin lines joined, then file lines joined
+        assert_eq!(out, b"a\tb\tc\nx\ty\tz\n");
+    }
+
+    #[test]
+    fn test_more_than_4_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let p = dir.path().join(format!("f{}.txt", i));
+            std::fs::write(&p, format!("{}\n", i)).unwrap();
+            paths.push(p);
+        }
+        let args: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+        let (out, _, code) = run_fpaste(b"", &args);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"0\t1\t2\t3\t4\t5\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_zero_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("gz1.txt");
+        let p2 = dir.path().join("gz2.txt");
+        std::fs::write(&p1, b"a\x00b\x00").unwrap();
+        std::fs::write(&p2, b"c\x00d\x00").unwrap();
+
+        let gnu_out = Command::new("paste")
+            .args(["-z", p1.to_str().unwrap(), p2.to_str().unwrap()])
+            .output();
+
+        let (our_out, _, code) =
+            run_fpaste(b"", &["-z", p1.to_str().unwrap(), p2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "Zero-mode output differs from GNU paste"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_serial_cycling() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("cycle.txt");
+        std::fs::write(&p1, b"a\nb\nc\nd\ne\n").unwrap();
+
+        let gnu_out = Command::new("paste")
+            .args(["-s", "-d", ",:", p1.to_str().unwrap()])
+            .output();
+
+        let (our_out, _, code) = run_fpaste(b"", &["-s", "-d", ",:", p1.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "Serial cycling delimiter output differs from GNU paste"
                 );
             }
         }

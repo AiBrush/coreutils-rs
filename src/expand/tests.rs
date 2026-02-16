@@ -196,6 +196,66 @@ fn test_parse_descending() {
     assert!(parse_tab_stops("8,4").is_err());
 }
 
+#[test]
+fn test_expand_tab_at_exact_boundary() {
+    // Tab at position 8 with tab size 8.
+    // "12345678" occupies columns 0-7, so the tab at column 8 is exactly on a stop.
+    // It should advance to the next stop at column 16, producing 8 spaces.
+    assert_eq!(expand("12345678\t", 8), "12345678        ");
+}
+
+#[test]
+fn test_expand_single_tab_stop_list() {
+    // A tab list with a single value "4" should behave as a regular interval of 4.
+    let tabs = parse_tab_stops("4").unwrap();
+    let mut out = Vec::new();
+    expand_bytes(b"\thello\n", &tabs, false, &mut out).unwrap();
+    let result = String::from_utf8(out).unwrap();
+    assert_eq!(result, "    hello\n");
+}
+
+#[test]
+fn test_unexpand_backspace_handling() {
+    // Backspace in unexpand: column decrements, disrupting alignment.
+    // Input: three spaces, backspace, three spaces at tabstop 4.
+    // The backspace disrupts the column tracking so a clean tab replacement is not possible.
+    let input = "   \x08   ";
+    let tabs = TabStops::Regular(4);
+    let mut out = Vec::new();
+    unexpand_bytes(input.as_bytes(), &tabs, true, &mut out).unwrap();
+    let result = String::from_utf8(out).unwrap();
+    // The backspace disrupts alignment; verify the backspace is preserved in output.
+    assert!(result.contains('\x08'));
+}
+
+#[test]
+fn test_unexpand_all_custom_tab_list() {
+    // unexpand with -a and custom tab list "4,8".
+    // Input has spaces at positions matching both stops.
+    // 4 spaces at start (cols 0-3 → tab stop at 4) + "ab" at cols 4-5 + 2 spaces (cols 6-7 → tab stop at 8) + "cd"
+    let tabs = parse_tab_stops("4,8").unwrap();
+    let input = "    ab  cd\n";
+    let mut out = Vec::new();
+    unexpand_bytes(input.as_bytes(), &tabs, true, &mut out).unwrap();
+    let result = String::from_utf8(out).unwrap();
+    assert_eq!(result, "\tab\tcd\n");
+}
+
+#[test]
+fn test_expand_empty_file() {
+    // Empty input returns empty output.
+    assert_eq!(expand("", 8), "");
+    assert_eq!(expand("", 4), "");
+    assert_eq!(expand("", 1), "");
+}
+
+#[test]
+fn test_expand_no_trailing_newline_simple() {
+    // Input "a\tb" without trailing newline should still expand the tab correctly.
+    // "a" at col 0, tab fills to col 8 → 7 spaces.
+    assert_eq!(expand("a\tb", 8), "a       b");
+}
+
 // ===== Integration tests =====
 #[cfg(test)]
 mod integration {
@@ -362,5 +422,110 @@ mod integration {
     fn test_expand_nonexistent_file() {
         let (_, code) = run_fexpand(b"", &["/tmp/nonexistent_fexpand_test_file"]);
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_expand_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file1 = dir.path().join("file1.txt");
+        let file2 = dir.path().join("file2.txt");
+        std::fs::write(&file1, b"\thello\n").unwrap();
+        std::fs::write(&file2, b"\tworld\n").unwrap();
+        let (out, code) = run_fexpand(b"", &[file1.to_str().unwrap(), file2.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let result = String::from_utf8(out).unwrap();
+        assert!(result.contains("        hello"));
+        assert!(result.contains("        world"));
+        // No tabs should remain in the output
+        assert!(!result.contains('\t'));
+    }
+
+    #[test]
+    fn test_unexpand_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file1 = dir.path().join("file1.txt");
+        let file2 = dir.path().join("file2.txt");
+        std::fs::write(&file1, b"    hello\n").unwrap();
+        std::fs::write(&file2, b"    world\n").unwrap();
+        let (out, code) = run_funexpand(
+            b"",
+            &[
+                "-a",
+                "-t",
+                "4",
+                file1.to_str().unwrap(),
+                file2.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0);
+        let result = String::from_utf8(out).unwrap();
+        assert!(result.contains("\thello"));
+        assert!(result.contains("\tworld"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_expand_initial() {
+        // Write file with leading tabs and mid-line tabs, compare expand -i with GNU expand
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("initial.txt");
+        std::fs::write(&path, b"\t\thello\tworld\nfoo\tbar\n\tbaz\tqux\n").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        // Run our fexpand -i
+        let (our_out, code) = run_fexpand(b"", &["-i", path_str]);
+        assert_eq!(code, 0);
+
+        // Run GNU expand -i
+        let gnu_result = Command::new("expand")
+            .arg("-i")
+            .arg(path_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        if let Ok(gnu) = gnu_result {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "fexpand -i output differs from GNU expand -i"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_unexpand_a_t() {
+        // Write file with spaces, compare unexpand -a -t 4 with GNU unexpand
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spaces.txt");
+        std::fs::write(
+            &path,
+            b"    hello   world\n        indented\nno spaces here\n",
+        )
+        .unwrap();
+        let path_str = path.to_str().unwrap();
+
+        // Run our funexpand -a -t 4
+        let (our_out, code) = run_funexpand(b"", &["-a", "-t", "4", path_str]);
+        assert_eq!(code, 0);
+
+        // Run GNU unexpand -a -t 4
+        let gnu_result = Command::new("unexpand")
+            .args(&["-a", "-t", "4"])
+            .arg(path_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        if let Ok(gnu) = gnu_result {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "funexpand -a -t 4 output differs from GNU unexpand -a -t 4"
+                );
+            }
+        }
     }
 }

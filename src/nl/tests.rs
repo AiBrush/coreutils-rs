@@ -361,6 +361,152 @@ fn test_parse_format() {
     assert!(parse_number_format("xx").is_err());
 }
 
+// --- Custom delimiter tests ---
+
+#[test]
+fn test_custom_delimiter_single_char() {
+    // -d X: single char delimiter becomes "XX" for section matching
+    // "XX" repeated twice = body delimiter "XXXX" won't match; "XX" alone = footer
+    // For body delimiter: the delimiter is "X", and body = 2x delimiter = "XX"
+    let config = NlConfig {
+        section_delimiter: vec![b'X'],
+        body_style: NumberingStyle::All,
+        ..default_config()
+    };
+    // "XX" is the body delimiter (delimiter repeated 2x)
+    let input = b"first\nXX\nsecond\n";
+    let result = nl_helper(input, &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    // "first" is numbered as line 1 in initial body section
+    // "XX" is a body section delimiter -> outputs empty line, resets numbering
+    // "second" is numbered as line 1 in new body section
+    assert!(output.contains("first"));
+    assert!(output.contains("second"));
+    // Body delimiter line should produce a blank line
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1], ""); // delimiter line becomes empty
+    assert!(lines[2].contains("1")); // numbering resets
+    assert!(lines[2].contains("second"));
+}
+
+#[test]
+fn test_custom_delimiter_double_char() {
+    // -d XY: delimiter is "XY", body delimiter = "XYXY"
+    let config = NlConfig {
+        section_delimiter: vec![b'X', b'Y'],
+        body_style: NumberingStyle::All,
+        ..default_config()
+    };
+    let input = b"first\nXYXY\nsecond\n";
+    let result = nl_helper(input, &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 3);
+    // "first" numbered as 1
+    assert!(lines[0].ends_with("first"));
+    assert!(lines[0].contains("1"));
+    // Delimiter line becomes empty
+    assert_eq!(lines[1], "");
+    // "second" numbered as 1 (reset)
+    assert!(lines[2].ends_with("second"));
+    assert!(lines[2].contains("1"));
+}
+
+#[test]
+fn test_full_page_cycle() {
+    // Full logical page: header (\:\:\:), body (\:\:), footer (\:)
+    let input =
+        b"\\:\\:\\:\nheader1\nheader2\n\\:\\:\nbody1\nbody2\nbody3\n\\:\nfooter1\nfooter2\n";
+    let config = NlConfig {
+        header_style: NumberingStyle::All,
+        body_style: NumberingStyle::All,
+        footer_style: NumberingStyle::All,
+        ..default_config()
+    };
+    let result = nl_helper(input, &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    // Line 0: header delimiter -> empty line
+    assert_eq!(lines[0], "");
+    // Lines 1-2: header section numbered 1,2
+    assert!(lines[1].contains("1") && lines[1].contains("header1"));
+    assert!(lines[2].contains("2") && lines[2].contains("header2"));
+    // Line 3: body delimiter -> empty line
+    assert_eq!(lines[3], "");
+    // Lines 4-6: body section numbered 1,2,3 (reset)
+    assert!(lines[4].contains("1") && lines[4].contains("body1"));
+    assert!(lines[5].contains("2") && lines[5].contains("body2"));
+    assert!(lines[6].contains("3") && lines[6].contains("body3"));
+    // Line 7: footer delimiter -> empty line
+    assert_eq!(lines[7], "");
+    // Lines 8-9: footer section numbered 1,2 (reset)
+    assert!(lines[8].contains("1") && lines[8].contains("footer1"));
+    assert!(lines[9].contains("2") && lines[9].contains("footer2"));
+}
+
+#[test]
+fn test_negative_starting_number() {
+    // -v -5: start numbering at -5
+    let config = NlConfig {
+        starting_line_number: -5,
+        body_style: NumberingStyle::All,
+        ..default_config()
+    };
+    let result = nl_helper(b"a\nb\nc\n", &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 3);
+    // Expect line numbers -5, -4, -3
+    assert!(lines[0].contains("-5"));
+    assert!(lines[0].ends_with("a"));
+    assert!(lines[1].contains("-4"));
+    assert!(lines[1].ends_with("b"));
+    assert!(lines[2].contains("-3"));
+    assert!(lines[2].ends_with("c"));
+}
+
+#[test]
+fn test_wide_numbers_exceeding_width() {
+    // -w 3: width is 3, but when numbers exceed 999 GNU nl expands rather than truncates
+    let config = NlConfig {
+        number_width: 3,
+        body_style: NumberingStyle::All,
+        ..default_config()
+    };
+    // Generate 1005 lines
+    let mut input = Vec::new();
+    for _ in 0..1005 {
+        input.extend_from_slice(b"x\n");
+    }
+    let result = nl_helper(&input, &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 1005);
+    // Line 1000 should have "1000" which is 4 digits, wider than width 3
+    // GNU nl does NOT truncate; it expands
+    assert!(lines[999].contains("1000"));
+    assert!(lines[999].ends_with("x"));
+    // Line 1 should be "  1\tx"
+    assert_eq!(lines[0], "  1\tx");
+    // Line 1005 should contain "1005"
+    assert!(lines[1004].contains("1005"));
+}
+
+#[test]
+fn test_tab_containing_lines() {
+    // Lines containing tabs should not interfere with the number separator
+    let config = default_config();
+    let input = b"col1\tcol2\n\tanother\n";
+    let result = nl_helper(input, &config);
+    let output = std::str::from_utf8(&result).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    // First line: "     1\tcol1\tcol2"
+    assert_eq!(lines[0], "     1\tcol1\tcol2");
+    // Second line: "     2\t\tanother"
+    assert_eq!(lines[1], "     2\t\tanother");
+}
+
 // --- Integration tests ---
 
 #[cfg(test)]
@@ -642,6 +788,154 @@ mod integration {
                 assert_eq!(
                     our_out, gnu.stdout,
                     "Starting/increment output differs from GNU nl"
+                );
+            }
+        }
+    }
+
+    // --- Additional integration tests ---
+
+    #[test]
+    fn test_join_blank_lines_integration() {
+        // -l 3 -ba: number all lines, but only number every 3rd consecutive blank
+        let input = b"a\n\n\n\nb\n\n\n\nc\n";
+        let (out, _, code) = run_fnl(input, &["-l", "3", "-b", "a"]);
+        assert_eq!(code, 0);
+        let output = std::str::from_utf8(&out).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        // "a" is numbered (1), then 3 blanks: first 2 not numbered, 3rd numbered (2)
+        // "b" is numbered (3), then 3 blanks: first 2 not numbered, 3rd numbered (4)
+        // "c" is numbered (5)
+        assert!(lines[0].contains("a"));
+        // The 3rd blank line should be numbered
+        assert!(lines[3].trim().starts_with(|c: char| c.is_ascii_digit()));
+        assert!(lines[4].contains("b"));
+    }
+
+    #[test]
+    fn test_regex_body_integration() {
+        // -b p^#: only number lines matching ^#
+        let input = b"# comment\nnormal line\n# another\nplain\n";
+        let (out, _, code) = run_fnl(input, &["-b", "p^#"]);
+        assert_eq!(code, 0);
+        let output = std::str::from_utf8(&out).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 4);
+        // Lines starting with # should be numbered
+        assert!(lines[0].contains("1") && lines[0].contains("# comment"));
+        // "normal line" should NOT be numbered (just spaces prefix)
+        assert!(lines[1].trim_start().starts_with("normal line"));
+        // "# another" should be numbered as 2
+        assert!(lines[2].contains("2") && lines[2].contains("# another"));
+        // "plain" should NOT be numbered
+        assert!(lines[3].trim_start().starts_with("plain"));
+    }
+
+    #[test]
+    fn test_no_renumber_integration() {
+        // -p -h a: don't reset numbering at logical page boundaries, number header lines
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_renumber.txt");
+        std::fs::write(&path, b"a\nb\n\\:\\:\\:\nc\nd\n").unwrap();
+        let (out, _, code) = run_fnl(b"", &["-p", "-h", "a", path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let output = std::str::from_utf8(&out).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        // "a" -> 1, "b" -> 2, header delimiter -> empty, "c" -> 3, "d" -> 4
+        // With -p, numbering should NOT reset at the header delimiter
+        assert!(lines[0].contains("1"));
+        assert!(lines[1].contains("2"));
+        assert_eq!(lines[2], ""); // section delimiter
+        assert!(lines[3].contains("3")); // continued numbering
+        assert!(lines[4].contains("4"));
+    }
+
+    #[test]
+    fn test_footer_section_integration() {
+        // Test file containing \: footer delimiter
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("footer.txt");
+        std::fs::write(&path, b"body1\nbody2\n\\:\nfooter1\nfooter2\n").unwrap();
+        // Default footer style is 'n' (none), so footer lines should not be numbered
+        let (out, _, code) = run_fnl(b"", &[path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let output = std::str::from_utf8(&out).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 5);
+        // body lines numbered
+        assert!(lines[0].contains("1") && lines[0].contains("body1"));
+        assert!(lines[1].contains("2") && lines[1].contains("body2"));
+        // footer delimiter -> empty line
+        assert_eq!(lines[2], "");
+        // footer lines NOT numbered (default footer style 'n')
+        assert!(lines[3].trim_start().starts_with("footer1"));
+        assert!(lines[4].trim_start().starts_with("footer2"));
+        // Verify footer lines don't have numbers
+        assert!(
+            !lines[3]
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
+        );
+        assert!(
+            !lines[4]
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
+        );
+    }
+
+    // --- GNU compatibility tests ---
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_section_delimiters() {
+        // Write file with header, body, footer sections and compare with GNU nl
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gnu_sections.txt");
+        std::fs::write(
+            &path,
+            b"\\:\\:\\:\nheader line\n\\:\\:\nbody line\n\\:\nfooter line\n",
+        )
+        .unwrap();
+
+        let gnu_out = Command::new("nl")
+            .args(["-h", "a", "-f", "a", path.to_str().unwrap()])
+            .output();
+        let (our_out, _, code) = run_fnl(b"", &["-h", "a", "-f", "a", path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "Section delimiter output differs from GNU nl"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_width_overflow() {
+        // Write 1100 lines, run nl -w 3 -ba, compare with GNU nl
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gnu_width_overflow.txt");
+        let mut data = Vec::new();
+        for i in 0..1100 {
+            data.extend_from_slice(format!("line{}\n", i).as_bytes());
+        }
+        std::fs::write(&path, &data).unwrap();
+
+        let gnu_out = Command::new("nl")
+            .args(["-w", "3", "-b", "a", path.to_str().unwrap()])
+            .output();
+        let (our_out, _, code) = run_fnl(b"", &["-w", "3", "-b", "a", path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_out, gnu.stdout,
+                    "Width overflow output differs from GNU nl"
                 );
             }
         }

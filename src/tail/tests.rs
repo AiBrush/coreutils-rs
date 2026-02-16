@@ -403,3 +403,231 @@ fn test_gnu_compat_plus_n() {
 
     assert_eq!(our_output.stdout, gnu_output.stdout);
 }
+
+// ---- Additional edge case and GNU compat tests ----
+
+#[test]
+fn test_stdin_integration() {
+    use std::io::Write;
+    let mut child = std::process::Command::new(bin_path("ftail"))
+        .arg("-n")
+        .arg("3")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"1\n2\n3\n4\n5\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n4\n5\n");
+}
+
+#[test]
+fn test_n_zero_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("zero.txt");
+    std::fs::write(&file_path, "1\n2\n3\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("ftail"))
+        .arg("-n")
+        .arg("0")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+}
+
+#[test]
+fn test_verbose_flag_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("verbose.txt");
+    std::fs::write(&file_path, "hello\nworld\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("ftail"))
+        .arg("-v")
+        .arg("-n")
+        .arg("1")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("==> "),
+        "expected verbose header in output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_empty_file_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("empty.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let output = std::process::Command::new(bin_path("ftail"))
+        .arg("-n")
+        .arg("5")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+}
+
+#[test]
+fn test_no_trailing_newline_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("notrail.txt");
+    std::fs::write(&file_path, "one\ntwo\nthree").unwrap();
+
+    let output = std::process::Command::new(bin_path("ftail"))
+        .arg("-n")
+        .arg("2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "two\nthree");
+}
+
+#[test]
+fn test_only_newlines() {
+    let result = run_tail_lines(b"\n\n\n", 2);
+    assert_eq!(result, b"\n\n");
+}
+
+#[test]
+fn test_multiple_files_bytes_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let file1 = dir.path().join("f1.txt");
+    let file2 = dir.path().join("f2.txt");
+    std::fs::write(&file1, "ABCDEF").unwrap();
+    std::fs::write(&file2, "123456").unwrap();
+
+    let output = std::process::Command::new(bin_path("ftail"))
+        .arg("-c")
+        .arg("3")
+        .arg(file1.to_str().unwrap())
+        .arg(file2.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("==> "),
+        "expected file headers for multiple files"
+    );
+    assert!(stdout.contains("DEF"), "expected last 3 bytes of file1");
+    assert!(stdout.contains("456"), "expected last 3 bytes of file2");
+}
+
+#[test]
+fn test_zero_terminated_plus_n() {
+    let input = b"a\0b\0c\0d\0";
+    let mut out = Vec::new();
+    tail_lines_from(input, 2, b'\0', &mut out).unwrap();
+    assert_eq!(out, b"b\0c\0d\0");
+}
+
+#[test]
+fn test_lines_from_zero() {
+    let input = b"a\nb\nc\n";
+    let result = run_tail_lines_from(input, 0);
+    assert_eq!(result, b"a\nb\nc\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_c_n() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("bytes.txt");
+    std::fs::write(&file_path, "hello world!").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("ftail"))
+        .arg("-c")
+        .arg("5")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_out = std::process::Command::new("tail")
+        .arg("-c")
+        .arg("5")
+        .arg(file_path.to_str().unwrap())
+        .output();
+
+    if let Ok(gnu) = gnu_out {
+        if gnu.status.success() {
+            assert_eq!(our_output.stdout, gnu.stdout);
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_c_plus_n() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("bytes.txt");
+    std::fs::write(&file_path, "hello world!").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("ftail"))
+        .arg("-c")
+        .arg("+7")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_out = std::process::Command::new("tail")
+        .arg("-c")
+        .arg("+7")
+        .arg(file_path.to_str().unwrap())
+        .output();
+
+    if let Ok(gnu) = gnu_out {
+        if gnu.status.success() {
+            assert_eq!(our_output.stdout, gnu.stdout);
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_zero_terminated() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("zero_term.bin");
+    std::fs::write(&file_path, b"a\0b\0c\0d\0").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("ftail"))
+        .arg("-z")
+        .arg("-n")
+        .arg("2")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_out = std::process::Command::new("tail")
+        .arg("-z")
+        .arg("-n")
+        .arg("2")
+        .arg(file_path.to_str().unwrap())
+        .output();
+
+    if let Ok(gnu) = gnu_out {
+        if gnu.status.success() {
+            assert_eq!(our_output.stdout, gnu.stdout);
+        }
+    }
+}

@@ -138,6 +138,108 @@ fn test_single_char_lines() {
     assert_eq!(fold("a\nb\nc\n", 80), "a\nb\nc\n");
 }
 
+// ===== Additional edge case tests =====
+
+#[test]
+fn test_width_zero() {
+    // Width 0: each byte in the input becomes a newline in the output.
+    // Input "abc\n" is 4 bytes, output is 4 newlines.
+    let mut out = Vec::new();
+    fold_bytes(b"abc\n", 0, false, false, &mut out).unwrap();
+    assert_eq!(out, b"\n\n\n\n");
+}
+
+#[test]
+fn test_backspace_column_mode() {
+    // In column mode (not byte mode), backspace (\x08) decrements the column counter.
+    // Input "abcd\x08e\n" with width 4:
+    //   a=col1, b=col2, c=col3, d=col4 (at width, but no break yet since nothing exceeds)
+    //   \x08 is backspace: col decrements to 3
+    //   e: col 3+1=4, which is not > 4, so no break
+    // Output is unchanged: "abcd\x08e\n"
+    let mut out = Vec::new();
+    fold_bytes(b"abcd\x08e\n", 4, false, false, &mut out).unwrap();
+    assert_eq!(out, b"abcd\x08e\n");
+}
+
+#[test]
+fn test_multibyte_utf8_column() {
+    // In column mode, each byte >= 0x20 (and != 0x7f) counts as 1 column.
+    // é is encoded as 0xC3 0xA9 (2 bytes), each counting as 1 column.
+    // Input "aéb\n" = bytes [0x61, 0xC3, 0xA9, 0x62, 0x0A] with width 3:
+    //   a -> col=1, 0xC3 -> col=2, 0xA9 -> col=3
+    //   b -> col+1=4 > 3, so break inserted before b
+    // This matches GNU fold behavior (byte-by-byte column counting).
+    let result = fold("a\u{e9}b\n", 3);
+    assert_eq!(result, "a\u{e9}\nb\n");
+}
+
+#[test]
+fn test_tab_at_exact_boundary() {
+    // Tab at col 0 with width 8: tab advances to next 8-col stop.
+    // char_width = 8, col + char_width = 0 + 8 = 8, which is NOT > 8.
+    // So the tab fits exactly at the boundary without a break.
+    let mut out = Vec::new();
+    fold_bytes(b"\t\n", 8, false, false, &mut out).unwrap();
+    assert_eq!(out, b"\t\n");
+}
+
+#[test]
+fn test_s_trailing_spaces_at_width() {
+    // Input "hello     world\n" with -s -w 10:
+    // "hello     " is 10 chars (5 letters + 5 spaces), fits exactly in width.
+    // Break occurs after the last space within width.
+    assert_eq!(fold_s("hello     world\n", 10), "hello     \nworld\n");
+}
+
+#[test]
+fn test_s_no_spaces_long_word() {
+    // Input "abcdefghijklmno\n" with -s -w 5:
+    // No spaces to break at, so fold must hard-break at width.
+    assert_eq!(fold_s("abcdefghijklmno\n", 5), "abcde\nfghij\nklmno\n");
+}
+
+#[test]
+fn test_s_space_at_position_zero() {
+    // Input " abcd\n" with -s -w 5:
+    // Space at start followed by 4 chars = 5 total columns, fits exactly.
+    assert_eq!(fold_s(" abcd\n", 5), " abcd\n");
+}
+
+#[test]
+fn test_crlf_line_endings() {
+    // CR (\r = 0x0d) is a control char (< 0x20), so it has 0 display width.
+    // Only LF (\n) is treated as a line terminator and resets the column.
+    // Input "abc\r\ndef\r\n" with width 10: everything fits, output unchanged.
+    let mut out = Vec::new();
+    fold_bytes(b"abc\r\ndef\r\n", 10, false, false, &mut out).unwrap();
+    assert_eq!(out, b"abc\r\ndef\r\n");
+}
+
+#[test]
+fn test_very_long_line() {
+    // Single line of 100,000 'a' characters with width 80.
+    // 100000 / 80 = 1250 chunks of 80 chars each.
+    // Each chunk gets a newline (1249 inserted + 1 original trailing = 1250 total).
+    let input = "a".repeat(100_000) + "\n";
+    let result = fold(&input, 80);
+    let line_count = result.matches('\n').count();
+    assert_eq!(line_count, 1250);
+    // Verify each folded line is exactly 80 chars
+    let lines: Vec<&str> = result.split('\n').collect();
+    for i in 0..1250 {
+        assert_eq!(lines[i].len(), 80, "Line {} should be 80 chars", i);
+    }
+}
+
+#[test]
+fn test_empty_input() {
+    // Empty input should produce empty output.
+    let mut out = Vec::new();
+    fold_bytes(b"", 80, false, false, &mut out).unwrap();
+    assert!(out.is_empty());
+}
+
 // ===== Integration tests =====
 
 #[cfg(test)]
@@ -291,5 +393,89 @@ mod integration {
         let (out, code) = run_ffold(b"", &["-w", "40", path.to_str().unwrap()]);
         assert_eq!(code, 0);
         assert!(!out.is_empty());
+    }
+
+    // ---- Additional integration tests ----
+
+    #[test]
+    fn test_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("f1.txt");
+        let f2 = dir.path().join("f2.txt");
+        std::fs::write(&f1, "1234567890\n").unwrap();
+        std::fs::write(&f2, "abcdefghij\n").unwrap();
+        let (out, code) = run_ffold(
+            b"",
+            &["-w", "5", f1.to_str().unwrap(), f2.to_str().unwrap()],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out, b"12345\n67890\nabcde\nfghij\n");
+    }
+
+    // ---- GNU compatibility tests ----
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_tabs_column() {
+        // Write "a\tb\tc\n" to file and compare ffold -w 20 with GNU fold -w 20.
+        // Tabs advance to next 8-column stop in column mode.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.txt");
+        std::fs::write(&path, "a\tb\tc\n").unwrap();
+
+        let our_output = Command::new(bin_path("ffold"))
+            .arg("-w")
+            .arg("20")
+            .arg(path.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let gnu_output = Command::new("fold")
+            .arg("-w")
+            .arg("20")
+            .arg(path.to_str().unwrap())
+            .output();
+
+        if let Ok(gnu) = gnu_output {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_output.stdout, gnu.stdout,
+                    "Output differs from GNU fold with tabs"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_s_only() {
+        // Write "hello world foo bar baz\n" to file and compare ffold -s -w 10 with GNU fold.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spaces.txt");
+        std::fs::write(&path, "hello world foo bar baz\n").unwrap();
+
+        let our_output = Command::new(bin_path("ffold"))
+            .arg("-s")
+            .arg("-w")
+            .arg("10")
+            .arg(path.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let gnu_output = Command::new("fold")
+            .arg("-s")
+            .arg("-w")
+            .arg("10")
+            .arg(path.to_str().unwrap())
+            .output();
+
+        if let Ok(gnu) = gnu_output {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_output.stdout, gnu.stdout,
+                    "Output differs from GNU fold -s"
+                );
+            }
+        }
     }
 }

@@ -113,6 +113,24 @@ fn test_gnu_compat_numbers() {
     assert_eq!(rev_str("12345\n"), "54321\n");
 }
 
+#[test]
+fn test_zero_length_lines() {
+    assert_eq!(rev_str("\n\n\n"), "\n\n\n");
+}
+
+#[test]
+fn test_single_char_no_newline() {
+    assert_eq!(rev_str("x"), "x");
+}
+
+#[test]
+fn test_mixed_valid_invalid_utf8() {
+    let input: Vec<u8> = vec![0xC0, 0x80, b'a', b'b', b'\n'];
+    let mut out = Vec::new();
+    rev_bytes(&input, &mut out).unwrap();
+    assert_eq!(out, vec![b'b', b'a', 0x80, 0xC0, b'\n']);
+}
+
 // Integration tests using the binary
 #[cfg(test)]
 mod integration {
@@ -225,6 +243,83 @@ mod integration {
         let gnu_out = Command::new("rev").arg(path.to_str().unwrap()).output();
 
         // Run our frev
+        let (our_out, code) = run_frev(b"", &[path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(our_out, gnu.stdout, "Output differs from GNU rev");
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_file_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, b"").unwrap();
+        let (out, code) = run_frev(b"", &[path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn test_multiple_files_with_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"abc\n").unwrap();
+        let (out, code) = run_frev(b"def\n", &["-", path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"fed\ncba\n");
+    }
+
+    #[test]
+    fn test_stress_many_lines() {
+        let line = b"abcdefghij\n";
+        let mut data = Vec::with_capacity(line.len() * 100_000);
+        for _ in 0..100_000 {
+            data.extend_from_slice(line);
+        }
+        let (out, code) = run_frev(&data, &[]);
+        assert_eq!(code, 0);
+        let first_line = out.split(|&b| b == b'\n').next().unwrap();
+        assert_eq!(first_line, b"jihgfedcba");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_multibyte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multibyte.txt");
+        std::fs::write(&path, "あいう\n").unwrap();
+
+        let gnu_out = Command::new("timeout")
+            .args(["5", "rev", path.to_str().unwrap()])
+            .output();
+
+        let (our_out, code) = run_frev(b"", &[path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+
+        if let Ok(gnu) = gnu_out {
+            if gnu.status.success() {
+                assert_eq!(our_out, gnu.stdout, "Output differs from GNU rev");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_binary_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.txt");
+        let mut data: Vec<u8> = (0x00..=0x0F).collect();
+        data.push(b'\n');
+        std::fs::write(&path, &data).unwrap();
+
+        let gnu_out = Command::new("timeout")
+            .args(["5", "rev", path.to_str().unwrap()])
+            .output();
+
         let (our_out, code) = run_frev(b"", &[path.to_str().unwrap()]);
         assert_eq!(code, 0);
 

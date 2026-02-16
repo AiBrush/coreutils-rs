@@ -535,3 +535,204 @@ fn test_gnu_compat_show_nonprinting() {
 
     assert_eq!(our_output.stdout, gnu_output.stdout);
 }
+
+// ---- Additional edge case and GNU compat tests ----
+
+#[test]
+fn test_squeeze_at_start() {
+    let input = b"\n\n\nhello\n";
+    let result = run_cat(input, &squeeze_blank_config());
+    assert_eq!(String::from_utf8_lossy(&result), "\nhello\n");
+}
+
+#[test]
+fn test_squeeze_only_empty_lines() {
+    let input = b"\n\n\n\n";
+    let result = run_cat(input, &squeeze_blank_config());
+    assert_eq!(String::from_utf8_lossy(&result), "\n");
+}
+
+#[test]
+fn test_no_trailing_newline_numbered() {
+    let input = b"hello";
+    let result = run_cat(input, &numbered_config());
+    assert_eq!(String::from_utf8_lossy(&result), "     1\thello");
+}
+
+#[test]
+fn test_stdin_dash_argument() {
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
+            child.wait_with_output()
+        })
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n");
+}
+
+#[test]
+fn test_stdin_mixed_with_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file1 = dir.path().join("file1.txt");
+    std::fs::write(&file1, "aaa\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-")
+        .arg(file1.to_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"bbb\n").unwrap();
+            child.wait_with_output()
+        })
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "bbb\naaa\n");
+}
+
+#[test]
+fn test_empty_file_with_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("empty.txt");
+    std::fs::write(&file_path, "").unwrap();
+
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-n")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+}
+
+#[test]
+fn test_b_overrides_n_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "one\n\nthree\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-bn")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "     1\tone\n\n     2\tthree\n"
+    );
+}
+
+#[test]
+fn test_e_combination() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, b"a\x01\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-e")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a^A$\n");
+}
+
+#[test]
+fn test_t_combination() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, b"a\t\x01\n").unwrap();
+
+    let output = std::process::Command::new(bin_path("fcat"))
+        .arg("-t")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a^I^A\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_squeeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "one\n\n\n\ntwo\n").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fcat"))
+        .arg("-s")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("cat")
+        .arg("-s")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_show_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.bin");
+    let mut data: Vec<u8> = (0..=31).collect();
+    data.push(b'\n');
+    std::fs::write(&file_path, &data).unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fcat"))
+        .arg("-A")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("cat")
+        .arg("-A")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_gnu_compat_number_nonblank_squeeze() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "one\n\n\n\ntwo\n").unwrap();
+
+    let our_output = std::process::Command::new(bin_path("fcat"))
+        .arg("-bs")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    let gnu_output = std::process::Command::new("cat")
+        .arg("-bs")
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(our_output.stdout, gnu_output.stdout);
+}
