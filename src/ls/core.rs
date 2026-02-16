@@ -1763,9 +1763,8 @@ pub fn ls_main(paths: &[String], config: &LsConfig) -> io::Result<bool> {
         if config.reverse { ord.reverse() } else { ord }
     });
 
-    let show_header = dir_args.len() > 1
-        || (!file_args.is_empty() && !dir_args.is_empty())
-        || config.recursive;
+    let show_header =
+        dir_args.len() > 1 || (!file_args.is_empty() && !dir_args.is_empty()) || config.recursive;
 
     for (i, dir) in dir_args.iter().enumerate() {
         if i > 0 || !file_args.is_empty() {

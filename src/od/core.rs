@@ -247,7 +247,11 @@ fn snprintf_g(v: f64, precision: usize) -> String {
         let exp: i32 = s[e_pos + 1..].parse().unwrap_or(0);
         if exp >= -(precision as i32) && exp < precision as i32 {
             // Use fixed notation
-            let fixed = format!("{:.prec$}", v, prec = (precision as i32 - 1 - exp).max(0) as usize);
+            let fixed = format!(
+                "{:.prec$}",
+                v,
+                prec = (precision as i32 - 1 - exp).max(0) as usize
+            );
             // Trim trailing zeros after decimal point
             if fixed.contains('.') {
                 let trimmed = fixed.trim_end_matches('0').trim_end_matches('.');
