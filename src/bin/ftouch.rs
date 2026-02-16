@@ -215,27 +215,6 @@ fn mktime_local(
     Ok(t)
 }
 
-/// Get today's midnight in local time.
-#[cfg(unix)]
-fn today_midnight() -> Result<i64, String> {
-    let (now_sec, _) = current_time();
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe {
-        if libc::localtime_r(&now_sec, &mut tm).is_null() {
-            return Err("failed to get local time".to_string());
-        }
-    }
-    tm.tm_hour = 0;
-    tm.tm_min = 0;
-    tm.tm_sec = 0;
-    tm.tm_isdst = -1;
-    let midnight = unsafe { libc::mktime(&mut tm) };
-    if midnight == -1 {
-        return Err("failed to compute midnight".to_string());
-    }
-    Ok(midnight)
-}
-
 /// Parse a -d DATE string.
 /// Supports: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY-MM-DDTHH:MM:SS, @epoch,
 ///           "now", "yesterday", "tomorrow", "N days ago", "N days"

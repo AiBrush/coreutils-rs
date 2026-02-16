@@ -151,7 +151,7 @@ fn create_single(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> Result
     match std::fs::create_dir(dir) {
         Ok(()) => {
             if verbose {
-                eprintln!("{}: created directory '{}'", TOOL_NAME, dir);
+                println!("{}: created directory '{}'", TOOL_NAME, dir);
             }
             if let Some(m) = mode {
                 apply_mode(dir, m)?;
@@ -193,7 +193,7 @@ fn create_with_parents(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> 
         match std::fs::create_dir(p) {
             Ok(()) => {
                 if verbose {
-                    eprintln!("{}: created directory '{}'", TOOL_NAME, p_str);
+                    println!("{}: created directory '{}'", TOOL_NAME, p_str);
                 }
                 // For parent directories (not the final target), set mode 0777 modified by umask
                 // unless explicitly specified. For the final target, use specified mode.
@@ -415,11 +415,11 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(0));
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains("created directory"),
+            stdout.contains("created directory"),
             "verbose should report creation: {}",
-            stderr
+            stdout
         );
     }
 
@@ -432,11 +432,11 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(0));
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains("created directory"),
+            stdout.contains("created directory"),
             "verbose should report parent creation: {}",
-            stderr
+            stdout
         );
     }
 

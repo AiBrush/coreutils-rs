@@ -28,6 +28,7 @@ fn main() {
     let mut null_terminated = false;
     let mut chdir: Option<String> = None;
     let mut command_start: Option<usize> = None;
+    let mut options_done = false; // GNU env: once we see NAME=VALUE, stop parsing options
 
     let mut i = 0;
     while i < args.len() {
@@ -36,6 +37,22 @@ fn main() {
         // Once we find a command, everything after is command + args
         if command_start.is_some() {
             break;
+        }
+
+        // After NAME=VALUE is seen, only more NAME=VALUE or command
+        if options_done {
+            if arg.contains('=') {
+                if let Some(pos) = arg.find('=') {
+                    let name = &arg[..pos];
+                    let value = &arg[pos + 1..];
+                    sets.push((name.to_string(), value.to_string()));
+                }
+            } else {
+                command_start = Some(i);
+                break;
+            }
+            i += 1;
+            continue;
         }
 
         match arg.as_str() {
@@ -143,12 +160,13 @@ fn main() {
                 }
             }
             s if s.contains('=') => {
-                // NAME=VALUE
+                // NAME=VALUE — stop processing options after this
                 if let Some(pos) = s.find('=') {
                     let name = &s[..pos];
                     let value = &s[pos + 1..];
                     sets.push((name.to_string(), value.to_string()));
                 }
+                options_done = true;
             }
             _ => {
                 // This is the start of COMMAND

@@ -372,9 +372,9 @@ fn make_link(
         Ok(()) => {
             if verbose {
                 if symbolic {
-                    eprintln!("'{}' -> '{}'", link_name, actual_target);
+                    println!("'{}' -> '{}'", link_name, actual_target);
                 } else {
-                    eprintln!("'{}' => '{}'", link_name, target);
+                    println!("'{}' => '{}'", link_name, target);
                 }
             }
             Ok(())
@@ -599,8 +599,8 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("->"), "verbose output should contain '->'");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("->"), "verbose output should contain '->'");
     }
 
     #[test]
