@@ -197,7 +197,10 @@ fn main() {
         i += 1;
     }
 
-    // Suppress unused variable warnings for features we acknowledge but don't fully use
+    // These flags are parsed for CLI compatibility but not fully implemented:
+    // -L/--logical: dereference TARGETs that are symlinks (default hard link behavior)
+    // -P/--physical: make hard links directly to symlinks (less common)
+    // -i/--interactive: prompt before overwrite (requires tty interaction)
     let _ = logical;
     let _ = physical;
     let _ = interactive;

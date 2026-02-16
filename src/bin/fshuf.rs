@@ -60,12 +60,19 @@ impl Rng {
         self.state
     }
 
-    /// Return a random index in [0, n)
+    /// Return a random index in [0, n) using rejection sampling to avoid modulo bias
     fn gen_range(&mut self, n: usize) -> usize {
-        if n == 0 {
+        if n <= 1 {
             return 0;
         }
-        (self.next_u64() % n as u64) as usize
+        let n = n as u64;
+        let threshold = u64::MAX - (u64::MAX % n);
+        loop {
+            let r = self.next_u64();
+            if r < threshold {
+                return (r % n) as usize;
+            }
+        }
     }
 }
 

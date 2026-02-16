@@ -74,7 +74,7 @@ fn parse_touch_timestamp(s: &str) -> Result<(i64, i64), String> {
         let secs: u32 = secs_str
             .parse()
             .map_err(|_| format!("invalid date format '{}'", s))?;
-        if secs > 61 {
+        if secs > 60 {
             return Err(format!("invalid date format '{}'", s));
         }
         (&s[..dot_pos], secs)
@@ -180,7 +180,18 @@ fn mktime_local(
 
     let t = unsafe { libc::mktime(&mut tm) };
     if t == -1 {
-        return Err("invalid time value".to_string());
+        // mktime returns -1 on error, but -1 is also a valid time_t
+        // (1969-12-31 23:59:59 UTC). Verify by checking if the normalized
+        // tm fields match our input.
+        if tm.tm_year != year - 1900
+            || tm.tm_mon != month as i32 - 1
+            || tm.tm_mday != day as i32
+            || tm.tm_hour != hour as i32
+            || tm.tm_min != minute as i32
+            || tm.tm_sec != second as i32
+        {
+            return Err("invalid time value".to_string());
+        }
     }
     Ok(t)
 }
@@ -276,7 +287,7 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
         || !(1..=31).contains(&day)
         || hour > 23
         || minute > 59
-        || second > 61
+        || second > 60
     {
         return Err(format!("invalid date '{}'", s));
     }
