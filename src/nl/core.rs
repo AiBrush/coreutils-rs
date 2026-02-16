@@ -137,15 +137,11 @@ fn format_number(num: i64, format: NumberFormat, width: usize, buf: &mut Vec<u8>
         NumberFormat::Ln => {
             buf.extend_from_slice(num_str.as_bytes());
             let pad = width.saturating_sub(num_str.len());
-            for _ in 0..pad {
-                buf.push(b' ');
-            }
+            buf.resize(buf.len() + pad, b' ');
         }
         NumberFormat::Rn => {
             let pad = width.saturating_sub(num_str.len());
-            for _ in 0..pad {
-                buf.push(b' ');
-            }
+            buf.resize(buf.len() + pad, b' ');
             buf.extend_from_slice(num_str.as_bytes());
         }
         NumberFormat::Rz => {
@@ -153,15 +149,11 @@ fn format_number(num: i64, format: NumberFormat, width: usize, buf: &mut Vec<u8>
                 buf.push(b'-');
                 let abs_str = &num_str[1..];
                 let pad = width.saturating_sub(abs_str.len() + 1);
-                for _ in 0..pad {
-                    buf.push(b'0');
-                }
+                buf.resize(buf.len() + pad, b'0');
                 buf.extend_from_slice(abs_str.as_bytes());
             } else {
                 let pad = width.saturating_sub(num_str.len());
-                for _ in 0..pad {
-                    buf.push(b'0');
-                }
+                buf.resize(buf.len() + pad, b'0');
                 buf.extend_from_slice(num_str.as_bytes());
             }
         }
@@ -267,9 +259,7 @@ pub fn nl_to_vec(data: &[u8], config: &NlConfig) -> Vec<u8> {
         } else {
             // Non-numbered lines: GNU nl outputs width + separator_len total spaces, then content
             let total_pad = config.number_width + config.number_separator.len();
-            for _ in 0..total_pad {
-                output.push(b' ');
-            }
+            output.resize(output.len() + total_pad, b' ');
             output.extend_from_slice(line);
         }
 
