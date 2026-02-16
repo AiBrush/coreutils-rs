@@ -13,7 +13,7 @@ fn main() {
     // Check if the binary name (last component of path) is "[".
     let invoked_as_bracket = std::path::Path::new(program)
         .file_name()
-        .map_or(false, |name| name == "[");
+        .is_some_and(|name| name == "[");
 
     let args = if invoked_as_bracket {
         let rest = &all_args[1..];

@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Configuration for the date command.
+#[derive(Default)]
 pub struct DateConfig {
     /// Display time described by STRING (-d).
     pub date_string: Option<String>,
@@ -20,22 +21,6 @@ pub struct DateConfig {
     pub utc: bool,
     /// Custom format string (starts with +).
     pub format: Option<String>,
-}
-
-impl Default for DateConfig {
-    fn default() -> Self {
-        Self {
-            date_string: None,
-            date_file: None,
-            iso_format: None,
-            rfc_email: false,
-            rfc_3339: None,
-            reference_file: None,
-            set_string: None,
-            utc: false,
-            format: None,
-        }
-    }
 }
 
 /// ISO 8601 format precision levels.

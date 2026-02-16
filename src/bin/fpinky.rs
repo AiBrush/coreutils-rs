@@ -22,8 +22,11 @@ use coreutils_rs::pinky;
 
 #[cfg(unix)]
 #[derive(Parser)]
-#[command(name = "pinky", about = "Lightweight finger")]
+#[command(name = "pinky", about = "Lightweight finger", disable_help_flag = true)]
 struct Cli {
+    /// display this help and exit
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
     /// produce long format output for the specified USERs
     #[arg(short = 'l')]
     long_format: bool,
@@ -69,26 +72,19 @@ fn main() {
     coreutils_rs::common::reset_sigpipe();
     let cli = Cli::parse();
 
-    let mut config = pinky::PinkyConfig::default();
-
-    config.long_format = cli.long_format;
-    config.omit_home_shell = cli.omit_home_shell;
-    config.omit_project = cli.omit_project;
-    config.omit_plan = cli.omit_plan;
-    config.omit_heading = cli.omit_heading;
-    config.omit_fullname = cli.omit_fullname;
-    config.omit_fullname_host = cli.omit_fullname_host;
-    config.omit_fullname_host_idle = cli.omit_fullname_host_idle;
-    config.users = cli.users;
-
-    if cli.short_format || !cli.long_format {
-        config.short_format = true;
-    }
-
-    // If long format is explicitly requested, disable short format
-    if cli.long_format {
-        config.short_format = false;
-    }
+    let short_format = !cli.long_format;
+    let config = pinky::PinkyConfig {
+        long_format: cli.long_format,
+        short_format,
+        omit_home_shell: cli.omit_home_shell,
+        omit_project: cli.omit_project,
+        omit_plan: cli.omit_plan,
+        omit_heading: cli.omit_heading,
+        omit_fullname: cli.omit_fullname,
+        omit_fullname_host: cli.omit_fullname_host,
+        omit_fullname_host_idle: cli.omit_fullname_host_idle,
+        users: cli.users,
+    };
 
     let output = pinky::run_pinky(&config);
     if !output.is_empty() {

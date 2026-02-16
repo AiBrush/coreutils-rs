@@ -3,9 +3,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 /// Status output level for dd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatusLevel {
     /// Print transfer stats at end (default).
+    #[default]
     Default,
     /// No informational messages to stderr.
     None,
@@ -13,12 +14,6 @@ pub enum StatusLevel {
     Progress,
     /// Like default but also suppress error messages.
     NoError,
-}
-
-impl Default for StatusLevel {
-    fn default() -> Self {
-        StatusLevel::Default
-    }
 }
 
 /// Conversion flags for dd (`conv=` option).

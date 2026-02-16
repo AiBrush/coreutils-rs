@@ -644,7 +644,7 @@ fn locale_quote(name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Natural version sort comparison (like GNU `ls -v` / `sort -V`).
-pub fn version_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
     let mut ai = 0;

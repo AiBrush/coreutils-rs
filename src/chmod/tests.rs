@@ -74,13 +74,13 @@ fn test_chmod_symbolic_add() {
 #[test]
 fn test_chmod_symbolic_remove() {
     let dir = tempfile::tempdir().unwrap();
-    let path = create_file_with_mode(&dir, "remove.txt", 0o755);
+    let path = create_file_with_mode(&dir, "remove.txt", 0o775);
 
-    let new_mode = parse_mode("g-w", 0o755).unwrap();
-    assert_eq!(new_mode, 0o735);
+    let new_mode = parse_mode("g-w", 0o775).unwrap();
+    assert_eq!(new_mode, 0o755);
 
     chmod_file(&path, new_mode, &default_config()).unwrap();
-    assert_eq!(get_mode(&path), 0o735);
+    assert_eq!(get_mode(&path), 0o755);
 }
 
 #[test]

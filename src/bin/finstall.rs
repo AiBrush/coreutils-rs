@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process;
 
 use coreutils_rs::install::{
-    install_directories, install_file, make_backup_name, parse_backup_mode, parse_mode,
+    install_directories, install_file, parse_backup_mode, parse_mode,
     BackupMode, InstallConfig,
 };
 
@@ -393,20 +393,18 @@ fn main() {
             }
         } else {
             // -D: create leading dirs
-            if config.create_leading {
-                if let Some(parent) = dst.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!(
-                                "{}: cannot create directory '{}': {}",
-                                TOOL_NAME,
-                                parent.display(),
-                                coreutils_rs::common::io_error_msg(&e)
-                            );
-                            process::exit(1);
-                        }
-                    }
-                }
+            if config.create_leading
+                && let Some(parent) = dst.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!(
+                    "{}: cannot create directory '{}': {}",
+                    TOOL_NAME,
+                    parent.display(),
+                    coreutils_rs::common::io_error_msg(&e)
+                );
+                process::exit(1);
             }
             if let Err(e) = install_file(src, dst, &config) {
                 eprintln!(

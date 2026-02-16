@@ -65,6 +65,10 @@ pub fn parse_mode(mode_str: &str, current_mode: u32) -> Result<u32, String> {
 fn parse_symbolic_mode(mode_str: &str, current_mode: u32) -> Result<u32, String> {
     let mut mode = current_mode & 0o7777;
 
+    // Preserve the file type bits from the original mode so that
+    // apply_symbolic_clause can detect directories for capital-X handling.
+    let file_type_bits = current_mode & 0o170000;
+
     // Get the current umask
     let umask = get_umask();
 
@@ -72,7 +76,7 @@ fn parse_symbolic_mode(mode_str: &str, current_mode: u32) -> Result<u32, String>
         if clause.is_empty() {
             return Err(format!("invalid mode: '{}'", mode_str));
         }
-        mode = apply_symbolic_clause(clause, mode, umask)?;
+        mode = apply_symbolic_clause(clause, mode | file_type_bits, umask)? & 0o7777;
     }
 
     Ok(mode)

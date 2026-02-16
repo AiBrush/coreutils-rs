@@ -468,7 +468,7 @@ fn test_parse_fields() {
     assert_eq!(parse_fields("1,3").unwrap(), vec![1, 3]);
     assert_eq!(parse_fields("1,2,3").unwrap(), vec![1, 2, 3]);
     // All fields
-    assert_eq!(parse_fields("-").unwrap(), vec![]);
+    assert_eq!(parse_fields("-").unwrap(), Vec::<usize>::new());
     // Ranges
     assert_eq!(parse_fields("1-3").unwrap(), vec![1, 2, 3]);
     // Field 0 should error

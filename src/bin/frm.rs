@@ -80,9 +80,9 @@ fn main() {
             "--verbose" => config.verbose = true,
             "--one-file-system" => config.one_file_system = true,
             "--no-preserve-root" => config.preserve_root = PreserveRoot::No,
-            s if s == "--preserve-root" => config.preserve_root = PreserveRoot::Yes,
-            s if s == "--preserve-root=all" => config.preserve_root = PreserveRoot::All,
-            s if s == "--interactive" => config.interactive = InteractiveMode::Always,
+            "--preserve-root" => config.preserve_root = PreserveRoot::Yes,
+            "--preserve-root=all" => config.preserve_root = PreserveRoot::All,
+            "--interactive" => config.interactive = InteractiveMode::Always,
             s if s.starts_with("--interactive=") => {
                 let val = &s["--interactive=".len()..];
                 match val {

@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Helper: create a fixed SystemTime for reproducible tests.
 fn fixed_time() -> SystemTime {
-    // 2024-01-15 10:30:00 UTC = 1705312200
-    UNIX_EPOCH + Duration::from_secs(1_705_312_200)
+    // 2024-01-15 10:30:00 UTC = 1705314600
+    UNIX_EPOCH + Duration::from_secs(1_705_314_600)
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn test_date_reference() {
 fn test_date_epoch() {
     let time = fixed_time();
     let result = format_date(&time, "%s", true);
-    assert_eq!(result, "1705312200");
+    assert_eq!(result, "1705314600");
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn test_parse_date_string_epoch() {
     let result = parse_date_string("@0").unwrap();
     assert_eq!(result, UNIX_EPOCH);
 
-    let result = parse_date_string("@1705312200").unwrap();
+    let result = parse_date_string("@1705314600").unwrap();
     assert_eq!(result, fixed_time());
 }
 

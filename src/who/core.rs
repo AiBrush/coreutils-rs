@@ -7,7 +7,6 @@ use std::ffi::CStr;
 use std::fmt::Write as FmtWrite;
 
 // utmpx entry type constants (from utmpx.h)
-const EMPTY: i16 = 0;
 const RUN_LVL: i16 = 1;
 const BOOT_TIME: i16 = 2;
 const NEW_TIME: i16 = 3;

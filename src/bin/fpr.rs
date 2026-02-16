@@ -17,7 +17,7 @@ fn parse_args() -> Cli {
         files: Vec::new(),
     };
 
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
 
     while i < args.len() {
@@ -29,8 +29,7 @@ fn parse_args() -> Cli {
         }
 
         // Handle +FIRST_PAGE[:LAST_PAGE]
-        if arg.starts_with('+') {
-            let page_spec = &arg[1..];
+        if let Some(page_spec) = arg.strip_prefix('+') {
             if let Some(colon) = page_spec.find(':') {
                 if let Ok(first) = page_spec[..colon].parse::<usize>() {
                     cli.config.first_page = first;
@@ -343,12 +342,12 @@ fn main() {
         for filename in &files {
             let lines: Vec<String> = if filename == "-" {
                 let stdin = io::stdin();
-                stdin.lock().lines().filter_map(|l| l.ok()).collect()
+                stdin.lock().lines().map_while(|l| l.ok()).collect()
             } else {
                 match fs::File::open(filename) {
                     Ok(f) => {
                         let reader = BufReader::new(f);
-                        reader.lines().filter_map(|l| l.ok()).collect()
+                        reader.lines().map_while(|l| l.ok()).collect()
                     }
                     Err(e) => {
                         if !cli.config.no_file_warnings {

@@ -291,7 +291,20 @@ pub fn csplit_file(
                     format!("invalid regex: {}", e)
                 })?;
 
-                if let Some(match_idx) = find_match(&lines, &re, current_line) {
+                // Start searching from current_line, but if the line at
+                // current_line itself matches (which happens after a previous
+                // regex split placed us here), skip it so we find the NEXT
+                // occurrence rather than re-matching the boundary line.
+                let search_start = if current_line > 0
+                    && current_line < total_lines
+                    && re.is_match(&lines[current_line])
+                {
+                    current_line + 1
+                } else {
+                    current_line
+                };
+
+                if let Some(match_idx) = find_match(&lines, &re, search_start) {
                     // Apply offset
                     let target = match_idx as i64 + *offset;
                     let split_at = if target < current_line as i64 {

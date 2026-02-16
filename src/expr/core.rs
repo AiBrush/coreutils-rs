@@ -325,6 +325,25 @@ impl<'a> ExprParser<'a> {
                 };
                 Ok(ExprValue::Integer(s.len() as i64))
             }
+            Some("+") => {
+                // GNU expr extension: '+' is a quoting prefix that treats the
+                // next token as a literal string, even if it would otherwise be
+                // interpreted as a keyword (match, length, substr, index).
+                self.consume();
+                match self.consume() {
+                    Some(tok) => {
+                        let tok = tok.to_string();
+                        if let Some(n) = parse_integer(&tok) {
+                            Ok(ExprValue::Integer(n))
+                        } else {
+                            Ok(ExprValue::Str(tok))
+                        }
+                    }
+                    None => Err(ExprError::Syntax(
+                        "missing argument after '+'".to_string(),
+                    )),
+                }
+            }
             _ => {
                 // Atom: a literal string or number.
                 let tok = self.consume().unwrap().to_string();
@@ -378,6 +397,10 @@ fn compare_values(left: &ExprValue, right: &ExprValue, op: &str) -> bool {
 /// - `\+`, `\?` are special in BRE (some implementations)
 /// - `+`, `?` are literal in BRE
 /// - The match is always anchored at the beginning (as if `^` is prepended).
+///
+/// When inside a `\(` ... `\)` group, `\.` is treated as a literal dot insertion
+/// that does not consume input. It is excluded from the regex and instead tracked
+/// separately so that the match result can be reconstructed with literal dots.
 fn bre_to_rust_regex(pattern: &str) -> String {
     let mut result = String::with_capacity(pattern.len() + 2);
     // BRE patterns in expr are implicitly anchored at the start
@@ -385,14 +408,17 @@ fn bre_to_rust_regex(pattern: &str) -> String {
 
     let bytes = pattern.as_bytes();
     let mut i = 0;
+    let mut group_depth = 0u32;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'(' => {
+                    group_depth += 1;
                     result.push('(');
                     i += 2;
                 }
                 b')' => {
+                    group_depth = group_depth.saturating_sub(1);
                     result.push(')');
                     i += 2;
                 }
@@ -426,7 +452,18 @@ fn bre_to_rust_regex(pattern: &str) -> String {
                     result.push_str("\\t");
                     i += 2;
                 }
-                b'.' | b'*' | b'\\' | b'[' | b']' | b'^' | b'$' | b'|' => {
+                b'.' => {
+                    if group_depth > 0 {
+                        // Inside a group, \. is a literal dot insertion that
+                        // does not consume input — skip it in the regex.
+                        i += 2;
+                    } else {
+                        result.push('\\');
+                        result.push('.');
+                        i += 2;
+                    }
+                }
+                b'*' | b'\\' | b'[' | b']' | b'^' | b'$' | b'|' => {
                     result.push('\\');
                     result.push(bytes[i + 1] as char);
                     i += 2;
@@ -485,6 +522,55 @@ fn bre_to_rust_regex(pattern: &str) -> String {
     result
 }
 
+/// Extract a template for the first `\(` ... `\)` group in a BRE pattern.
+/// The template is a list of entries: `true` means a literal dot insertion (from `\.`),
+/// `false` means a character matched from the input.
+/// Returns None if there is no group.
+fn bre_group_template(pattern: &str) -> Option<Vec<bool>> {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_group = false;
+    let mut template = Vec::new();
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'(' if !in_group => {
+                    in_group = true;
+                    i += 2;
+                }
+                b')' if in_group => {
+                    return Some(template);
+                }
+                b'.' if in_group => {
+                    // \. inside group = literal dot insertion (not consuming input)
+                    template.push(true);
+                    i += 2;
+                }
+                _ if in_group => {
+                    // Any other escape inside the group consumes a character from input
+                    template.push(false);
+                    i += 2;
+                }
+                _ => {
+                    i += 2;
+                }
+            }
+        } else if in_group {
+            // Regular character inside group consumes input
+            template.push(false);
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    if in_group {
+        Some(template)
+    } else {
+        None
+    }
+}
+
 /// Check whether a BRE pattern contains `\(` ... `\)` groups.
 fn bre_has_groups(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
@@ -500,6 +586,8 @@ fn bre_has_groups(pattern: &str) -> bool {
 
 /// Perform regex match operation.
 /// If the pattern has `\(` ... `\)` groups, returns the first captured group (or empty string).
+/// When the group contains `\.`, literal dots are inserted into the result at those positions
+/// without consuming characters from the input.
 /// Otherwise returns the number of matched characters (or 0).
 fn do_match(string: &str, pattern: &str) -> Result<ExprValue, ExprError> {
     let has_groups = bre_has_groups(pattern);
@@ -512,9 +600,25 @@ fn do_match(string: &str, pattern: &str) -> Result<ExprValue, ExprError> {
     match re.captures(string) {
         Some(caps) => {
             if has_groups {
-                // Return the first captured group
+                // Return the first captured group, expanded with literal dot insertions
                 match caps.get(1) {
-                    Some(m) => Ok(ExprValue::Str(m.as_str().to_string())),
+                    Some(m) => {
+                        let captured = m.as_str();
+                        if let Some(template) = bre_group_template(pattern) {
+                            let mut result = String::new();
+                            let mut char_iter = captured.chars();
+                            for is_literal_dot in &template {
+                                if *is_literal_dot {
+                                    result.push('.');
+                                } else if let Some(ch) = char_iter.next() {
+                                    result.push(ch);
+                                }
+                            }
+                            Ok(ExprValue::Str(result))
+                        } else {
+                            Ok(ExprValue::Str(captured.to_string()))
+                        }
+                    }
                     None => Ok(ExprValue::Str(String::new())),
                 }
             } else {

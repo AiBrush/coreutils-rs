@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process;
 
 use coreutils_rs::mv::{
-    make_backup_name, mv_file, parse_backup_mode, strip_trailing_slashes, BackupMode, MvConfig,
+    mv_file, parse_backup_mode, strip_trailing_slashes, BackupMode, MvConfig,
 };
 
 const TOOL_NAME: &str = "mv";
@@ -212,7 +212,7 @@ fn main() {
         }
         for source in &operands {
             let src_path = Path::new(source);
-            if !src_path.exists() && !src_path.symlink_metadata().is_ok() {
+            if !src_path.exists() && src_path.symlink_metadata().is_err() {
                 eprintln!(
                     "{}: cannot stat '{}': No such file or directory",
                     TOOL_NAME, source
@@ -253,7 +253,7 @@ fn main() {
         }
         let src = Path::new(&operands[0]);
         let dst = Path::new(&operands[1]);
-        if !src.exists() && !src.symlink_metadata().is_ok() {
+        if !src.exists() && src.symlink_metadata().is_err() {
             eprintln!(
                 "{}: cannot stat '{}': No such file or directory",
                 TOOL_NAME, operands[0]
@@ -282,7 +282,7 @@ fn main() {
         let dst_str = &operands[1];
         let dst = Path::new(dst_str);
 
-        if !src.exists() && !src.symlink_metadata().is_ok() {
+        if !src.exists() && src.symlink_metadata().is_err() {
             eprintln!(
                 "{}: cannot stat '{}': No such file or directory",
                 TOOL_NAME, operands[0]
@@ -329,7 +329,7 @@ fn main() {
         }
         for source in &operands[..operands.len() - 1] {
             let src_path = Path::new(source);
-            if !src_path.exists() && !src_path.symlink_metadata().is_ok() {
+            if !src_path.exists() && src_path.symlink_metadata().is_err() {
                 eprintln!(
                     "{}: cannot stat '{}': No such file or directory",
                     TOOL_NAME, source

@@ -195,8 +195,10 @@ fn format_paragraph<W: Write>(
 
 /// Reflow words into lines that fit within the configured width.
 ///
-/// Uses greedy line breaking: add words to the current line as long as they fit,
-/// then start a new line.
+/// Uses optimal line breaking with a cost function matching GNU fmt:
+///   SHORT_COST(n) = (n * 10)^2  where n = goal - line_length
+///   RAGGED_COST(n) = (n * 10)^2 / 2  where n = line_length - next_line_length
+///   Last line has zero cost.
 fn reflow_paragraph(
     words: &[&str],
     prefix: &str,
@@ -204,62 +206,135 @@ fn reflow_paragraph(
     cont_indent: &str,
     config: &FmtConfig,
 ) -> String {
-    let mut result = String::new();
-    let mut line = format!("{}{}", prefix, first_indent);
-    let mut is_first_line = true;
-
-    for (i, word) in words.iter().enumerate() {
-        let separator = if line.len() == prefix.len() + if is_first_line { first_indent.len() } else { cont_indent.len() } {
-            // Line is at indent level; no separator needed before first word.
-            ""
-        } else if config.uniform_spacing && i > 0 && is_sentence_end(words[i - 1]) {
-            "  "
-        } else {
-            " "
-        };
-
-        let new_len = line.len() + separator.len() + word.len();
-
-        if new_len > config.width
-            && line.len()
-                > prefix.len()
-                    + if is_first_line {
-                        first_indent.len()
-                    } else {
-                        cont_indent.len()
-                    }
-        {
-            // Current line is non-empty beyond indent; emit it and start a new one.
-            result.push_str(&line);
-            result.push('\n');
-            is_first_line = false;
-            line = format!("{}{}", prefix, cont_indent);
-        }
-
-        let sep = if line.len() == prefix.len() + if is_first_line { first_indent.len() } else { cont_indent.len() } {
-            ""
-        } else if config.uniform_spacing && i > 0 && is_sentence_end(words[i - 1]) {
-            "  "
-        } else {
-            " "
-        };
-
-        line.push_str(sep);
-        line.push_str(word);
+    if words.is_empty() {
+        return String::new();
     }
 
-    // Emit final line if it has content beyond the indent.
-    let indent_len = prefix.len()
-        + if is_first_line {
-            first_indent.len()
+    let n = words.len();
+    let first_base = prefix.len() + first_indent.len();
+    let cont_base = prefix.len() + cont_indent.len();
+    let goal = config.goal as i64;
+    let width = config.width;
+
+    // Compute separator widths between consecutive words on the same line.
+    let sep_widths: Vec<usize> = (0..n)
+        .map(|i| {
+            if i == 0 {
+                0
+            } else if config.uniform_spacing && is_sentence_end(words[i - 1]) {
+                2
+            } else {
+                1
+            }
+        })
+        .collect();
+
+    let word_lens: Vec<usize> = words.iter().map(|w| w.len()).collect();
+
+    // DP state:
+    // cost[i] = minimum cost to format words[i..n]
+    // best[i] = last word index of the optimal line starting at word i
+    // first_line_len[i] = length of the first line in the optimal layout of words[i..n]
+    // has_more_lines[i] = whether the sub-solution at i has more than one line
+    let mut cost = vec![i64::MAX; n + 1];
+    let mut best = vec![0usize; n];
+    let mut first_line_len = vec![0i64; n + 1];
+    let mut has_more_lines = vec![false; n + 1]; // true if sub-solution has >= 2 lines
+    cost[n] = 0;
+
+    for i in (0..n).rev() {
+        let base = if i == 0 { first_base } else { cont_base };
+        let mut len = base + word_lens[i];
+
+        for j in i..n {
+            if j > i {
+                len += sep_widths[j] + word_lens[j];
+            }
+
+            if len > width {
+                if j == i {
+                    let line_cost = if j == n - 1 {
+                        0
+                    } else {
+                        let short_n = goal - len as i64;
+                        let short_cost = short_n * 10 * short_n * 10;
+                        // Ragged cost only if the next sub-solution has more than one line
+                        // (i.e., next line is not the last line of the paragraph)
+                        let ragged_cost = if has_more_lines[j + 1] {
+                            let ragged_n = len as i64 - first_line_len[j + 1];
+                            ragged_n * 10 * ragged_n * 10 / 2
+                        } else {
+                            0
+                        };
+                        short_cost + ragged_cost
+                    };
+                    if cost[j + 1] != i64::MAX {
+                        let total = line_cost + cost[j + 1];
+                        if total < cost[i] {
+                            cost[i] = total;
+                            best[i] = j;
+                            first_line_len[i] = len as i64;
+                            has_more_lines[i] = j + 1 < n;
+                        }
+                    }
+                }
+                break;
+            }
+
+            let line_cost = if j == n - 1 {
+                0
+            } else {
+                let short_n = goal - len as i64;
+                let short_cost = short_n * 10 * short_n * 10;
+                // Ragged cost only when the next line is not the last line
+                let ragged_cost = if has_more_lines[j + 1] {
+                    let ragged_n = len as i64 - first_line_len[j + 1];
+                    ragged_n * 10 * ragged_n * 10 / 2
+                } else {
+                    0
+                };
+                short_cost + ragged_cost
+            };
+
+            if cost[j + 1] != i64::MAX {
+                let total = line_cost + cost[j + 1];
+                if total < cost[i] {
+                    cost[i] = total;
+                    best[i] = j;
+                    first_line_len[i] = len as i64;
+                    has_more_lines[i] = j + 1 < n;
+                }
+            }
+        }
+    }
+
+    // Reconstruct the lines from the DP solution.
+    let mut result = String::new();
+    let mut i = 0;
+    let mut is_first_line = true;
+
+    while i < n {
+        let j = best[i];
+        let base = if is_first_line {
+            format!("{}{}", prefix, first_indent)
         } else {
-            cont_indent.len()
+            format!("{}{}", prefix, cont_indent)
         };
-    if line.len() > indent_len {
-        result.push_str(&line);
+
+        result.push_str(&base);
+        result.push_str(words[i]);
+        for k in (i + 1)..=j {
+            if config.uniform_spacing && is_sentence_end(words[k - 1]) {
+                result.push_str("  ");
+            } else {
+                result.push(' ');
+            }
+            result.push_str(words[k]);
+        }
         result.push('\n');
-    } else if !line.is_empty() && words.is_empty() {
-        result.push('\n');
+
+        is_first_line = false;
+        i = j + 1;
     }
 
     result

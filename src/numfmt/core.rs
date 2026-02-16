@@ -337,12 +337,12 @@ fn format_scaled(value: f64, unit: ScaleUnit, round: RoundMethod) -> String {
 
 /// Format a plain number, removing unnecessary trailing zeros and decimal point.
 fn format_plain_number(value: f64) -> String {
-    if value == value.floor() && value.abs() < 1e15 {
-        format!("{}", value as i64)
+    let int_val = value as i64;
+    if value == (int_val as f64) {
+        format!("{}", int_val)
     } else {
         // Use enough precision to avoid loss.
-        let s = format!("{:.1}", value);
-        s
+        format!("{:.1}", value)
     }
 }
 
@@ -372,12 +372,7 @@ fn format_with_scale(
         let scaled = value / chosen_mult;
         let scaled = apply_round_for_display(scaled, round);
 
-        // Format with 1 decimal place like GNU numfmt.
-        if scaled == scaled.floor() {
-            format!("{sign}{:.1}{}{}", scaled.abs(), suffix, i_suffix)
-        } else {
-            format!("{sign}{:.1}{}{}", scaled.abs(), suffix, i_suffix)
-        }
+        format!("{sign}{:.1}{}{}", scaled.abs(), suffix, i_suffix)
     } else {
         // Value is smaller than the smallest suffix, output as-is.
         format_plain_number(value)
@@ -436,7 +431,7 @@ fn group_thousands(s: &str) -> String {
     if remainder > 0 {
         result.push_str(&digits[..remainder]);
     }
-    for (i, chunk) in digits[remainder..].as_bytes().chunks(3).enumerate() {
+    for (i, chunk) in digits.as_bytes()[remainder..].chunks(3).enumerate() {
         if i > 0 || remainder > 0 {
             result.push(',');
         }
@@ -659,10 +654,9 @@ fn convert_number(token: &str, config: &NumfmtConfig) -> Result<String, String> 
     let mut result = if let Some(ref fmt) = config.format {
         // If --to is also specified, first scale, then format.
         if config.to != ScaleUnit::None {
-            let scaled = format_scaled(value, config.to, config.round);
             // When both --format and --to are given, the scaled output
             // is used as-is (GNU behavior).
-            scaled
+            format_scaled(value, config.to, config.round)
         } else {
             let rounded = apply_round(value, config.round);
             apply_format(rounded, fmt)?

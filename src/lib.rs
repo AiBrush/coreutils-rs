@@ -15,7 +15,10 @@
     clippy::needless_borrows_for_generic_args,
     clippy::needless_lifetimes,
     clippy::needless_return,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::write_literal,
+    clippy::io_other_error
 )]
 
 /// Use mimalloc as the global allocator for all binaries.

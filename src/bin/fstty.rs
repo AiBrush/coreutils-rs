@@ -164,18 +164,16 @@ fn main() {
             };
             match coreutils_rs::stty::apply_settings(&mut termios, &config.settings) {
                 Ok(changed) => {
-                    if changed {
-                        if let Err(e) = coreutils_rs::stty::set_termios(fd, &termios) {
-                            let src =
-                                config.device.as_deref().unwrap_or("standard input");
-                            eprintln!(
-                                "{}: {}: {}",
-                                TOOL_NAME,
-                                src,
-                                coreutils_rs::common::io_error_msg(&e)
-                            );
-                            process::exit(1);
-                        }
+                    if changed && let Err(e) = coreutils_rs::stty::set_termios(fd, &termios) {
+                        let src =
+                            config.device.as_deref().unwrap_or("standard input");
+                        eprintln!(
+                            "{}: {}: {}",
+                            TOOL_NAME,
+                            src,
+                            coreutils_rs::common::io_error_msg(&e)
+                        );
+                        process::exit(1);
                     }
                 }
                 Err(e) => {

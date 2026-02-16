@@ -208,7 +208,7 @@ fn parse_args() -> (NumfmtConfig, Vec<String>) {
                     config.delimiter = val.chars().next();
                 } else if arg.starts_with('-') && arg.len() > 1 {
                     // Could be a negative number.
-                    if arg.chars().nth(1).map_or(false, |c| c.is_ascii_digit() || c == '.') {
+                    if arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit() || c == '.') {
                         positional.push(arg);
                     } else {
                         eprintln!("{}: unrecognized option '{}'", TOOL_NAME, arg);

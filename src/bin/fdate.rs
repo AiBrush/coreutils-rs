@@ -3,7 +3,7 @@ use std::process;
 use std::time::SystemTime;
 
 use coreutils_rs::common::{io_error_msg, reset_sigpipe};
-use coreutils_rs::date::{self, DateConfig, IsoFormat, Rfc3339Format};
+use coreutils_rs::date::{self, DateConfig, IsoFormat};
 
 struct Cli {
     config: DateConfig,
@@ -31,8 +31,8 @@ fn parse_args() -> Cli {
             // After --, next arg could be a format string
             if let Some(next) = args.next() {
                 let ns = next.to_string_lossy();
-                if ns.starts_with('+') {
-                    cli.config.format = Some(ns[1..].to_string());
+                if let Some(fmt) = ns.strip_prefix('+') {
+                    cli.config.format = Some(fmt.to_string());
                 }
             }
             break;
@@ -162,8 +162,8 @@ fn parse_args() -> Cli {
             }
         } else {
             // Positional argument - treat as format if starts with +
-            if s.starts_with('+') {
-                cli.config.format = Some(s[1..].to_string());
+            if let Some(fmt) = s.strip_prefix('+') {
+                cli.config.format = Some(fmt.to_string());
             } else {
                 eprintln!("date: extra operand '{}'", s);
                 process::exit(1);
