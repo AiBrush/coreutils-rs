@@ -489,7 +489,7 @@ fn format_fs_specifiers(fmt: &str, path: &str, sfs: &libc::statfs) -> String {
                     #[cfg(target_os = "linux")]
                     result.push_str(&format!("{:x}", sfs.f_type));
                     #[cfg(not(target_os = "linux"))]
-                    result.push_str("0");
+                    result.push('0');
                 }
                 'T' => {
                     #[cfg(target_os = "linux")]

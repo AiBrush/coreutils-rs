@@ -78,6 +78,7 @@ pub fn shred_file(path: &Path, config: &ShredConfig) -> io::Result<()> {
             }
             #[cfg(not(unix))]
             {
+                #[allow(clippy::permissions_set_readonly_false)]
                 if perms.readonly() {
                     perms.set_readonly(false);
                     let _ = fs::set_permissions(path, perms);
