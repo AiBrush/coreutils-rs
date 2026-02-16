@@ -198,16 +198,22 @@ fn main() {
     }
 
     // Change directory if requested
-    if let Some(ref dir) = chdir
-        && let Err(e) = std::env::set_current_dir(dir)
-    {
-        eprintln!(
-            "{}: cannot change directory to '{}': {}",
-            TOOL_NAME,
-            dir,
-            coreutils_rs::common::io_error_msg(&e)
-        );
-        process::exit(125);
+    if let Some(ref dir) = chdir {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            eprintln!(
+                "{}: cannot change directory to \u{2018}{}\u{2019}: {}",
+                TOOL_NAME,
+                dir,
+                coreutils_rs::common::io_error_msg(&e)
+            );
+            process::exit(125);
+        }
+        // Update PWD to canonical path, matching GNU env behavior
+        if let Ok(cwd) = std::env::current_dir() {
+            unsafe {
+                std::env::set_var("PWD", cwd);
+            }
+        }
     }
 
     if let Some(start) = command_start {

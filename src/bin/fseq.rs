@@ -439,6 +439,7 @@ fn main() {
         && format.is_none();
 
     // Determine format string
+    let mut int_pad_width: usize = 0; // For integer equal-width, use native formatting
     let fmt = if let Some(ref f) = format {
         if equal_width {
             eprintln!(
@@ -462,7 +463,9 @@ fn main() {
         };
         let w = first_width.max(last_width);
         if use_int {
-            format!("%0{w}g")
+            // Use native Rust integer zero-padding (avoids %g scientific notation for large numbers)
+            int_pad_width = w;
+            "INT_PAD".to_string() // Marker to enter the format path
         } else {
             format!("%0{w}.{prec}f")
         }
@@ -515,8 +518,13 @@ fn main() {
                     let _ = out.write_all(separator.as_bytes());
                 }
                 is_first = false;
-                let s = format_number(&fmt, current as f64);
-                let _ = out.write_all(s.as_bytes());
+                if int_pad_width > 0 {
+                    // Native Rust integer zero-padding (correct for all integer sizes)
+                    let _ = write!(out, "{:0width$}", current, width = int_pad_width);
+                } else {
+                    let s = format_number(&fmt, current as f64);
+                    let _ = out.write_all(s.as_bytes());
+                }
                 current += inc_i;
             }
         } else {
@@ -525,8 +533,12 @@ fn main() {
                     let _ = out.write_all(separator.as_bytes());
                 }
                 is_first = false;
-                let s = format_number(&fmt, current as f64);
-                let _ = out.write_all(s.as_bytes());
+                if int_pad_width > 0 {
+                    let _ = write!(out, "{:0width$}", current, width = int_pad_width);
+                } else {
+                    let s = format_number(&fmt, current as f64);
+                    let _ = out.write_all(s.as_bytes());
+                }
                 current += inc_i;
             }
         }

@@ -290,27 +290,62 @@ fn main() {
 }
 
 fn parse_range(s: &str) -> (u64, u64) {
-    let parts: Vec<&str> = s.splitn(2, '-').collect();
-    if parts.len() != 2 {
-        eprintln!("{}: invalid input range: '{}'", TOOL_NAME, s);
-        process::exit(1);
-    }
-    let lo: u64 = match parts[0].parse() {
+    // Find the separator '-' that's not part of a negative number sign
+    // Format: LO-HI where LO and HI are non-negative integers
+    let sep_pos = if s.starts_with('-') {
+        // First char is '-' (could be negative, which is invalid for u64 range)
+        // Look for next '-' as separator
+        match s[1..].find('-') {
+            Some(p) => p + 1,
+            None => {
+                eprintln!(
+                    "{}: invalid input range: \u{2018}{}\u{2019}",
+                    TOOL_NAME, s
+                );
+                process::exit(1);
+            }
+        }
+    } else {
+        match s.find('-') {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "{}: invalid input range: \u{2018}{}\u{2019}",
+                    TOOL_NAME, s
+                );
+                process::exit(1);
+            }
+        }
+    };
+
+    let lo_str = &s[..sep_pos];
+    let hi_str = &s[sep_pos + 1..];
+
+    let lo: u64 = match lo_str.parse() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("{}: invalid input range: '{}'", TOOL_NAME, s);
+            eprintln!(
+                "{}: invalid input range: \u{2018}{}\u{2019}",
+                TOOL_NAME, s
+            );
             process::exit(1);
         }
     };
-    let hi: u64 = match parts[1].parse() {
+    let hi: u64 = match hi_str.parse() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("{}: invalid input range: '{}'", TOOL_NAME, s);
+            eprintln!(
+                "{}: invalid input range: \u{2018}{}\u{2019}",
+                TOOL_NAME, s
+            );
             process::exit(1);
         }
     };
     if lo > hi {
-        eprintln!("{}: invalid input range: '{}'", TOOL_NAME, s);
+        eprintln!(
+            "{}: invalid input range: \u{2018}{}\u{2019}",
+            TOOL_NAME, s
+        );
         process::exit(1);
     }
     (lo, hi)

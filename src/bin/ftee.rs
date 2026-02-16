@@ -82,10 +82,32 @@ fn main() {
             }
             "--append" => append = true,
             "--ignore-interrupts" => ignore_interrupts = true,
-            "--output-error" | "--output-error=warn" => output_error = OutputErrorMode::Warn,
-            "--output-error=warn-nopipe" => output_error = OutputErrorMode::WarnNoPipe,
-            "--output-error=exit" => output_error = OutputErrorMode::Exit,
-            "--output-error=exit-nopipe" => output_error = OutputErrorMode::ExitNoPipe,
+            "--output-error" => output_error = OutputErrorMode::Warn,
+            s if s.starts_with("--output-error=") => {
+                let mode_val = &s["--output-error=".len()..];
+                output_error = match mode_val {
+                    "warn" => OutputErrorMode::Warn,
+                    "warn-nopipe" => OutputErrorMode::WarnNoPipe,
+                    "exit" => OutputErrorMode::Exit,
+                    "exit-nopipe" => OutputErrorMode::ExitNoPipe,
+                    _ => {
+                        eprintln!(
+                            "{}: invalid argument \u{2018}{}\u{2019} for \u{2018}--output-error\u{2019}",
+                            TOOL_NAME, mode_val
+                        );
+                        eprintln!("Valid arguments are:");
+                        eprintln!("  - \u{2018}warn\u{2019}");
+                        eprintln!("  - \u{2018}warn-nopipe\u{2019}");
+                        eprintln!("  - \u{2018}exit\u{2019}");
+                        eprintln!("  - \u{2018}exit-nopipe\u{2019}");
+                        eprintln!(
+                            "Try \u{2018}{} --help\u{2019} for more information.",
+                            TOOL_NAME
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             "--" => saw_dashdash = true,
             s if s.starts_with('-') && s.len() > 1 && !s.starts_with("--") => {
                 for ch in s[1..].chars() {

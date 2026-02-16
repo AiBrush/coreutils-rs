@@ -147,13 +147,30 @@ fn check_path(path: &str, posix_check: bool, extra_check: bool) -> Result<(), St
 }
 
 fn check_system_limits(path: &str) -> Result<(), String> {
-    // Get system limits (pathconf is Unix-only, use defaults elsewhere)
+    // Find the longest existing prefix of the path to use for pathconf
+    // Different filesystems may have different limits
     #[cfg(unix)]
-    let (path_max, name_max) = unsafe {
-        (
-            libc::pathconf(c"/".as_ptr(), libc::_PC_PATH_MAX),
-            libc::pathconf(c"/".as_ptr(), libc::_PC_NAME_MAX),
-        )
+    let (path_max, name_max) = {
+        let prefix = {
+            let p = std::path::Path::new(path);
+            let mut check = p.to_path_buf();
+            loop {
+                if check.exists() {
+                    break check.to_string_lossy().to_string();
+                }
+                if !check.pop() || check.as_os_str().is_empty() {
+                    break "/".to_string();
+                }
+            }
+        };
+        let c_prefix = std::ffi::CString::new(prefix.as_str())
+            .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
+        unsafe {
+            (
+                libc::pathconf(c_prefix.as_ptr(), libc::_PC_PATH_MAX),
+                libc::pathconf(c_prefix.as_ptr(), libc::_PC_NAME_MAX),
+            )
+        }
     };
     #[cfg(not(unix))]
     let (path_max, name_max): (i64, i64) = (4096, 255);

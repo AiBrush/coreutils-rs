@@ -118,7 +118,7 @@ fn main() {
         process::exit(1);
     }
 
-    let parsed_mode = mode.as_ref().map(|m| parse_octal_mode(m));
+    let parsed_mode = mode.as_ref().map(|m| parse_mode(m));
 
     let mut exit_code = 0;
     for dir in &dirs {
@@ -195,12 +195,22 @@ fn create_with_parents(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> 
                 if verbose {
                     println!("{}: created directory '{}'", TOOL_NAME, p_str);
                 }
-                // For parent directories (not the final target), set mode 0777 modified by umask
-                // unless explicitly specified. For the final target, use specified mode.
-                if *p == path
-                    && let Some(m) = mode
-                {
-                    let _ = apply_mode(&p_str, m);
+                if *p == path {
+                    // Final target directory: apply specified mode
+                    if let Some(m) = mode {
+                        let _ = apply_mode(&p_str, m);
+                    }
+                } else if mode.is_some() {
+                    // Intermediate directory: ensure u+wx for traversal
+                    // GNU mkdir does this so parent dirs are usable even with restrictive -m
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&*p) {
+                        let current = meta.permissions().mode() & 0o7777;
+                        let needed = current | 0o300; // u+wx
+                        if needed != current {
+                            let _ = apply_mode(&p_str, needed as libc::mode_t);
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -247,11 +257,186 @@ fn apply_mode(path: &str, mode: libc::mode_t) -> Result<(), i32> {
 }
 
 #[cfg(unix)]
-fn parse_octal_mode(s: &str) -> libc::mode_t {
-    libc::mode_t::from_str_radix(s, 8).unwrap_or_else(|_| {
-        eprintln!("{}: invalid mode: '{}'", TOOL_NAME, s);
-        process::exit(1);
-    })
+fn parse_mode(s: &str) -> libc::mode_t {
+    // Try octal first: non-empty, all chars are octal digits
+    if !s.is_empty() && s.chars().all(|c| matches!(c, '0'..='7')) {
+        return libc::mode_t::from_str_radix(s, 8).unwrap_or_else(|_| {
+            eprintln!("{}: invalid mode: \u{2018}{}\u{2019}", TOOL_NAME, s);
+            process::exit(1);
+        });
+    }
+
+    // Parse symbolic mode, starting from base 0o777 (default for mkdir)
+    parse_symbolic_mode(s, 0o777)
+}
+
+#[cfg(unix)]
+fn parse_symbolic_mode(s: &str, base: libc::mode_t) -> libc::mode_t {
+    let mut mode = base;
+
+    // Get current umask
+    let umask_val = unsafe {
+        let m = libc::umask(0);
+        libc::umask(m);
+        m
+    };
+
+    for clause in s.split(',') {
+        if clause.is_empty() {
+            eprintln!("{}: invalid mode: \u{2018}{}\u{2019}", TOOL_NAME, s);
+            process::exit(1);
+        }
+
+        let bytes = clause.as_bytes();
+        let mut pos = 0;
+
+        // Parse who: [ugoa]*
+        let mut who_u = false;
+        let mut who_g = false;
+        let mut who_o = false;
+        let mut explicit_who = false;
+
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'u' => {
+                    who_u = true;
+                    explicit_who = true;
+                }
+                b'g' => {
+                    who_g = true;
+                    explicit_who = true;
+                }
+                b'o' => {
+                    who_o = true;
+                    explicit_who = true;
+                }
+                b'a' => {
+                    who_u = true;
+                    who_g = true;
+                    who_o = true;
+                    explicit_who = true;
+                }
+                _ => break,
+            }
+            pos += 1;
+        }
+
+        // If no explicit who, default to all
+        if !explicit_who {
+            who_u = true;
+            who_g = true;
+            who_o = true;
+        }
+
+        // Must have at least one operation
+        if pos >= bytes.len() || !matches!(bytes[pos], b'+' | b'-' | b'=') {
+            eprintln!("{}: invalid mode: \u{2018}{}\u{2019}", TOOL_NAME, s);
+            process::exit(1);
+        }
+
+        // Parse one or more operations: [+-=][rwxXst]*
+        while pos < bytes.len() && matches!(bytes[pos], b'+' | b'-' | b'=') {
+            let op = bytes[pos];
+            pos += 1;
+
+            // Parse permission chars
+            let mut perm_rwx: libc::mode_t = 0;
+            let mut has_s = false;
+            let mut has_t = false;
+
+            while pos < bytes.len() {
+                match bytes[pos] {
+                    b'r' => perm_rwx |= 4,
+                    b'w' => perm_rwx |= 2,
+                    b'x' => perm_rwx |= 1,
+                    b'X' => {
+                        // For mkdir (always directory), X = x
+                        perm_rwx |= 1;
+                    }
+                    b's' => has_s = true,
+                    b't' => has_t = true,
+                    b'u' => {
+                        // Copy user bits
+                        perm_rwx |= ((mode >> 6) & 7) as libc::mode_t;
+                        pos += 1;
+                        break;
+                    }
+                    b'g' => {
+                        // Copy group bits
+                        perm_rwx |= ((mode >> 3) & 7) as libc::mode_t;
+                        pos += 1;
+                        break;
+                    }
+                    b'o' => {
+                        // Copy other bits
+                        perm_rwx |= (mode & 7) as libc::mode_t;
+                        pos += 1;
+                        break;
+                    }
+                    _ => break,
+                }
+                pos += 1;
+            }
+
+            // Build the full bits to apply
+            let mut bits: libc::mode_t = 0;
+            if who_u {
+                bits |= perm_rwx << 6;
+            }
+            if who_g {
+                bits |= perm_rwx << 3;
+            }
+            if who_o {
+                bits |= perm_rwx;
+            }
+            if has_s {
+                if who_u {
+                    bits |= 0o4000;
+                }
+                if who_g {
+                    bits |= 0o2000;
+                }
+            }
+            if has_t {
+                bits |= 0o1000;
+            }
+
+            match op {
+                b'+' => {
+                    if !explicit_who {
+                        bits &= !umask_val;
+                    }
+                    mode |= bits;
+                }
+                b'-' => {
+                    if !explicit_who {
+                        bits &= !umask_val;
+                    }
+                    mode &= !bits;
+                }
+                b'=' => {
+                    // Clear bits for specified who classes
+                    let mut clear_mask: libc::mode_t = 0;
+                    if who_u {
+                        clear_mask |= 0o4700;
+                    }
+                    if who_g {
+                        clear_mask |= 0o2070;
+                    }
+                    if who_o {
+                        clear_mask |= 0o1007;
+                    }
+                    if !explicit_who {
+                        bits &= !umask_val;
+                    }
+                    mode = (mode & !clear_mask) | bits;
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    mode
 }
 
 #[cfg(unix)]

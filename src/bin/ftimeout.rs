@@ -341,16 +341,14 @@ fn main() {
     }
 
     if timed_out {
-        // Wait a bit for the process to die, then apply kill-after if set
+        // Wait for child to die after the initial signal
         if let Some(kill_secs) = kill_after {
+            // Poll until child exits or kill-after period elapses
             let kill_nanos = (kill_secs * 1_000_000_000.0) as u128;
             let kill_start = std::time::Instant::now();
             loop {
                 let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-                if ret == child_pid {
-                    break;
-                }
-                if ret < 0 {
+                if ret == child_pid || ret < 0 {
                     break;
                 }
                 if kill_start.elapsed().as_nanos() >= kill_nanos {
@@ -360,36 +358,21 @@ fn main() {
                             TOOL_NAME, command
                         );
                     }
-                    let ret = unsafe { libc::kill(target_pid, libc::SIGKILL) };
-                    if ret == 0 {
-                        // Wait for the killed process
+                    let kill_ret = unsafe { libc::kill(target_pid, libc::SIGKILL) };
+                    if kill_ret == 0 {
                         unsafe {
                             libc::waitpid(child_pid, &mut status, 0);
                         }
                     }
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         } else {
-            // Wait for child to exit after signal
-            let wait_start = std::time::Instant::now();
-            loop {
-                let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-                if ret == child_pid || ret < 0 {
-                    break;
-                }
-                // Give it a reasonable time to die
-                if wait_start.elapsed().as_secs() > 5 {
-                    let ret = unsafe { libc::kill(target_pid, libc::SIGKILL) };
-                    if ret == 0 {
-                        unsafe {
-                            libc::waitpid(child_pid, &mut status, 0);
-                        }
-                    }
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            // No kill-after: blocking wait for child to exit after signal
+            // This matches GNU timeout behavior
+            unsafe {
+                libc::waitpid(child_pid, &mut status, 0);
             }
         }
 
@@ -401,6 +384,7 @@ fn main() {
                     libc::signal(sig, libc::SIG_DFL);
                     libc::raise(sig);
                 }
+                // If raise didn't kill us (shouldn't happen for uncatchable signals)
                 process::exit(128 + sig as i32);
             }
             process::exit(EXIT_TIMEOUT);
