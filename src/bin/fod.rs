@@ -292,23 +292,30 @@ fn parse_radix(s: &str) -> AddressRadix {
 
 fn parse_offset(s: &str) -> u64 {
     let s = s.trim();
-    let (num_str, multiplier) = if s.ends_with("GB") {
-        (&s[..s.len() - 2], 1_000_000_000u64)
-    } else if s.ends_with("GiB") || s.ends_with("G") {
-        let trim = if s.ends_with("GiB") { 3 } else { 1 };
-        (&s[..s.len() - trim], 1_073_741_824u64)
-    } else if s.ends_with("MB") {
-        (&s[..s.len() - 2], 1_000_000u64)
-    } else if s.ends_with("MiB") || s.ends_with("M") {
-        let trim = if s.ends_with("MiB") { 3 } else { 1 };
-        (&s[..s.len() - trim], 1_048_576u64)
-    } else if s.ends_with("KB") || s.ends_with("kB") {
-        (&s[..s.len() - 2], 1_000u64)
-    } else if s.ends_with("KiB") || s.ends_with("K") || s.ends_with("k") {
-        let trim = if s.ends_with("KiB") { 3 } else { 1 };
-        (&s[..s.len() - trim], 1_024u64)
-    } else if s.ends_with('b') {
-        (&s[..s.len() - 1], 512u64)
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GiB") {
+        (n, 1_073_741_824u64)
+    } else if let Some(n) = s.strip_suffix("GB") {
+        (n, 1_000_000_000u64)
+    } else if let Some(n) = s.strip_suffix('G') {
+        (n, 1_073_741_824u64)
+    } else if let Some(n) = s.strip_suffix("MiB") {
+        (n, 1_048_576u64)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n, 1_000_000u64)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1_048_576u64)
+    } else if let Some(n) = s.strip_suffix("KiB") {
+        (n, 1_024u64)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n, 1_000u64)
+    } else if let Some(n) = s.strip_suffix("kB") {
+        (n, 1_000u64)
+    } else if let Some(n) = s.strip_suffix('K') {
+        (n, 1_024u64)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1_024u64)
+    } else if let Some(n) = s.strip_suffix('b') {
+        (n, 512u64)
     } else {
         (s, 1u64)
     };
