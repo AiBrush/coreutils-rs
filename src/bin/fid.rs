@@ -242,31 +242,39 @@ fn gid_to_name(gid: libc::gid_t) -> String {
 #[cfg(unix)]
 fn get_user_groups(c_name: &CString, pw_gid: libc::gid_t) -> Vec<libc::gid_t> {
     let mut ngroups: libc::c_int = 64;
-    let mut gids: Vec<libc::gid_t> = vec![0; ngroups as usize];
 
-    let ret = unsafe {
-        libc::getgrouplist(
-            c_name.as_ptr(),
-            pw_gid,
-            gids.as_mut_ptr(),
-            &mut ngroups,
-        )
-    };
-
-    if ret == -1 {
-        gids.resize(ngroups as usize, 0);
-        unsafe {
-            libc::getgrouplist(
-                c_name.as_ptr(),
-                pw_gid,
-                gids.as_mut_ptr(),
-                &mut ngroups,
-            );
+    // macOS getgrouplist uses c_int, Linux uses gid_t
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut gids: Vec<libc::c_int> = vec![0; ngroups as usize];
+        let ret = unsafe {
+            libc::getgrouplist(c_name.as_ptr(), pw_gid as libc::c_int, gids.as_mut_ptr(), &mut ngroups)
+        };
+        if ret == -1 {
+            gids.resize(ngroups as usize, 0);
+            unsafe {
+                libc::getgrouplist(c_name.as_ptr(), pw_gid as libc::c_int, gids.as_mut_ptr(), &mut ngroups);
+            }
         }
+        gids.truncate(ngroups as usize);
+        return gids.into_iter().map(|g| g as libc::gid_t).collect();
     }
 
-    gids.truncate(ngroups as usize);
-    gids
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let mut gids: Vec<libc::gid_t> = vec![0; ngroups as usize];
+        let ret = unsafe {
+            libc::getgrouplist(c_name.as_ptr(), pw_gid, gids.as_mut_ptr(), &mut ngroups)
+        };
+        if ret == -1 {
+            gids.resize(ngroups as usize, 0);
+            unsafe {
+                libc::getgrouplist(c_name.as_ptr(), pw_gid, gids.as_mut_ptr(), &mut ngroups);
+            }
+        }
+        gids.truncate(ngroups as usize);
+        gids
+    }
 }
 
 #[cfg(unix)]
