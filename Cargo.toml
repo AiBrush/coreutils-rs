@@ -275,6 +275,42 @@ path = "src/bin/fbase32.rs"
 name = "fbasenc"
 path = "src/bin/fbasenc.rs"
 
+[[bin]]
+name = "fid"
+path = "src/bin/fid.rs"
+
+[[bin]]
+name = "fenv"
+path = "src/bin/fenv.rs"
+
+[[bin]]
+name = "ftimeout"
+path = "src/bin/ftimeout.rs"
+
+[[bin]]
+name = "ftee"
+path = "src/bin/ftee.rs"
+
+[[bin]]
+name = "fchroot"
+path = "src/bin/fchroot.rs"
+
+[[bin]]
+name = "fseq"
+path = "src/bin/fseq.rs"
+
+[[bin]]
+name = "ftsort"
+path = "src/bin/ftsort.rs"
+
+[[bin]]
+name = "fshuf"
+path = "src/bin/fshuf.rs"
+
+[[bin]]
+name = "fdircolors"
+path = "src/bin/fdircolors.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "cargo"] }
