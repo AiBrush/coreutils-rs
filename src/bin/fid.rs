@@ -419,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_matches_gnu_default() {
         let gnu = Command::new("id").output();
         if let Ok(gnu) = gnu {
@@ -448,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_matches_gnu_big_g() {
         let gnu = Command::new("id").arg("-G").output();
         if let Ok(gnu) = gnu {

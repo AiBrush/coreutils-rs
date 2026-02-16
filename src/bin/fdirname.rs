@@ -222,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_dirname_matches_gnu() {
         let test_cases = vec![
             vec!["/usr/bin"],
