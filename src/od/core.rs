@@ -223,6 +223,7 @@ fn format_value(bytes: &[u8], fmt: OutputFormat, width: usize) -> String {
 /// Format a float using C's %g format.
 /// Uses libc snprintf on Unix and Rust formatting on Windows.
 fn snprintf_g(v: f64, precision: usize) -> String {
+    let precision = precision.min(50);
     #[cfg(unix)]
     {
         let mut buf = [0u8; 64];

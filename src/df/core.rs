@@ -517,13 +517,6 @@ fn build_row(info: &FsInfo, config: &DfConfig) -> Vec<String> {
             .collect();
     }
 
-    let avail_header = if config.portability {
-        "Available"
-    } else {
-        "Avail"
-    };
-    let _ = avail_header;
-
     if config.inodes {
         vec![
             info.source.clone(),
