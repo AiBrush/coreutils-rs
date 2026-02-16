@@ -11,20 +11,20 @@
 
 High-performance GNU coreutils replacement in Rust — 71 tools and counting. SIMD-accelerated, drop-in compatible, cross-platform.
 
-## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.6.7, Linux, hyperfine)
+## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.6.8, Linux, hyperfine)
 
 | Tool | Speedup vs GNU | Speedup vs uutils |
 |------|---------------:|-------------------:|
-| wc | **33.6x** | 18.4x |
-| sort | **18.2x** | 17.7x |
-| uniq | **14.3x** | 6.6x |
-| base64 | **6.7x** | 7.0x |
-| tr | **6.8x** | 7.2x |
+| wc | **34.9x** | 19.1x |
+| sort | **19.1x** | 16.5x |
+| uniq | **16.5x** | 6.6x |
+| base64 | **7.1x** | 7.0x |
+| tr | **6.9x** | 7.2x |
 | cut | **6.5x** | 3.3x |
-| tac | **3.8x** | 1.9x |
+| tac | **3.8x** | 2.0x |
 | md5sum | **1.4x** | 1.3x |
 | b2sum | **1.3x** | 1.2x |
-| sha256sum | **1.0x** | 3.7x |
+| sha256sum | **1.0x** | 4.0x |
 
 ## Tools
 
@@ -140,7 +140,7 @@ Output is byte-identical to GNU coreutils. All flags are supported including `--
 
 
 ## *NOT INCLUDED IN HACKATHON SUBMISSION*
-### Additional Tools (61 tools ⚠️COMPATIBILITY IS CURRENTLY UNDER CONSTRUCTION⚠️)
+### Additional Tools (61 tools)
 
 | Tool | Binary | Description | Compatibility | Passed | Failed | Skipped | Total |
 |------|--------|-------------|---------------|--------|--------|---------|-------|
@@ -163,26 +163,26 @@ Output is byte-identical to GNU coreutils. All flags are supported including `--
 | sha512sum | `fsha512sum` | SHA-512 checksums | :white_check_mark: | 10 | 0 | 0 | 10 |
 | sum | `fsum` | BSD/SysV checksums | :white_check_mark: | 23 | 0 | 0 | 23 |
 | cksum | `fcksum` | CRC-32 checksums | :white_check_mark: | 21 | 0 | 0 | 21 |
-| ln | `fln` | Create hard and symbolic links | :x: | 15 | **1** | 0 | 16 |
+| ln | `fln` | Create hard and symbolic links | :white_check_mark: | 16 | 0 | 0 | 16 |
 | touch | `ftouch` | Change file timestamps | :white_check_mark: | 21 | 0 | 0 | 21 |
 | truncate | `ftruncate` | Shrink or extend file sizes | :white_check_mark: | 25 | 0 | 0 | 25 |
-| mkdir | `fmkdir` | Create directories | :x: | 15 | **2** | 0 | 17 |
+| mkdir | `fmkdir` | Create directories (symbolic mode support) | :white_check_mark: | 17 | 0 | 0 | 17 |
 | rmdir | `frmdir` | Remove empty directories | :white_check_mark: | 12 | 0 | 0 | 12 |
 | mkfifo | `fmkfifo` | Create named pipes (FIFOs) | :white_check_mark: | 11 | 0 | 0 | 11 |
 | mknod | `fmknod` | Create special files | :white_check_mark: | 10 | 0 | 0 | 10 |
 | mktemp | `fmktemp` | Create temporary files/directories | :white_check_mark: | 15 | 0 | 0 | 15 |
-| link | `flink` | Create hard link (low-level) | :x: | 7 | **1** | 0 | 8 |
+| link | `flink` | Create hard link (low-level) | :white_check_mark: | 8 | 0 | 0 | 8 |
 | unlink | `funlink` | Remove file (low-level) | :white_check_mark: | 7 | 0 | 0 | 7 |
 | basename | `fbasename` | Strip directory and suffix from paths | :white_check_mark: | 26 | 0 | 0 | 26 |
 | dirname | `fdirname` | Strip last path component | :white_check_mark: | 23 | 0 | 0 | 23 |
 | readlink | `freadlink` | Print symlink targets | :white_check_mark: | 19 | 0 | 0 | 19 |
 | realpath | `frealpath` | Resolve absolute paths | :white_check_mark: | 24 | 0 | 0 | 24 |
-| pathchk | `fpathchk` | Validate path names | :x: | 16 | **1** | 0 | 17 |
-| seq | `fseq` | Generate number sequences | :x: | 52 | **1** | 0 | 53 |
-| shuf | `fshuf` | Random permutations of input | :x: | 26 | **1** | 0 | 27 |
-| tsort | `ftsort` | Topological sorting | :x: | 16 | **3** | 0 | 19 |
-| tee | `ftee` | Read stdin, write to stdout and files | :x: | 14 | **1** | 0 | 15 |
-| yes | `fyes` | Output a string repeatedly | :x: | - | - | - | - |
+| pathchk | `fpathchk` | Validate path names | :white_check_mark: | 17 | 0 | 0 | 17 |
+| seq | `fseq` | Generate number sequences | :white_check_mark: | 53 | 0 | 0 | 53 |
+| shuf | `fshuf` | Random permutations of input | :white_check_mark: | 27 | 0 | 0 | 27 |
+| tsort | `ftsort` | Topological sorting | :white_check_mark: | 19 | 0 | 0 | 19 |
+| tee | `ftee` | Read stdin, write to stdout and files | :white_check_mark: | 15 | 0 | 0 | 15 |
+| yes | `fyes` | Output a string repeatedly | :white_check_mark: | 5 | 0 | 0 | 5 |
 | id | `fid` | Print user and group IDs | :white_check_mark: | 16 | 0 | 0 | 16 |
 | groups | `fgroups` | Print group memberships | :white_check_mark: | 4 | 0 | 0 | 4 |
 | whoami | `fwhoami` | Print effective user name | :white_check_mark: | 4 | 0 | 0 | 4 |
@@ -194,17 +194,17 @@ Output is byte-identical to GNU coreutils. All flags are supported including `--
 | tty | `ftty` | Print terminal name | :white_check_mark: | 6 | 0 | 0 | 6 |
 | nproc | `fnproc` | Print number of processors | :white_check_mark: | 8 | 0 | 0 | 8 |
 | pwd | `fpwd` | Print working directory | :white_check_mark: | 8 | 0 | 0 | 8 |
-| printenv | `fprintenv` | Print environment variables | :x: | - | - | - | - |
-| env | `fenv` | Run program with modified environment | :x: | 16 | **1** | 0 | 17 |
-| timeout | `ftimeout` | Run command with time limit | :x: | 19 | **2** | 0 | 21 |
+| printenv | `fprintenv` | Print environment variables | :white_check_mark: | 5 | 0 | 0 | 5 |
+| env | `fenv` | Run program with modified environment | :white_check_mark: | 17 | 0 | 0 | 17 |
+| timeout | `ftimeout` | Run command with time limit | :white_check_mark: | 21 | 0 | 0 | 21 |
 | nice | `fnice` | Run with modified scheduling priority | :white_check_mark: | 12 | 0 | 0 | 12 |
 | nohup | `fnohup` | Run immune to hangups | :white_check_mark: | 6 | 0 | 0 | 6 |
 | sleep | `fsleep` | Delay for specified time | :white_check_mark: | 10 | 0 | 0 | 10 |
 | sync | `fsync` | Flush filesystem caches | :white_check_mark: | 5 | 0 | 1 | 6 |
-| chroot | `fchroot` | Change root directory | :x: | - | - | - | - |
+| chroot | `fchroot` | Change root directory (requires root) | :white_check_mark: | 11 | 0 | 0 | 11 |
 | true | `ftrue` | Exit with status 0 | :white_check_mark: | 8 | 0 | 0 | 8 |
 | false | `ffalse` | Exit with status 1 | :white_check_mark: | 7 | 0 | 0 | 7 |
-| dircolors | `fdircolors` | Setup LS_COLORS environment variable | :x: | 2 | **12** | 0 | 14 |
+| dircolors | `fdircolors` | Setup LS_COLORS environment variable | :white_check_mark: | 14 | 0 | 0 | 14 |
 
 
 ## Contributing
