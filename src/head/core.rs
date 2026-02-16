@@ -226,8 +226,8 @@ fn head_lines_streaming_file(
     #[cfg(not(target_os = "linux"))]
     let file = std::fs::File::open(path)?;
 
-    let mut reader = io::BufReader::with_capacity(65536, file);
-    let mut buf = [0u8; 65536];
+    let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
+    let mut buf = [0u8; 262144];
     let mut count = 0u64;
 
     loop {
@@ -378,7 +378,7 @@ pub fn head_stdin_lines_streaming(n: u64, delimiter: u8, out: &mut impl Write) -
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; 262144];
     let mut count = 0u64;
 
     loop {

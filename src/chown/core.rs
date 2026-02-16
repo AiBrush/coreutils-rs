@@ -253,6 +253,7 @@ fn print_verbose(path: &Path, uid: Option<u32>, gid: Option<u32>, changed: bool)
 }
 
 /// Recursively change ownership of a directory tree.
+/// Uses rayon for parallel processing when verbose/changes output is not needed.
 pub fn chown_recursive(
     path: &Path,
     uid: Option<u32>,
@@ -261,8 +262,6 @@ pub fn chown_recursive(
     is_command_line_arg: bool,
     tool_name: &str,
 ) -> i32 {
-    let mut errors = 0;
-
     // Preserve-root check
     if config.preserve_root && path == Path::new("/") {
         eprintln!(
@@ -276,7 +275,16 @@ pub fn chown_recursive(
         return 1;
     }
 
-    // Change this entry first
+    // For non-verbose mode, use parallel traversal
+    if !config.verbose && !config.changes {
+        let error_count = std::sync::atomic::AtomicI32::new(0);
+        chown_recursive_parallel(path, uid, gid, config, is_command_line_arg, tool_name, &error_count);
+        return error_count.load(std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Sequential path for verbose/changes mode
+    let mut errors = 0;
+
     if let Err(e) = chown_file(path, uid, gid, config) {
         if !config.silent {
             eprintln!(
@@ -289,14 +297,12 @@ pub fn chown_recursive(
         errors += 1;
     }
 
-    // Determine whether to descend into this path
     let should_follow = match config.symlink_follow {
         SymlinkFollow::Always => true,
         SymlinkFollow::CommandLine => is_command_line_arg,
         SymlinkFollow::Never => false,
     };
 
-    // Check if it's a directory (possibly through a symlink)
     let is_dir = if should_follow {
         fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
     } else {
@@ -341,4 +347,65 @@ pub fn chown_recursive(
     }
 
     errors
+}
+
+/// Parallel recursive chown using rayon.
+fn chown_recursive_parallel(
+    path: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    config: &ChownConfig,
+    is_command_line_arg: bool,
+    tool_name: &str,
+    error_count: &std::sync::atomic::AtomicI32,
+) {
+    if let Err(e) = chown_file(path, uid, gid, config) {
+        if !config.silent {
+            eprintln!(
+                "{}: changing ownership of '{}': {}",
+                tool_name,
+                path.display(),
+                crate::common::io_error_msg(&e)
+            );
+        }
+        error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    let should_follow = match config.symlink_follow {
+        SymlinkFollow::Always => true,
+        SymlinkFollow::CommandLine => is_command_line_arg,
+        SymlinkFollow::Never => false,
+    };
+
+    let is_dir = if should_follow {
+        fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    } else {
+        fs::symlink_metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    };
+
+    if is_dir {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if !config.silent {
+                    eprintln!(
+                        "{}: cannot read directory '{}': {}",
+                        tool_name,
+                        path.display(),
+                        crate::common::io_error_msg(&e)
+                    );
+                }
+                error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+
+        use rayon::prelude::*;
+        entries.par_iter().for_each(|entry| {
+            chown_recursive_parallel(&entry.path(), uid, gid, config, false, tool_name, error_count);
+        });
+    }
 }

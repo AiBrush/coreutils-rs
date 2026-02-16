@@ -334,7 +334,8 @@ pub fn join(
     let mut warned1 = false;
     let mut warned2 = false;
 
-    let mut buf = Vec::with_capacity((data1.len() + data2.len()) / 2);
+    const FLUSH_THRESHOLD: usize = 256 * 1024;
+    let mut buf = Vec::with_capacity((data1.len() + data2.len()).min(FLUSH_THRESHOLD * 2));
 
     // Handle -o auto: build format from first lines
     let auto_specs: Option<Vec<OutputSpec>> = if config.auto_format {
@@ -485,6 +486,12 @@ pub fn join(
                     }
                 }
                 i2 += 1;
+
+                // Periodic flush to limit memory usage for large inputs
+                if buf.len() >= FLUSH_THRESHOLD {
+                    out.write_all(&buf)?;
+                    buf.clear();
+                }
             }
             Ordering::Equal => {
                 // Find all consecutive file2 lines with the same key

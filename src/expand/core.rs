@@ -119,7 +119,8 @@ pub fn parse_tab_stops(spec: &str) -> Result<TabStops, String> {
 }
 
 // Pre-computed spaces buffer for fast tab expansion (avoids per-tab allocation)
-const SPACES: [u8; 64] = [b' '; 64];
+// Larger buffer (256 bytes) means most tabs can be served in a single memcpy
+const SPACES: [u8; 256] = [b' '; 256];
 
 /// Write N spaces to a Vec efficiently using pre-computed buffer.
 #[inline]
@@ -130,18 +131,6 @@ fn push_spaces(output: &mut Vec<u8>, n: usize) {
         output.extend_from_slice(&SPACES[..chunk]);
         remaining -= chunk;
     }
-}
-
-/// Write N spaces to a writer efficiently using pre-computed buffer.
-#[inline]
-fn write_spaces(out: &mut impl Write, n: usize) -> std::io::Result<()> {
-    let mut remaining = n;
-    while remaining > 0 {
-        let chunk = remaining.min(SPACES.len());
-        out.write_all(&SPACES[..chunk])?;
-        remaining -= chunk;
-    }
-    Ok(())
 }
 
 /// Expand tabs to spaces using SIMD scanning.
@@ -173,40 +162,50 @@ pub fn expand_bytes(
 }
 
 /// Fast expand for regular tab stops without -i flag.
-/// Streams directly to writer using memchr2 SIMD to find tabs and newlines.
-/// Avoids allocating a large intermediate buffer.
+/// Uses batched internal buffer to reduce write syscalls.
 fn expand_regular_fast(data: &[u8], tab_size: usize, out: &mut impl Write) -> std::io::Result<()> {
+    const FLUSH_THRESHOLD: usize = 256 * 1024;
+    let mut buf = Vec::with_capacity(data.len().min(FLUSH_THRESHOLD * 2) + data.len() / 8);
     let mut column: usize = 0;
     let mut pos: usize = 0;
 
     while pos < data.len() {
         match memchr::memchr2(b'\t', b'\n', &data[pos..]) {
             Some(offset) => {
-                // Bulk write everything before the special byte
+                // Bulk copy everything before the special byte
                 if offset > 0 {
-                    out.write_all(&data[pos..pos + offset])?;
+                    buf.extend_from_slice(&data[pos..pos + offset]);
                     column += offset;
                 }
                 let byte = data[pos + offset];
                 pos += offset + 1;
 
                 if byte == b'\n' {
-                    out.write_all(b"\n")?;
+                    buf.push(b'\n');
                     column = 0;
                 } else {
-                    // Tab: write spaces directly to output
+                    // Tab: push spaces to buffer
                     let spaces = tab_size - (column % tab_size);
-                    write_spaces(out, spaces)?;
+                    push_spaces(&mut buf, spaces);
                     column += spaces;
+                }
+
+                // Flush when buffer is large enough
+                if buf.len() >= FLUSH_THRESHOLD {
+                    out.write_all(&buf)?;
+                    buf.clear();
                 }
             }
             None => {
-                out.write_all(&data[pos..])?;
+                buf.extend_from_slice(&data[pos..]);
                 break;
             }
         }
     }
 
+    if !buf.is_empty() {
+        out.write_all(&buf)?;
+    }
     Ok(())
 }
 
