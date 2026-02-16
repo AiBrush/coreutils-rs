@@ -122,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_printenv_matches_gnu() {
         let gnu = Command::new("printenv").arg("PATH").output();
         if let Ok(gnu) = gnu {
