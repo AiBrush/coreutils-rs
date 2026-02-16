@@ -123,7 +123,7 @@ fn test_format_short_heading_default() {
     let heading = format_short_heading(&config);
     assert!(heading.contains("Login"));
     assert!(heading.contains("Name"));
-    assert!(heading.contains("Tty"));
+    assert!(heading.contains("TTY"));
     assert!(heading.contains("Idle"));
     assert!(heading.contains("When"));
     assert!(heading.contains("Where"));
@@ -138,7 +138,7 @@ fn test_format_short_heading_omit_fullname() {
     let heading = format_short_heading(&config);
     assert!(heading.contains("Login"));
     assert!(!heading.contains("Name"));
-    assert!(heading.contains("Tty"));
+    assert!(heading.contains("TTY"));
 }
 
 #[test]
