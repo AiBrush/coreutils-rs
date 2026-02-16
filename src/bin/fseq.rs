@@ -422,10 +422,7 @@ fn main() {
             "{}: invalid Zero increment value: \u{2018}{}\u{2019}",
             TOOL_NAME, increment_str
         );
-        eprintln!(
-            "Try \u{2018}{} --help\u{2019} for more information.",
-            TOOL_NAME
-        );
+        eprintln!("Try '{} --help' for more information.", TOOL_NAME);
         process::exit(1);
     }
 

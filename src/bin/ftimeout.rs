@@ -396,10 +396,12 @@ fn main() {
         if preserve_status {
             process::exit(status_to_code(status));
         } else {
-            // For non-SIGTERM signals (like SIGKILL), exit with 128+signal
-            let child_code = status_to_code(status);
-            if sig != libc::SIGTERM && child_code > 128 {
-                process::exit(child_code);
+            if sig != libc::SIGTERM {
+                unsafe {
+                    libc::signal(sig, libc::SIG_DFL);
+                    libc::raise(sig);
+                }
+                process::exit(128 + sig as i32);
             }
             process::exit(EXIT_TIMEOUT);
         }

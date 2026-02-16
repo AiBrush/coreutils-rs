@@ -226,7 +226,7 @@ fn main() {
             126
         };
         eprintln!(
-            "{}: '{}': {}",
+            "{}: \u{2018}{}\u{2019}: {}",
             TOOL_NAME,
             command,
             coreutils_rs::common::io_error_msg(&err)

@@ -82,9 +82,9 @@ fn topological_sort(
     while let Some(node) = stack.pop() {
         result.push(node.clone());
         if let Some(neighbors) = adj.get(&node) {
-            // Collect newly freed successors, then push in reverse order
-            // so that the first successor in adjacency list is on top of the stack
-            // and gets processed first (matching GNU tsort's DFS ordering)
+            // Collect newly freed successors, push in forward order
+            // so the last successor is on top (LIFO), matching GNU tsort's
+            // behavior where new zero-count nodes are prepended to the queue
             let mut new_zeros = Vec::new();
             for neighbor in neighbors {
                 if let Some(deg) = in_degree.get_mut(neighbor)
@@ -96,7 +96,7 @@ fn topological_sort(
                     }
                 }
             }
-            for n in new_zeros.into_iter().rev() {
+            for n in new_zeros {
                 stack.push(n);
             }
         }
@@ -211,7 +211,7 @@ fn run(input: &str, source_name: &str) -> i32 {
                             }
                         }
                     }
-                    for n in new_zeros.into_iter().rev() {
+                    for n in new_zeros {
                         stack.push(n);
                     }
                 }
