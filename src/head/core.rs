@@ -298,9 +298,8 @@ pub fn head_file(
                 // Non-Linux: still avoid full mmap
                 #[cfg(not(target_os = "linux"))]
                 {
-                    match head_bytes_streaming_file(path, *n, out) {
-                        Ok(true) => return Ok(true),
-                        _ => {}
+                    if let Ok(true) = head_bytes_streaming_file(path, *n, out) {
+                        return Ok(true);
                     }
                 }
             }

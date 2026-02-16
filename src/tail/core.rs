@@ -426,24 +426,24 @@ pub fn tail_file(
                     _ => {}
                 }
             }
-            TailMode::Bytes(n) => {
+            TailMode::Bytes(_n) => {
                 #[cfg(target_os = "linux")]
                 {
                     use std::os::unix::io::AsRawFd;
                     let stdout = io::stdout();
                     let out_fd = stdout.as_raw_fd();
-                    if let Ok(true) = sendfile_tail_bytes(path, *n, out_fd) {
+                    if let Ok(true) = sendfile_tail_bytes(path, *_n, out_fd) {
                         return Ok(true);
                     }
                 }
             }
-            TailMode::BytesFrom(n) => {
+            TailMode::BytesFrom(_n) => {
                 #[cfg(target_os = "linux")]
                 {
                     use std::os::unix::io::AsRawFd;
                     let stdout = io::stdout();
                     let out_fd = stdout.as_raw_fd();
-                    if let Ok(true) = sendfile_tail_bytes_from(path, *n, out_fd) {
+                    if let Ok(true) = sendfile_tail_bytes_from(path, *_n, out_fd) {
                         return Ok(true);
                     }
                 }
