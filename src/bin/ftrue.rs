@@ -1,31 +1,9 @@
 // ftrue — exit with status 0
 //
-// GNU true accepts and ignores all arguments except --help and --version.
-
-const TOOL_NAME: &str = "true";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+// GNU true ignores ALL arguments and always exits 0.
 
 fn main() {
-    // true always exits 0, even with unrecognized args.
-    // Only --help and --version produce output (and still exit 0).
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() == 1 {
-        match args[0].as_str() {
-            "--help" => {
-                println!("Usage: {} [ignored command line arguments]", TOOL_NAME);
-                println!("  or:  {} OPTION", TOOL_NAME);
-                println!("Exit with a status code indicating success.");
-                println!();
-                println!("      --help     display this help and exit");
-                println!("      --version  output version information and exit");
-            }
-            "--version" => {
-                println!("{} (fcoreutils) {}", TOOL_NAME, VERSION);
-            }
-            _ => {}
-        }
-    }
-    // Always exit 0
+    // true always exits 0, ignoring all arguments
 }
 
 #[cfg(test)]
@@ -54,21 +32,19 @@ mod tests {
     }
 
     #[test]
-    fn test_true_help() {
+    fn test_true_help_silent() {
+        // GNU true ignores --help and still exits 0 silently
         let output = cmd().arg("--help").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
-        assert!(!output.stdout.is_empty());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Exit with a status code indicating success"));
+        assert!(output.stdout.is_empty());
     }
 
     #[test]
-    fn test_true_version() {
+    fn test_true_version_silent() {
+        // GNU true ignores --version and still exits 0 silently
         let output = cmd().arg("--version").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("true"));
-        assert!(stdout.contains("fcoreutils"));
+        assert!(output.stdout.is_empty());
     }
 
     #[test]

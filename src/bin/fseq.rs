@@ -323,7 +323,10 @@ fn main() {
             "-f" | "--format" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{}: option requires an argument -- 'f'", TOOL_NAME);
+                    eprintln!(
+                        "{}: option requires an argument -- \u{2018}f\u{2019}",
+                        TOOL_NAME
+                    );
                     process::exit(1);
                 }
                 format = Some(args[i].clone());
@@ -331,7 +334,10 @@ fn main() {
             "-s" | "--separator" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{}: option requires an argument -- 's'", TOOL_NAME);
+                    eprintln!(
+                        "{}: option requires an argument -- \u{2018}s\u{2019}",
+                        TOOL_NAME
+                    );
                     process::exit(1);
                 }
                 separator = args[i].clone();
@@ -372,7 +378,10 @@ fn main() {
             positional[2].clone(),
         ),
         _ => {
-            eprintln!("{}: extra operand '{}'", TOOL_NAME, positional[3]);
+            eprintln!(
+                "{}: extra operand \u{2018}{}\u{2019}",
+                TOOL_NAME, positional[3]
+            );
             process::exit(1);
         }
     };
@@ -381,7 +390,7 @@ fn main() {
         Ok(v) => v,
         Err(_) => {
             eprintln!(
-                "{}: invalid floating point argument: '{}'",
+                "{}: invalid floating point argument: \u{2018}{}\u{2019}",
                 TOOL_NAME, first_str
             );
             process::exit(1);
@@ -391,7 +400,7 @@ fn main() {
         Ok(v) => v,
         Err(_) => {
             eprintln!(
-                "{}: invalid floating point argument: '{}'",
+                "{}: invalid floating point argument: \u{2018}{}\u{2019}",
                 TOOL_NAME, increment_str
             );
             process::exit(1);
@@ -401,7 +410,7 @@ fn main() {
         Ok(v) => v,
         Err(_) => {
             eprintln!(
-                "{}: invalid floating point argument: '{}'",
+                "{}: invalid floating point argument: \u{2018}{}\u{2019}",
                 TOOL_NAME, last_str
             );
             process::exit(1);
@@ -410,10 +419,13 @@ fn main() {
 
     if increment == 0.0 {
         eprintln!(
-            "{}: invalid Zero increment value: '{}'",
+            "{}: invalid Zero increment value: \u{2018}{}\u{2019}",
             TOOL_NAME, increment_str
         );
-        eprintln!("Try '{} --help' for more information.", TOOL_NAME);
+        eprintln!(
+            "Try \u{2018}{} --help\u{2019} for more information.",
+            TOOL_NAME
+        );
         process::exit(1);
     }
 

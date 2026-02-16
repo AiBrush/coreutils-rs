@@ -215,27 +215,6 @@ fn mktime_local(
     Ok(t)
 }
 
-/// Get today's midnight in local time.
-#[cfg(unix)]
-fn today_midnight() -> Result<i64, String> {
-    let (now_sec, _) = current_time();
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe {
-        if libc::localtime_r(&now_sec, &mut tm).is_null() {
-            return Err("failed to get local time".to_string());
-        }
-    }
-    tm.tm_hour = 0;
-    tm.tm_min = 0;
-    tm.tm_sec = 0;
-    tm.tm_isdst = -1;
-    let midnight = unsafe { libc::mktime(&mut tm) };
-    if midnight == -1 {
-        return Err("failed to compute midnight".to_string());
-    }
-    Ok(midnight)
-}
-
 /// Parse a -d DATE string.
 /// Supports: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY-MM-DDTHH:MM:SS, @epoch,
 ///           "now", "yesterday", "tomorrow", "N days ago", "N days"
@@ -248,19 +227,19 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
         return Ok((sec, nsec));
     }
 
-    // Relative date: "yesterday"
+    // Relative date: "yesterday" — GNU date -d yesterday means 24 hours ago from now
     if trimmed.eq_ignore_ascii_case("yesterday") {
-        let midnight = today_midnight()?;
-        return Ok((midnight - 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec - 86400, 0));
     }
 
-    // Relative date: "tomorrow"
+    // Relative date: "tomorrow" — 24 hours from now
     if trimmed.eq_ignore_ascii_case("tomorrow") {
-        let midnight = today_midnight()?;
-        return Ok((midnight + 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec + 86400, 0));
     }
 
-    // Relative date: "N days ago"
+    // Relative date: "N days ago" — N*86400 seconds before now
     if let Some(rest) = trimmed.strip_suffix(" ago") {
         let rest = rest.trim();
         if let Some(num_str) = rest
@@ -268,19 +247,19 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
             .or_else(|| rest.strip_suffix(" day"))
             && let Ok(n) = num_str.trim().parse::<i64>()
         {
-            let midnight = today_midnight()?;
-            return Ok((midnight - n * 86400, 0));
+            let (sec, _) = current_time();
+            return Ok((sec - n * 86400, 0));
         }
     }
 
-    // Relative date: "N days" (future)
+    // Relative date: "N days" (future) — N*86400 seconds from now
     if let Some(num_str) = trimmed
         .strip_suffix(" days")
         .or_else(|| trimmed.strip_suffix(" day"))
         && let Ok(n) = num_str.trim().parse::<i64>()
     {
-        let midnight = today_midnight()?;
-        return Ok((midnight + n * 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec + n * 86400, 0));
     }
 
     // Epoch seconds: @N or @N.N

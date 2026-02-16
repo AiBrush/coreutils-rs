@@ -79,11 +79,13 @@ fn main() {
 }
 
 fn check_path(path: &str, posix_check: bool, extra_check: bool) -> Result<(), String> {
-    // -P checks: empty name and leading hyphen
+    // Empty string is not a valid pathname (all modes)
+    if path.is_empty() {
+        return Err("empty file name".to_string());
+    }
+
+    // -P checks: leading hyphen and empty components
     if extra_check {
-        if path.is_empty() {
-            return Err("empty file name".to_string());
-        }
         // Check each component for leading hyphen and empty components
         let components: Vec<&str> = if path.contains('/') {
             path.split('/').collect()

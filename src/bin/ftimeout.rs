@@ -396,6 +396,11 @@ fn main() {
         if preserve_status {
             process::exit(status_to_code(status));
         } else {
+            // For non-SIGTERM signals (like SIGKILL), exit with 128+signal
+            let child_code = status_to_code(status);
+            if sig != libc::SIGTERM && child_code > 128 {
+                process::exit(child_code);
+            }
             process::exit(EXIT_TIMEOUT);
         }
     }
@@ -562,12 +567,8 @@ mod tests {
             .output()
             .unwrap();
         let code = output.status.code().unwrap();
-        // Sent KILL (9), so either 124 (timed out default) or the process exit code
-        assert!(
-            code == 124 || code == 137,
-            "Expected 124 or 137, got {}",
-            code
-        );
+        // Sent KILL (9), exit code should be 128+9=137
+        assert_eq!(code, 137, "Expected 137 (128+SIGKILL), got {}", code);
     }
 
     #[test]

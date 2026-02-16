@@ -1,33 +1,9 @@
 // ffalse — exit with status 1
 //
-// GNU false accepts and ignores all arguments except --help and --version.
-// --help and --version exit 0; all other invocations exit 1.
-
-const TOOL_NAME: &str = "false";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+// GNU false ignores ALL arguments and always exits 1.
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() == 1 {
-        match args[0].as_str() {
-            "--help" => {
-                println!("Usage: {} [ignored command line arguments]", TOOL_NAME);
-                println!("  or:  {} OPTION", TOOL_NAME);
-                println!("Exit with a status code indicating failure.");
-                println!();
-                println!("      --help     display this help and exit");
-                println!("      --version  output version information and exit");
-                // GNU false --help exits 0
-                return;
-            }
-            "--version" => {
-                println!("{} (fcoreutils) {}", TOOL_NAME, VERSION);
-                // GNU false --version exits 0
-                return;
-            }
-            _ => {}
-        }
-    }
+    // false always exits 1, ignoring all arguments
     std::process::exit(1);
 }
 
@@ -57,20 +33,19 @@ mod tests {
     }
 
     #[test]
-    fn test_false_help() {
+    fn test_false_help_silent() {
+        // GNU false ignores --help and still exits 1 silently
         let output = cmd().arg("--help").output().unwrap();
-        assert_eq!(output.status.code(), Some(0));
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Exit with a status code indicating failure"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
     }
 
     #[test]
-    fn test_false_version() {
+    fn test_false_version_silent() {
+        // GNU false ignores --version and still exits 1 silently
         let output = cmd().arg("--version").output().unwrap();
-        assert_eq!(output.status.code(), Some(0));
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("false"));
-        assert!(stdout.contains("fcoreutils"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
     }
 
     #[test]

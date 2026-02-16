@@ -45,14 +45,17 @@ fn main() {
                         _ => {
                             eprintln!("{}: invalid option -- '{}'", TOOL_NAME, ch);
                             eprintln!("Try '{} --help' for more information.", TOOL_NAME);
-                            process::exit(1);
+                            process::exit(2);
                         }
                     }
                 }
             }
-            _ => {
-                eprintln!("{}: ignoring non-option arguments", TOOL_NAME);
+            s if s.starts_with("--") => {
+                eprintln!("{}: unrecognized option '{}'", TOOL_NAME, s);
+                eprintln!("Try '{} --help' for more information.", TOOL_NAME);
+                process::exit(2);
             }
+            _ => {}
         }
     }
 

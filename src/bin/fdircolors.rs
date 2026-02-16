@@ -38,14 +38,19 @@ enum OutputFormat {
 const DEFAULT_DATABASE: &str = "\
 # Configuration file for dircolors, a utility to help you set the
 # LS_COLORS environment variable used by GNU ls with the --color option.
-# Copyright (C) 1996-2024 Free Software Foundation, Inc.
+# Copyright (C) 1996-2025 Free Software Foundation, Inc.
 # Copying and distribution of this file, with or without modification,
 # are permitted provided the copyright notice and this notice are preserved.
-# The keywords COLOR, OPTIONS, and EIGHTBIT (strstrings stripping strleading
-# comments) are recognized but ignored.
+#
+# The keywords COLOR, OPTIONS, and EIGHTBIT (honored by the
+# slackware version of dircolors) are recognized but ignored.
 # Global config options can be specified before TERM or COLORTERM entries
+# ===================================================================
+# Terminal filters
+# ===================================================================
 # Below are TERM or COLORTERM entries, which can be glob patterns, which
 # restrict following config to systems with matching environment variables.
+COLORTERM ?*
 TERM Eterm
 TERM ansi
 TERM *color*
@@ -70,13 +75,15 @@ TERM st
 TERM terminator
 TERM tmux*
 TERM vt100
+TERM vt220
 TERM xterm*
+# ===================================================================
+# Basic file attributes
+# ===================================================================
 # Below are the color init strings for the basic file types.
 # One can use codes for 256 or more colors supported by modern terminals.
 # The default color codes use the capabilities of an 8 color terminal
-# with some strstripping for readstrability.
-# Below are the color init strings for the basic file types. A color init
-# string consists of one or more of the following numeric codes:
+# with some additional attributes as per the following codes:
 # Attribute codes:
 # 00=none 01=bold 04=underscore 05=blink 07=reverse 08=concealed
 # Text color codes:
@@ -97,77 +104,92 @@ BLK 40;33;01 # block device driver
 CHR 40;33;01 # character device driver
 ORPHAN 40;31;01 # symlink to nonexistent file, or non-stat'able file ...
 MISSING 00 # ... and the files they point to
-SETUID 37;41 # file that is setuid (u+s)
-SETGID 30;43 # file that is setgid (g+s)
-CAPABILITY 00 # file with capability (very expensive to lookup)
+SETUID 37;41 # regular file that is setuid (u+s)
+SETGID 30;43 # regular file that is setgid (g+s)
+CAPABILITY 00 # regular file with capability (very expensive to lookup)
 STICKY_OTHER_WRITABLE 30;42 # dir that is sticky and other-writable (+t,o+w)
 OTHER_WRITABLE 34;42 # dir that is other-writable (o+w) and not sticky
 STICKY 37;44 # dir with the sticky bit set (+t) and not other-writable
-# This is for files with execute permission:
+# This is for regular files with execute permission:
 EXEC 01;32
+# ===================================================================
+# File extension attributes
+# ===================================================================
 # List any file extensions like '.gz' or '.tar' that you would like ls
-# to color below. Put the extension, a space, and the color init string.
-# (and strany comments you want to add after a '#')
+# to color below. Put the suffix, a space, and the color init string.
+# (and any comments you want to add after a '#').
+# Suffixes are matched case insensitively, but if you define different
+# init strings for separate cases, those will be honored.
+#
 # If you use DOS-style suffixes, you may want to uncomment the following:
 #.cmd 01;32 # executables (bright green)
 #.exe 01;32
 #.com 01;32
 #.btm 01;32
 #.bat 01;32
-# Or if you want to color scripts even if they are not executable:
+# Or if you want to color scripts even if they do not have the
+# executable bit actually set.
 #.sh 01;32
 #.csh 01;32
- # archives or compressed (bright red)
-.tar 01;31
-.tgz 01;31
+# archives or compressed (bright red)
+.7z 01;31
+.ace 01;31
+.alz 01;31
+.apk 01;31
 .arc 01;31
 .arj 01;31
-.taz 01;31
+.bz 01;31
+.bz2 01;31
+.cab 01;31
+.cpio 01;31
+.crate 01;31
+.deb 01;31
+.drpm 01;31
+.dwm 01;31
+.dz 01;31
+.ear 01;31
+.egg 01;31
+.esd 01;31
+.gz 01;31
+.jar 01;31
 .lha 01;31
+.lrz 01;31
+.lz 01;31
 .lz4 01;31
 .lzh 01;31
 .lzma 01;31
-.tlz 01;31
-.txz 01;31
-.tzo 01;31
-.t7z 01;31
-.zip 01;31
-.z 01;31
-.dz 01;31
-.gz 01;31
-.lrz 01;31
-.lz 01;31
 .lzo 01;31
-.xz 01;31
-.zst 01;31
-.tzst 01;31
-.bz2 01;31
-.bz 01;31
+.pyz 01;31
+.rar 01;31
+.rpm 01;31
+.rz 01;31
+.sar 01;31
+.swm 01;31
+.t7z 01;31
+.tar 01;31
+.taz 01;31
 .tbz 01;31
 .tbz2 01;31
+.tgz 01;31
+.tlz 01;31
+.txz 01;31
 .tz 01;31
-.deb 01;31
-.rpm 01;31
-.jar 01;31
+.tzo 01;31
+.tzst 01;31
+.udeb 01;31
 .war 01;31
-.ear 01;31
-.sar 01;31
-.rar 01;31
-.alz 01;31
-.ace 01;31
-.zoo 01;31
-.cpio 01;31
-.7z 01;31
-.rz 01;31
-.cab 01;31
+.whl 01;31
 .wim 01;31
-.swm 01;31
-.dwm 01;31
-.esd 01;31
+.xz 01;31
+.z 01;31
+.zip 01;31
+.zoo 01;31
+.zst 01;31
 # image formats
 .avif 01;35
 .jpg 01;35
 .jpeg 01;35
+.jxl 01;35
 .mjpg 01;35
 .mjpeg 01;35
 .gif 01;35
@@ -239,20 +261,26 @@ EXEC 01;32
 *~ 00;90
 *# 00;90
 .bak 00;90
+.crdownload 00;90
+.dpkg-dist 00;90
+.dpkg-new 00;90
+.dpkg-old 00;90
+.dpkg-tmp 00;90
 .old 00;90
 .orig 00;90
 .part 00;90
 .rej 00;90
-.swp 00;90
-.tmp 00;90
-.dpkg-dist 00;90
-.dpkg-old 00;90
-.ucf-dist 00;90
-.ucf-new 00;90
-.ucf-old 00;90
 .rpmnew 00;90
 .rpmorig 00;90
 .rpmsave 00;90
+.swp 00;90
+.tmp 00;90
+.ucf-dist 00;90
+.ucf-new 00;90
+.ucf-old 00;90
+#
+# Subsequent TERM or COLORTERM entries, can be used to add / override
+# config specific to those matching environment variables.
 ";
 
 /// Parse a dircolors database (either built-in or from a file) and return

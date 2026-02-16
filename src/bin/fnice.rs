@@ -148,7 +148,7 @@ fn main() {
             eprintln!("{}: cannot get niceness", TOOL_NAME);
             process::exit(125);
         }
-        println!("{}", current + adjustment);
+        println!("{}", current);
         return;
     }
 
