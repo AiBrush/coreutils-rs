@@ -112,12 +112,12 @@ fn run(input: &str, source_name: &str) -> i32 {
                     if removed.contains(nb) {
                         continue;
                     }
-                    if let Some(d) = in_deg.get_mut(nb) {
-                        if *d > 0 {
-                            *d -= 1;
-                            if *d == 0 {
-                                new_zeros.push(nb.clone());
-                            }
+                    if let Some(d) = in_deg.get_mut(nb)
+                        && *d > 0
+                    {
+                        *d -= 1;
+                        if *d == 0 {
+                            new_zeros.push(nb.clone());
                         }
                     }
                 }
