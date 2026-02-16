@@ -57,14 +57,38 @@ fn main() {
                 show_all = true;
                 any_flag = true;
             }
-            "-s" | "--kernel-name" => { show_sysname = true; any_flag = true; }
-            "-n" | "--nodename" => { show_nodename = true; any_flag = true; }
-            "-r" | "--kernel-release" => { show_release = true; any_flag = true; }
-            "-v" | "--kernel-version" => { show_version = true; any_flag = true; }
-            "-m" | "--machine" => { show_machine = true; any_flag = true; }
-            "-p" | "--processor" => { show_processor = true; any_flag = true; }
-            "-i" | "--hardware-platform" => { show_hardware = true; any_flag = true; }
-            "-o" | "--operating-system" => { show_os = true; any_flag = true; }
+            "-s" | "--kernel-name" => {
+                show_sysname = true;
+                any_flag = true;
+            }
+            "-n" | "--nodename" => {
+                show_nodename = true;
+                any_flag = true;
+            }
+            "-r" | "--kernel-release" => {
+                show_release = true;
+                any_flag = true;
+            }
+            "-v" | "--kernel-version" => {
+                show_version = true;
+                any_flag = true;
+            }
+            "-m" | "--machine" => {
+                show_machine = true;
+                any_flag = true;
+            }
+            "-p" | "--processor" => {
+                show_processor = true;
+                any_flag = true;
+            }
+            "-i" | "--hardware-platform" => {
+                show_hardware = true;
+                any_flag = true;
+            }
+            "-o" | "--operating-system" => {
+                show_os = true;
+                any_flag = true;
+            }
             s if s.starts_with('-') && s.len() > 1 && !s.starts_with("--") => {
                 for ch in s[1..].chars() {
                     match ch {
@@ -120,17 +144,37 @@ fn main() {
 
         let mut parts: Vec<&str> = Vec::new();
 
-        let sysname = unsafe { CStr::from_ptr(uts.sysname.as_ptr()) }.to_str().unwrap_or("unknown");
-        let nodename = unsafe { CStr::from_ptr(uts.nodename.as_ptr()) }.to_str().unwrap_or("unknown");
-        let release = unsafe { CStr::from_ptr(uts.release.as_ptr()) }.to_str().unwrap_or("unknown");
-        let version = unsafe { CStr::from_ptr(uts.version.as_ptr()) }.to_str().unwrap_or("unknown");
-        let machine = unsafe { CStr::from_ptr(uts.machine.as_ptr()) }.to_str().unwrap_or("unknown");
+        let sysname = unsafe { CStr::from_ptr(uts.sysname.as_ptr()) }
+            .to_str()
+            .unwrap_or("unknown");
+        let nodename = unsafe { CStr::from_ptr(uts.nodename.as_ptr()) }
+            .to_str()
+            .unwrap_or("unknown");
+        let release = unsafe { CStr::from_ptr(uts.release.as_ptr()) }
+            .to_str()
+            .unwrap_or("unknown");
+        let version = unsafe { CStr::from_ptr(uts.version.as_ptr()) }
+            .to_str()
+            .unwrap_or("unknown");
+        let machine = unsafe { CStr::from_ptr(uts.machine.as_ptr()) }
+            .to_str()
+            .unwrap_or("unknown");
 
-        if show_sysname { parts.push(sysname); }
-        if show_nodename { parts.push(nodename); }
-        if show_release { parts.push(release); }
-        if show_version { parts.push(version); }
-        if show_machine { parts.push(machine); }
+        if show_sysname {
+            parts.push(sysname);
+        }
+        if show_nodename {
+            parts.push(nodename);
+        }
+        if show_release {
+            parts.push(release);
+        }
+        if show_version {
+            parts.push(version);
+        }
+        if show_machine {
+            parts.push(machine);
+        }
         // On Linux, -p and -i are typically "unknown"; GNU skips "unknown" in -a mode
         let processor = "unknown";
         let hardware = "unknown";
@@ -188,7 +232,11 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
-        assert!(parts.len() >= 5, "uname -a should have multiple fields, got: {:?}", parts);
+        assert!(
+            parts.len() >= 5,
+            "uname -a should have multiple fields, got: {:?}",
+            parts
+        );
     }
 
     #[test]

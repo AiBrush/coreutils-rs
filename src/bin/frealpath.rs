@@ -382,10 +382,7 @@ mod tests {
         fs::write(&target, "data").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let output = cmd()
-            .args(["-s", link.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-s", link.to_str().unwrap()]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         // With -s, should NOT resolve the symlink — output should contain the symlink path

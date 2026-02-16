@@ -63,7 +63,9 @@ fn main() {
                 println!("  -a, --append             append to the given FILEs, do not overwrite");
                 println!("  -i, --ignore-interrupts  ignore interrupt signals");
                 println!("  -p                       diagnose errors writing to non pipes");
-                println!("      --output-error[=MODE]  set behavior on write error.  See MODE below");
+                println!(
+                    "      --output-error[=MODE]  set behavior on write error.  See MODE below"
+                );
                 println!("      --help               display this help and exit");
                 println!("      --version            output version information and exit");
                 println!();
@@ -311,10 +313,7 @@ mod tests {
             .unwrap();
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(0));
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "hello world\n"
-        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world\n");
     }
 
     #[test]
@@ -380,12 +379,7 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"multi\n")
-            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"multi\n").unwrap();
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(0));
 
@@ -402,12 +396,7 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"data\n")
-            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"data\n").unwrap();
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(0));
     }
@@ -475,12 +464,7 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"new\n")
-            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"new\n").unwrap();
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(0));
 

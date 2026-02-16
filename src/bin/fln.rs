@@ -145,14 +145,8 @@ fn main() {
                             if rest.is_empty() {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'S'",
-                                        TOOL_NAME
-                                    );
-                                    eprintln!(
-                                        "Try '{} --help' for more information.",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'S'", TOOL_NAME);
+                                    eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                                     process::exit(1);
                                 }
                                 suffix = args[i].clone();
@@ -167,14 +161,8 @@ fn main() {
                             if rest.is_empty() {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 't'",
-                                        TOOL_NAME
-                                    );
-                                    eprintln!(
-                                        "Try '{} --help' for more information.",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 't'", TOOL_NAME);
+                                    eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                                     process::exit(1);
                                 }
                                 target_dir = Some(args[i].clone());
@@ -217,11 +205,7 @@ fn main() {
         // -t DIRECTORY TARGET...
         // All operands are targets; link them into DIRECTORY
         if !Path::new(dir).is_dir() {
-            eprintln!(
-                "{}: target '{}' is not a directory",
-                TOOL_NAME,
-                dir
-            );
+            eprintln!("{}: target '{}' is not a directory", TOOL_NAME, dir);
             process::exit(1);
         }
         for target in &operands {
@@ -238,8 +222,7 @@ fn main() {
             if operands.len() < 2 {
                 eprintln!(
                     "{}: missing destination file operand after '{}'",
-                    TOOL_NAME,
-                    operands[0]
+                    TOOL_NAME, operands[0]
                 );
             } else {
                 eprintln!("{}: extra operand '{}'", TOOL_NAME, operands[2]);
@@ -298,11 +281,7 @@ fn main() {
         // Multiple operands: last must be a directory
         let dir = &operands[operands.len() - 1];
         if !Path::new(dir).is_dir() {
-            eprintln!(
-                "{}: target '{}' is not a directory",
-                TOOL_NAME,
-                dir
-            );
+            eprintln!("{}: target '{}' is not a directory", TOOL_NAME, dir);
             process::exit(1);
         }
         for target in &operands[..operands.len() - 1] {
@@ -496,63 +475,29 @@ fn print_help() {
     println!("  or:  {} [OPTION]... TARGET", TOOL_NAME);
     println!("  or:  {} [OPTION]... TARGET... DIRECTORY", TOOL_NAME);
     println!("  or:  {} [OPTION]... -t DIRECTORY TARGET...", TOOL_NAME);
-    println!(
-        "In the 1st form, create a link to TARGET with the name LINK_NAME."
-    );
-    println!(
-        "In the 2nd form, create a link to TARGET in the current directory."
-    );
-    println!(
-        "In the 3rd and 4th forms, create links to each TARGET in DIRECTORY."
-    );
+    println!("In the 1st form, create a link to TARGET with the name LINK_NAME.");
+    println!("In the 2nd form, create a link to TARGET in the current directory.");
+    println!("In the 3rd and 4th forms, create links to each TARGET in DIRECTORY.");
     println!("Create hard links by default, symbolic links with --symbolic.");
     println!();
-    println!(
-        "  -b                         like --backup but does not accept an argument"
-    );
-    println!(
-        "  -f, --force                remove existing destination files"
-    );
-    println!(
-        "  -i, --interactive          prompt whether to remove destinations"
-    );
-    println!(
-        "  -L, --logical              dereference TARGETs that are symbolic links"
-    );
-    println!(
-        "  -n, --no-dereference       treat LINK_NAME as a normal file if"
-    );
-    println!(
-        "                               it is a symbolic link to a directory"
-    );
-    println!(
-        "  -P, --physical             make hard links directly to symbolic links"
-    );
-    println!(
-        "  -r, --relative             create symbolic links relative to link location"
-    );
-    println!(
-        "  -s, --symbolic             make symbolic links instead of hard links"
-    );
-    println!(
-        "  -S, --suffix=SUFFIX        override the usual backup suffix"
-    );
-    println!(
-        "  -t, --target-directory=DIRECTORY  specify the DIRECTORY in which to create"
-    );
+    println!("  -b                         like --backup but does not accept an argument");
+    println!("  -f, --force                remove existing destination files");
+    println!("  -i, --interactive          prompt whether to remove destinations");
+    println!("  -L, --logical              dereference TARGETs that are symbolic links");
+    println!("  -n, --no-dereference       treat LINK_NAME as a normal file if");
+    println!("                               it is a symbolic link to a directory");
+    println!("  -P, --physical             make hard links directly to symbolic links");
+    println!("  -r, --relative             create symbolic links relative to link location");
+    println!("  -s, --symbolic             make symbolic links instead of hard links");
+    println!("  -S, --suffix=SUFFIX        override the usual backup suffix");
+    println!("  -t, --target-directory=DIRECTORY  specify the DIRECTORY in which to create");
     println!("                               the links");
-    println!(
-        "  -T, --no-target-directory   treat LINK_NAME as a normal file always"
-    );
-    println!(
-        "  -v, --verbose              print name of each linked file"
-    );
+    println!("  -T, --no-target-directory   treat LINK_NAME as a normal file always");
+    println!("  -v, --verbose              print name of each linked file");
     println!("      --help     display this help and exit");
     println!("      --version  output version information and exit");
     println!();
-    println!(
-        "The backup suffix is '~', unless set with --suffix or SIMPLE_BACKUP_SUFFIX."
-    );
+    println!("The backup suffix is '~', unless set with --suffix or SIMPLE_BACKUP_SUFFIX.");
 }
 
 #[cfg(all(test, unix))]
@@ -643,11 +588,7 @@ mod tests {
 
         // With -f, should succeed
         let output = cmd()
-            .args([
-                "-sf",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sf", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -662,19 +603,12 @@ mod tests {
         fs::write(&target, "hello").unwrap();
 
         let output = cmd()
-            .args([
-                "-sv",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sv", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("->"),
-            "verbose output should contain '->'"
-        );
+        assert!(stderr.contains("->"), "verbose output should contain '->'");
     }
 
     #[test]
@@ -687,11 +621,7 @@ mod tests {
         fs::write(&target, "hello").unwrap();
 
         let output = cmd()
-            .args([
-                "-sr",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sr", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -716,11 +646,7 @@ mod tests {
         fs::write(&link, "old_content").unwrap();
 
         let output = cmd()
-            .args([
-                "-sb",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sb", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -754,7 +680,10 @@ mod tests {
         assert!(output.status.success());
 
         let backup = dir.path().join("custom_link.txt.bak");
-        assert!(backup.exists(), "backup file with custom suffix should exist");
+        assert!(
+            backup.exists(),
+            "backup file with custom suffix should exist"
+        );
         assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
     }
 
@@ -779,7 +708,11 @@ mod tests {
 
         let expected_link = dest_dir.join("target.txt");
         assert!(
-            expected_link.symlink_metadata().unwrap().file_type().is_symlink(),
+            expected_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "link should be created in target directory"
         );
     }
@@ -792,11 +725,7 @@ mod tests {
         fs::write(&target, "hello").unwrap();
 
         let output = cmd()
-            .args([
-                "-sT",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sT", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -805,10 +734,7 @@ mod tests {
 
     #[test]
     fn test_no_target_directory_extra_operand() {
-        let output = cmd()
-            .args(["-T", "a", "b", "c"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-T", "a", "b", "c"]).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("extra operand"));
@@ -834,8 +760,20 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(dest.join("t1.txt").symlink_metadata().unwrap().file_type().is_symlink());
-        assert!(dest.join("t2.txt").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            dest.join("t1.txt")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            dest.join("t2.txt")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -867,11 +805,7 @@ mod tests {
         let link = dir.path().join("dangling.txt");
 
         let output = cmd()
-            .args([
-                "-s",
-                "/nonexistent_target_12345",
-                link.to_str().unwrap(),
-            ])
+            .args(["-s", "/nonexistent_target_12345", link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -910,7 +844,13 @@ mod tests {
         assert!(output.status.success());
 
         let expected = dest.join("target.txt");
-        assert!(expected.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            expected
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -953,19 +893,11 @@ mod tests {
         let our_link = dir.path().join("our_sym.txt");
 
         let gnu = Command::new("ln")
-            .args([
-                "-s",
-                target.to_str().unwrap(),
-                gnu_link.to_str().unwrap(),
-            ])
+            .args(["-s", target.to_str().unwrap(), gnu_link.to_str().unwrap()])
             .output();
         if let Ok(gnu) = gnu {
             let ours = cmd()
-                .args([
-                    "-s",
-                    target.to_str().unwrap(),
-                    our_link.to_str().unwrap(),
-                ])
+                .args(["-s", target.to_str().unwrap(), our_link.to_str().unwrap()])
                 .output()
                 .unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
@@ -989,19 +921,11 @@ mod tests {
         fs::write(&our_link, "old").unwrap();
 
         let gnu = Command::new("ln")
-            .args([
-                "-sf",
-                target.to_str().unwrap(),
-                gnu_link.to_str().unwrap(),
-            ])
+            .args(["-sf", target.to_str().unwrap(), gnu_link.to_str().unwrap()])
             .output();
         if let Ok(gnu) = gnu {
             let ours = cmd()
-                .args([
-                    "-sf",
-                    target.to_str().unwrap(),
-                    our_link.to_str().unwrap(),
-                ])
+                .args(["-sf", target.to_str().unwrap(), our_link.to_str().unwrap()])
                 .output()
                 .unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
@@ -1052,7 +976,11 @@ mod tests {
 
         let expected_link = work_dir.join("single_target.txt");
         assert!(
-            expected_link.symlink_metadata().unwrap().file_type().is_symlink(),
+            expected_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "link should be created in current directory"
         );
         assert_eq!(fs::read_to_string(&expected_link).unwrap(), "data");
@@ -1068,11 +996,7 @@ mod tests {
 
         // -sfv = symbolic, force, verbose
         let output = cmd()
-            .args([
-                "-sfv",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sfv", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -1090,11 +1014,7 @@ mod tests {
 
         // -n should work without error
         let output = cmd()
-            .args([
-                "-sn",
-                target.to_str().unwrap(),
-                link.to_str().unwrap(),
-            ])
+            .args(["-sn", target.to_str().unwrap(), link.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());

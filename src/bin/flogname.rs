@@ -85,7 +85,11 @@ mod tests {
     fn test_logname_exit_0_or_1() {
         let output = cmd().output().unwrap();
         let code = output.status.code().unwrap();
-        assert!(code == 0 || code == 1, "exit code should be 0 or 1, got {}", code);
+        assert!(
+            code == 0 || code == 1,
+            "exit code should be 0 or 1, got {}",
+            code
+        );
     }
 
     #[test]
@@ -95,11 +99,7 @@ mod tests {
         if let Ok(gnu) = gnu {
             let ours = cmd().output().unwrap();
             // Both should succeed or both fail
-            assert_eq!(
-                ours.status.code(),
-                gnu.status.code(),
-                "Exit code mismatch"
-            );
+            assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
             if gnu.status.success() {
                 assert_eq!(ours.stdout, gnu.stdout, "STDOUT mismatch");
             }

@@ -174,8 +174,8 @@ fn sha1_bytes(data: &[u8]) -> String {
         use digest::Digest;
         return hex_encode(&sha1::Sha1::digest(data));
     }
-    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha1(), data)
-        .expect("SHA1 hash failed");
+    let digest =
+        openssl::hash::hash(openssl::hash::MessageDigest::sha1(), data).expect("SHA1 hash failed");
     hex_encode(&digest)
 }
 
@@ -712,8 +712,7 @@ fn hash_file_pipelined_read(
                 HashAlgorithm::Sha384 => openssl::hash::MessageDigest::sha384(),
                 _ => openssl::hash::MessageDigest::sha512(),
             };
-            let mut hasher =
-                openssl::hash::Hasher::new(md).map_err(|e| io::Error::other(e))?;
+            let mut hasher = openssl::hash::Hasher::new(md).map_err(|e| io::Error::other(e))?;
             while let Ok((buf, n)) = rx.recv() {
                 hasher.update(&buf[..n]).map_err(|e| io::Error::other(e))?;
                 let _ = buf_tx.send(buf);
@@ -1806,11 +1805,7 @@ fn hash_stream_with_prefix(
         HashAlgorithm::Sha1 => {
             #[cfg(target_os = "linux")]
             {
-                hash_stream_with_prefix_openssl(
-                    openssl::hash::MessageDigest::sha1(),
-                    prefix,
-                    file,
-                )
+                hash_stream_with_prefix_openssl(openssl::hash::MessageDigest::sha1(), prefix, file)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1876,11 +1871,7 @@ fn hash_stream_with_prefix(
         HashAlgorithm::Md5 => {
             #[cfg(target_os = "linux")]
             {
-                hash_stream_with_prefix_openssl(
-                    openssl::hash::MessageDigest::md5(),
-                    prefix,
-                    file,
-                )
+                hash_stream_with_prefix_openssl(openssl::hash::MessageDigest::md5(), prefix, file)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1913,8 +1904,7 @@ fn hash_stream_with_prefix_openssl(
     prefix: &[u8],
     mut file: File,
 ) -> io::Result<String> {
-    let mut hasher =
-        openssl::hash::Hasher::new(md).map_err(|e| io::Error::other(e))?;
+    let mut hasher = openssl::hash::Hasher::new(md).map_err(|e| io::Error::other(e))?;
     hasher.update(prefix).map_err(|e| io::Error::other(e))?;
     STREAM_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();

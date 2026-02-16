@@ -74,8 +74,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::fs;
+    use std::process::Command;
 
     fn cmd() -> Command {
         let mut path = std::env::current_exe().unwrap();

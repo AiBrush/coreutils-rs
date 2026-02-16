@@ -69,8 +69,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
     use std::io::Read;
+    use std::process::{Command, Stdio};
 
     fn cmd() -> Command {
         let mut path = std::env::current_exe().unwrap();
@@ -82,10 +82,7 @@ mod tests {
 
     #[test]
     fn test_yes_default_y() {
-        let mut child = cmd()
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = cmd().stdout(Stdio::piped()).spawn().unwrap();
 
         let mut stdout = child.stdout.take().unwrap();
         let mut buf = Vec::new();
@@ -104,7 +101,11 @@ mod tests {
 
         let text = String::from_utf8_lossy(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines.len() >= 5, "Expected at least 5 lines, got {}", lines.len());
+        assert!(
+            lines.len() >= 5,
+            "Expected at least 5 lines, got {}",
+            lines.len()
+        );
         for line in &lines[..5] {
             assert_eq!(*line, "y");
         }
@@ -112,11 +113,7 @@ mod tests {
 
     #[test]
     fn test_yes_custom_string() {
-        let mut child = cmd()
-            .arg("hello")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = cmd().arg("hello").stdout(Stdio::piped()).spawn().unwrap();
 
         let mut stdout = child.stdout.take().unwrap();
         let mut buf = Vec::new();
@@ -134,7 +131,11 @@ mod tests {
 
         let text = String::from_utf8_lossy(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines.len() >= 3, "Expected at least 3 lines, got {}", lines.len());
+        assert!(
+            lines.len() >= 3,
+            "Expected at least 3 lines, got {}",
+            lines.len()
+        );
         for line in &lines[..3] {
             assert_eq!(*line, "hello");
         }
@@ -164,7 +165,11 @@ mod tests {
 
         let text = String::from_utf8_lossy(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines.len() >= 2, "Expected at least 2 lines, got {}", lines.len());
+        assert!(
+            lines.len() >= 2,
+            "Expected at least 2 lines, got {}",
+            lines.len()
+        );
         for line in &lines[..2] {
             assert_eq!(*line, "a b");
         }
@@ -173,10 +178,7 @@ mod tests {
     #[test]
     fn test_yes_pipe_closes() {
         // yes piped to head should terminate
-        let child = cmd()
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = cmd().stdout(Stdio::piped()).spawn().unwrap();
 
         let head = Command::new("head")
             .arg("-n")
@@ -199,7 +201,10 @@ mod tests {
             .output();
         if let Ok(gnu) = gnu {
             let ours = Command::new("sh")
-                .args(["-c", &format!("{} | head -n 1000", cmd().get_program().to_str().unwrap())])
+                .args([
+                    "-c",
+                    &format!("{} | head -n 1000", cmd().get_program().to_str().unwrap()),
+                ])
                 .output()
                 .unwrap();
             assert_eq!(

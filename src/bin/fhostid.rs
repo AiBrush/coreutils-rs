@@ -65,7 +65,12 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let trimmed = stdout.trim();
-        assert_eq!(trimmed.len(), 8, "hostid should be 8 hex chars, got: '{}'", trimmed);
+        assert_eq!(
+            trimmed.len(),
+            8,
+            "hostid should be 8 hex chars, got: '{}'",
+            trimmed
+        );
         assert!(
             trimmed.chars().all(|c| c.is_ascii_hexdigit()),
             "hostid should be hex, got: '{}'",

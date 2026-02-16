@@ -106,7 +106,11 @@ fn main() {
     if let Some(ref spec) = userspec {
         let parts: Vec<&str> = spec.splitn(2, ':').collect();
         let user_part = parts[0];
-        let group_part = if parts.len() > 1 { Some(parts[1]) } else { None };
+        let group_part = if parts.len() > 1 {
+            Some(parts[1])
+        } else {
+            None
+        };
 
         if !user_part.is_empty() {
             target_uid = Some(resolve_user(user_part).unwrap_or_else(|| {
@@ -142,7 +146,10 @@ fn main() {
 
     // Perform chroot
     let c_newroot = CString::new(newroot.as_str()).unwrap_or_else(|_| {
-        eprintln!("{}: cannot change root directory to '{}': Invalid argument", TOOL_NAME, newroot);
+        eprintln!(
+            "{}: cannot change root directory to '{}': Invalid argument",
+            TOOL_NAME, newroot
+        );
         process::exit(125);
     });
 
@@ -311,10 +318,7 @@ mod tests {
 
     #[test]
     fn test_nonexistent_directory() {
-        let output = cmd()
-            .arg("/nonexistent_dir_xyz_999")
-            .output()
-            .unwrap();
+        let output = cmd().arg("/nonexistent_dir_xyz_999").output().unwrap();
         let code = output.status.code().unwrap();
         assert_ne!(code, 0);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -353,10 +357,7 @@ mod tests {
             .arg("/nonexistent_dir_xyz_999")
             .output();
         if let Ok(gnu) = gnu {
-            let ours = cmd()
-                .arg("/nonexistent_dir_xyz_999")
-                .output()
-                .unwrap();
+            let ours = cmd().arg("/nonexistent_dir_xyz_999").output().unwrap();
             assert_ne!(gnu.status.code(), Some(0));
             assert_ne!(ours.status.code(), Some(0));
         }
@@ -365,10 +366,7 @@ mod tests {
     #[test]
     fn test_skip_chdir_accepted() {
         // Just verify the flag is accepted (will still fail without root)
-        let output = cmd()
-            .args(["--skip-chdir", "/tmp"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["--skip-chdir", "/tmp"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
     }
 
@@ -385,10 +383,7 @@ mod tests {
     #[test]
     fn test_groups_accepted() {
         // Just verify the flag is parsed (will still fail without root)
-        let output = cmd()
-            .args(["--groups=0,1", "/tmp"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["--groups=0,1", "/tmp"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
     }
 }

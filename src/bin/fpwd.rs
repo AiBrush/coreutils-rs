@@ -20,7 +20,9 @@ fn main() {
                 println!("Usage: {} [OPTION]...", TOOL_NAME);
                 println!("Print the full filename of the current working directory.");
                 println!();
-                println!("  -L, --logical    use PWD from environment, even if it contains symlinks");
+                println!(
+                    "  -L, --logical    use PWD from environment, even if it contains symlinks"
+                );
                 println!("  -P, --physical   avoid all symlinks");
                 println!("      --help       display this help and exit");
                 println!("      --version    output version information and exit");
@@ -119,7 +121,11 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let path = stdout.trim();
-        assert!(path.starts_with('/'), "Should print absolute path, got: {}", path);
+        assert!(
+            path.starts_with('/'),
+            "Should print absolute path, got: {}",
+            path
+        );
     }
 
     #[test]

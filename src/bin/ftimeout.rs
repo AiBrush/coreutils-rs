@@ -54,25 +54,43 @@ fn main() {
                 println!("                           SIGNAL may be a name like 'HUP' or a number;");
                 println!("                           see 'kill -l' for a list of signals");
                 println!("  -k, --kill-after=DURATION");
-                println!("                         also send a KILL signal if COMMAND is still running");
+                println!(
+                    "                         also send a KILL signal if COMMAND is still running"
+                );
                 println!("                           this long after the initial signal was sent");
-                println!("      --foreground       when not running timeout directly from a shell prompt,");
-                println!("                           allow COMMAND to read from the TTY and get TTY signals");
-                println!("      --preserve-status  exit with the same status as COMMAND, even when the");
+                println!(
+                    "      --foreground       when not running timeout directly from a shell prompt,"
+                );
+                println!(
+                    "                           allow COMMAND to read from the TTY and get TTY signals"
+                );
+                println!(
+                    "      --preserve-status  exit with the same status as COMMAND, even when the"
+                );
                 println!("                           command times out");
-                println!("  -v, --verbose          diagnose to stderr any signal sent upon timeout");
+                println!(
+                    "  -v, --verbose          diagnose to stderr any signal sent upon timeout"
+                );
                 println!("      --help             display this help and exit");
                 println!("      --version          output version information and exit");
                 println!();
                 println!("DURATION is a floating point number with an optional suffix:");
-                println!("'s' for seconds (the default), 'm' for minutes, 'h' for hours or 'd' for days.");
+                println!(
+                    "'s' for seconds (the default), 'm' for minutes, 'h' for hours or 'd' for days."
+                );
                 println!("A duration of 0 disables the associated timeout.");
                 println!();
-                println!("If the command times out, and --preserve-status is not set, then exit with");
+                println!(
+                    "If the command times out, and --preserve-status is not set, then exit with"
+                );
                 println!("status 124.  Otherwise, exit with the status of COMMAND.  If no signal");
                 println!("is specified, send the TERM signal upon timeout.  The TERM signal kills");
-                println!("any process that does not block or catch that signal.  It may be necessary");
-                println!("to use the KILL (9) signal, since this signal cannot be caught, in which");
+                println!(
+                    "any process that does not block or catch that signal.  It may be necessary"
+                );
+                println!(
+                    "to use the KILL (9) signal, since this signal cannot be caught, in which"
+                );
                 println!("case the exit status is 128+9 rather than 124.");
                 return;
             }
@@ -127,10 +145,7 @@ fn main() {
                             } else {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 's'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 's'", TOOL_NAME);
                                     process::exit(EXIT_FAILURE);
                                 }
                                 signal_name = args[i].clone();
@@ -140,10 +155,7 @@ fn main() {
                             if j + 1 < chars.len() {
                                 let val: String = chars[j + 1..].iter().collect();
                                 kill_after = Some(parse_duration(&val).unwrap_or_else(|| {
-                                    eprintln!(
-                                        "{}: invalid time interval '{}'",
-                                        TOOL_NAME, val
-                                    );
+                                    eprintln!("{}: invalid time interval '{}'", TOOL_NAME, val);
                                     process::exit(EXIT_FAILURE);
                                 }));
                                 j = chars.len();
@@ -151,20 +163,13 @@ fn main() {
                             } else {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'k'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'k'", TOOL_NAME);
                                     process::exit(EXIT_FAILURE);
                                 }
-                                kill_after =
-                                    Some(parse_duration(&args[i]).unwrap_or_else(|| {
-                                        eprintln!(
-                                            "{}: invalid time interval '{}'",
-                                            TOOL_NAME, args[i]
-                                        );
-                                        process::exit(EXIT_FAILURE);
-                                    }));
+                                kill_after = Some(parse_duration(&args[i]).unwrap_or_else(|| {
+                                    eprintln!("{}: invalid time interval '{}'", TOOL_NAME, args[i]);
+                                    process::exit(EXIT_FAILURE);
+                                }));
                             }
                         }
                         _ => {
@@ -492,10 +497,7 @@ mod tests {
 
     #[test]
     fn test_command_completes_before_timeout() {
-        let output = cmd()
-            .args(["10", "echo", "hello"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["10", "echo", "hello"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "hello");
@@ -503,10 +505,7 @@ mod tests {
 
     #[test]
     fn test_command_times_out() {
-        let output = cmd()
-            .args(["0.1", "sleep", "10"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["0.1", "sleep", "10"]).output().unwrap();
         // Exit code should be 124 (timed out)
         assert_eq!(output.status.code(), Some(124));
     }
@@ -560,20 +559,14 @@ mod tests {
     #[test]
     fn test_duration_with_suffix() {
         // 0.1s should work the same as 0.1
-        let output = cmd()
-            .args(["0.1s", "sleep", "10"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["0.1s", "sleep", "10"]).output().unwrap();
         assert_eq!(output.status.code(), Some(124));
     }
 
     #[test]
     fn test_zero_duration() {
         // Duration of 0 means no timeout
-        let output = cmd()
-            .args(["0", "echo", "no timeout"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["0", "echo", "no timeout"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "no timeout");
@@ -612,7 +605,9 @@ mod tests {
 
     #[test]
     fn test_matches_gnu_exit_codes_success() {
-        let gnu = Command::new("timeout").args(["10", "echo", "test"]).output();
+        let gnu = Command::new("timeout")
+            .args(["10", "echo", "test"])
+            .output();
         if let Ok(gnu) = gnu {
             let ours = cmd().args(["10", "echo", "test"]).output().unwrap();
             assert_eq!(ours.stdout, gnu.stdout, "STDOUT mismatch");

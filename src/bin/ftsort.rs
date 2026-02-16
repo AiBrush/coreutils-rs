@@ -103,10 +103,7 @@ fn run(input: &str, source_name: &str) -> i32 {
     let tokens: Vec<&str> = input.split_whitespace().collect();
 
     if !tokens.len().is_multiple_of(2) {
-        eprintln!(
-            "{}: input contains an odd number of tokens",
-            TOOL_NAME
-        );
+        eprintln!("{}: input contains an odd number of tokens", TOOL_NAME);
         return 1;
     }
 
@@ -391,10 +388,7 @@ mod tests {
             let mut f = std::fs::File::create(&file_path).unwrap();
             f.write_all(b"1 2\n2 3\n3 4\n").unwrap();
         }
-        let output = cmd()
-            .arg(file_path.to_str().unwrap())
-            .output()
-            .unwrap();
+        let output = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.trim().lines().collect();

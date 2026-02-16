@@ -137,11 +137,7 @@ fn parse_args() -> Cli {
                         }
                     }
                     _ => {
-                        eprintln!(
-                            "{}: invalid option -- '{}'",
-                            TOOL_NAME,
-                            bytes[i] as char
-                        );
+                        eprintln!("{}: invalid option -- '{}'", TOOL_NAME, bytes[i] as char);
                         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                         process::exit(1);
                     }
@@ -328,11 +324,7 @@ fn main() {
     let data = if filename == "-" {
         let mut buf = Vec::new();
         if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-            eprintln!(
-                "{}: {}",
-                TOOL_NAME,
-                coreutils_rs::common::io_error_msg(&e)
-            );
+            eprintln!("{}: {}", TOOL_NAME, coreutils_rs::common::io_error_msg(&e));
             process::exit(1);
         }
         buf
@@ -445,12 +437,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"Hello\n")
-            .unwrap();
+        child.stdin.take().unwrap().write_all(b"Hello\n").unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -610,7 +597,10 @@ mod tests {
         assert_eq!(base32_decode(b"MZXW6===", false).unwrap(), b"foo");
         assert_eq!(base32_decode(b"MZXW6YQ=", false).unwrap(), b"foob");
         assert_eq!(base32_decode(b"MZXW6YTB", false).unwrap(), b"fooba");
-        assert_eq!(base32_decode(b"MZXW6YTBOI======", false).unwrap(), b"foobar");
+        assert_eq!(
+            base32_decode(b"MZXW6YTBOI======", false).unwrap(),
+            b"foobar"
+        );
     }
 
     #[test]
@@ -628,12 +618,7 @@ mod tests {
             Ok(c) => c,
             Err(_) => return,
         };
-        gnu_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        gnu_child.stdin.take().unwrap().write_all(input).unwrap();
         let gnu_out = gnu_child.wait_with_output().unwrap();
 
         let mut our_child = cmd()
@@ -641,12 +626,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        our_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        our_child.stdin.take().unwrap().write_all(input).unwrap();
         let our_out = our_child.wait_with_output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&our_out.stdout),
@@ -671,12 +651,7 @@ mod tests {
             Ok(c) => c,
             Err(_) => return,
         };
-        gnu_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(encoded)
-            .unwrap();
+        gnu_child.stdin.take().unwrap().write_all(encoded).unwrap();
         let gnu_out = gnu_child.wait_with_output().unwrap();
 
         let mut our_child = cmd()
@@ -685,12 +660,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        our_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(encoded)
-            .unwrap();
+        our_child.stdin.take().unwrap().write_all(encoded).unwrap();
         let our_out = our_child.wait_with_output().unwrap();
         assert_eq!(
             our_out.stdout, gnu_out.stdout,

@@ -34,8 +34,12 @@ fn main() {
                 println!("Print NAME with any leading directory components removed.");
                 println!("If specified, also remove a trailing SUFFIX.");
                 println!();
-                println!("Mandatory arguments to long options are mandatory for short options too.");
-                println!("  -a, --multiple       support multiple arguments and treat each as a NAME");
+                println!(
+                    "Mandatory arguments to long options are mandatory for short options too."
+                );
+                println!(
+                    "  -a, --multiple       support multiple arguments and treat each as a NAME"
+                );
                 println!("  -s, --suffix=SUFFIX  remove a trailing SUFFIX; implies -a");
                 println!("  -z, --zero           end each output line with NUL, not newline");
                 println!("      --help           display this help and exit");
@@ -76,14 +80,8 @@ fn main() {
                             if rest.is_empty() {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 's'",
-                                        TOOL_NAME
-                                    );
-                                    eprintln!(
-                                        "Try '{} --help' for more information.",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 's'", TOOL_NAME);
+                                    eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                                     process::exit(1);
                                 }
                                 suffix = Some(args[i].clone());
@@ -131,11 +129,7 @@ fn main() {
         let result = basename(&names[0], Some(&names[1]));
         print!("{}{}", result, terminator);
     } else {
-        eprintln!(
-            "{}: extra operand '{}'",
-            TOOL_NAME,
-            names[2]
-        );
+        eprintln!("{}: extra operand '{}'", TOOL_NAME, names[2]);
         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
         process::exit(1);
     }

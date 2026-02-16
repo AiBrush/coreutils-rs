@@ -45,11 +45,7 @@ fn decimal_places(s: &str) -> usize {
         let frac = &s[pos + 1..];
         // Trim trailing zeros for precision determination
         let trimmed = frac.trim_end_matches('0');
-        if trimmed.is_empty() {
-            0
-        } else {
-            trimmed.len()
-        }
+        if trimmed.is_empty() { 0 } else { trimmed.len() }
     } else {
         0
     }
@@ -380,7 +376,10 @@ fn main() {
     let first: f64 = match first_str.parse() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("{}: invalid floating point argument: '{}'", TOOL_NAME, first_str);
+            eprintln!(
+                "{}: invalid floating point argument: '{}'",
+                TOOL_NAME, first_str
+            );
             process::exit(1);
         }
     };
@@ -397,13 +396,19 @@ fn main() {
     let last: f64 = match last_str.parse() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("{}: invalid floating point argument: '{}'", TOOL_NAME, last_str);
+            eprintln!(
+                "{}: invalid floating point argument: '{}'",
+                TOOL_NAME, last_str
+            );
             process::exit(1);
         }
     };
 
     if increment == 0.0 {
-        eprintln!("{}: invalid Zero increment value: '{}'", TOOL_NAME, increment_str);
+        eprintln!(
+            "{}: invalid Zero increment value: '{}'",
+            TOOL_NAME, increment_str
+        );
         process::exit(1);
     }
 

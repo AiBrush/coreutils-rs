@@ -190,7 +190,10 @@ fn main() {
             "--random-source" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{}: option requires an argument -- 'random-source'", TOOL_NAME);
+                    eprintln!(
+                        "{}: option requires an argument -- 'random-source'",
+                        TOOL_NAME
+                    );
                     process::exit(1);
                 }
                 random_source = Some(args[i].clone());
@@ -399,15 +402,15 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: HashSet<&str> = stdout.trim().lines().collect();
         let expected: HashSet<&str> = ["a", "b", "c", "d", "e"].iter().copied().collect();
-        assert_eq!(lines, expected, "All elements should be present after shuffle");
+        assert_eq!(
+            lines, expected,
+            "All elements should be present after shuffle"
+        );
     }
 
     #[test]
     fn test_echo_mode() {
-        let output = cmd()
-            .args(["-e", "x", "y", "z"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-e", "x", "y", "z"]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: HashSet<&str> = stdout.trim().lines().collect();
@@ -417,27 +420,17 @@ mod tests {
 
     #[test]
     fn test_input_range() {
-        let output = cmd()
-            .args(["-i", "1-5"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-i", "1-5"]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut lines: Vec<i32> = stdout
-            .trim()
-            .lines()
-            .map(|l| l.parse().unwrap())
-            .collect();
+        let mut lines: Vec<i32> = stdout.trim().lines().map(|l| l.parse().unwrap()).collect();
         lines.sort();
         assert_eq!(lines, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
     fn test_head_count() {
-        let output = cmd()
-            .args(["-i", "1-100", "-n", "5"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-i", "1-100", "-n", "5"]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -479,7 +472,10 @@ mod tests {
         assert!(output.status.success());
         let stdout = &output.stdout;
         // Output should be NUL-terminated
-        let items: HashSet<&[u8]> = stdout.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+        let items: HashSet<&[u8]> = stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(items.len(), 3);
         assert!(items.contains(&b"a"[..]));
         assert!(items.contains(&b"b"[..]));
@@ -491,13 +487,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let outpath = dir.join("fshuf_test_output.txt");
         let output = cmd()
-            .args([
-                "-e",
-                "hello",
-                "world",
-                "-o",
-                outpath.to_str().unwrap(),
-            ])
+            .args(["-e", "hello", "world", "-o", outpath.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -565,10 +555,7 @@ mod tests {
 
     #[test]
     fn test_head_count_zero() {
-        let output = cmd()
-            .args(["-i", "1-10", "-n", "0"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-i", "1-10", "-n", "0"]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, "");

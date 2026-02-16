@@ -16,7 +16,9 @@ use std::process;
 /// Clear errno to 0 (portable across Unix platforms)
 #[cfg(unix)]
 fn clear_errno() {
-    unsafe { *errno_ptr() = 0; }
+    unsafe {
+        *errno_ptr() = 0;
+    }
 }
 
 /// Get current errno value (portable across Unix platforms)
@@ -28,11 +30,17 @@ fn get_errno() -> i32 {
 #[cfg(unix)]
 unsafe fn errno_ptr() -> *mut i32 {
     #[cfg(target_os = "linux")]
-    { unsafe { libc::__errno_location() } }
+    {
+        unsafe { libc::__errno_location() }
+    }
     #[cfg(target_os = "macos")]
-    { unsafe { libc::__error() } }
+    {
+        unsafe { libc::__error() }
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    { unsafe { libc::__errno_location() } }
+    {
+        unsafe { libc::__errno_location() }
+    }
 }
 
 #[cfg(unix)]
@@ -54,7 +62,9 @@ fn main() {
         match arg.as_str() {
             "--help" => {
                 println!("Usage: {} [OPTION] [COMMAND [ARG]...]", TOOL_NAME);
-                println!("Run COMMAND with an adjusted niceness, which affects process scheduling.");
+                println!(
+                    "Run COMMAND with an adjusted niceness, which affects process scheduling."
+                );
                 println!("With no COMMAND, print the current niceness.");
                 println!();
                 println!("  -n, --adjustment=N   add integer N to the niceness (default 10)");

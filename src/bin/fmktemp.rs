@@ -160,10 +160,7 @@ fn main() {
     // Validate template: must have at least 3 consecutive X's before suffix
     let (prefix, x_count, suf_part) = parse_template(&full_template, &suffix);
     if x_count < 3 {
-        eprintln!(
-            "{}: too few X's in template '{}'",
-            TOOL_NAME, full_template
-        );
+        eprintln!("{}: too few X's in template '{}'", TOOL_NAME, full_template);
         process::exit(1);
     }
 
@@ -213,12 +210,16 @@ fn generate_random_name(x_count: usize) -> String {
         let seed = unsafe {
             let mut tv: libc::timeval = std::mem::zeroed();
             libc::gettimeofday(&mut tv, std::ptr::null_mut());
-            (tv.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add(tv.tv_usec as u64)
+            (tv.tv_sec as u64)
+                .wrapping_mul(1_000_000)
+                .wrapping_add(tv.tv_usec as u64)
                 .wrapping_add(libc::getpid() as u64)
         };
         let mut state = seed;
         for byte in &mut buf {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *byte = (state >> 33) as u8;
         }
     }
@@ -252,7 +253,8 @@ fn create_temp(
                     // Set permissions to 0700 for directories (private)
                     #[cfg(unix)]
                     {
-                        let c_path = std::ffi::CString::new(path.as_str()).map_err(|e| e.to_string())?;
+                        let c_path =
+                            std::ffi::CString::new(path.as_str()).map_err(|e| e.to_string())?;
                         unsafe {
                             libc::chmod(c_path.as_ptr(), 0o700);
                         }
@@ -277,16 +279,13 @@ fn create_temp(
         } else {
             // Create file exclusively
             use std::fs::OpenOptions;
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(_file) => {
                     // Set permissions to 0600 for files (private)
                     #[cfg(unix)]
                     {
-                        let c_path = std::ffi::CString::new(path.as_str()).map_err(|e| e.to_string())?;
+                        let c_path =
+                            std::ffi::CString::new(path.as_str()).map_err(|e| e.to_string())?;
                         unsafe {
                             libc::chmod(c_path.as_ptr(), 0o600);
                         }
@@ -474,7 +473,11 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let path = stdout.trim();
-        assert!(path.ends_with(".txt"), "path should end with .txt: {}", path);
+        assert!(
+            path.ends_with(".txt"),
+            "path should end with .txt: {}",
+            path
+        );
         assert!(std::path::Path::new(path).exists());
     }
 
@@ -548,7 +551,10 @@ mod tests {
         let out2 = cmd().arg(&template).output().unwrap();
         let path1 = String::from_utf8_lossy(&out1.stdout).trim().to_string();
         let path2 = String::from_utf8_lossy(&out2.stdout).trim().to_string();
-        assert_ne!(path1, path2, "two invocations should produce different names");
+        assert_ne!(
+            path1, path2,
+            "two invocations should produce different names"
+        );
     }
 
     #[test]
@@ -601,7 +607,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let meta = std::fs::metadata(path).unwrap();
             let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "directory should have mode 0700, got {:o}", mode);
+            assert_eq!(
+                mode, 0o700,
+                "directory should have mode 0700, got {:o}",
+                mode
+            );
         }
     }
 }

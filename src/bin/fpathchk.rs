@@ -12,7 +12,8 @@ const POSIX_NAME_MAX: usize = 14;
 const POSIX_PATH_MAX: usize = 256;
 
 /// POSIX portable filename character set
-const POSIX_PORTABLE_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+const POSIX_PORTABLE_CHARS: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
 
 fn main() {
     coreutils_rs::common::reset_sigpipe();
@@ -151,8 +152,10 @@ fn check_system_limits(path: &str) -> Result<(), String> {
     // Get system limits (pathconf is Unix-only, use defaults elsewhere)
     #[cfg(unix)]
     let (path_max, name_max) = unsafe {
-        (libc::pathconf(c"/".as_ptr(), libc::_PC_PATH_MAX),
-         libc::pathconf(c"/".as_ptr(), libc::_PC_NAME_MAX))
+        (
+            libc::pathconf(c"/".as_ptr(), libc::_PC_PATH_MAX),
+            libc::pathconf(c"/".as_ptr(), libc::_PC_NAME_MAX),
+        )
     };
     #[cfg(not(unix))]
     let (path_max, name_max): (i64, i64) = (4096, 255);
@@ -188,10 +191,7 @@ fn check_system_limits(path: &str) -> Result<(), String> {
     while !check.as_os_str().is_empty() && check != std::path::Path::new("/") {
         if check.exists() {
             if !check.is_dir() && check != p {
-                return Err(format!(
-                    "'{}' is not a directory",
-                    check.display()
-                ));
+                return Err(format!("'{}' is not a directory", check.display()));
             }
             break;
         }
@@ -235,28 +235,19 @@ mod tests {
     #[test]
     fn test_pathchk_portable_invalid_chars() {
         // -p should reject non-POSIX characters like spaces
-        let output = cmd()
-            .args(["-p", "/tmp/bad name"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-p", "/tmp/bad name"]).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("nonportable character"));
 
         // Also check a colon
-        let output2 = cmd()
-            .args(["-p", "/tmp/f:n"])
-            .output()
-            .unwrap();
+        let output2 = cmd().args(["-p", "/tmp/f:n"]).output().unwrap();
         assert_eq!(output2.status.code(), Some(1));
         let stderr2 = String::from_utf8_lossy(&output2.stderr);
         assert!(stderr2.contains("nonportable character"));
 
         // Valid POSIX name should pass
-        let output3 = cmd()
-            .args(["-p", "/tmp/valid_name.txt"])
-            .output()
-            .unwrap();
+        let output3 = cmd().args(["-p", "/tmp/valid_name.txt"]).output().unwrap();
         assert!(output3.status.success());
     }
 
@@ -276,10 +267,7 @@ mod tests {
         assert!(stderr.contains("leading '-'"));
 
         // Also check component with leading dash
-        let output2 = cmd()
-            .args(["-P", "--", "/tmp/-badname"])
-            .output()
-            .unwrap();
+        let output2 = cmd().args(["-P", "--", "/tmp/-badname"]).output().unwrap();
         assert_eq!(output2.status.code(), Some(1));
     }
 
@@ -289,7 +277,11 @@ mod tests {
         let gnu = Command::new("pathchk").arg("/tmp").output();
         if let Ok(gnu) = gnu {
             let ours = cmd().arg("/tmp").output().unwrap();
-            assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch for valid path");
+            assert_eq!(
+                ours.status.code(),
+                gnu.status.code(),
+                "Exit code mismatch for valid path"
+            );
         }
 
         // -p with invalid chars
@@ -297,10 +289,7 @@ mod tests {
             .args(["-p", "/tmp/file name"])
             .output();
         if let Ok(gnu_p) = gnu_p {
-            let ours_p = cmd()
-                .args(["-p", "/tmp/file name"])
-                .output()
-                .unwrap();
+            let ours_p = cmd().args(["-p", "/tmp/file name"]).output().unwrap();
             assert_eq!(
                 ours_p.status.code(),
                 gnu_p.status.code(),
@@ -309,14 +298,9 @@ mod tests {
         }
 
         // -P with leading dash
-        let gnu_pd = Command::new("pathchk")
-            .args(["-P", "--", "-test"])
-            .output();
+        let gnu_pd = Command::new("pathchk").args(["-P", "--", "-test"]).output();
         if let Ok(gnu_pd) = gnu_pd {
-            let ours_pd = cmd()
-                .args(["-P", "--", "-test"])
-                .output()
-                .unwrap();
+            let ours_pd = cmd().args(["-P", "--", "-test"]).output().unwrap();
             assert_eq!(
                 ours_pd.status.code(),
                 gnu_pd.status.code(),

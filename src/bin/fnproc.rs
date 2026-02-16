@@ -156,7 +156,12 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        assert!(all_n >= default_n, "--all ({}) should be >= default ({})", all_n, default_n);
+        assert!(
+            all_n >= default_n,
+            "--all ({}) should be >= default ({})",
+            all_n,
+            default_n
+        );
     }
 
     #[test]

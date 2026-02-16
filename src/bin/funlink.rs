@@ -37,11 +37,7 @@ fn main() {
     }
 
     if args.len() > 1 {
-        eprintln!(
-            "{}: extra operand '{}'",
-            TOOL_NAME,
-            args[1]
-        );
+        eprintln!("{}: extra operand '{}'", TOOL_NAME, args[1]);
         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
         process::exit(1);
     }
@@ -59,8 +55,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::fs;
+    use std::process::Command;
 
     fn cmd() -> Command {
         let mut path = std::env::current_exe().unwrap();
@@ -120,10 +116,7 @@ mod tests {
             .arg("/nonexistent_unlink_test_file")
             .output();
         if let Ok(gnu) = gnu {
-            let ours = cmd()
-                .arg("/nonexistent_unlink_test_file")
-                .output()
-                .unwrap();
+            let ours = cmd().arg("/nonexistent_unlink_test_file").output().unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
         }
     }

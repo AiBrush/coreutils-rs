@@ -28,7 +28,9 @@ fn main() {
         match arg.as_str() {
             "--help" => {
                 println!("Usage: {} [OPTION]... [USERNAME]...", TOOL_NAME);
-                println!("Print group memberships for each USERNAME or, if no USERNAME is specified,");
+                println!(
+                    "Print group memberships for each USERNAME or, if no USERNAME is specified,"
+                );
                 println!("for the current process.");
                 println!();
                 println!("      --help     display this help and exit");
@@ -114,28 +116,51 @@ fn get_user_groups(user: &str) -> Result<Vec<String>, String> {
     {
         let mut gids: Vec<libc::c_int> = vec![0; ngroups as usize];
         let ret = unsafe {
-            libc::getgrouplist(c_user.as_ptr(), pw_gid as libc::c_int, gids.as_mut_ptr(), &mut ngroups)
+            libc::getgrouplist(
+                c_user.as_ptr(),
+                pw_gid as libc::c_int,
+                gids.as_mut_ptr(),
+                &mut ngroups,
+            )
         };
         if ret == -1 {
             gids.resize(ngroups as usize, 0);
             unsafe {
-                libc::getgrouplist(c_user.as_ptr(), pw_gid as libc::c_int, gids.as_mut_ptr(), &mut ngroups);
+                libc::getgrouplist(
+                    c_user.as_ptr(),
+                    pw_gid as libc::c_int,
+                    gids.as_mut_ptr(),
+                    &mut ngroups,
+                );
             }
         }
         gids.truncate(ngroups as usize);
-        return Ok(gids.iter().map(|&gid| gid_to_name(gid as libc::gid_t)).collect());
+        return Ok(gids
+            .iter()
+            .map(|&gid| gid_to_name(gid as libc::gid_t))
+            .collect());
     }
 
     #[cfg(not(target_vendor = "apple"))]
     {
         let mut gids: Vec<libc::gid_t> = vec![0; ngroups as usize];
         let ret = unsafe {
-            libc::getgrouplist(c_user.as_ptr(), pw_gid as libc::gid_t, gids.as_mut_ptr(), &mut ngroups)
+            libc::getgrouplist(
+                c_user.as_ptr(),
+                pw_gid as libc::gid_t,
+                gids.as_mut_ptr(),
+                &mut ngroups,
+            )
         };
         if ret == -1 {
             gids.resize(ngroups as usize, 0);
             unsafe {
-                libc::getgrouplist(c_user.as_ptr(), pw_gid as libc::gid_t, gids.as_mut_ptr(), &mut ngroups);
+                libc::getgrouplist(
+                    c_user.as_ptr(),
+                    pw_gid as libc::gid_t,
+                    gids.as_mut_ptr(),
+                    &mut ngroups,
+                );
             }
         }
         gids.truncate(ngroups as usize);
@@ -179,7 +204,10 @@ mod tests {
         let output = cmd().arg("root").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("root"), "root should be in a group containing 'root'");
+        assert!(
+            stdout.contains("root"),
+            "root should be in a group containing 'root'"
+        );
     }
 
     #[test]

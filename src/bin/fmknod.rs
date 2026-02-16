@@ -62,10 +62,7 @@ fn main() {
                         if let Some(val) = args.next() {
                             mode = Some(val);
                         } else {
-                            eprintln!(
-                                "{}: option requires an argument -- 'm'",
-                                TOOL_NAME
-                            );
+                            eprintln!("{}: option requires an argument -- 'm'", TOOL_NAME);
                             process::exit(1);
                         }
                     } else {
@@ -88,10 +85,7 @@ fn main() {
     }
 
     if positional.len() < 2 {
-        eprintln!(
-            "{}: missing operand after '{}'",
-            TOOL_NAME, positional[0]
-        );
+        eprintln!("{}: missing operand after '{}'", TOOL_NAME, positional[0]);
         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
         process::exit(1);
     }
@@ -119,16 +113,11 @@ fn main() {
                     TOOL_NAME,
                     positional.last().unwrap()
                 );
-                eprintln!(
-                    "Special files require major and minor device numbers."
-                );
+                eprintln!("Special files require major and minor device numbers.");
                 process::exit(1);
             }
             if positional.len() > 4 {
-                eprintln!(
-                    "{}: too many arguments after major/minor",
-                    TOOL_NAME
-                );
+                eprintln!("{}: too many arguments after major/minor", TOOL_NAME);
                 process::exit(1);
             }
             let major = parse_device_number(&positional[2], "major");
@@ -136,10 +125,7 @@ fn main() {
             create_special(name, node_type, major, minor, &mode);
         }
         _ => {
-            eprintln!(
-                "{}: invalid device type '{}'",
-                TOOL_NAME, node_type
-            );
+            eprintln!("{}: invalid device type '{}'", TOOL_NAME, node_type);
             eprintln!("Try '{} --help' for more information.", TOOL_NAME);
             process::exit(1);
         }
@@ -294,10 +280,7 @@ mod tests {
     fn test_create_fifo() {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("testfifo");
-        let output = cmd()
-            .args([fifo.to_str().unwrap(), "p"])
-            .output()
-            .unwrap();
+        let output = cmd().args([fifo.to_str().unwrap(), "p"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
 
         #[cfg(unix)]
@@ -331,10 +314,7 @@ mod tests {
     fn test_invalid_type() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("badtype");
-        let output = cmd()
-            .args([path.to_str().unwrap(), "x"])
-            .output()
-            .unwrap();
+        let output = cmd().args([path.to_str().unwrap(), "x"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -348,10 +328,7 @@ mod tests {
     fn test_missing_major_minor_for_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blockdev");
-        let output = cmd()
-            .args([path.to_str().unwrap(), "b"])
-            .output()
-            .unwrap();
+        let output = cmd().args([path.to_str().unwrap(), "b"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -365,10 +342,7 @@ mod tests {
     fn test_missing_major_minor_for_char() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chardev");
-        let output = cmd()
-            .args([path.to_str().unwrap(), "c"])
-            .output()
-            .unwrap();
+        let output = cmd().args([path.to_str().unwrap(), "c"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
     }
 
@@ -416,15 +390,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("existfifo");
         // Create it first
-        cmd()
-            .args([fifo.to_str().unwrap(), "p"])
-            .output()
-            .unwrap();
+        cmd().args([fifo.to_str().unwrap(), "p"]).output().unwrap();
         // Try again
-        let output = cmd()
-            .args([fifo.to_str().unwrap(), "p"])
-            .output()
-            .unwrap();
+        let output = cmd().args([fifo.to_str().unwrap(), "p"]).output().unwrap();
         assert_ne!(output.status.code(), Some(0));
     }
 

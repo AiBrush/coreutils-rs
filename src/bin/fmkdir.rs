@@ -84,10 +84,7 @@ fn main() {
                                 if let Some(val) = args.next() {
                                     mode = Some(val);
                                 } else {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'm'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'm'", TOOL_NAME);
                                     process::exit(1);
                                 }
                             } else {
@@ -174,11 +171,7 @@ fn create_single(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> Result
 }
 
 #[cfg(unix)]
-fn create_with_parents(
-    dir: &str,
-    verbose: bool,
-    mode: Option<libc::mode_t>,
-) -> Result<(), i32> {
+fn create_with_parents(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> Result<(), i32> {
     let path = std::path::Path::new(dir);
 
     // Collect all ancestors that need to be created
@@ -518,9 +511,7 @@ mod tests {
         let target = dir.path().join("gnu_existing");
         std::fs::create_dir(&target).unwrap();
 
-        let gnu = Command::new("mkdir")
-            .arg(target.to_str().unwrap())
-            .output();
+        let gnu = Command::new("mkdir").arg(target.to_str().unwrap()).output();
         if let Ok(gnu_out) = gnu {
             // Re-create for our test (it already exists)
             let ours = cmd().arg(target.to_str().unwrap()).output().unwrap();

@@ -93,9 +93,9 @@ fn parse_size(s: &str) -> Result<(SizeMode, u64), String> {
         .parse()
         .map_err(|_| format!("invalid number: '{}'", s))?;
 
-    let total = value.checked_mul(multiplier).ok_or_else(|| {
-        format!("size overflow: '{}'", s)
-    })?;
+    let total = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size overflow: '{}'", s))?;
 
     Ok((mode, total))
 }
@@ -216,14 +216,8 @@ fn main() {
                             if rest.is_empty() {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 's'",
-                                        TOOL_NAME
-                                    );
-                                    eprintln!(
-                                        "Try '{} --help' for more information.",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 's'", TOOL_NAME);
+                                    eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                                     process::exit(1);
                                 }
                                 size_str = Some(args[i].clone());
@@ -237,14 +231,8 @@ fn main() {
                             if rest.is_empty() {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'r'",
-                                        TOOL_NAME
-                                    );
-                                    eprintln!(
-                                        "Try '{} --help' for more information.",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'r'", TOOL_NAME);
+                                    eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                                     process::exit(1);
                                 }
                                 reference = Some(args[i].clone());
@@ -403,18 +391,12 @@ fn print_help() {
     println!();
     println!("A FILE argument that does not exist is created.");
     println!();
-    println!(
-        "If a FILE is larger than the specified size, the extra data is lost."
-    );
-    println!(
-        "If a FILE is shorter, it is extended, and the sparse extended part (hole)"
-    );
+    println!("If a FILE is larger than the specified size, the extra data is lost.");
+    println!("If a FILE is shorter, it is extended, and the sparse extended part (hole)");
     println!("reads as zero bytes.");
     println!();
     println!("  -c, --no-create        do not create any files");
-    println!(
-        "  -o, --io-blocks        treat SIZE as number of IO blocks instead of bytes"
-    );
+    println!("  -o, --io-blocks        treat SIZE as number of IO blocks instead of bytes");
     println!("  -r, --reference=RFILE  base size on RFILE");
     println!("  -s, --size=SIZE        set or adjust the file size by SIZE bytes");
     println!("      --help     display this help and exit");
@@ -546,11 +528,7 @@ mod tests {
         fs::write(&file, "hello").unwrap(); // 5 bytes
 
         let output = cmd()
-            .args([
-                "-r",
-                ref_file.to_str().unwrap(),
-                file.to_str().unwrap(),
-            ])
+            .args(["-r", ref_file.to_str().unwrap(), file.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -718,12 +696,7 @@ mod tests {
         fs::write(&f2, "bbbbb").unwrap();
 
         let output = cmd()
-            .args([
-                "-s",
-                "10",
-                f1.to_str().unwrap(),
-                f2.to_str().unwrap(),
-            ])
+            .args(["-s", "10", f1.to_str().unwrap(), f2.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -832,17 +805,26 @@ mod tests {
 
     #[test]
     fn test_compute_new_size_absolute() {
-        assert_eq!(super::compute_new_size(100, super::SizeMode::Absolute, 50), 50);
+        assert_eq!(
+            super::compute_new_size(100, super::SizeMode::Absolute, 50),
+            50
+        );
     }
 
     #[test]
     fn test_compute_new_size_extend() {
-        assert_eq!(super::compute_new_size(100, super::SizeMode::Extend, 50), 150);
+        assert_eq!(
+            super::compute_new_size(100, super::SizeMode::Extend, 50),
+            150
+        );
     }
 
     #[test]
     fn test_compute_new_size_shrink() {
-        assert_eq!(super::compute_new_size(100, super::SizeMode::Shrink, 30), 70);
+        assert_eq!(
+            super::compute_new_size(100, super::SizeMode::Shrink, 30),
+            70
+        );
     }
 
     #[test]
@@ -852,7 +834,10 @@ mod tests {
 
     #[test]
     fn test_compute_new_size_round_down() {
-        assert_eq!(super::compute_new_size(12, super::SizeMode::RoundDown, 5), 10);
+        assert_eq!(
+            super::compute_new_size(12, super::SizeMode::RoundDown, 5),
+            10
+        );
     }
 
     #[test]

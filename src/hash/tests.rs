@@ -766,19 +766,28 @@ fn test_hash_bytes_sha1_hello() {
 #[test]
 fn test_sha224_empty() {
     let hash = hash_reader(HashAlgorithm::Sha224, Cursor::new(b"")).unwrap();
-    assert_eq!(hash, "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f");
+    assert_eq!(
+        hash,
+        "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+    );
 }
 
 #[test]
 fn test_sha224_hello_newline() {
     let hash = hash_reader(HashAlgorithm::Sha224, Cursor::new(b"hello\n")).unwrap();
-    assert_eq!(hash, "2d6d67d91d0badcdd06cbbba1fe11538a68a37ec9c2e26457ceff12b");
+    assert_eq!(
+        hash,
+        "2d6d67d91d0badcdd06cbbba1fe11538a68a37ec9c2e26457ceff12b"
+    );
 }
 
 #[test]
 fn test_hash_bytes_sha224_empty() {
     let hash = hash_bytes(HashAlgorithm::Sha224, b"");
-    assert_eq!(hash, "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f");
+    assert_eq!(
+        hash,
+        "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+    );
 }
 
 // ── SHA-384 tests ────────────────────────────────────────────────────

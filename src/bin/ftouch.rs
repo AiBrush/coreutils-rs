@@ -148,11 +148,7 @@ fn parse_touch_timestamp(s: &str) -> Result<(i64, i64), String> {
         _ => return Err(format!("invalid date format '{}'", s)),
     };
 
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
         return Err(format!("invalid date format '{}'", s));
     }
 
@@ -222,9 +218,7 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
                 .map_err(|_| format!("invalid date '{}'", s))?;
             return Ok((sec, nsec));
         }
-        let sec: i64 = rest
-            .parse()
-            .map_err(|_| format!("invalid date '{}'", s))?;
+        let sec: i64 = rest.parse().map_err(|_| format!("invalid date '{}'", s))?;
         return Ok((sec, 0));
     }
 
@@ -336,8 +330,7 @@ fn set_file_times(
     };
 
     let times = [atime, mtime];
-    let c_path =
-        CString::new(path).map_err(|_| std::io::Error::other("invalid path"))?;
+    let c_path = CString::new(path).map_err(|_| std::io::Error::other("invalid path"))?;
 
     let flags = if no_deref {
         libc::AT_SYMLINK_NOFOLLOW
@@ -345,9 +338,7 @@ fn set_file_times(
         0
     };
 
-    let ret = unsafe {
-        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags)
-    };
+    let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) };
 
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -476,12 +467,10 @@ fn main() {
     // Determine the timestamp to apply
     let (ts_sec, ts_nsec) = if let Some(ref r) = reference {
         match get_file_times(r) {
-            Ok(tp) => {
-                match target {
-                    TimeTarget::Both | TimeTarget::AccessOnly => (tp.atime_sec, tp.atime_nsec),
-                    TimeTarget::ModifyOnly => (tp.mtime_sec, tp.mtime_nsec),
-                }
-            }
+            Ok(tp) => match target {
+                TimeTarget::Both | TimeTarget::AccessOnly => (tp.atime_sec, tp.atime_nsec),
+                TimeTarget::ModifyOnly => (tp.mtime_sec, tp.mtime_nsec),
+            },
             Err(e) => {
                 eprintln!(
                     "{}: failed to get attributes of '{}': {}",
@@ -561,22 +550,14 @@ fn print_help() {
     println!();
     println!("  -a                     change only the access time");
     println!("  -c, --no-create        do not create any files");
-    println!(
-        "  -d, --date=STRING      parse STRING and use it instead of current time"
-    );
+    println!("  -d, --date=STRING      parse STRING and use it instead of current time");
     println!("  -h, --no-dereference   affect each symbolic link instead of any referenced");
     println!("                         file (useful only on systems that can change the");
     println!("                         timestamps of a symlink)");
     println!("  -m                     change only the modification time");
-    println!(
-        "  -r, --reference=FILE   use this file's times instead of current time"
-    );
-    println!(
-        "  -t STAMP               use [[CC]YY]MMDDhhmm[.ss] instead of current time"
-    );
-    println!(
-        "      --time=WORD        change the specified time:"
-    );
+    println!("  -r, --reference=FILE   use this file's times instead of current time");
+    println!("  -t STAMP               use [[CC]YY]MMDDhhmm[.ss] instead of current time");
+    println!("      --time=WORD        change the specified time:");
     println!("                           WORD is access, atime, or use: equivalent to -a");
     println!("                           WORD is modify or mtime: equivalent to -m");
     println!("      --help     display this help and exit");
@@ -632,10 +613,7 @@ mod tests {
         let file = dir.path().join("nocreate.txt");
         assert!(!file.exists());
 
-        let output = cmd()
-            .args(["-c", file.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-c", file.to_str().unwrap()]).output().unwrap();
         assert!(output.status.success());
         assert!(!file.exists());
     }
@@ -913,11 +891,16 @@ mod tests {
         let gnu_file = dir.path().join("gnu_touch.txt");
         let our_file = dir.path().join("our_touch.txt");
 
-        let gnu = Command::new("touch").arg(gnu_file.to_str().unwrap()).output();
+        let gnu = Command::new("touch")
+            .arg(gnu_file.to_str().unwrap())
+            .output();
         if let Ok(gnu) = gnu {
             let ours = cmd().arg(our_file.to_str().unwrap()).output().unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
-            assert!(gnu_file.exists() == our_file.exists(), "File creation mismatch");
+            assert!(
+                gnu_file.exists() == our_file.exists(),
+                "File creation mismatch"
+            );
         }
     }
 

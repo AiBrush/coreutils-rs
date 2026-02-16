@@ -98,10 +98,7 @@ mod tests {
     #[test]
     fn test_tty_on_pipe() {
         // When stdin is a pipe (not a tty), should print "not a tty" and exit 1
-        let output = cmd()
-            .stdin(Stdio::piped())
-            .output()
-            .unwrap();
+        let output = cmd().stdin(Stdio::piped()).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "not a tty");
@@ -109,20 +106,17 @@ mod tests {
 
     #[test]
     fn test_tty_silent_on_pipe() {
-        let output = cmd()
-            .arg("-s")
-            .stdin(Stdio::piped())
-            .output()
-            .unwrap();
+        let output = cmd().arg("-s").stdin(Stdio::piped()).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty(), "silent mode should produce no output");
+        assert!(
+            output.stdout.is_empty(),
+            "silent mode should produce no output"
+        );
     }
 
     #[test]
     fn test_tty_matches_gnu() {
-        let gnu = Command::new("tty")
-            .stdin(Stdio::piped())
-            .output();
+        let gnu = Command::new("tty").stdin(Stdio::piped()).output();
         if let Ok(gnu) = gnu {
             let ours = cmd().stdin(Stdio::piped()).output().unwrap();
             assert_eq!(ours.stdout, gnu.stdout, "STDOUT mismatch");

@@ -63,7 +63,10 @@ fn main() {
 
     if files.is_empty() {
         if data_only || file_system {
-            eprintln!("{}: --data and --file-system require at least one FILE argument", TOOL_NAME);
+            eprintln!(
+                "{}: --data and --file-system require at least one FILE argument",
+                TOOL_NAME
+            );
             process::exit(1);
         }
         // sync all filesystems
@@ -107,16 +110,24 @@ fn sync_file(path: &str, data_only: bool, file_system: bool) -> std::io::Result<
             // syncfs — sync the filesystem containing this file
             // syncfs is Linux-specific; fall back to fsync on other Unix
             #[cfg(target_os = "linux")]
-            { unsafe { libc::syncfs(fd) } }
+            {
+                unsafe { libc::syncfs(fd) }
+            }
             #[cfg(not(target_os = "linux"))]
-            { unsafe { libc::fsync(fd) } }
+            {
+                unsafe { libc::fsync(fd) }
+            }
         } else if data_only {
             // fdatasync — sync data only, skip metadata
             // fdatasync is Linux-specific; fall back to fsync on other Unix
             #[cfg(target_os = "linux")]
-            { unsafe { libc::fdatasync(fd) } }
+            {
+                unsafe { libc::fdatasync(fd) }
+            }
             #[cfg(not(target_os = "linux"))]
-            { unsafe { libc::fsync(fd) } }
+            {
+                unsafe { libc::fsync(fd) }
+            }
         } else {
             // fsync — sync data + metadata
             unsafe { libc::fsync(fd) }
@@ -137,8 +148,8 @@ fn sync_file(path: &str, data_only: bool, file_system: bool) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::fs;
+    use std::process::Command;
 
     fn cmd() -> Command {
         let mut path = std::env::current_exe().unwrap();
@@ -161,10 +172,7 @@ mod tests {
         fs::write(&file, "hello").unwrap();
 
         // -f (filesystem sync)
-        let output = cmd()
-            .args(["-f", file.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-f", file.to_str().unwrap()]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
     }
 
@@ -174,10 +182,7 @@ mod tests {
         let file = dir.path().join("testfile.txt");
         fs::write(&file, "hello").unwrap();
 
-        let output = cmd()
-            .args(["-d", file.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-d", file.to_str().unwrap()]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
     }
 

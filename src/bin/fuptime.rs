@@ -79,8 +79,8 @@ fn main() {
 
 #[cfg(unix)]
 fn read_uptime() -> Result<f64, String> {
-    let content =
-        std::fs::read_to_string("/proc/uptime").map_err(|e| format!("cannot read /proc/uptime: {}", e))?;
+    let content = std::fs::read_to_string("/proc/uptime")
+        .map_err(|e| format!("cannot read /proc/uptime: {}", e))?;
     content
         .split_whitespace()
         .next()
@@ -111,11 +111,7 @@ fn count_users() -> usize {
     if let Ok(output) = std::process::Command::new("who").output()
         && output.status.success()
     {
-        return output
-            .stdout
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
+        return output.stdout.iter().filter(|&&b| b == b'\n').count();
     }
     0
 }
@@ -129,7 +125,13 @@ fn format_uptime(secs: f64) -> String {
 
     if days > 0 {
         if hours > 0 || minutes > 0 {
-            format!("{} day{}, {:2}:{:02}", days, if days != 1 { "s" } else { "" }, hours, minutes)
+            format!(
+                "{} day{}, {:2}:{:02}",
+                days,
+                if days != 1 { "s" } else { "" },
+                hours,
+                minutes
+            )
         } else {
             format!("{} day{}", days, if days != 1 { "s" } else { "" })
         }
@@ -169,11 +171,7 @@ fn print_pretty(uptime_secs: f64) {
 
     let mut parts = Vec::new();
     if days > 0 {
-        parts.push(format!(
-            "{} day{}",
-            days,
-            if days != 1 { "s" } else { "" }
-        ));
+        parts.push(format!("{} day{}", days, if days != 1 { "s" } else { "" }));
     }
     if hours > 0 {
         parts.push(format!(
@@ -236,7 +234,10 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("up"), "Should contain 'up'");
-        assert!(stdout.contains("load average"), "Should contain 'load average'");
+        assert!(
+            stdout.contains("load average"),
+            "Should contain 'load average'"
+        );
     }
 
     #[test]
@@ -244,7 +245,10 @@ mod tests {
         let output = cmd().arg("-p").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.starts_with("up "), "Pretty format should start with 'up '");
+        assert!(
+            stdout.starts_with("up "),
+            "Pretty format should start with 'up '"
+        );
     }
 
     #[test]
@@ -254,7 +258,11 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let trimmed = stdout.trim();
         // Should be in format yyyy-mm-dd HH:MM:SS
-        assert!(trimmed.len() >= 19, "Since format should be at least 19 chars: '{}'", trimmed);
+        assert!(
+            trimmed.len() >= 19,
+            "Since format should be at least 19 chars: '{}'",
+            trimmed
+        );
         assert!(trimmed.contains('-'), "Should contain date separator");
         assert!(trimmed.contains(':'), "Should contain time separator");
     }

@@ -115,7 +115,10 @@ mod tests {
         let start = Instant::now();
         let output = cmd().arg("0").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
-        assert!(start.elapsed().as_millis() < 500, "sleep 0 should complete quickly");
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "sleep 0 should complete quickly"
+        );
     }
 
     #[test]

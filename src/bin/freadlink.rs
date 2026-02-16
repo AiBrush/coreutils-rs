@@ -256,10 +256,7 @@ mod tests {
         fs::write(&target, "data").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let output = cmd()
-            .args(["-f", link.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-f", link.to_str().unwrap()]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Canonicalized path should resolve to the real target
@@ -285,14 +282,14 @@ mod tests {
         fs::write(&target, "content").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let output = cmd()
-            .args(["-n", link.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-n", link.to_str().unwrap()]).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Should NOT end with newline
-        assert!(!stdout.ends_with('\n'), "output should not end with newline");
+        assert!(
+            !stdout.ends_with('\n'),
+            "output should not end with newline"
+        );
         assert_eq!(stdout.as_ref(), target.to_str().unwrap());
     }
 
@@ -320,10 +317,7 @@ mod tests {
             .args(["-f", link.to_str().unwrap()])
             .output();
         if let Ok(gnu_f) = gnu_f {
-            let ours_f = cmd()
-                .args(["-f", link.to_str().unwrap()])
-                .output()
-                .unwrap();
+            let ours_f = cmd().args(["-f", link.to_str().unwrap()]).output().unwrap();
             assert_eq!(
                 ours_f.status.code(),
                 gnu_f.status.code(),

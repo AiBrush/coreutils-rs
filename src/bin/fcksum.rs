@@ -255,10 +255,7 @@ mod tests {
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, b"hello\n").unwrap();
 
-        let output = cmd()
-            .arg(file_path.to_str().unwrap())
-            .output()
-            .unwrap();
+        let output = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.split_whitespace().collect();
@@ -288,10 +285,7 @@ mod tests {
 
     #[test]
     fn test_nonexistent_file() {
-        let output = cmd()
-            .arg("/nonexistent/file.txt")
-            .output()
-            .unwrap();
+        let output = cmd().arg("/nonexistent/file.txt").output().unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("cksum:"));
@@ -303,10 +297,7 @@ mod tests {
         let file_path = dir.path().join("empty.txt");
         std::fs::write(&file_path, b"").unwrap();
 
-        let output = cmd()
-            .arg(file_path.to_str().unwrap())
-            .output()
-            .unwrap();
+        let output = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.split_whitespace().collect();
@@ -322,10 +313,7 @@ mod tests {
         let data = vec![0u8; 10240];
         std::fs::write(&file_path, &data).unwrap();
 
-        let output = cmd()
-            .arg(file_path.to_str().unwrap())
-            .output()
-            .unwrap();
+        let output = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.split_whitespace().collect();
@@ -346,10 +334,7 @@ mod tests {
                 .arg(file_path.to_str().unwrap())
                 .output();
             if let Ok(gnu_out) = gnu_out {
-                let ours = cmd()
-                    .arg(file_path.to_str().unwrap())
-                    .output()
-                    .unwrap();
+                let ours = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
                 assert_eq!(
                     String::from_utf8_lossy(&ours.stdout),
                     String::from_utf8_lossy(&gnu_out.stdout),
@@ -369,10 +354,7 @@ mod tests {
             .arg(file_path.to_str().unwrap())
             .output();
         if let Ok(gnu_out) = gnu_out {
-            let ours = cmd()
-                .arg(file_path.to_str().unwrap())
-                .output()
-                .unwrap();
+            let ours = cmd().arg(file_path.to_str().unwrap()).output().unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&ours.stdout),
                 String::from_utf8_lossy(&gnu_out.stdout),

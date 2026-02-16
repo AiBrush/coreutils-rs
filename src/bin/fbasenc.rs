@@ -145,11 +145,7 @@ fn parse_args() -> Cli {
                         }
                     }
                     _ => {
-                        eprintln!(
-                            "{}: invalid option -- '{}'",
-                            TOOL_NAME,
-                            bytes[i] as char
-                        );
+                        eprintln!("{}: invalid option -- '{}'", TOOL_NAME, bytes[i] as char);
                         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
                         process::exit(1);
                     }
@@ -600,7 +596,10 @@ fn z85_decode(input: &[u8], ignore_garbage: bool) -> Result<Vec<u8>, String> {
     }
 
     if filtered.len() % 5 != 0 {
-        return Err(format!("{}: invalid input (length must be a multiple of 5 for Z85 decoding)", TOOL_NAME));
+        return Err(format!(
+            "{}: invalid input (length must be a multiple of 5 for Z85 decoding)",
+            TOOL_NAME
+        ));
     }
 
     let mut result = Vec::with_capacity(filtered.len() * 4 / 5);
@@ -690,11 +689,7 @@ fn main() {
     let data = if filename == "-" {
         let mut buf = Vec::new();
         if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-            eprintln!(
-                "{}: {}",
-                TOOL_NAME,
-                coreutils_rs::common::io_error_msg(&e)
-            );
+            eprintln!("{}: {}", TOOL_NAME, coreutils_rs::common::io_error_msg(&e));
             process::exit(1);
         }
         buf
@@ -857,12 +852,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -895,10 +885,7 @@ mod tests {
         // Should contain - or _ if the data maps to those
         let standard = base64_encode(input, BASE64_ALPHABET);
         // Verify the url-safe version substitutes correctly
-        assert_eq!(
-            standard.replace('+', "-").replace('/', "_"),
-            encoded
-        );
+        assert_eq!(standard.replace('+', "-").replace('/', "_"), encoded);
     }
 
     #[test]
@@ -921,12 +908,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1007,12 +989,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1075,12 +1052,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1124,12 +1096,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1173,12 +1140,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1224,12 +1186,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&enc.stdout)
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&enc.stdout).unwrap();
         let dec = child.wait_with_output().unwrap();
         assert!(dec.status.success());
         assert_eq!(&dec.stdout, input);
@@ -1355,8 +1312,14 @@ mod tests {
     fn test_base64_decode_fn() {
         assert_eq!(base64_decode(b"", &BASE64_DECODE, false).unwrap(), b"");
         assert_eq!(base64_decode(b"Zg==", &BASE64_DECODE, false).unwrap(), b"f");
-        assert_eq!(base64_decode(b"Zm8=", &BASE64_DECODE, false).unwrap(), b"fo");
-        assert_eq!(base64_decode(b"Zm9v", &BASE64_DECODE, false).unwrap(), b"foo");
+        assert_eq!(
+            base64_decode(b"Zm8=", &BASE64_DECODE, false).unwrap(),
+            b"fo"
+        );
+        assert_eq!(
+            base64_decode(b"Zm9v", &BASE64_DECODE, false).unwrap(),
+            b"foo"
+        );
         assert_eq!(
             base64_decode(b"Zm9vYmFy", &BASE64_DECODE, false).unwrap(),
             b"foobar"
@@ -1424,12 +1387,7 @@ mod tests {
             Ok(c) => c,
             Err(_) => return,
         };
-        gnu_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        gnu_child.stdin.take().unwrap().write_all(input).unwrap();
         let gnu_out = gnu_child.wait_with_output().unwrap();
 
         let mut our_child = cmd()
@@ -1438,12 +1396,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        our_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        our_child.stdin.take().unwrap().write_all(input).unwrap();
         let our_out = our_child.wait_with_output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&our_out.stdout),
@@ -1468,12 +1421,7 @@ mod tests {
             Ok(c) => c,
             Err(_) => return,
         };
-        gnu_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        gnu_child.stdin.take().unwrap().write_all(input).unwrap();
         let gnu_out = gnu_child.wait_with_output().unwrap();
 
         let mut our_child = cmd()
@@ -1482,12 +1430,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        our_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        our_child.stdin.take().unwrap().write_all(input).unwrap();
         let our_out = our_child.wait_with_output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&our_out.stdout),
@@ -1512,12 +1455,7 @@ mod tests {
             Ok(c) => c,
             Err(_) => return,
         };
-        gnu_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        gnu_child.stdin.take().unwrap().write_all(input).unwrap();
         let gnu_out = gnu_child.wait_with_output().unwrap();
 
         let mut our_child = cmd()
@@ -1526,12 +1464,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        our_child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .unwrap();
+        our_child.stdin.take().unwrap().write_all(input).unwrap();
         let our_out = our_child.wait_with_output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&our_out.stdout),

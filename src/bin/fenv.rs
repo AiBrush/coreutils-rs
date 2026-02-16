@@ -40,7 +40,10 @@ fn main() {
 
         match arg.as_str() {
             "--help" => {
-                println!("Usage: {} [OPTION]... [-] [NAME=VALUE]... [COMMAND [ARG]...]", TOOL_NAME);
+                println!(
+                    "Usage: {} [OPTION]... [-] [NAME=VALUE]... [COMMAND [ARG]...]",
+                    TOOL_NAME
+                );
                 println!("Set each NAME to VALUE in the environment and run COMMAND.");
                 println!();
                 println!("  -i, --ignore-environment  start with an empty environment");
@@ -109,10 +112,7 @@ fn main() {
                             } else {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'u'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'u'", TOOL_NAME);
                                     process::exit(125);
                                 }
                                 unsets.push(args[i].clone());
@@ -127,10 +127,7 @@ fn main() {
                             } else {
                                 i += 1;
                                 if i >= args.len() {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 'C'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 'C'", TOOL_NAME);
                                     process::exit(125);
                                 }
                                 chdir = Some(args[i].clone());
@@ -253,10 +250,7 @@ mod tests {
 
     #[test]
     fn test_ignore_environment() {
-        let output = cmd()
-            .args(["-i", "TEST_VAR=hello"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-i", "TEST_VAR=hello"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         // With -i, only TEST_VAR should be set
@@ -266,10 +260,7 @@ mod tests {
 
     #[test]
     fn test_dash_alias_for_i() {
-        let output = cmd()
-            .args(["-", "MY_VAR=world"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-", "MY_VAR=world"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("MY_VAR=world"));
@@ -278,10 +269,7 @@ mod tests {
 
     #[test]
     fn test_unset() {
-        let output = cmd()
-            .args(["-u", "PATH"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-u", "PATH"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Check that no line starts with "PATH=" (other vars may contain PATH in their names)
@@ -291,10 +279,7 @@ mod tests {
 
     #[test]
     fn test_set_var() {
-        let output = cmd()
-            .args(["MY_TEST_VAR=12345"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["MY_TEST_VAR=12345"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("MY_TEST_VAR=12345"));
@@ -302,10 +287,7 @@ mod tests {
 
     #[test]
     fn test_run_command() {
-        let output = cmd()
-            .args(["echo", "hello"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["echo", "hello"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "hello");
@@ -324,10 +306,7 @@ mod tests {
 
     #[test]
     fn test_null_terminator() {
-        let output = cmd()
-            .args(["-i", "-0", "A=1", "B=2"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-i", "-0", "A=1", "B=2"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = &output.stdout;
         assert!(stdout.contains(&0u8), "Should contain NUL bytes");
@@ -339,10 +318,7 @@ mod tests {
 
     #[test]
     fn test_chdir() {
-        let output = cmd()
-            .args(["-C", "/tmp", "pwd"])
-            .output()
-            .unwrap();
+        let output = cmd().args(["-C", "/tmp", "pwd"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "/tmp");
@@ -376,10 +352,7 @@ mod tests {
 
     #[test]
     fn test_nonexistent_command() {
-        let output = cmd()
-            .arg("nonexistent_cmd_999")
-            .output()
-            .unwrap();
+        let output = cmd().arg("nonexistent_cmd_999").output().unwrap();
         assert_eq!(output.status.code(), Some(127));
     }
 }

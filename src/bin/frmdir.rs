@@ -184,10 +184,7 @@ mod tests {
         let base = dir.path().join("a").join("b").join("c");
         fs::create_dir_all(&base).unwrap();
 
-        let _output = cmd()
-            .args(["-p", base.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let _output = cmd().args(["-p", base.to_str().unwrap()]).output().unwrap();
         // c, b, and a should all be removed
         // (exit code may be non-zero because it tries to remove the tempdir parent too)
         assert!(!dir.path().join("a").exists(), "a/ should be removed");
@@ -213,10 +210,7 @@ mod tests {
 
     #[test]
     fn test_rmdir_nonexistent() {
-        let output = cmd()
-            .arg("/nonexistent_rmdir_test_12345")
-            .output()
-            .unwrap();
+        let output = cmd().arg("/nonexistent_rmdir_test_12345").output().unwrap();
         assert_eq!(output.status.code(), Some(1));
     }
 
@@ -226,10 +220,7 @@ mod tests {
             .arg("/nonexistent_rmdir_test_67890")
             .output();
         if let Ok(gnu) = gnu {
-            let ours = cmd()
-                .arg("/nonexistent_rmdir_test_67890")
-                .output()
-                .unwrap();
+            let ours = cmd().arg("/nonexistent_rmdir_test_67890").output().unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
         }
     }

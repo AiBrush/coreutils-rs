@@ -43,7 +43,10 @@ fn main() {
             println!("If standard output is a terminal, append output to 'nohup.out' if possible,");
             println!("'$HOME/nohup.out' otherwise.");
             println!("If standard error is a terminal, redirect it to standard output.");
-            println!("To save output to FILE, use '{} COMMAND > FILE'.", TOOL_NAME);
+            println!(
+                "To save output to FILE, use '{} COMMAND > FILE'.",
+                TOOL_NAME
+            );
             println!();
             println!("      --help     display this help and exit");
             println!("      --version  output version information and exit");
@@ -75,11 +78,17 @@ fn main() {
                 unsafe {
                     libc::dup2(f.as_raw_fd(), 1);
                 }
-                eprintln!("{}: ignoring input and appending output to 'nohup.out'", TOOL_NAME);
+                eprintln!(
+                    "{}: ignoring input and appending output to 'nohup.out'",
+                    TOOL_NAME
+                );
                 Some(f)
             }
             None => {
-                eprintln!("{}: failed to open 'nohup.out': Permission denied or no suitable path", TOOL_NAME);
+                eprintln!(
+                    "{}: failed to open 'nohup.out': Permission denied or no suitable path",
+                    TOOL_NAME
+                );
                 process::exit(127);
             }
         }
@@ -117,7 +126,11 @@ fn main() {
 #[cfg(unix)]
 fn open_nohup_out() -> Option<File> {
     // Try current directory first
-    if let Ok(f) = OpenOptions::new().create(true).append(true).open("nohup.out") {
+    if let Ok(f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("nohup.out")
+    {
         return Some(f);
     }
 
@@ -160,10 +173,7 @@ mod tests {
 
     #[test]
     fn test_nohup_nonexistent_command() {
-        let output = cmd()
-            .arg("nonexistent_cmd_12345")
-            .output()
-            .unwrap();
+        let output = cmd().arg("nonexistent_cmd_12345").output().unwrap();
         assert_eq!(output.status.code(), Some(127));
     }
 
