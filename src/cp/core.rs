@@ -267,14 +267,17 @@ fn copy_file_range_linux(src: &Path, dst: &Path) -> io::Result<()> {
         let to_copy = (remaining as u64).min(isize::MAX as u64) as usize;
         // SAFETY: src_file and dst_file are valid open file descriptors;
         // null offsets mean the kernel uses and updates the file offsets.
+        // Uses raw syscall instead of libc::copy_file_range to support
+        // older glibc versions (e.g. cross-compilation with cross-rs).
         let ret = unsafe {
-            libc::copy_file_range(
+            libc::syscall(
+                libc::SYS_copy_file_range,
                 src_file.as_raw_fd(),
-                std::ptr::null_mut(),
+                std::ptr::null_mut::<libc::off64_t>(),
                 dst_file.as_raw_fd(),
-                std::ptr::null_mut(),
+                std::ptr::null_mut::<libc::off64_t>(),
                 to_copy,
-                0,
+                0u32,
             )
         };
         if ret < 0 {

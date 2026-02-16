@@ -23,9 +23,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
@@ -41,17 +40,8 @@ jobs:
         with:
           key: build-v2-${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross
-
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v6
