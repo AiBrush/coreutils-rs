@@ -1,5 +1,4 @@
 use std::io::{self, BufWriter, Write};
-use std::mem::ManuallyDrop;
 use std::process;
 
 use coreutils_rs::cat::{self, CatConfig};
@@ -176,6 +175,7 @@ fn main() {
     if cli.config.is_plain() {
         #[cfg(unix)]
         {
+            use std::mem::ManuallyDrop;
             use std::os::unix::io::FromRawFd;
             let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
             let mut had_error = false;
