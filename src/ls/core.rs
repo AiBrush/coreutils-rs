@@ -697,7 +697,7 @@ fn version_cmp(a: &str, b: &str) -> Ordering {
     ab.len().cmp(&bb.len())
 }
 
-fn sort_entries(entries: &mut Vec<FileEntry>, config: &LsConfig) {
+fn sort_entries(entries: &mut [FileEntry], config: &LsConfig) {
     if config.group_directories_first {
         // Stable sort: directories first, then sort within each group
         entries.sort_by(|a, b| {

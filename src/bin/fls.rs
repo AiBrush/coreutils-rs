@@ -80,10 +80,10 @@ fn get_terminal_width() -> Option<usize> {
     if ret == 0 && ws.ws_col > 0 {
         return Some(ws.ws_col as usize);
     }
-    if let Ok(val) = std::env::var("COLUMNS") {
-        if let Ok(w) = val.parse::<usize>() {
-            return Some(w);
-        }
+    if let Ok(val) = std::env::var("COLUMNS")
+        && let Ok(w) = val.parse::<usize>()
+    {
+        return Some(w);
     }
     None
 }
@@ -110,6 +110,7 @@ fn take_short_value(
     }
 }
 
+#[cfg(unix)]
 fn parse_args() -> (LsConfig, Vec<String>) {
     let is_tty = atty_stdout();
     let mut config = LsConfig::default();
@@ -125,12 +126,11 @@ fn parse_args() -> (LsConfig, Vec<String>) {
     }
 
     // Detect terminal width
-    if is_tty {
-        if let Some(w) = get_terminal_width() {
-            if w > 0 {
-                config.width = w;
-            }
-        }
+    if is_tty
+        && let Some(w) = get_terminal_width()
+        && w > 0
+    {
+        config.width = w;
     }
 
     let mut explicit_format = false;
@@ -541,6 +541,7 @@ fn parse_args() -> (LsConfig, Vec<String>) {
     (config, paths)
 }
 
+#[cfg(unix)]
 fn main() {
     reset_sigpipe();
 
