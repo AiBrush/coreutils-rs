@@ -568,7 +568,7 @@ mod tests {
             .unwrap();
         let code = output.status.code().unwrap();
         // Sent KILL (9), exit code should be 128+9=137
-        assert_eq!(code, 137, "Expected 137 (128+SIGKILL), got {}");
+        assert_eq!(code, 137, "Expected 137 (128+SIGKILL), got {}", code);
     }
 
     #[test]
