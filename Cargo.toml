@@ -83,6 +83,18 @@ path = "src/bin/funexpand.rs"
 name = "ffold"
 path = "src/bin/ffold.rs"
 
+[[bin]]
+name = "fhead"
+path = "src/bin/fhead.rs"
+
+[[bin]]
+name = "ftail"
+path = "src/bin/ftail.rs"
+
+[[bin]]
+name = "fcat"
+path = "src/bin/fcat.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "cargo"] }
