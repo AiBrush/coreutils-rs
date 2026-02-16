@@ -204,7 +204,7 @@ fn create_with_parents(dir: &str, verbose: bool, mode: Option<libc::mode_t>) -> 
                     // Intermediate directory: ensure u+wx for traversal
                     // GNU mkdir does this so parent dirs are usable even with restrictive -m
                     use std::os::unix::fs::PermissionsExt;
-                    if let Ok(meta) = std::fs::metadata(&*p) {
+                    if let Ok(meta) = std::fs::metadata(&**p) {
                         let current = meta.permissions().mode() & 0o7777;
                         let needed = current | 0o300; // u+wx
                         if needed != current {
