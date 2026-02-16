@@ -721,7 +721,15 @@ fn sort_entries(entries: &mut [FileEntry], config: &LsConfig) {
 fn compare_entries(a: &FileEntry, b: &FileEntry, config: &LsConfig) -> Ordering {
     let ord = match config.sort_by {
         SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        SortBy::Size => b.size.cmp(&a.size),
+        SortBy::Size => {
+            let size_ord = b.size.cmp(&a.size);
+            if size_ord == Ordering::Equal {
+                // GNU uses name as tie-breaker for equal sizes.
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            } else {
+                size_ord
+            }
+        }
         SortBy::Time => {
             let ta = a.time_secs(config.time_field);
             let tb = b.time_secs(config.time_field);
@@ -729,7 +737,13 @@ fn compare_entries(a: &FileEntry, b: &FileEntry, config: &LsConfig) -> Ordering 
             if ord == Ordering::Equal {
                 let na = a.time_nsec(config.time_field);
                 let nb = b.time_nsec(config.time_field);
-                nb.cmp(&na)
+                let nsec_ord = nb.cmp(&na);
+                if nsec_ord == Ordering::Equal {
+                    // GNU uses name as tie-breaker for equal times.
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                } else {
+                    nsec_ord
+                }
             } else {
                 ord
             }
@@ -1749,7 +1763,9 @@ pub fn ls_main(paths: &[String], config: &LsConfig) -> io::Result<bool> {
         if config.reverse { ord.reverse() } else { ord }
     });
 
-    let show_header = dir_args.len() > 1 || (!file_args.is_empty() && !dir_args.is_empty());
+    let show_header = dir_args.len() > 1
+        || (!file_args.is_empty() && !dir_args.is_empty())
+        || config.recursive;
 
     for (i, dir) in dir_args.iter().enumerate() {
         if i > 0 || !file_args.is_empty() {

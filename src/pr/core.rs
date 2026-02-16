@@ -462,17 +462,45 @@ fn write_header<W: Write>(
     page_num: usize,
     config: &PrConfig,
 ) -> io::Result<()> {
-    let indent_str = " ".repeat(config.indent);
-
     // 2 blank lines
     writeln!(output)?;
     writeln!(output)?;
 
-    // Header line: date  header  Page N
+    // Header line: date is left-aligned, header is centered, Page N is right-aligned.
+    // Total width is page_width (default 72).
     let page_str = format!("Page {}", page_num);
-    // GNU pr format: date is left, header is centered, page is right
-    // Simplified: "{date}  {header}  {page}"
-    writeln!(output, "{}{} {} {}", indent_str, date_str, header, page_str)?;
+    let line_width = config.page_width;
+
+    let left = date_str;
+    let right = &page_str;
+    let center = header;
+
+    // Available space for center text between left and right.
+    let left_len = left.len();
+    let right_len = right.len();
+    let center_len = center.len();
+
+    // GNU pr centers the header title within the line.
+    // The layout is: LEFT + spaces + CENTER + spaces + RIGHT
+    // where the total is exactly line_width characters.
+    if left_len + center_len + right_len + 2 >= line_width {
+        // Not enough space to center; just concatenate.
+        writeln!(output, "{} {} {}", left, center, right)?;
+    } else {
+        let total_spaces = line_width - left_len - center_len - right_len;
+        // Distribute spaces evenly around the center text.
+        let left_spaces = total_spaces / 2;
+        let right_spaces = total_spaces - left_spaces;
+        writeln!(
+            output,
+            "{}{}{}{}{}",
+            left,
+            " ".repeat(left_spaces),
+            center,
+            " ".repeat(right_spaces),
+            right
+        )?;
+    }
 
     // 2 blank lines
     writeln!(output)?;
