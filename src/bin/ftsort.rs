@@ -41,13 +41,14 @@ fn run(input: &str, source_name: &str) -> i32 {
     let mut name_to_id: HashMap<String, usize> = HashMap::new();
 
     let get_id = |name: &str, names: &mut Vec<String>, map: &mut HashMap<String, usize>| -> usize {
-        if let Some(&id) = map.get(name) {
-            id
-        } else {
-            let id = names.len();
-            names.push(name.to_string());
-            map.insert(name.to_string(), id);
-            id
+        use std::collections::hash_map::Entry;
+        match map.entry(name.to_string()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = names.len();
+                names.push(e.key().clone());
+                *e.insert(id)
+            }
         }
     };
 

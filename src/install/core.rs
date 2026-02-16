@@ -376,7 +376,8 @@ fn optimized_copy(src: &Path, dst: &Path) -> io::Result<u64> {
                 drop(src_file);
                 return fs::copy(src, dst);
             }
-            break;
+            // Partial failure after some success — this is an error
+            return Err(io::Error::last_os_error());
         }
         used_cfr = true;
         remaining -= n as u64;
