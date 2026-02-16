@@ -264,11 +264,10 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
         if let Some(num_str) = rest
             .strip_suffix(" days")
             .or_else(|| rest.strip_suffix(" day"))
+            && let Ok(n) = num_str.trim().parse::<i64>()
         {
-            if let Ok(n) = num_str.trim().parse::<i64>() {
-                let midnight = today_midnight()?;
-                return Ok((midnight - n * 86400, 0));
-            }
+            let midnight = today_midnight()?;
+            return Ok((midnight - n * 86400, 0));
         }
     }
 
@@ -276,11 +275,10 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
     if let Some(num_str) = trimmed
         .strip_suffix(" days")
         .or_else(|| trimmed.strip_suffix(" day"))
+        && let Ok(n) = num_str.trim().parse::<i64>()
     {
-        if let Ok(n) = num_str.trim().parse::<i64>() {
-            let midnight = today_midnight()?;
-            return Ok((midnight + n * 86400, 0));
-        }
+        let midnight = today_midnight()?;
+        return Ok((midnight + n * 86400, 0));
     }
 
     // Epoch seconds: @N or @N.N
