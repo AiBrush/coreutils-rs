@@ -347,7 +347,10 @@ fn main() {
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
 
-    match join::join(&data1, &data2, &cli.config, tool_name, &mut out) {
+    let file1_name = if cli.files[0] == "-" { "-" } else { &cli.files[0] };
+    let file2_name = if cli.files[1] == "-" { "-" } else { &cli.files[1] };
+
+    match join::join(&data1, &data2, &cli.config, tool_name, file1_name, file2_name, &mut out) {
         Ok(had_order_error) => {
             if let Err(e) = out.flush() {
                 if e.kind() != io::ErrorKind::BrokenPipe {

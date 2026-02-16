@@ -115,8 +115,9 @@ pub fn read_file(path: &Path) -> io::Result<FileData> {
                 Ok(FileData::Owned(buf))
             }
         }
-    } else if len > 0 {
-        // Non-regular file (special files) — read from open fd
+    } else if !metadata.file_type().is_file() {
+        // Non-regular file (pipe, FIFO, device, process substitution) — read from open fd.
+        // Pipes report len=0 from stat(), so we must always try to read regardless of len.
         let mut buf = Vec::new();
         let mut reader = file;
         reader.read_to_end(&mut buf)?;
@@ -188,8 +189,9 @@ pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
                 return Ok(FileData::Owned(buf));
             }
         }
-    } else if len > 0 {
-        // Non-regular file (special files) — read from open fd
+    } else if !metadata.file_type().is_file() {
+        // Non-regular file (pipe, FIFO, device, process substitution) — read from open fd.
+        // Pipes report len=0 from stat(), so we must always try to read regardless of len.
         let mut buf = Vec::new();
         let mut reader = file;
         reader.read_to_end(&mut buf)?;

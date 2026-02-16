@@ -126,14 +126,17 @@ pub fn comm(
 
     let mut buf = Vec::with_capacity(data1.len() + data2.len());
 
-    while i1 < lines1.len() && i2 < lines2.len() {
-        // Order checks
-        if config.order_check != OrderCheck::None {
-            if !warned1 && i1 > 0 && compare_lines(lines1[i1], lines1[i1 - 1], ci) == Ordering::Less
+    // Macro to check sort order of a file and handle warnings/errors.
+    macro_rules! check_order {
+        ($warned:ident, $lines:ident, $idx:ident, $file_num:expr) => {
+            if config.order_check != OrderCheck::None
+                && !$warned
+                && $idx > 0
+                && compare_lines($lines[$idx], $lines[$idx - 1], ci) == Ordering::Less
             {
                 had_order_error = true;
-                warned1 = true;
-                eprintln!("{}: file 1 is not in sorted order", tool_name);
+                $warned = true;
+                eprintln!("{}: file {} is not in sorted order", tool_name, $file_num);
                 if config.order_check == OrderCheck::Strict {
                     out.write_all(&buf)?;
                     return Ok(CommResult {
@@ -144,25 +147,14 @@ pub fn comm(
                     });
                 }
             }
-            if !warned2 && i2 > 0 && compare_lines(lines2[i2], lines2[i2 - 1], ci) == Ordering::Less
-            {
-                had_order_error = true;
-                warned2 = true;
-                eprintln!("{}: file 2 is not in sorted order", tool_name);
-                if config.order_check == OrderCheck::Strict {
-                    out.write_all(&buf)?;
-                    return Ok(CommResult {
-                        count1,
-                        count2,
-                        count3,
-                        had_order_error,
-                    });
-                }
-            }
-        }
+        };
+    }
 
+    while i1 < lines1.len() && i2 < lines2.len() {
         match compare_lines(lines1[i1], lines2[i2], ci) {
             Ordering::Less => {
+                // File1 line is unique — check file1 sort order before consuming
+                check_order!(warned1, lines1, i1, 1);
                 if !config.suppress_col1 {
                     buf.extend_from_slice(lines1[i1]);
                     buf.push(delim);
@@ -171,6 +163,8 @@ pub fn comm(
                 i1 += 1;
             }
             Ordering::Greater => {
+                // File2 line is unique — check file2 sort order before consuming
+                check_order!(warned2, lines2, i2, 2);
                 if !config.suppress_col2 {
                     buf.extend_from_slice(&prefix2);
                     buf.extend_from_slice(lines2[i2]);
@@ -180,6 +174,7 @@ pub fn comm(
                 i2 += 1;
             }
             Ordering::Equal => {
+                // Lines match — no sort check needed (GNU comm behavior)
                 if !config.suppress_col3 {
                     buf.extend_from_slice(&prefix3);
                     buf.extend_from_slice(lines1[i1]);
@@ -259,6 +254,11 @@ pub fn comm(
         buf.extend_from_slice(sep);
         buf.extend_from_slice(b"total");
         buf.push(delim);
+    }
+
+    // In Default mode, print a final summary message (matches GNU comm behavior)
+    if had_order_error && config.order_check == OrderCheck::Default {
+        eprintln!("{}: input is not in sorted order", tool_name);
     }
 
     out.write_all(&buf)?;

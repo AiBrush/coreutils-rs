@@ -312,6 +312,8 @@ pub fn join(
     data2: &[u8],
     config: &JoinConfig,
     tool_name: &str,
+    file1_name: &str,
+    file2_name: &str,
     out: &mut impl Write,
 ) -> io::Result<bool> {
     let delim = if config.zero_terminated { b'\0' } else { b'\n' };
@@ -411,8 +413,9 @@ pub fn join(
                     had_order_error = true;
                     warned1 = true;
                     eprintln!(
-                        "{}: input:{}: is not sorted: {}",
+                        "{}: {}:{}: is not sorted: {}",
                         tool_name,
+                        file1_name,
                         i1 + 1,
                         String::from_utf8_lossy(lines1[i1])
                     );
@@ -428,8 +431,9 @@ pub fn join(
                     had_order_error = true;
                     warned2 = true;
                     eprintln!(
-                        "{}: input:{}: is not sorted: {}",
+                        "{}: {}:{}: is not sorted: {}",
                         tool_name,
+                        file2_name,
                         i2 + 1,
                         String::from_utf8_lossy(lines2[i2])
                     );
@@ -535,8 +539,9 @@ pub fn join(
                             had_order_error = true;
                             warned1 = true;
                             eprintln!(
-                                "{}: input:{}: is not sorted: {}",
+                                "{}: {}:{}: is not sorted: {}",
                                 tool_name,
+                                file1_name,
                                 i1 + 1,
                                 String::from_utf8_lossy(lines1[i1])
                             );
