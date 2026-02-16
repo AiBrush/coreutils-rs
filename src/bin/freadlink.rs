@@ -221,7 +221,7 @@ fn print_help() {
     println!("      --version  output version information and exit");
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::process::Command;

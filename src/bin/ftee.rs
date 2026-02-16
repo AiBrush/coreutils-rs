@@ -105,6 +105,7 @@ fn main() {
     }
 
     if ignore_interrupts {
+        #[cfg(unix)]
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_IGN);
         }

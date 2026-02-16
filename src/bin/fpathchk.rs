@@ -148,9 +148,14 @@ fn check_path(path: &str, posix_check: bool, extra_check: bool) -> Result<(), St
 }
 
 fn check_system_limits(path: &str) -> Result<(), String> {
-    // Get system limits
-    let path_max = unsafe { libc::pathconf(c"/".as_ptr(), libc::_PC_PATH_MAX) };
-    let name_max = unsafe { libc::pathconf(c"/".as_ptr(), libc::_PC_NAME_MAX) };
+    // Get system limits (pathconf is Unix-only, use defaults elsewhere)
+    #[cfg(unix)]
+    let (path_max, name_max) = unsafe {
+        (libc::pathconf(c"/".as_ptr(), libc::_PC_PATH_MAX),
+         libc::pathconf(c"/".as_ptr(), libc::_PC_NAME_MAX))
+    };
+    #[cfg(not(unix))]
+    let (path_max, name_max): (i64, i64) = (4096, 255);
 
     if path_max > 0 && path.len() > path_max as usize {
         return Err(format!(

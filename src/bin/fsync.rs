@@ -105,10 +105,18 @@ fn sync_file(path: &str, data_only: bool, file_system: bool) -> std::io::Result<
         let fd = file.as_raw_fd();
         let ret = if file_system {
             // syncfs — sync the filesystem containing this file
-            unsafe { libc::syncfs(fd) }
+            // syncfs is Linux-specific; fall back to fsync on other Unix
+            #[cfg(target_os = "linux")]
+            { unsafe { libc::syncfs(fd) } }
+            #[cfg(not(target_os = "linux"))]
+            { unsafe { libc::fsync(fd) } }
         } else if data_only {
             // fdatasync — sync data only, skip metadata
-            unsafe { libc::fdatasync(fd) }
+            // fdatasync is Linux-specific; fall back to fsync on other Unix
+            #[cfg(target_os = "linux")]
+            { unsafe { libc::fdatasync(fd) } }
+            #[cfg(not(target_os = "linux"))]
+            { unsafe { libc::fsync(fd) } }
         } else {
             // fsync — sync data + metadata
             unsafe { libc::fsync(fd) }
