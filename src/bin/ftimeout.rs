@@ -366,7 +366,7 @@ fn main() {
                     }
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         } else {
             // No kill-after: blocking wait for child to exit after signal

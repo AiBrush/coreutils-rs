@@ -27,7 +27,7 @@ fn print_version() {
 fn run(input: &str, source_name: &str) -> i32 {
     let mut all_nodes: Vec<String> = Vec::new();
     let mut edges: Vec<(String, String)> = Vec::new();
-    let mut seen_nodes: HashMap<String, bool> = HashMap::new();
+    let mut seen_nodes: HashSet<String> = HashSet::new();
 
     // Parse tokens from input
     let tokens: Vec<&str> = input.split_whitespace().collect();
@@ -44,33 +44,21 @@ fn run(input: &str, source_name: &str) -> i32 {
         let from = pair[0].to_string();
         let to = pair[1].to_string();
 
-        if !seen_nodes.contains_key(&from) {
-            seen_nodes.insert(from.clone(), true);
+        if seen_nodes.insert(from.clone()) {
             all_nodes.push(from.clone());
         }
-        if !seen_nodes.contains_key(&to) {
-            seen_nodes.insert(to.clone(), true);
+        if seen_nodes.insert(to.clone()) {
             all_nodes.push(to.clone());
         }
 
         edges.push((from, to));
     }
 
-    // Build graph
-    let mut unique_nodes: Vec<String> = Vec::new();
-    {
-        let mut seen = HashSet::new();
-        for node in &all_nodes {
-            if seen.insert(node.clone()) {
-                unique_nodes.push(node.clone());
-            }
-        }
-    }
-
+    // Build graph (all_nodes is already deduplicated via seen_nodes)
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_deg: HashMap<String, usize> = HashMap::new();
 
-    for node in &unique_nodes {
+    for node in &all_nodes {
         adj.entry(node.clone()).or_default();
         in_deg.entry(node.clone()).or_insert(0);
     }
@@ -83,7 +71,7 @@ fn run(input: &str, source_name: &str) -> i32 {
         }
     }
 
-    let total = unique_nodes.len();
+    let total = all_nodes.len();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -94,7 +82,7 @@ fn run(input: &str, source_name: &str) -> i32 {
     let mut removed: HashSet<String> = HashSet::new();
 
     // Seed queue with initial zero-degree nodes
-    for node in &unique_nodes {
+    for node in &all_nodes {
         if in_deg.get(node).copied().unwrap_or(0) == 0 {
             queue.push_back(node.clone());
         }
@@ -106,9 +94,9 @@ fn run(input: &str, source_name: &str) -> i32 {
             processed += 1;
             removed.insert(node.clone());
             let _ = writeln!(out, "{node}");
-            if let Some(neighbors) = adj.get(&node).cloned() {
+            if let Some(neighbors) = adj.get(&node) {
                 let mut new_zeros = Vec::new();
-                for nb in &neighbors {
+                for nb in neighbors {
                     if removed.contains(nb) {
                         continue;
                     }
@@ -135,7 +123,7 @@ fn run(input: &str, source_name: &str) -> i32 {
         has_cycle = true;
 
         // Find the first unprocessed node in input order
-        let start = unique_nodes
+        let start = all_nodes
             .iter()
             .find(|n| !removed.contains(*n))
             .unwrap()

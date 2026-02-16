@@ -259,7 +259,7 @@ fn apply_mode(path: &str, mode: libc::mode_t) -> Result<(), i32> {
 #[cfg(unix)]
 fn parse_mode(s: &str) -> libc::mode_t {
     // Try octal first: non-empty, all chars are octal digits
-    if !s.is_empty() && s.chars().all(|c| matches!(c, '0'..='7')) {
+    if !s.is_empty() && s.bytes().all(|c| matches!(c, b'0'..=b'7')) {
         return libc::mode_t::from_str_radix(s, 8).unwrap_or_else(|_| {
             eprintln!("{}: invalid mode: \u{2018}{}\u{2019}", TOOL_NAME, s);
             process::exit(1);

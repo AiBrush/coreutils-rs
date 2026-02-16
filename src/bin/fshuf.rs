@@ -292,10 +292,10 @@ fn main() {
 fn parse_range(s: &str) -> (u64, u64) {
     // Find the separator '-' that's not part of a negative number sign
     // Format: LO-HI where LO and HI are non-negative integers
-    let sep_pos = if s.starts_with('-') {
+    let sep_pos = if let Some(rest) = s.strip_prefix('-') {
         // First char is '-' (could be negative, which is invalid for u64 range)
         // Look for next '-' as separator
-        match s[1..].find('-') {
+        match rest.find('-') {
             Some(p) => p + 1,
             None => {
                 eprintln!(
