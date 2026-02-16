@@ -26,11 +26,15 @@ struct VmspliceWriter {
 impl VmspliceWriter {
     fn new() -> Self {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let is_pipe = unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
-        };
-        Self { raw, is_pipe }
+        // vmsplice(2) maps user pages into the pipe without copying. The caller
+        // must keep those pages valid until the reader consumes them. When tac
+        // drops the input Vec before the pipe reader reads, the reader sees
+        // freed/zeroed memory. Disable vmsplice and use regular write/writev
+        // which copy data into kernel buffers that persist correctly.
+        Self {
+            raw,
+            is_pipe: false,
+        }
     }
 }
 
