@@ -240,6 +240,34 @@ fn test_empty_input() {
     assert!(out.is_empty());
 }
 
+// ===== Tabs with -s tests =====
+
+#[test]
+fn test_tabs_with_s() {
+    // fold -s -w 20 should break at tabs (not just spaces)
+    // Input: abc\tdef\tghi\tjkl\tmno\tpqr\tstu\tvwx\n
+    // abc=col3, \t=col8, def=col11, \t=col16, ghi=col19
+    // Next \t would go to col24 > 20, so break at last tab (col16)
+    let input = "abc\tdef\tghi\tjkl\tmno\tpqr\tstu\tvwx\n";
+    let result = fold_s(input, 20);
+    assert_eq!(result, "abc\tdef\t\nghi\tjkl\t\nmno\tpqr\t\nstu\tvwx\n");
+}
+
+#[test]
+fn test_tabs_with_bs() {
+    // In byte mode with -s, tabs should also be treated as break points
+    let result = fold_bs("hello\tworld\ttest\n", 8);
+    // "hello\t" = 6 bytes, fits in 8
+    // "hello\tw" = 7 bytes, fits in 8
+    // "hello\two" = 8 bytes, at limit
+    // "hello\twor" = 9 bytes > 8, break at tab (pos 5)
+    // After break: "world\t" = 6 bytes, fits
+    // "world\tt" = 7 bytes, fits
+    // "world\tte" = 8 bytes, at limit
+    // "world\ttes" = 9 bytes > 8, break at tab (pos 11 in output)
+    assert_eq!(result, "hello\t\nworld\t\ntest\n");
+}
+
 // ===== Integration tests =====
 
 #[cfg(test)]
@@ -441,6 +469,33 @@ mod integration {
                 assert_eq!(
                     our_output.stdout, gnu.stdout,
                     "Output differs from GNU fold with tabs"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gnu_compat_tabs_with_s() {
+        // fold -s -w 20 on tab-separated data should break at tabs
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs_s.txt");
+        std::fs::write(&path, "abc\tdef\tghi\tjkl\tmno\tpqr\tstu\tvwx\n").unwrap();
+
+        let our_output = Command::new(bin_path("ffold"))
+            .args(["-s", "-w", "20", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        let gnu_output = Command::new("fold")
+            .args(["-s", "-w", "20", path.to_str().unwrap()])
+            .output();
+
+        if let Ok(gnu) = gnu_output {
+            if gnu.status.success() {
+                assert_eq!(
+                    our_output.stdout, gnu.stdout,
+                    "Output differs from GNU fold -s with tabs"
                 );
             }
         }

@@ -664,4 +664,31 @@ mod integration {
             }
         }
     }
+
+    #[test]
+    fn test_stdin_twice_split_lines() {
+        // GNU paste: `paste - -` reads alternating lines from shared stdin
+        let (out, _, code) = run_fpaste(b"1\n2\n3\n4\n5\n6\n", &["-", "-"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"1\t2\n3\t4\n5\t6\n");
+    }
+
+    #[test]
+    fn test_stdin_three_times() {
+        let (out, _, code) = run_fpaste(b"1\n2\n3\n4\n5\n6\n7\n8\n9\n", &["-", "-", "-"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"1\t2\t3\n4\t5\t6\n7\t8\t9\n");
+    }
+
+    #[test]
+    fn test_stdin_plus_file_plus_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mid.txt");
+        std::fs::write(&p, b"X\nY\nZ\n").unwrap();
+        // stdin has 6 lines, distributed round-robin between two - args
+        // First - gets lines 1,3,5; second - gets lines 2,4,6
+        let (out, _, code) = run_fpaste(b"a\nb\nc\nd\ne\nf\n", &["-", p.to_str().unwrap(), "-"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"a\tX\tb\nc\tY\td\ne\tZ\tf\n");
+    }
 }

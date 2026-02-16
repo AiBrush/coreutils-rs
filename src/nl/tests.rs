@@ -617,6 +617,25 @@ mod integration {
     }
 
     #[test]
+    fn test_no_trailing_newline_file() {
+        // File without trailing newline: output should also not have trailing newline
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_newline.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let (out, _, code) = run_fnl(b"", &[path.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"     1\thello");
+    }
+
+    #[test]
+    fn test_no_trailing_newline_stdin() {
+        // Stdin without trailing newline: output should also not have trailing newline
+        let (out, _, code) = run_fnl(b"hello", &[]);
+        assert_eq!(code, 0);
+        assert_eq!(out, b"     1\thello");
+    }
+
+    #[test]
     fn test_nonexistent_file() {
         let (_, _, code) = run_fnl(b"", &["/tmp/nonexistent_fnl_test_file"]);
         assert_eq!(code, 1);

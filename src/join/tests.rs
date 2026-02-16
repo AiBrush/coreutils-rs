@@ -7,6 +7,8 @@ fn join_str(input1: &str, input2: &str, config: &JoinConfig) -> String {
         input2.as_bytes(),
         config,
         "join",
+        "file1",
+        "file2",
         &mut out,
     )
     .unwrap();
@@ -259,7 +261,16 @@ fn test_auto_format() {
 fn test_order_check_default() {
     let config = default_config();
     let mut out = Vec::new();
-    let had_error = join(b"b 1\na 2\n", b"a x\nb y\n", &config, "join", &mut out).unwrap();
+    let had_error = join(
+        b"b 1\na 2\n",
+        b"a x\nb y\n",
+        &config,
+        "join",
+        "file1",
+        "file2",
+        &mut out,
+    )
+    .unwrap();
     assert!(had_error);
 }
 
@@ -268,7 +279,16 @@ fn test_order_check_none() {
     let mut config = default_config();
     config.order_check = OrderCheck::None;
     let mut out = Vec::new();
-    let had_error = join(b"b 1\na 2\n", b"a x\nb y\n", &config, "join", &mut out).unwrap();
+    let had_error = join(
+        b"b 1\na 2\n",
+        b"a x\nb y\n",
+        &config,
+        "join",
+        "file1",
+        "file2",
+        &mut out,
+    )
+    .unwrap();
     assert!(!had_error);
 }
 

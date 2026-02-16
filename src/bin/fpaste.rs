@@ -138,63 +138,67 @@ fn main() {
         cli.files
     };
 
-    // Read all files. Stdin is read once and shared if `-` appears multiple times.
-    let mut file_data_owned: Vec<coreutils_rs::common::io::FileData> = Vec::new();
-    let mut stdin_data: Option<coreutils_rs::common::io::FileData> = None;
-    let mut data_indices: Vec<usize> = Vec::new(); // index into file_data_owned or stdin
+    let terminator = if cli.config.zero_terminated {
+        0u8
+    } else {
+        b'\n'
+    };
     let mut had_error = false;
+
+    // Count stdin occurrences
+    let stdin_count = files.iter().filter(|f| *f == "-").count();
+
+    // Read stdin once if needed
+    let stdin_raw: Vec<u8> = if stdin_count > 0 {
+        match read_stdin() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("paste: standard input: {}", io_error_msg(&e));
+                had_error = true;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Distribute stdin lines among multiple `-` arguments.
+    // GNU paste shares a single stdin stream: `paste - -` reads alternating lines.
+    let mut stdin_parts: Vec<Vec<u8>> = if stdin_count > 1 && cli.config.serial {
+        // Serial mode: first `-` consumes all stdin, rest get empty
+        let mut parts = vec![Vec::new(); stdin_count];
+        parts[0] = stdin_raw;
+        parts
+    } else if stdin_count > 1 {
+        // Parallel mode: round-robin distribute stdin lines
+        distribute_stdin_lines(&stdin_raw, stdin_count, terminator)
+    } else {
+        vec![stdin_raw]
+    };
+
+    // Build file data for each argument
+    let mut file_data: Vec<coreutils_rs::common::io::FileData> = Vec::with_capacity(files.len());
+    let mut stdin_idx = 0;
 
     for filename in &files {
         if filename == "-" {
-            if stdin_data.is_none() {
-                match read_stdin() {
-                    Ok(d) => {
-                        stdin_data = Some(coreutils_rs::common::io::FileData::Owned(d));
-                    }
-                    Err(e) => {
-                        eprintln!("paste: standard input: {}", io_error_msg(&e));
-                        had_error = true;
-                        // Push empty data so indices stay correct
-                        file_data_owned.push(coreutils_rs::common::io::FileData::Owned(Vec::new()));
-                        data_indices.push(file_data_owned.len() - 1);
-                        continue;
-                    }
-                }
-            }
-            // Sentinel for stdin reference
-            data_indices.push(usize::MAX);
+            let data = std::mem::take(&mut stdin_parts[stdin_idx]);
+            file_data.push(coreutils_rs::common::io::FileData::Owned(data));
+            stdin_idx += 1;
         } else {
             match read_file(Path::new(filename)) {
-                Ok(d) => {
-                    file_data_owned.push(d);
-                    data_indices.push(file_data_owned.len() - 1);
-                }
+                Ok(d) => file_data.push(d),
                 Err(e) => {
                     eprintln!("paste: {}: {}", filename, io_error_msg(&e));
                     had_error = true;
-                    // Push empty data so indices stay correct
-                    file_data_owned.push(coreutils_rs::common::io::FileData::Owned(Vec::new()));
-                    data_indices.push(file_data_owned.len() - 1);
+                    file_data.push(coreutils_rs::common::io::FileData::Owned(Vec::new()));
                 }
             }
         }
     }
 
     // Build reference slices
-    let stdin_ref: &[u8] = match &stdin_data {
-        Some(d) => d,
-        None => b"",
-    };
-    let data_refs: Vec<&[u8]> = data_indices
-        .iter()
-        .map(|&idx| {
-            if idx == usize::MAX {
-                stdin_ref
-            } else {
-                &*file_data_owned[idx]
-            }
-        })
-        .collect();
+    let data_refs: Vec<&[u8]> = file_data.iter().map(|d| &**d).collect();
 
     // Build output buffer
     let output = paste::paste_to_vec(&data_refs, &cli.config);
@@ -211,6 +215,28 @@ fn main() {
     if had_error {
         process::exit(1);
     }
+}
+
+/// Distribute stdin lines round-robin among multiple stdin arguments.
+/// This matches GNU paste behavior where `paste - -` reads alternating lines from stdin.
+fn distribute_stdin_lines(data: &[u8], count: usize, terminator: u8) -> Vec<Vec<u8>> {
+    let mut parts = vec![Vec::new(); count];
+    let mut start = 0;
+    let mut line_idx = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == terminator {
+            let target = line_idx % count;
+            parts[target].extend_from_slice(&data[start..=i]);
+            start = i + 1;
+            line_idx += 1;
+        }
+    }
+    // Handle last line without terminator
+    if start < data.len() {
+        let target = line_idx % count;
+        parts[target].extend_from_slice(&data[start..]);
+    }
+    parts
 }
 
 /// Write the full buffer to stdout, retrying on partial/interrupted writes.

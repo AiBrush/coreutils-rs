@@ -125,7 +125,7 @@ fn fold_byte_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &mut
             }
         }
 
-        if break_at_spaces && byte == b' ' {
+        if break_at_spaces && (byte == b' ' || byte == b'\t') {
             last_space_out_pos = Some(output.len());
         }
 
@@ -187,7 +187,7 @@ fn fold_column_mode(data: &[u8], width: usize, break_at_spaces: bool, output: &m
             }
         }
 
-        if break_at_spaces && byte == b' ' {
+        if break_at_spaces && (byte == b' ' || byte == b'\t') {
             last_space_out_pos = Some(output.len());
         }
 
