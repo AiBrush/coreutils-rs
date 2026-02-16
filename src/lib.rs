@@ -30,10 +30,6 @@ pub mod cat;
 #[cfg(unix)]
 pub mod chgrp;
 #[cfg(unix)]
-pub mod chown;
-#[cfg(unix)]
-pub mod chgrp;
-#[cfg(unix)]
 pub mod chmod;
 #[cfg(unix)]
 pub mod chown;

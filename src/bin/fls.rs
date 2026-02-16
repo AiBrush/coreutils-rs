@@ -73,6 +73,7 @@ fn print_help() {
     );
 }
 
+#[cfg(unix)]
 fn get_terminal_width() -> Option<usize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
@@ -87,6 +88,7 @@ fn get_terminal_width() -> Option<usize> {
     None
 }
 
+#[cfg(unix)]
 /// Take the next value for a short option: rest-of-arg or next arg.
 fn take_short_value(
     bytes: &[u8],
