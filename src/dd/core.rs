@@ -404,20 +404,20 @@ fn try_copy_file_range_dd(config: &DdConfig) -> Option<io::Result<DdStats>> {
     let block_size = config.ibs;
 
     // Determine total bytes to copy
-    let total_to_copy = if let Some(count) = config.count {
-        Some(count * block_size as u64)
-    } else {
-        None
-    };
+    let total_to_copy = config.count.map(|count| count * block_size as u64);
 
     let mut bytes_remaining = total_to_copy;
     loop {
         let chunk = match bytes_remaining {
-            Some(r) if r == 0 => break,
+            Some(0) => break,
             Some(r) => r.min(block_size as u64 * 1024) as usize, // copy in large chunks
             None => block_size * 1024,
         };
 
+        // SAFETY: in_fd and out_fd are valid file descriptors (files are open for the
+        // lifetime of this function). in_off and out_off are valid, aligned i64 pointers
+        // with no aliasing. The kernel updates offsets atomically. Return value is checked:
+        // negative = error, 0 = EOF, positive = bytes copied.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_copy_file_range,

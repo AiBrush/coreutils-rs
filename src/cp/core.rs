@@ -345,6 +345,7 @@ pub fn copy_file(src: &Path, dst: &Path, config: &CpConfig) -> io::Result<()> {
     {
         if matches!(config.reflink, ReflinkMode::Auto | ReflinkMode::Always) {
             use std::os::unix::io::AsRawFd;
+            // FICLONE = _IOW(0x94, 9, int) from linux/fs.h
             const FICLONE: libc::c_ulong = 0x40049409;
 
             if let Ok(src_file) = std::fs::File::open(src) {
@@ -354,6 +355,8 @@ pub fn copy_file(src: &Path, dst: &Path, config: &CpConfig) -> io::Result<()> {
                     .truncate(true)
                     .open(dst);
                 if let Ok(dst_file) = dst_file {
+                    // SAFETY: Both file descriptors are valid (files are open),
+                    // FICLONE takes an fd as argument, and we check the return value.
                     let ret = unsafe {
                         libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
                     };

@@ -325,9 +325,7 @@ pub fn cat_with_options(
                 let s = itoa_buf.format(*line_num);
                 // Right-align in 6-char field
                 let pad = if s.len() < 6 { 6 - s.len() } else { 0 };
-                for _ in 0..pad {
-                    buf.push(b' ');
-                }
+                buf.extend(std::iter::repeat_n(b' ', pad));
                 buf.extend_from_slice(s.as_bytes());
                 buf.push(b'\t');
                 *line_num += 1;
@@ -335,9 +333,7 @@ pub fn cat_with_options(
         } else if config.number {
             let s = itoa_buf.format(*line_num);
             let pad = if s.len() < 6 { 6 - s.len() } else { 0 };
-            for _ in 0..pad {
-                buf.push(b' ');
-            }
+            buf.extend(std::iter::repeat_n(b' ', pad));
             buf.extend_from_slice(s.as_bytes());
             buf.push(b'\t');
             *line_num += 1;
