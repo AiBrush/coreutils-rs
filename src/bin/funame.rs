@@ -179,13 +179,26 @@ fn main() {
         }
         // On Linux, -p (processor) and -i (hardware platform) use the machine name
         // matching GNU coreutils behavior. GNU skips "unknown" values in -a mode.
+        // On macOS, GNU uname maps arm64 -> "arm" and x86_64 -> "i386".
         #[cfg(target_os = "linux")]
         let processor = machine;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        let processor = match machine {
+            "arm64" => "arm",
+            "x86_64" => "i386",
+            _ => machine,
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let processor = "unknown";
         #[cfg(target_os = "linux")]
         let hardware = machine;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        let hardware = match machine {
+            "arm64" => "arm",
+            "x86_64" => "i386",
+            _ => machine,
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let hardware = "unknown";
         if show_processor && !(show_all && processor == "unknown") {
             parts.push(processor);
