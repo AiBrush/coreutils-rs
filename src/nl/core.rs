@@ -137,11 +137,15 @@ fn format_number(num: i64, format: NumberFormat, width: usize, buf: &mut Vec<u8>
         NumberFormat::Ln => {
             buf.extend_from_slice(num_str.as_bytes());
             let pad = width.saturating_sub(num_str.len());
-            buf.extend(std::iter::repeat_n(b' ', pad));
+            for _ in 0..pad {
+                buf.push(b' ');
+            }
         }
         NumberFormat::Rn => {
             let pad = width.saturating_sub(num_str.len());
-            buf.extend(std::iter::repeat_n(b' ', pad));
+            for _ in 0..pad {
+                buf.push(b' ');
+            }
             buf.extend_from_slice(num_str.as_bytes());
         }
         NumberFormat::Rz => {
@@ -149,11 +153,15 @@ fn format_number(num: i64, format: NumberFormat, width: usize, buf: &mut Vec<u8>
                 buf.push(b'-');
                 let abs_str = &num_str[1..];
                 let pad = width.saturating_sub(abs_str.len() + 1);
-                buf.extend(std::iter::repeat_n(b'0', pad));
+                for _ in 0..pad {
+                    buf.push(b'0');
+                }
                 buf.extend_from_slice(abs_str.as_bytes());
             } else {
                 let pad = width.saturating_sub(num_str.len());
-                buf.extend(std::iter::repeat_n(b'0', pad));
+                for _ in 0..pad {
+                    buf.push(b'0');
+                }
                 buf.extend_from_slice(num_str.as_bytes());
             }
         }
@@ -205,7 +213,7 @@ pub fn nl_to_vec(data: &[u8], config: &NlConfig) -> Vec<u8> {
 
         // Check for section delimiter
         if let Some(section) = check_section_delimiter(line, &config.section_delimiter) {
-            if !config.no_renumber && section == Section::Header {
+            if !config.no_renumber {
                 line_number = config.starting_line_number;
             }
             current_section = section;
@@ -255,10 +263,12 @@ pub fn nl_to_vec(data: &[u8], config: &NlConfig) -> Vec<u8> {
             );
             output.extend_from_slice(&config.number_separator);
             output.extend_from_slice(line);
-            line_number += config.line_increment;
-        } else if !is_blank {
-            // Non-numbered non-blank: output padding for alignment
-            output.extend(std::iter::repeat_n(b' ', config.number_width));
+            line_number = line_number.wrapping_add(config.line_increment);
+        } else {
+            // Non-numbered lines: GNU nl outputs spaces (width) + separator + content
+            for _ in 0..config.number_width {
+                output.push(b' ');
+            }
             output.extend_from_slice(&config.number_separator);
             output.extend_from_slice(line);
         }

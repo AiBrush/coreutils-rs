@@ -34,8 +34,9 @@ fn test_multiple_lines() {
 #[test]
 fn test_empty_lines_not_numbered() {
     // Default body style 't' skips empty lines
+    // Non-numbered lines get width + separator_len spaces (7 = 6+1)
     let result = nl_helper(b"a\n\nb\n", &default_config());
-    assert_eq!(result, b"     1\ta\n      \t\n     2\tb\n");
+    assert_eq!(result, b"     1\ta\n       \n     2\tb\n");
 }
 
 #[test]
@@ -55,7 +56,8 @@ fn test_body_style_none() {
         ..default_config()
     };
     let result = nl_helper(b"a\nb\n", &config);
-    assert_eq!(result, b"      \ta\n      \tb\n");
+    // Non-numbered lines: 7 spaces (width 6 + 1 for tab separator)
+    assert_eq!(result, b"       a\n       b\n");
 }
 
 // --- Number format tests ---
@@ -217,8 +219,8 @@ fn test_join_blank_lines() {
     };
     let input = b"a\n\n\n\nb\n";
     let result = nl_helper(input, &config);
-    // With -l 3 and -b a: first 2 blanks get padding but not numbered, 3rd blank is numbered
-    let expected = b"     1\ta\n      \t\n      \t\n     2\t\n     3\tb\n";
+    // With -l 3 and -b a: first 2 blanks get spaces (not numbered), 3rd blank is numbered
+    let expected = b"     1\ta\n       \n       \n     2\t\n     3\tb\n";
     assert_eq!(
         std::str::from_utf8(&result).unwrap(),
         std::str::from_utf8(expected).unwrap()
@@ -252,9 +254,10 @@ fn test_no_trailing_newline() {
 
 #[test]
 fn test_only_newlines() {
-    // Default body style 't' doesn't number empty lines, but they still get padding
+    // Default body style 't' doesn't number empty lines
+    // Non-numbered lines get width + separator_len spaces (7 total)
     let result = nl_helper(b"\n\n\n", &default_config());
-    assert_eq!(result, b"      \t\n      \t\n      \t\n");
+    assert_eq!(result, b"       \n       \n       \n");
 }
 
 #[test]
@@ -269,8 +272,9 @@ fn test_all_empty_lines_numbered() {
 
 #[test]
 fn test_single_newline() {
+    // Non-numbered blank: 7 spaces (width 6 + 1 for separator)
     let result = nl_helper(b"\n", &default_config());
-    assert_eq!(result, b"      \t\n");
+    assert_eq!(result, b"       \n");
 }
 
 #[test]
