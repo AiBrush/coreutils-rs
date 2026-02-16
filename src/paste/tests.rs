@@ -687,10 +687,7 @@ mod integration {
         std::fs::write(&p, b"X\nY\nZ\n").unwrap();
         // stdin has 6 lines, distributed round-robin between two - args
         // First - gets lines 1,3,5; second - gets lines 2,4,6
-        let (out, _, code) = run_fpaste(
-            b"a\nb\nc\nd\ne\nf\n",
-            &["-", p.to_str().unwrap(), "-"],
-        );
+        let (out, _, code) = run_fpaste(b"a\nb\nc\nd\ne\nf\n", &["-", p.to_str().unwrap(), "-"]);
         assert_eq!(code, 0);
         assert_eq!(out, b"a\tX\tb\nc\tY\td\ne\tZ\tf\n");
     }

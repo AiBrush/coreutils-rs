@@ -138,7 +138,11 @@ fn main() {
         cli.files
     };
 
-    let terminator = if cli.config.zero_terminated { 0u8 } else { b'\n' };
+    let terminator = if cli.config.zero_terminated {
+        0u8
+    } else {
+        b'\n'
+    };
     let mut had_error = false;
 
     // Count stdin occurrences
