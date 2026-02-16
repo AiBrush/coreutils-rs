@@ -267,7 +267,7 @@ fn get_user_groups(c_name: &CString, pw_gid: libc::gid_t) -> Vec<libc::gid_t> {
             }
         }
         gids.truncate(ngroups as usize);
-        return gids.into_iter().map(|g| g as libc::gid_t).collect();
+        gids.into_iter().map(|g| g as libc::gid_t).collect()
     }
 
     #[cfg(not(target_vendor = "apple"))]
