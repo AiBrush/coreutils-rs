@@ -35,91 +35,139 @@ fn print_version() {
     println!("{} (fcoreutils) {}", TOOL_NAME, VERSION);
 }
 
-/// A simple random number generator seeded from a byte source.
-struct Rng {
-    state: u64,
+/// Random number generator matching GNU's randint algorithm.
+/// When using --random-source, reads bytes from the file on each generation.
+/// When no source, uses xorshift64 PRNG seeded from /dev/urandom.
+enum RandGen {
+    /// GNU-compatible: read bytes from file, maintain running state
+    FileSource {
+        reader: io::BufReader<fs::File>,
+        source_path: String,
+        randnum: u64,
+        randmax: u64,
+    },
+    /// Fast PRNG for when no --random-source given
+    Xorshift { state: u64 },
 }
 
-impl Rng {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut state: u64 = 0;
-        for (i, &b) in bytes.iter().take(8).enumerate() {
-            state |= (b as u64) << (i * 8);
-        }
-        if state == 0 {
-            state = 0x12345678_9abcdef0;
-        }
-        Rng { state }
-    }
-
-    /// xorshift64 PRNG
-    fn next_u64(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        self.state
-    }
-
-    /// Return a random index in [0, n) using rejection sampling to avoid modulo bias
-    fn gen_range(&mut self, n: usize) -> usize {
-        if n <= 1 {
-            return 0;
-        }
-        let n = n as u64;
-        let threshold = u64::MAX - (u64::MAX % n);
-        loop {
-            let r = self.next_u64();
-            if r < threshold {
-                return (r % n) as usize;
-            }
-        }
-    }
-}
-
-fn get_random_seed(random_source: &Option<String>) -> Vec<u8> {
-    if let Some(source) = random_source {
-        let mut f = match fs::File::open(source) {
+impl RandGen {
+    fn from_file(path: &str) -> Self {
+        let f = match fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!(
                     "{}: {}: {}",
                     TOOL_NAME,
-                    source,
+                    path,
                     coreutils_rs::common::io_error_msg(&e)
                 );
                 process::exit(1);
             }
         };
-        let mut buf = vec![0u8; 8];
-        let _ = f.read(&mut buf);
-        buf
-    } else {
-        // Read from /dev/urandom
+        RandGen::FileSource {
+            reader: io::BufReader::new(f),
+            source_path: path.to_string(),
+            randnum: 0,
+            randmax: 0,
+        }
+    }
+
+    fn from_urandom() -> Self {
         let mut f = match fs::File::open("/dev/urandom") {
             Ok(f) => f,
             Err(_) => {
-                // Fallback: use current time-based seed
                 let t = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
-                return t.to_le_bytes().to_vec();
+                let mut state = t as u64;
+                if state == 0 {
+                    state = 0x12345678_9abcdef0;
+                }
+                return RandGen::Xorshift { state };
             }
         };
-        let mut buf = vec![0u8; 8];
+        let mut buf = [0u8; 8];
         let _ = f.read_exact(&mut buf);
-        buf
+        let mut state = u64::from_le_bytes(buf);
+        if state == 0 {
+            state = 0x12345678_9abcdef0;
+        }
+        RandGen::Xorshift { state }
+    }
+
+    /// Generate a random number in [0, genmax] matching GNU's randint_genmax.
+    fn gen_max(&mut self, genmax: u64) -> u64 {
+        if genmax == 0 {
+            return 0;
+        }
+        match self {
+            RandGen::FileSource {
+                reader,
+                source_path,
+                randnum,
+                randmax,
+            } => loop {
+                if *randmax < genmax {
+                    let mut buf = [0u8; 1];
+                    if reader.read_exact(&mut buf).is_err() {
+                        eprintln!("{}: {}: end of file", TOOL_NAME, source_path);
+                        process::exit(1);
+                    }
+                    *randnum = randnum.wrapping_mul(256).wrapping_add(buf[0] as u64);
+                    *randmax = randmax.wrapping_mul(256).wrapping_add(255);
+                } else {
+                    let excess_max = *randmax - genmax;
+                    let excess = excess_max % (genmax + 1);
+                    if excess <= *randmax - *randnum {
+                        let result = *randnum % (genmax + 1);
+                        *randnum /= genmax + 1;
+                        *randmax = excess_max / (genmax + 1);
+                        return result;
+                    }
+                    // Rejection: need more bytes
+                    let mut buf = [0u8; 1];
+                    if reader.read_exact(&mut buf).is_err() {
+                        eprintln!("{}: {}: end of file", TOOL_NAME, source_path);
+                        process::exit(1);
+                    }
+                    *randnum = randnum.wrapping_mul(256).wrapping_add(buf[0] as u64);
+                    *randmax = randmax.wrapping_mul(256).wrapping_add(255);
+                }
+            },
+            RandGen::Xorshift { state } => {
+                let n = genmax + 1;
+                let threshold = u64::MAX - (u64::MAX % n);
+                loop {
+                    *state ^= *state << 13;
+                    *state ^= *state >> 7;
+                    *state ^= *state << 17;
+                    let r = *state;
+                    if r < threshold {
+                        return r % n;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return a random index in [0, n)
+    fn gen_range(&mut self, n: usize) -> usize {
+        if n <= 1 {
+            return 0;
+        }
+        self.gen_max((n - 1) as u64) as usize
     }
 }
 
-/// Fisher-Yates shuffle
-fn shuffle(items: &mut [String], rng: &mut Rng) {
+/// Top-down Fisher-Yates shuffle (matches GNU's algorithm)
+fn shuffle(items: &mut [String], rng: &mut RandGen) {
     let n = items.len();
     if n <= 1 {
         return;
     }
-    for i in (1..n).rev() {
-        let j = rng.gen_range(i + 1);
+    for i in 0..n {
+        let j = i + rng.gen_range(n - i);
         items.swap(i, j);
     }
 }
@@ -239,8 +287,11 @@ fn main() {
         return;
     }
 
-    let seed = get_random_seed(&random_source);
-    let mut rng = Rng::from_bytes(&seed);
+    let mut rng = if let Some(ref source) = random_source {
+        RandGen::from_file(source)
+    } else {
+        RandGen::from_urandom()
+    };
 
     // Determine output destination
     let stdout = io::stdout();

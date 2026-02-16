@@ -96,7 +96,7 @@ fn remove_one(dir: &str, ignore_nonempty: bool, verbose: bool) -> Result<(), i32
                 return Ok(());
             }
             eprintln!(
-                "{}: failed to remove directory '{}': {}",
+                "{}: failed to remove '{}': {}",
                 TOOL_NAME,
                 dir,
                 coreutils_rs::common::io_error_msg(&e)

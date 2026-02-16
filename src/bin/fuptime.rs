@@ -77,7 +77,7 @@ fn main() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_uptime() -> Result<f64, String> {
     let content = std::fs::read_to_string("/proc/uptime")
         .map_err(|e| format!("cannot read /proc/uptime: {}", e))?;
@@ -89,18 +89,44 @@ fn read_uptime() -> Result<f64, String> {
         .map_err(|_| "cannot parse uptime".to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn read_uptime() -> Result<f64, String> {
+    use std::mem;
+    use std::ptr;
+
+    let mut boottime: libc::timeval = unsafe { mem::zeroed() };
+    let mut size = mem::size_of::<libc::timeval>();
+    let mut mib: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            &mut boottime as *mut _ as *mut libc::c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret != 0 {
+        return Err("cannot determine boot time".to_string());
+    }
+
+    let now = unsafe { libc::time(ptr::null_mut()) };
+    Ok((now - boottime.tv_sec) as f64)
+}
+
 #[cfg(unix)]
 fn read_loadavg() -> (f64, f64, f64) {
-    if let Ok(content) = std::fs::read_to_string("/proc/loadavg") {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let a = parts[0].parse().unwrap_or(0.0);
-            let b = parts[1].parse().unwrap_or(0.0);
-            let c = parts[2].parse().unwrap_or(0.0);
-            return (a, b, c);
-        }
+    // getloadavg works on both Linux and macOS
+    let mut loadavg = [0.0f64; 3];
+    let ret = unsafe { libc::getloadavg(loadavg.as_mut_ptr(), 3) };
+    if ret == 3 {
+        (loadavg[0], loadavg[1], loadavg[2])
+    } else {
+        (0.0, 0.0, 0.0)
     }
-    (0.0, 0.0, 0.0)
 }
 
 #[cfg(unix)]
@@ -216,7 +242,7 @@ fn print_since(uptime_secs: f64) {
     );
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
     use std::process::Command;
 
@@ -271,6 +297,10 @@ mod tests {
     fn test_uptime_matches_gnu_format() {
         let gnu = Command::new("uptime").arg("-p").output();
         if let Ok(gnu) = gnu {
+            // Skip if GNU uptime doesn't support -p (e.g., macOS)
+            if !gnu.status.success() {
+                return;
+            }
             let ours = cmd().arg("-p").output().unwrap();
             assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
             // The pretty format should be similar (may differ slightly in wording)
