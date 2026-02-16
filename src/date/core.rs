@@ -190,7 +190,7 @@ fn apply_format_modifier(formatted: &str, modifier: char) -> String {
     match modifier {
         '-' => {
             // Remove leading zeros and spaces (no padding)
-            let trimmed = formatted.trim_start_matches(|c: char| c == '0' || c == ' ');
+            let trimmed = formatted.trim_start_matches(['0', ' ']);
             if trimmed.is_empty() {
                 "0".to_string()
             } else {
