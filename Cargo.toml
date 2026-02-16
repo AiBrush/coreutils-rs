@@ -171,6 +171,54 @@ path = "src/bin/fmkfifo.rs"
 name = "frmdir"
 path = "src/bin/frmdir.rs"
 
+[[bin]]
+name = "fyes"
+path = "src/bin/fyes.rs"
+
+[[bin]]
+name = "fbasename"
+path = "src/bin/fbasename.rs"
+
+[[bin]]
+name = "fdirname"
+path = "src/bin/fdirname.rs"
+
+[[bin]]
+name = "freadlink"
+path = "src/bin/freadlink.rs"
+
+[[bin]]
+name = "frealpath"
+path = "src/bin/frealpath.rs"
+
+[[bin]]
+name = "fpathchk"
+path = "src/bin/fpathchk.rs"
+
+[[bin]]
+name = "fsleep"
+path = "src/bin/fsleep.rs"
+
+[[bin]]
+name = "fnice"
+path = "src/bin/fnice.rs"
+
+[[bin]]
+name = "fnohup"
+path = "src/bin/fnohup.rs"
+
+[[bin]]
+name = "fgroups"
+path = "src/bin/fgroups.rs"
+
+[[bin]]
+name = "funame"
+path = "src/bin/funame.rs"
+
+[[bin]]
+name = "fuptime"
+path = "src/bin/fuptime.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "cargo"] }
