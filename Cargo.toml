@@ -28,160 +28,252 @@ name = "coreutils_rs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fwc"
-path = "src/bin/fwc.rs"
-
-[[bin]]
-name = "fcut"
-path = "src/bin/fcut.rs"
-
-[[bin]]
-name = "fbase64"
-path = "src/bin/fbase64.rs"
-
-[[bin]]
-name = "fsha256sum"
-path = "src/bin/fsha256sum.rs"
-
-[[bin]]
-name = "fsort"
-path = "src/bin/fsort.rs"
-
-[[bin]]
-name = "ftr"
-path = "src/bin/ftr.rs"
-
-[[bin]]
-name = "funiq"
-path = "src/bin/funiq.rs"
+name = "farch"
+path = "src/bin/farch.rs"
 
 [[bin]]
 name = "fb2sum"
 path = "src/bin/fb2sum.rs"
 
 [[bin]]
-name = "ftac"
-path = "src/bin/ftac.rs"
+name = "fbase32"
+path = "src/bin/fbase32.rs"
 
 [[bin]]
-name = "fmd5sum"
-path = "src/bin/fmd5sum.rs"
-
-[[bin]]
-name = "frev"
-path = "src/bin/frev.rs"
-
-[[bin]]
-name = "fexpand"
-path = "src/bin/fexpand.rs"
-
-[[bin]]
-name = "funexpand"
-path = "src/bin/funexpand.rs"
-
-[[bin]]
-name = "ffold"
-path = "src/bin/ffold.rs"
-
-[[bin]]
-name = "fhead"
-path = "src/bin/fhead.rs"
-
-[[bin]]
-name = "ftail"
-path = "src/bin/ftail.rs"
-
-[[bin]]
-name = "fcat"
-path = "src/bin/fcat.rs"
-
-[[bin]]
-name = "fcomm"
-path = "src/bin/fcomm.rs"
-
-[[bin]]
-name = "fjoin"
-path = "src/bin/fjoin.rs"
-
-[[bin]]
-name = "fpaste"
-path = "src/bin/fpaste.rs"
-
-[[bin]]
-name = "fnl"
-path = "src/bin/fnl.rs"
-
-[[bin]]
-name = "ftrue"
-path = "src/bin/ftrue.rs"
-
-[[bin]]
-name = "ffalse"
-path = "src/bin/ffalse.rs"
-
-[[bin]]
-name = "flink"
-path = "src/bin/flink.rs"
-
-[[bin]]
-name = "funlink"
-path = "src/bin/funlink.rs"
-
-[[bin]]
-name = "fsync"
-path = "src/bin/fsync.rs"
-
-[[bin]]
-name = "fhostid"
-path = "src/bin/fhostid.rs"
-
-[[bin]]
-name = "flogname"
-path = "src/bin/flogname.rs"
-
-[[bin]]
-name = "fwhoami"
-path = "src/bin/fwhoami.rs"
-
-[[bin]]
-name = "ftty"
-path = "src/bin/ftty.rs"
-
-[[bin]]
-name = "fnproc"
-path = "src/bin/fnproc.rs"
-
-[[bin]]
-name = "farch"
-path = "src/bin/farch.rs"
-
-[[bin]]
-name = "fprintenv"
-path = "src/bin/fprintenv.rs"
-
-[[bin]]
-name = "fpwd"
-path = "src/bin/fpwd.rs"
-
-[[bin]]
-name = "fmkfifo"
-path = "src/bin/fmkfifo.rs"
-
-[[bin]]
-name = "frmdir"
-path = "src/bin/frmdir.rs"
-
-[[bin]]
-name = "fyes"
-path = "src/bin/fyes.rs"
+name = "fbase64"
+path = "src/bin/fbase64.rs"
 
 [[bin]]
 name = "fbasename"
 path = "src/bin/fbasename.rs"
 
 [[bin]]
+name = "fbasenc"
+path = "src/bin/fbasenc.rs"
+
+[[bin]]
+name = "fcat"
+path = "src/bin/fcat.rs"
+
+[[bin]]
+name = "fchcon"
+path = "src/bin/fchcon.rs"
+
+[[bin]]
+name = "fchgrp"
+path = "src/bin/fchgrp.rs"
+
+[[bin]]
+name = "fchmod"
+path = "src/bin/fchmod.rs"
+
+[[bin]]
+name = "fchown"
+path = "src/bin/fchown.rs"
+
+[[bin]]
+name = "fchroot"
+path = "src/bin/fchroot.rs"
+
+[[bin]]
+name = "fcksum"
+path = "src/bin/fcksum.rs"
+
+[[bin]]
+name = "fcomm"
+path = "src/bin/fcomm.rs"
+
+[[bin]]
+name = "fcp"
+path = "src/bin/fcp.rs"
+
+[[bin]]
+name = "fcsplit"
+path = "src/bin/fcsplit.rs"
+
+[[bin]]
+name = "fcut"
+path = "src/bin/fcut.rs"
+
+[[bin]]
+name = "fdate"
+path = "src/bin/fdate.rs"
+
+[[bin]]
+name = "fdd"
+path = "src/bin/fdd.rs"
+
+[[bin]]
+name = "fdf"
+path = "src/bin/fdf.rs"
+
+[[bin]]
+name = "fdir"
+path = "src/bin/fdir.rs"
+
+[[bin]]
+name = "fdircolors"
+path = "src/bin/fdircolors.rs"
+
+[[bin]]
 name = "fdirname"
 path = "src/bin/fdirname.rs"
+
+[[bin]]
+name = "fdu"
+path = "src/bin/fdu.rs"
+
+[[bin]]
+name = "fecho"
+path = "src/bin/fecho.rs"
+
+[[bin]]
+name = "fenv"
+path = "src/bin/fenv.rs"
+
+[[bin]]
+name = "fexpand"
+path = "src/bin/fexpand.rs"
+
+[[bin]]
+name = "fexpr"
+path = "src/bin/fexpr.rs"
+
+[[bin]]
+name = "ffactor"
+path = "src/bin/ffactor.rs"
+
+[[bin]]
+name = "ffalse"
+path = "src/bin/ffalse.rs"
+
+[[bin]]
+name = "ffmt"
+path = "src/bin/ffmt.rs"
+
+[[bin]]
+name = "ffold"
+path = "src/bin/ffold.rs"
+
+[[bin]]
+name = "fgroups"
+path = "src/bin/fgroups.rs"
+
+[[bin]]
+name = "fhead"
+path = "src/bin/fhead.rs"
+
+[[bin]]
+name = "fhostid"
+path = "src/bin/fhostid.rs"
+
+[[bin]]
+name = "fid"
+path = "src/bin/fid.rs"
+
+[[bin]]
+name = "finstall"
+path = "src/bin/finstall.rs"
+
+[[bin]]
+name = "fjoin"
+path = "src/bin/fjoin.rs"
+
+[[bin]]
+name = "flink"
+path = "src/bin/flink.rs"
+
+[[bin]]
+name = "fln"
+path = "src/bin/fln.rs"
+
+[[bin]]
+name = "flogname"
+path = "src/bin/flogname.rs"
+
+[[bin]]
+name = "fls"
+path = "src/bin/fls.rs"
+
+[[bin]]
+name = "fmd5sum"
+path = "src/bin/fmd5sum.rs"
+
+[[bin]]
+name = "fmkdir"
+path = "src/bin/fmkdir.rs"
+
+[[bin]]
+name = "fmkfifo"
+path = "src/bin/fmkfifo.rs"
+
+[[bin]]
+name = "fmknod"
+path = "src/bin/fmknod.rs"
+
+[[bin]]
+name = "fmktemp"
+path = "src/bin/fmktemp.rs"
+
+[[bin]]
+name = "fmv"
+path = "src/bin/fmv.rs"
+
+[[bin]]
+name = "fnice"
+path = "src/bin/fnice.rs"
+
+[[bin]]
+name = "fnl"
+path = "src/bin/fnl.rs"
+
+[[bin]]
+name = "fnohup"
+path = "src/bin/fnohup.rs"
+
+[[bin]]
+name = "fnproc"
+path = "src/bin/fnproc.rs"
+
+[[bin]]
+name = "fnumfmt"
+path = "src/bin/fnumfmt.rs"
+
+[[bin]]
+name = "fod"
+path = "src/bin/fod.rs"
+
+[[bin]]
+name = "fpaste"
+path = "src/bin/fpaste.rs"
+
+[[bin]]
+name = "fpathchk"
+path = "src/bin/fpathchk.rs"
+
+[[bin]]
+name = "fpinky"
+path = "src/bin/fpinky.rs"
+
+[[bin]]
+name = "fpr"
+path = "src/bin/fpr.rs"
+
+[[bin]]
+name = "fprintenv"
+path = "src/bin/fprintenv.rs"
+
+[[bin]]
+name = "fprintf"
+path = "src/bin/fprintf.rs"
+
+[[bin]]
+name = "fptx"
+path = "src/bin/fptx.rs"
+
+[[bin]]
+name = "fpwd"
+path = "src/bin/fpwd.rs"
 
 [[bin]]
 name = "freadlink"
@@ -192,56 +284,24 @@ name = "frealpath"
 path = "src/bin/frealpath.rs"
 
 [[bin]]
-name = "fpathchk"
-path = "src/bin/fpathchk.rs"
+name = "frev"
+path = "src/bin/frev.rs"
 
 [[bin]]
-name = "fsleep"
-path = "src/bin/fsleep.rs"
+name = "frm"
+path = "src/bin/frm.rs"
 
 [[bin]]
-name = "fnice"
-path = "src/bin/fnice.rs"
+name = "frmdir"
+path = "src/bin/frmdir.rs"
 
 [[bin]]
-name = "fnohup"
-path = "src/bin/fnohup.rs"
+name = "fruncon"
+path = "src/bin/fruncon.rs"
 
 [[bin]]
-name = "fgroups"
-path = "src/bin/fgroups.rs"
-
-[[bin]]
-name = "funame"
-path = "src/bin/funame.rs"
-
-[[bin]]
-name = "fmktemp"
-path = "src/bin/fmktemp.rs"
-
-[[bin]]
-name = "fmknod"
-path = "src/bin/fmknod.rs"
-
-[[bin]]
-name = "fmkdir"
-path = "src/bin/fmkdir.rs"
-
-[[bin]]
-name = "fuptime"
-path = "src/bin/fuptime.rs"
-
-[[bin]]
-name = "ftruncate"
-path = "src/bin/ftruncate.rs"
-
-[[bin]]
-name = "ftouch"
-path = "src/bin/ftouch.rs"
-
-[[bin]]
-name = "fln"
-path = "src/bin/fln.rs"
+name = "fseq"
+path = "src/bin/fseq.rs"
 
 [[bin]]
 name = "fsha1sum"
@@ -252,6 +312,10 @@ name = "fsha224sum"
 path = "src/bin/fsha224sum.rs"
 
 [[bin]]
+name = "fsha256sum"
+path = "src/bin/fsha256sum.rs"
+
+[[bin]]
 name = "fsha384sum"
 path = "src/bin/fsha384sum.rs"
 
@@ -260,56 +324,132 @@ name = "fsha512sum"
 path = "src/bin/fsha512sum.rs"
 
 [[bin]]
-name = "fsum"
-path = "src/bin/fsum.rs"
-
-[[bin]]
-name = "fcksum"
-path = "src/bin/fcksum.rs"
-
-[[bin]]
-name = "fbase32"
-path = "src/bin/fbase32.rs"
-
-[[bin]]
-name = "fbasenc"
-path = "src/bin/fbasenc.rs"
-
-[[bin]]
-name = "fid"
-path = "src/bin/fid.rs"
-
-[[bin]]
-name = "fenv"
-path = "src/bin/fenv.rs"
-
-[[bin]]
-name = "ftimeout"
-path = "src/bin/ftimeout.rs"
-
-[[bin]]
-name = "ftee"
-path = "src/bin/ftee.rs"
-
-[[bin]]
-name = "fchroot"
-path = "src/bin/fchroot.rs"
-
-[[bin]]
-name = "fseq"
-path = "src/bin/fseq.rs"
-
-[[bin]]
-name = "ftsort"
-path = "src/bin/ftsort.rs"
+name = "fshred"
+path = "src/bin/fshred.rs"
 
 [[bin]]
 name = "fshuf"
 path = "src/bin/fshuf.rs"
 
 [[bin]]
-name = "fdircolors"
-path = "src/bin/fdircolors.rs"
+name = "fsleep"
+path = "src/bin/fsleep.rs"
+
+[[bin]]
+name = "fsort"
+path = "src/bin/fsort.rs"
+
+[[bin]]
+name = "fsplit"
+path = "src/bin/fsplit.rs"
+
+[[bin]]
+name = "fstat"
+path = "src/bin/fstat.rs"
+
+[[bin]]
+name = "fstdbuf"
+path = "src/bin/fstdbuf.rs"
+
+[[bin]]
+name = "fstty"
+path = "src/bin/fstty.rs"
+
+[[bin]]
+name = "fsum"
+path = "src/bin/fsum.rs"
+
+[[bin]]
+name = "fsync"
+path = "src/bin/fsync.rs"
+
+[[bin]]
+name = "ftac"
+path = "src/bin/ftac.rs"
+
+[[bin]]
+name = "ftail"
+path = "src/bin/ftail.rs"
+
+[[bin]]
+name = "ftee"
+path = "src/bin/ftee.rs"
+
+[[bin]]
+name = "ftest"
+path = "src/bin/ftest.rs"
+
+[[bin]]
+name = "ftimeout"
+path = "src/bin/ftimeout.rs"
+
+[[bin]]
+name = "ftouch"
+path = "src/bin/ftouch.rs"
+
+[[bin]]
+name = "ftr"
+path = "src/bin/ftr.rs"
+
+[[bin]]
+name = "ftrue"
+path = "src/bin/ftrue.rs"
+
+[[bin]]
+name = "ftruncate"
+path = "src/bin/ftruncate.rs"
+
+[[bin]]
+name = "ftsort"
+path = "src/bin/ftsort.rs"
+
+[[bin]]
+name = "ftty"
+path = "src/bin/ftty.rs"
+
+[[bin]]
+name = "funame"
+path = "src/bin/funame.rs"
+
+[[bin]]
+name = "funexpand"
+path = "src/bin/funexpand.rs"
+
+[[bin]]
+name = "funiq"
+path = "src/bin/funiq.rs"
+
+[[bin]]
+name = "funlink"
+path = "src/bin/funlink.rs"
+
+[[bin]]
+name = "fuptime"
+path = "src/bin/fuptime.rs"
+
+[[bin]]
+name = "fusers"
+path = "src/bin/fusers.rs"
+
+[[bin]]
+name = "fvdir"
+path = "src/bin/fvdir.rs"
+
+[[bin]]
+name = "fwc"
+path = "src/bin/fwc.rs"
+
+[[bin]]
+name = "fwho"
+path = "src/bin/fwho.rs"
+
+[[bin]]
+name = "fwhoami"
+path = "src/bin/fwhoami.rs"
+
+[[bin]]
+name = "fyes"
+path = "src/bin/fyes.rs"
 
 [dependencies]
 # CLI argument parsing

@@ -27,20 +27,64 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod base64;
 pub mod cat;
+#[cfg(unix)]
+pub mod chgrp;
+#[cfg(unix)]
+pub mod chmod;
+#[cfg(unix)]
+pub mod chown;
 pub mod comm;
 pub mod common;
+// #[cfg(unix)]
+// pub mod cp;
+pub mod csplit;
 pub mod cut;
+// pub mod date;
+// pub mod dd;
+// #[cfg(unix)]
+// pub mod df;
+pub mod du;
+pub mod echo;
 pub mod expand;
+pub mod expr;
+pub mod factor;
+pub mod fmt;
 pub mod fold;
 pub mod hash;
 pub mod head;
+// #[cfg(unix)]
+// pub mod install;
 pub mod join;
+#[cfg(unix)]
+pub mod ls;
+#[cfg(unix)]
+pub mod mv;
 pub mod nl;
+// pub mod numfmt;
+pub mod od;
 pub mod paste;
+#[cfg(unix)]
+pub mod pinky;
+pub mod pr;
+pub mod printf;
+pub mod ptx;
 pub mod rev;
+#[cfg(unix)]
+pub mod rm;
+pub mod shred;
 pub mod sort;
+pub mod stat;
+pub mod split;
+// #[cfg(unix)]
+// #[cfg(unix)]
+pub mod stdbuf;
 pub mod tac;
 pub mod tail;
+pub mod test_cmd;
 pub mod tr;
 pub mod uniq;
+#[cfg(unix)]
+pub mod users;
 pub mod wc;
+#[cfg(unix)]
+pub mod who;
