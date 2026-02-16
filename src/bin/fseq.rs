@@ -7,7 +7,6 @@
 use std::io::{BufWriter, Write};
 use std::process;
 
-
 const TOOL_NAME: &str = "seq";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

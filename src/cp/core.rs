@@ -357,9 +357,8 @@ pub fn copy_file(src: &Path, dst: &Path, config: &CpConfig) -> io::Result<()> {
                 if let Ok(dst_file) = dst_file {
                     // SAFETY: Both file descriptors are valid (files are open),
                     // FICLONE takes an fd as argument, and we check the return value.
-                    let ret = unsafe {
-                        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
-                    };
+                    let ret =
+                        unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
                     if ret == 0 {
                         preserve_attributes(src, dst, config)?;
                         return Ok(());
