@@ -1,5 +1,6 @@
 // farch — print machine hardware name (equivalent to uname -m)
 
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::process;
 
