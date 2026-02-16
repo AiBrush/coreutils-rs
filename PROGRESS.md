@@ -1,11 +1,15 @@
 # coreutils-rs Progress
 
-## Current Status: All 10 Tools Complete - v0.0.16 Released
+## Current Status: 21 Tools Complete
 
-All 10 GNU coreutils replacements are fully implemented, optimized, and tested.
+21 GNU coreutils replacements are fully implemented and tested.
 Each tool is a drop-in replacement with byte-identical GNU output.
 
-**Compatibility: 409/413 (99.0%)** on independent test suite. Remaining 4 failures are tool name differences only (fcut vs cut in error messages, etc.).
+**10 performance-optimized tools** with independent benchmarks (v0.5.8): wc, cut, base64, sha256sum, md5sum, b2sum, sort, tr, uniq, tac.
+
+**11 additional tools** added in v0.6.x: head, tail, cat, rev, expand, unexpand, fold, paste, nl, comm, join.
+
+**Compatibility: 820/826 (99.3%)** on independent test suite (v0.5.8).
 
 ## Tool Checklist
 
@@ -80,6 +84,80 @@ Each tool is a drop-in replacement with byte-identical GNU output.
 - [x] 1MB BufWriter for efficient reversed output
 - [x] Custom separator support (`-s`)
 - [x] Before-separator mode (`-b`)
+- [x] GNU-identical output format
+
+### head (Output First Lines) - COMPLETE
+- [x] Zero-copy mmap for large files
+- [x] SIMD newline scanning with memchr
+- [x] Byte count mode (`-c`)
+- [x] All flags: `-n`, `-c`, `-q`, `-v`, `-z`
+- [x] GNU-identical output format
+
+### tail (Output Last Lines) - COMPLETE
+- [x] Reverse SIMD scan for efficient last-N-lines
+- [x] Follow mode (`-f`, `--follow`)
+- [x] Byte count mode (`-c`)
+- [x] All flags: `-n`, `-c`, `-f`, `-q`, `-v`, `-z`, `--pid`
+- [x] GNU-identical output format
+
+### cat (Concatenate) - COMPLETE
+- [x] Zero-copy splice/sendfile for piped output
+- [x] Memory-mapped I/O for large files
+- [x] Line numbering (`-n`, `-b`)
+- [x] All flags: `-A`, `-b`, `-e`, `-E`, `-n`, `-s`, `-t`, `-T`, `-v`
+- [x] GNU-identical output format
+
+### rev (Reverse Lines) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] SIMD newline scanning
+- [x] In-place line reversal
+- [x] GNU-identical output format
+
+### expand (Tabs to Spaces) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] Configurable tab stops (`-t`)
+- [x] All flags: `-i`, `-t`, `--tabs`
+- [x] GNU-identical output format
+
+### unexpand (Spaces to Tabs) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] Configurable tab stops (`-t`)
+- [x] All flags: `-a`, `-t`, `--first-only`
+- [x] GNU-identical output format
+
+### fold (Line Wrapping) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] Byte and character width modes
+- [x] All flags: `-b`, `-s`, `-w`
+- [x] GNU-identical output format
+
+### paste (Merge Lines) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] Serial and parallel modes
+- [x] Custom delimiter support (`-d`)
+- [x] All flags: `-d`, `-s`, `-z`
+- [x] GNU-identical output format
+
+### nl (Number Lines) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] SIMD newline scanning with memchr
+- [x] Section delimiter support (header/body/footer)
+- [x] Regex line matching (`-b pBRE`)
+- [x] All flags: `-b`, `-h`, `-f`, `-d`, `-i`, `-l`, `-n`, `-p`, `-s`, `-v`, `-w`
+- [x] GNU-identical output format
+
+### comm (Compare Sorted Files) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] Three-column output (unique to file1, unique to file2, common)
+- [x] Order checking with configurable strictness
+- [x] All flags: `-1`, `-2`, `-3`, `-i`, `-z`, `--check-order`, `--nocheck-order`, `--output-delimiter`, `--total`
+- [x] GNU-identical output format
+
+### join (Join Sorted Files) - COMPLETE
+- [x] Zero-copy mmap file reading
+- [x] SIMD field scanning
+- [x] Cross-product joins for many-to-many matches
+- [x] All flags: `-a`, `-e`, `-i`, `-j`, `-o`, `-t`, `-v`, `-z`, `-1`, `-2`, `--check-order`, `--nocheck-order`, `--header`
 - [x] GNU-identical output format
 
 ## Benchmarks (100MB text file, hyperfine --warmup 2 --min-runs 5)

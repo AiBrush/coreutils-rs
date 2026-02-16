@@ -9,37 +9,55 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/AiBrush/coreutils-rs)](https://github.com/AiBrush/coreutils-rs/releases)
 
-High-performance GNU coreutils replacement in Rust. Faster with SIMD acceleration. Drop-in compatible, cross-platform.
+High-performance GNU coreutils replacement in Rust — 21 tools and counting. SIMD-accelerated, drop-in compatible, cross-platform.
 
-## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.5.7, Linux, hyperfine)
+## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.5.8, Linux, hyperfine)
 
 | Tool | Speedup vs GNU | Speedup vs uutils |
 |------|---------------:|-------------------:|
-| wc | **34.8x** | 21.0x |
-| sort | **18.5x** | 16.6x |
-| uniq | **17.8x** | 6.0x |
-| base64 | **7.5x** | 7.1x |
-| tr | **7.0x** | 7.1x |
-| cut | **6.9x** | 3.7x |
-| tac | **4.0x** | 2.0x |
+| wc | **34.2x** | 20.7x |
+| sort | **17.7x** | 16.6x |
+| uniq | **14.9x** | 6.0x |
+| tr | **7.2x** | 7.1x |
+| base64 | **6.8x** | 7.1x |
+| cut | **6.2x** | 3.7x |
+| tac | **3.8x** | 2.0x |
 | md5sum | **1.4x** | 1.3x |
-| sha256sum | **1.2x** | 4.8x |
 | b2sum | **1.3x** | 1.2x |
+| sha256sum | **1.0x** | 4.8x |
 
 ## Tools
 
-| Tool | Binary | Status | Description |
-|------|--------|--------|-------------|
-| wc | `fwc` | Optimized | Word, line, char, byte count (SIMD SSE2, single-pass, parallel) |
-| cut | `fcut` | Optimized | Field/byte/char extraction (mmap, SIMD) |
-| sha256sum | `fsha256sum` | Optimized | SHA-256 checksums (mmap, madvise, readahead, parallel) |
-| md5sum | `fmd5sum` | Optimized | MD5 checksums (mmap, batch I/O, parallel hash, batched output) |
-| b2sum | `fb2sum` | Optimized | BLAKE2b checksums (mmap, madvise, readahead) |
-| base64 | `fbase64` | Optimized | Base64 encode/decode (SIMD, parallel, fused strip+decode) |
-| sort | `fsort` | Optimized | Line sorting (parallel merge sort) |
-| tr | `ftr` | Optimized | Character translation (SIMD pshufb compact, AVX2/SSE2, parallel) |
-| uniq | `funiq` | Optimized | Filter duplicate lines (mmap, zero-copy, single-pass) |
-| tac | `ftac` | Optimized | Reverse file lines (parallel memchr, zero-copy writev, vmsplice) |
+### Performance-Optimized (10 tools, independently benchmarked)
+
+| Tool | Binary | Description |
+|------|--------|-------------|
+| wc | `fwc` | Word, line, char, byte count (SIMD SSE2, single-pass, parallel) |
+| cut | `fcut` | Field/byte/char extraction (mmap, SIMD) |
+| sha256sum | `fsha256sum` | SHA-256 checksums (mmap, madvise, readahead, parallel) |
+| md5sum | `fmd5sum` | MD5 checksums (mmap, batch I/O, parallel hash, batched output) |
+| b2sum | `fb2sum` | BLAKE2b checksums (mmap, madvise, readahead) |
+| base64 | `fbase64` | Base64 encode/decode (SIMD, parallel, fused strip+decode) |
+| sort | `fsort` | Line sorting (parallel merge sort) |
+| tr | `ftr` | Character translation (SIMD pshufb compact, AVX2/SSE2, parallel) |
+| uniq | `funiq` | Filter duplicate lines (mmap, zero-copy, single-pass) |
+| tac | `ftac` | Reverse file lines (parallel memchr, zero-copy writev, vmsplice) |
+
+### Additional Tools (11 tools, GNU-compatible)
+
+| Tool | Binary | Description |
+|------|--------|-------------|
+| head | `fhead` | Output first lines of files (zero-copy mmap, SIMD newline scan) |
+| tail | `ftail` | Output last lines of files (reverse SIMD scan, follow mode) |
+| cat | `fcat` | Concatenate files (zero-copy splice/sendfile, mmap) |
+| rev | `frev` | Reverse lines character-by-character (mmap, SIMD) |
+| expand | `fexpand` | Convert tabs to spaces (mmap, configurable tab stops) |
+| unexpand | `funexpand` | Convert spaces to tabs (mmap, configurable tab stops) |
+| fold | `ffold` | Wrap lines to specified width (mmap, byte/char modes) |
+| paste | `fpaste` | Merge lines of files (mmap, serial/parallel modes) |
+| nl | `fnl` | Number lines of files (mmap, section delimiters, regex) |
+| comm | `fcomm` | Compare sorted files line by line (mmap, SIMD) |
+| join | `fjoin` | Join lines of two sorted files on a common field (mmap) |
 
 ## Installation
 
@@ -96,6 +114,28 @@ ftr -d '[:space:]' < file # Delete whitespace
 funiq file.txt            # Remove adjacent duplicates
 funiq -c file.txt         # Count occurrences
 ftac file.txt             # Print lines in reverse order
+
+# File viewing and transformation
+fhead -n 20 file.txt      # First 20 lines
+ftail -n 20 file.txt      # Last 20 lines
+ftail -f logfile.txt      # Follow file for new lines
+fcat file1.txt file2.txt  # Concatenate files
+fcat -n file.txt          # With line numbers
+frev file.txt             # Reverse each line
+
+# Text formatting
+fexpand file.txt          # Convert tabs to spaces
+funexpand file.txt        # Convert spaces to tabs
+ffold -w 80 file.txt      # Wrap lines at 80 columns
+fnl file.txt              # Number lines
+fpaste file1 file2        # Merge files line by line
+fpaste -s file.txt        # Serial mode (join all lines)
+
+# Set operations on sorted files
+fcomm file1 file2         # Compare two sorted files
+fcomm -12 file1 file2     # Only lines common to both
+fjoin file1 file2         # Join on common field
+fjoin -t, -1 2 -2 1 a b  # Join CSV files on specific fields
 ```
 
 ## Key Optimizations
