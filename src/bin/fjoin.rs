@@ -375,6 +375,7 @@ fn main() {
                 process::exit(1);
             }
             if had_order_error {
+                eprintln!("{}: input is not in sorted order", tool_name);
                 process::exit(1);
             }
         }

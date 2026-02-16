@@ -248,19 +248,19 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
         return Ok((sec, nsec));
     }
 
-    // Relative date: "yesterday"
+    // Relative date: "yesterday" — GNU date -d yesterday means 24 hours ago from now
     if trimmed.eq_ignore_ascii_case("yesterday") {
-        let midnight = today_midnight()?;
-        return Ok((midnight - 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec - 86400, 0));
     }
 
-    // Relative date: "tomorrow"
+    // Relative date: "tomorrow" — 24 hours from now
     if trimmed.eq_ignore_ascii_case("tomorrow") {
-        let midnight = today_midnight()?;
-        return Ok((midnight + 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec + 86400, 0));
     }
 
-    // Relative date: "N days ago"
+    // Relative date: "N days ago" — N*86400 seconds before now
     if let Some(rest) = trimmed.strip_suffix(" ago") {
         let rest = rest.trim();
         if let Some(num_str) = rest
@@ -268,19 +268,19 @@ fn parse_date_string(s: &str) -> Result<(i64, i64), String> {
             .or_else(|| rest.strip_suffix(" day"))
             && let Ok(n) = num_str.trim().parse::<i64>()
         {
-            let midnight = today_midnight()?;
-            return Ok((midnight - n * 86400, 0));
+            let (sec, _) = current_time();
+            return Ok((sec - n * 86400, 0));
         }
     }
 
-    // Relative date: "N days" (future)
+    // Relative date: "N days" (future) — N*86400 seconds from now
     if let Some(num_str) = trimmed
         .strip_suffix(" days")
         .or_else(|| trimmed.strip_suffix(" day"))
         && let Ok(n) = num_str.trim().parse::<i64>()
     {
-        let midnight = today_midnight()?;
-        return Ok((midnight + n * 86400, 0));
+        let (sec, _) = current_time();
+        return Ok((sec + n * 86400, 0));
     }
 
     // Epoch seconds: @N or @N.N

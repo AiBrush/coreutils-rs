@@ -82,17 +82,22 @@ fn topological_sort(
     while let Some(node) = stack.pop() {
         result.push(node.clone());
         if let Some(neighbors) = adj.get(&node) {
-            // Process successors in insertion order; push onto stack
-            // LIFO means last-pushed (last successor) gets processed first
+            // Collect newly freed successors, then push in reverse order
+            // so that the first successor in adjacency list is on top of the stack
+            // and gets processed first (matching GNU tsort's DFS ordering)
+            let mut new_zeros = Vec::new();
             for neighbor in neighbors {
                 if let Some(deg) = in_degree.get_mut(neighbor)
                     && *deg > 0
                 {
                     *deg -= 1;
                     if *deg == 0 {
-                        stack.push(neighbor.clone());
+                        new_zeros.push(neighbor.clone());
                     }
                 }
+            }
+            for n in new_zeros.into_iter().rev() {
+                stack.push(n);
             }
         }
     }
@@ -195,15 +200,19 @@ fn run(input: &str, source_name: &str) -> i32 {
             while let Some(node) = stack.pop() {
                 resolved.push(node.clone());
                 if let Some(neighbors) = adj.get(&node) {
+                    let mut new_zeros = Vec::new();
                     for nb in neighbors {
                         if let Some(d) = in_deg.get_mut(nb)
                             && *d > 0
                         {
                             *d -= 1;
                             if *d == 0 {
-                                stack.push(nb.clone());
+                                new_zeros.push(nb.clone());
                             }
                         }
+                    }
+                    for n in new_zeros.into_iter().rev() {
+                        stack.push(n);
                     }
                 }
             }
