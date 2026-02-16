@@ -441,6 +441,65 @@ fn group_thousands(s: &str) -> String {
     format!("{}{}{}", sign, result, rest)
 }
 
+/// Apply width/padding from a printf-style format string to an already-scaled string.
+/// Used when both --to and --format are specified.
+fn apply_format_padding(scaled: &str, fmt: &str) -> String {
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+
+    // Find '%'.
+    while i < bytes.len() && bytes[i] != b'%' {
+        i += 1;
+    }
+    let prefix = &fmt[..i];
+    if i >= bytes.len() {
+        return format!("{}{}", prefix, scaled);
+    }
+    i += 1; // skip '%'
+
+    // Parse flags.
+    let mut left_align = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0' | b'+' | b' ' | b'#' | b'\'' => {}
+            b'-' => left_align = true,
+            _ => break,
+        }
+        i += 1;
+    }
+
+    // Parse width.
+    let mut width: usize = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        width = width
+            .saturating_mul(10)
+            .saturating_add((bytes[i] - b'0') as usize);
+        i += 1;
+    }
+
+    // Skip precision and conversion char.
+    while i < bytes.len() && (bytes[i] == b'.' || bytes[i].is_ascii_digit()) {
+        i += 1;
+    }
+    if i < bytes.len() {
+        i += 1; // skip conversion char
+    }
+    let suffix = &fmt[i..];
+
+    let padded = if width > 0 && scaled.len() < width {
+        let pad_len = width - scaled.len();
+        if left_align {
+            format!("{}{}", scaled, " ".repeat(pad_len))
+        } else {
+            format!("{}{}", " ".repeat(pad_len), scaled)
+        }
+    } else {
+        scaled.to_string()
+    };
+
+    format!("{}{}{}", prefix, padded, suffix)
+}
+
 /// Apply printf-style format to a number.
 fn apply_format(value: f64, fmt: &str) -> Result<String, String> {
     // Parse format: %[flags][width][.precision]f
@@ -652,11 +711,11 @@ fn convert_number(token: &str, config: &NumfmtConfig) -> Result<String, String> 
 
     // Format the output.
     let mut result = if let Some(ref fmt) = config.format {
-        // If --to is also specified, first scale, then format.
+        // If --to is also specified, first scale, then apply format padding.
         if config.to != ScaleUnit::None {
-            // When both --format and --to are given, the scaled output
-            // is used as-is (GNU behavior).
-            format_scaled(value, config.to, config.round)
+            let scaled = format_scaled(value, config.to, config.round);
+            // Extract width from the format string and apply padding.
+            apply_format_padding(&scaled, fmt)
         } else {
             let rounded = apply_round(value, config.round);
             apply_format(rounded, fmt)?

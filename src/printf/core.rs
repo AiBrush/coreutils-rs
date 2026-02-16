@@ -237,6 +237,12 @@ fn process_conversion(
             let formatted = apply_float_format(&s, val < 0.0, &flags, width);
             output.extend_from_slice(formatted.as_bytes());
         }
+        b'q' => {
+            let s = arg;
+            let quoted = shell_quote(s);
+            let formatted = apply_string_format(&quoted, &flags, width, precision);
+            output.extend_from_slice(&formatted);
+        }
         _ => {
             // Unknown conversion: output literally
             output.push(b'%');
@@ -812,6 +818,76 @@ fn format_g(value: f64, prec: usize, upper: bool) -> String {
         };
         let s = format!("{value:.decimal_prec$}");
         trim_g_trailing_zeros(&s)
+    }
+}
+
+/// Shell-quote a string for %q format specifier (GNU printf compat).
+/// Uses backslash escaping for special characters, or $'...' for control chars.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+
+    // Check if the string needs quoting at all.
+    let needs_quoting = s.bytes().any(|b| {
+        !b.is_ascii_alphanumeric()
+            && b != b'_'
+            && b != b'/'
+            && b != b'.'
+            && b != b'-'
+            && b != b':'
+            && b != b','
+            && b != b'+'
+            && b != b'@'
+            && b != b'%'
+    });
+
+    if !needs_quoting {
+        return s.to_string();
+    }
+
+    // Check if we have control characters that need $'...' quoting.
+    let has_control = s.bytes().any(|b| b < 0x20 || b == 0x7f || b >= 0x80);
+
+    if has_control {
+        let mut result = String::from("$'");
+        for byte in s.bytes() {
+            match byte {
+                b'\'' => result.push_str("\\'"),
+                b'\\' => result.push_str("\\\\"),
+                b'\n' => result.push_str("\\n"),
+                b'\t' => result.push_str("\\t"),
+                b'\r' => result.push_str("\\r"),
+                0x07 => result.push_str("\\a"),
+                0x08 => result.push_str("\\b"),
+                0x0c => result.push_str("\\f"),
+                0x0b => result.push_str("\\v"),
+                0x1b => result.push_str("\\E"),
+                b if b < 0x20 || b == 0x7f => {
+                    result.push_str(&format!("\\{:03o}", b));
+                }
+                b if b >= 0x80 => {
+                    result.push_str(&format!("\\{:03o}", b));
+                }
+                _ => result.push(byte as char),
+            }
+        }
+        result.push('\'');
+        result
+    } else {
+        // Use backslash escaping for simple special chars.
+        let mut result = String::with_capacity(s.len() * 2);
+        for ch in s.chars() {
+            match ch {
+                ' ' | '\'' | '"' | '\\' | '$' | '`' | '!' | '(' | ')' | '[' | ']' | '{' | '}'
+                | '<' | '>' | '|' | '&' | ';' | '#' | '~' | '?' | '*' | '=' | '^' => {
+                    result.push('\\');
+                    result.push(ch);
+                }
+                _ => result.push(ch),
+            }
+        }
+        result
     }
 }
 

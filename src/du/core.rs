@@ -128,8 +128,11 @@ fn du_recursive(
     let mtime = meta.mtime();
 
     if meta.is_dir() {
-        // For separate_dirs, don't seed with this directory's own allocation.
-        let mut dir_size: u64 = if config.separate_dirs { 0 } else { size };
+        // Track the full subtree size (for returning to parent)
+        // and the display size (what we show for this directory).
+        let mut subtree_size: u64 = size;
+        // For separate_dirs, display size only includes this dir + direct files, not subdirs.
+        let mut display_size: u64 = size;
 
         let read_dir = match std::fs::read_dir(path) {
             Ok(rd) => rd,
@@ -177,6 +180,9 @@ fn du_recursive(
                 }
             }
 
+            // Check if child is a directory (for separate_dirs logic).
+            let child_is_dir = child_path.symlink_metadata().map_or(false, |m| m.is_dir());
+
             let child_size = du_recursive(
                 &child_path,
                 config,
@@ -185,21 +191,24 @@ fn du_recursive(
                 depth + 1,
                 Some(root_dev.unwrap_or(meta.dev())),
             )?;
-            dir_size += child_size;
+            subtree_size += child_size;
+            if config.separate_dirs && child_is_dir {
+                // Don't add subdirectory sizes to display size.
+            } else {
+                display_size += child_size;
+            }
         }
 
         // Emit an entry for this directory if within display depth.
         if should_report_dir(config, depth) {
             entries.push(DuEntry {
-                size: dir_size,
+                size: display_size,
                 path: path.to_path_buf(),
                 mtime: if config.show_time { Some(mtime) } else { None },
             });
         }
 
-        // Return the total contribution of this subtree to the parent.
-        // With separate_dirs the directory's own allocation is still counted upward.
-        Ok(dir_size + if config.separate_dirs { size } else { 0 })
+        Ok(subtree_size)
     } else {
         // Regular file / symlink / special file.
         if config.all && within_depth(config, depth) {

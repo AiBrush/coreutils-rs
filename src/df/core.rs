@@ -274,28 +274,29 @@ fn is_pseudo(fstype: &str) -> bool {
 }
 
 /// Get filesystem info for all relevant mount points.
-pub fn get_filesystems(config: &DfConfig) -> Vec<FsInfo> {
+/// Returns (filesystems, had_error) where had_error is true if any file was not found.
+pub fn get_filesystems(config: &DfConfig) -> (Vec<FsInfo>, bool) {
     let mounts = read_mounts();
+    let mut had_error = false;
 
     // If specific files are given, find their mount points.
     if !config.files.is_empty() {
         let mut result = Vec::new();
-        let mut seen_targets = HashSet::new();
+        // GNU df does NOT deduplicate when specific files are given.
         for file in &config.files {
             match find_mount_for_file(file, &mounts) {
                 Some(mount) => {
-                    if seen_targets.insert(mount.target.clone()) {
-                        if let Some(info) = statvfs_info(mount) {
-                            result.push(info);
-                        }
+                    if let Some(info) = statvfs_info(mount) {
+                        result.push(info);
                     }
                 }
                 None => {
                     eprintln!("df: {}: No such file or directory", file);
+                    had_error = true;
                 }
             }
         }
-        return result;
+        return (result, had_error);
     }
 
     let mut result = Vec::new();
@@ -340,7 +341,7 @@ pub fn get_filesystems(config: &DfConfig) -> Vec<FsInfo> {
         }
     }
 
-    result
+    (result, had_error)
 }
 
 // ──────────────────────────────────────────────────
@@ -475,93 +476,15 @@ pub fn parse_output_fields(s: &str) -> Result<Vec<String>, String> {
 }
 
 // ──────────────────────────────────────────────────
-// Output formatting
+// Output formatting (GNU-compatible auto-sized columns)
 // ──────────────────────────────────────────────────
-
-/// Print the df output header.
-pub fn print_header(config: &DfConfig, out: &mut impl Write) -> io::Result<()> {
-    if let Some(ref fields) = config.output_fields {
-        let headers: Vec<String> = fields
-            .iter()
-            .map(|f| match f.as_str() {
-                "source" => "Filesystem".to_string(),
-                "fstype" => "Type".to_string(),
-                "itotal" => "Inodes".to_string(),
-                "iused" => "IUsed".to_string(),
-                "iavail" => "IFree".to_string(),
-                "ipcent" => "IUse%".to_string(),
-                "size" => size_header(config),
-                "used" => "Used".to_string(),
-                "avail" => "Avail".to_string(),
-                "pcent" => "Use%".to_string(),
-                "file" => "File".to_string(),
-                "target" => "Mounted on".to_string(),
-                _ => f.clone(),
-            })
-            .collect();
-        writeln!(out, "{}", headers.join(" "))?;
-    } else if config.inodes {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            "Filesystem", "Inodes", "IUsed", "IFree", "IUse%", "Mounted on"
-        )?;
-    } else if config.portability {
-        if config.print_type {
-            writeln!(
-                out,
-                "{:<20} {:<8} {:>12} {:>12} {:>12} {:>5} {}",
-                "Filesystem",
-                "Type",
-                size_header(config),
-                "Used",
-                "Available",
-                "Capacity",
-                "Mounted on"
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{:<20} {:>12} {:>12} {:>12} {:>5} {}",
-                "Filesystem",
-                size_header(config),
-                "Used",
-                "Available",
-                "Capacity",
-                "Mounted on"
-            )?;
-        }
-    } else if config.print_type {
-        writeln!(
-            out,
-            "{:<20} {:<8} {:>10} {:>10} {:>10} {:>5} {}",
-            "Filesystem",
-            "Type",
-            size_header(config),
-            "Used",
-            "Avail",
-            "Use%",
-            "Mounted on"
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            "Filesystem",
-            size_header(config),
-            "Used",
-            "Avail",
-            "Use%",
-            "Mounted on"
-        )?;
-    }
-    Ok(())
-}
 
 /// Determine the size column header.
 fn size_header(config: &DfConfig) -> String {
     if config.human_readable || config.si {
         "Size".to_string()
+    } else if config.portability {
+        "1024-blocks".to_string()
     } else if config.block_size == 1024 {
         "1K-blocks".to_string()
     } else if config.block_size == 1024 * 1024 {
@@ -571,10 +494,10 @@ fn size_header(config: &DfConfig) -> String {
     }
 }
 
-/// Print a single filesystem info line.
-pub fn print_fs_line(info: &FsInfo, config: &DfConfig, out: &mut impl Write) -> io::Result<()> {
+/// Build a row of string values for a filesystem entry.
+fn build_row(info: &FsInfo, config: &DfConfig) -> Vec<String> {
     if let Some(ref fields) = config.output_fields {
-        let values: Vec<String> = fields
+        return fields
             .iter()
             .map(|f| match f.as_str() {
                 "source" => info.source.clone(),
@@ -592,76 +515,120 @@ pub fn print_fs_line(info: &FsInfo, config: &DfConfig, out: &mut impl Write) -> 
                 _ => String::new(),
             })
             .collect();
-        writeln!(out, "{}", values.join(" "))?;
-    } else if config.inodes {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            info.source,
-            info.itotal,
-            info.iused,
-            info.iavail,
-            format_percent(info.iuse_percent),
-            info.target
-        )?;
-    } else if config.portability {
-        if config.print_type {
-            writeln!(
-                out,
-                "{:<20} {:<8} {:>12} {:>12} {:>12} {:>5} {}",
-                info.source,
-                info.fstype,
-                format_size(info.total, config),
-                format_size(info.used, config),
-                format_size(info.available, config),
-                format_percent(info.use_percent),
-                info.target
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{:<20} {:>12} {:>12} {:>12} {:>5} {}",
-                info.source,
-                format_size(info.total, config),
-                format_size(info.used, config),
-                format_size(info.available, config),
-                format_percent(info.use_percent),
-                info.target
-            )?;
-        }
-    } else if config.print_type {
-        writeln!(
-            out,
-            "{:<20} {:<8} {:>10} {:>10} {:>10} {:>5} {}",
-            info.source,
-            info.fstype,
-            format_size(info.total, config),
-            format_size(info.used, config),
-            format_size(info.available, config),
-            format_percent(info.use_percent),
-            info.target
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            info.source,
-            format_size(info.total, config),
-            format_size(info.used, config),
-            format_size(info.available, config),
-            format_percent(info.use_percent),
-            info.target
-        )?;
     }
-    Ok(())
+
+    let avail_header = if config.portability {
+        "Available"
+    } else {
+        "Avail"
+    };
+    let _ = avail_header;
+
+    if config.inodes {
+        vec![
+            info.source.clone(),
+            format!("{}", info.itotal),
+            format!("{}", info.iused),
+            format!("{}", info.iavail),
+            format_percent(info.iuse_percent),
+            info.target.clone(),
+        ]
+    } else if config.print_type {
+        vec![
+            info.source.clone(),
+            info.fstype.clone(),
+            format_size(info.total, config),
+            format_size(info.used, config),
+            format_size(info.available, config),
+            format_percent(info.use_percent),
+            info.target.clone(),
+        ]
+    } else {
+        vec![
+            info.source.clone(),
+            format_size(info.total, config),
+            format_size(info.used, config),
+            format_size(info.available, config),
+            format_percent(info.use_percent),
+            info.target.clone(),
+        ]
+    }
 }
 
-/// Print the total line.
-pub fn print_total_line(
-    filesystems: &[FsInfo],
-    config: &DfConfig,
-    out: &mut impl Write,
-) -> io::Result<()> {
+/// Build the header row.
+fn build_header_row(config: &DfConfig) -> Vec<String> {
+    if let Some(ref fields) = config.output_fields {
+        return fields
+            .iter()
+            .map(|f| match f.as_str() {
+                "source" => "Filesystem".to_string(),
+                "fstype" => "Type".to_string(),
+                "itotal" => "Inodes".to_string(),
+                "iused" => "IUsed".to_string(),
+                "iavail" => "IFree".to_string(),
+                "ipcent" => "IUse%".to_string(),
+                "size" => size_header(config),
+                "used" => "Used".to_string(),
+                "avail" => "Avail".to_string(),
+                "pcent" => "Use%".to_string(),
+                "file" => "File".to_string(),
+                "target" => "Mounted on".to_string(),
+                _ => f.clone(),
+            })
+            .collect();
+    }
+
+    let pct_header = if config.portability {
+        "Capacity"
+    } else if config.inodes {
+        "IUse%"
+    } else {
+        "Use%"
+    };
+
+    if config.inodes {
+        vec![
+            "Filesystem".to_string(),
+            "Inodes".to_string(),
+            "IUsed".to_string(),
+            "IFree".to_string(),
+            pct_header.to_string(),
+            "Mounted on".to_string(),
+        ]
+    } else if config.print_type {
+        vec![
+            "Filesystem".to_string(),
+            "Type".to_string(),
+            size_header(config),
+            "Used".to_string(),
+            if config.portability {
+                "Available"
+            } else {
+                "Avail"
+            }
+            .to_string(),
+            pct_header.to_string(),
+            "Mounted on".to_string(),
+        ]
+    } else {
+        vec![
+            "Filesystem".to_string(),
+            size_header(config),
+            "Used".to_string(),
+            if config.portability {
+                "Available"
+            } else {
+                "Avail"
+            }
+            .to_string(),
+            pct_header.to_string(),
+            "Mounted on".to_string(),
+        ]
+    }
+}
+
+/// Build a total row.
+fn build_total_row(filesystems: &[FsInfo], config: &DfConfig) -> Vec<String> {
     let total_size: u64 = filesystems.iter().map(|f| f.total).sum();
     let total_used: u64 = filesystems.iter().map(|f| f.used).sum();
     let total_avail: u64 = filesystems.iter().map(|f| f.available).sum();
@@ -684,41 +651,194 @@ pub fn print_total_line(
     };
 
     if config.inodes {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            "total",
-            total_itotal,
-            total_iused,
-            total_iavail,
+        vec![
+            "total".to_string(),
+            format!("{}", total_itotal),
+            format!("{}", total_iused),
+            format!("{}", total_iavail),
             format_percent(iuse_pct),
-            "-"
-        )?;
+            "-".to_string(),
+        ]
     } else if config.print_type {
-        writeln!(
-            out,
-            "{:<20} {:<8} {:>10} {:>10} {:>10} {:>5} {}",
-            "total",
-            "-",
+        vec![
+            "total".to_string(),
+            "-".to_string(),
             format_size(total_size, config),
             format_size(total_used, config),
             format_size(total_avail, config),
             format_percent(use_pct),
-            "-"
-        )?;
+            "-".to_string(),
+        ]
     } else {
-        writeln!(
-            out,
-            "{:<20} {:>10} {:>10} {:>10} {:>5} {}",
-            "total",
+        vec![
+            "total".to_string(),
             format_size(total_size, config),
             format_size(total_used, config),
             format_size(total_avail, config),
             format_percent(use_pct),
-            "-"
-        )?;
+            "-".to_string(),
+        ]
     }
+}
+
+/// Column alignment type.
+enum ColAlign {
+    Left,
+    Right,
+    None, // last column, no padding
+}
+
+/// Get column alignment for the standard df output.
+fn get_col_alignments(config: &DfConfig, num_cols: usize) -> Vec<ColAlign> {
+    if num_cols == 0 {
+        return vec![];
+    }
+    let mut aligns = Vec::with_capacity(num_cols);
+
+    if config.output_fields.is_some() {
+        // For --output, first column is left-aligned, rest right-aligned, last is no-pad.
+        aligns.push(ColAlign::Left);
+        for _ in 1..num_cols.saturating_sub(1) {
+            aligns.push(ColAlign::Right);
+        }
+        if num_cols > 1 {
+            aligns.push(ColAlign::None);
+        }
+    } else if config.print_type {
+        // Filesystem(left) Type(left) Size(right) Used(right) Avail(right) Use%(right) Mounted(none)
+        aligns.push(ColAlign::Left);
+        aligns.push(ColAlign::Left);
+        for _ in 2..num_cols.saturating_sub(1) {
+            aligns.push(ColAlign::Right);
+        }
+        if num_cols > 2 {
+            aligns.push(ColAlign::None);
+        }
+    } else {
+        // Filesystem(left) numeric(right)... last(none)
+        aligns.push(ColAlign::Left);
+        for _ in 1..num_cols.saturating_sub(1) {
+            aligns.push(ColAlign::Right);
+        }
+        if num_cols > 1 {
+            aligns.push(ColAlign::None);
+        }
+    }
+
+    aligns
+}
+
+/// Print all rows with auto-sized columns, matching GNU df output format.
+fn print_table(
+    header: &[String],
+    rows: &[Vec<String>],
+    config: &DfConfig,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let num_cols = header.len();
+    if num_cols == 0 {
+        return Ok(());
+    }
+
+    // Compute column widths from header and all data rows.
+    let mut widths = vec![0usize; num_cols];
+    for (i, h) in header.iter().enumerate() {
+        widths[i] = widths[i].max(h.len());
+    }
+    for row in rows {
+        for (i, val) in row.iter().enumerate() {
+            if i < num_cols {
+                widths[i] = widths[i].max(val.len());
+            }
+        }
+    }
+
+    let aligns = get_col_alignments(config, num_cols);
+
+    // Print header.
+    print_row(header, &widths, &aligns, out)?;
+
+    // Print data rows.
+    for row in rows {
+        print_row(row, &widths, &aligns, out)?;
+    }
+
     Ok(())
+}
+
+/// Print a single row with the given column widths and alignments.
+fn print_row(
+    row: &[String],
+    widths: &[usize],
+    aligns: &[ColAlign],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let num_cols = widths.len();
+    for (i, val) in row.iter().enumerate() {
+        if i < num_cols {
+            if i > 0 {
+                write!(out, " ")?;
+            }
+            let w = widths[i];
+            match aligns.get(i).unwrap_or(&ColAlign::Right) {
+                ColAlign::Left => write!(out, "{:<width$}", val, width = w)?,
+                ColAlign::Right => write!(out, "{:>width$}", val, width = w)?,
+                ColAlign::None => write!(out, "{}", val)?,
+            }
+        }
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Print the df output header (for backward compat with tests).
+pub fn print_header(config: &DfConfig, out: &mut impl Write) -> io::Result<()> {
+    let header = build_header_row(config);
+    // Use minimal widths from just the header itself.
+    let widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    let aligns = get_col_alignments(config, header.len());
+    print_row(&header, &widths, &aligns, out)
+}
+
+/// Print a single filesystem info line (for backward compat with tests).
+pub fn print_fs_line(info: &FsInfo, config: &DfConfig, out: &mut impl Write) -> io::Result<()> {
+    let header = build_header_row(config);
+    let row = build_row(info, config);
+    // Compute widths from both header and this single row.
+    let num_cols = header.len();
+    let mut widths = vec![0usize; num_cols];
+    for (i, h) in header.iter().enumerate() {
+        widths[i] = widths[i].max(h.len());
+    }
+    for (i, v) in row.iter().enumerate() {
+        if i < num_cols {
+            widths[i] = widths[i].max(v.len());
+        }
+    }
+    let aligns = get_col_alignments(config, num_cols);
+    print_row(&row, &widths, &aligns, out)
+}
+
+/// Print the total line (for backward compat with tests).
+pub fn print_total_line(
+    filesystems: &[FsInfo],
+    config: &DfConfig,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let row = build_total_row(filesystems, config);
+    let header = build_header_row(config);
+    let num_cols = header.len();
+    let mut widths = vec![0usize; num_cols];
+    for (i, h) in header.iter().enumerate() {
+        widths[i] = widths[i].max(h.len());
+    }
+    for (i, v) in row.iter().enumerate() {
+        if i < num_cols {
+            widths[i] = widths[i].max(v.len());
+        }
+    }
+    let aligns = get_col_alignments(config, num_cols);
+    print_row(&row, &widths, &aligns, out)
 }
 
 /// Run the df command and write output.
@@ -726,9 +846,19 @@ pub fn run_df(config: &DfConfig) -> i32 {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
-    let filesystems = get_filesystems(config);
+    let (filesystems, had_error) = get_filesystems(config);
 
-    if let Err(e) = print_header(config, &mut out) {
+    let header = build_header_row(config);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for info in &filesystems {
+        rows.push(build_row(info, config));
+    }
+
+    if config.total {
+        rows.push(build_total_row(&filesystems, config));
+    }
+
+    if let Err(e) = print_table(&header, &rows, config, &mut out) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             return 0;
         }
@@ -736,26 +866,6 @@ pub fn run_df(config: &DfConfig) -> i32 {
         return 1;
     }
 
-    for info in &filesystems {
-        if let Err(e) = print_fs_line(info, config, &mut out) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return 0;
-            }
-            eprintln!("df: write error: {}", e);
-            return 1;
-        }
-    }
-
-    if config.total {
-        if let Err(e) = print_total_line(&filesystems, config, &mut out) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return 0;
-            }
-            eprintln!("df: write error: {}", e);
-            return 1;
-        }
-    }
-
     let _ = out.flush();
-    0
+    if had_error { 1 } else { 0 }
 }
