@@ -99,7 +99,7 @@ enum OutputFormat {
 const DEFAULT_DATABASE: &str = "\
 # Configuration file for dircolors, a utility to help you set the
 # LS_COLORS environment variable used by GNU ls with the --color option.
-# Copyright (C) 1996-2024 Free Software Foundation, Inc.
+# Copyright (C) 1996-2025 Free Software Foundation, Inc.
 # Copying and distribution of this file, with or without modification,
 # are permitted provided the copyright notice and this notice are preserved.
 #
@@ -446,10 +446,18 @@ fn parse_database(input: &str) -> ParsedDatabase {
         entries.push(format!("{ls_key}={value}"));
     }
 
+    let ls_colors = if entries.is_empty() {
+        String::new()
+    } else {
+        let mut s = entries.join(":");
+        s.push(':');
+        s
+    };
+
     ParsedDatabase {
         term_patterns,
         colorterm_patterns,
-        ls_colors: entries.join(":"),
+        ls_colors,
     }
 }
 
