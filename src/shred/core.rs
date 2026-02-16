@@ -102,7 +102,8 @@ pub fn shred_file(path: &Path, config: &ShredConfig) -> io::Result<()> {
     };
 
     let mut file = fs::OpenOptions::new().write(true).open(path)?;
-    let buf_size = 65536usize; // 64KB buffer
+    // Use 1MB buffer for fewer read/write syscalls (~16x fewer than 64KB)
+    let buf_size = 1024 * 1024usize;
     let mut rng_buf = vec![0u8; buf_size];
 
     let total_passes = config.iterations + if config.zero_pass { 1 } else { 0 };

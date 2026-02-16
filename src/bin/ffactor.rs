@@ -84,7 +84,7 @@ fn main() {
     }
 
     let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
     let mut had_error = false;
 
     if numbers.is_empty() {

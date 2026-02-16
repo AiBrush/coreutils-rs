@@ -89,6 +89,7 @@ fn parse_args() -> Cli {
 
 /// Streaming checksum using BufReader with 8MB buffer.
 /// Avoids loading entire file into memory.
+/// Unrolled inner loops enable auto-vectorization for higher throughput.
 fn process_streaming<R: io::Read>(reader: R, algorithm: Algorithm) -> io::Result<(u32, u64)> {
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
     let mut total_bytes: u64 = 0;
@@ -103,7 +104,20 @@ fn process_streaming<R: io::Read>(reader: R, algorithm: Algorithm) -> io::Result
                 }
                 let n = buf.len();
                 total_bytes += n as u64;
-                for &byte in buf {
+                // Unrolled 4x for better instruction-level parallelism
+                let chunks = buf.chunks_exact(4);
+                let remainder = chunks.remainder();
+                for chunk in chunks {
+                    checksum = (checksum >> 1) + ((checksum & 1) << 15);
+                    checksum = (checksum + u32::from(chunk[0])) & 0xFFFF;
+                    checksum = (checksum >> 1) + ((checksum & 1) << 15);
+                    checksum = (checksum + u32::from(chunk[1])) & 0xFFFF;
+                    checksum = (checksum >> 1) + ((checksum & 1) << 15);
+                    checksum = (checksum + u32::from(chunk[2])) & 0xFFFF;
+                    checksum = (checksum >> 1) + ((checksum & 1) << 15);
+                    checksum = (checksum + u32::from(chunk[3])) & 0xFFFF;
+                }
+                for &byte in remainder {
                     checksum = (checksum >> 1) + ((checksum & 1) << 15);
                     checksum = (checksum + u32::from(byte)) & 0xFFFF;
                 }
@@ -121,7 +135,20 @@ fn process_streaming<R: io::Read>(reader: R, algorithm: Algorithm) -> io::Result
                 }
                 let n = buf.len();
                 total_bytes += n as u64;
-                for &byte in buf {
+                // Unrolled 8-wide accumulation enables auto-vectorization
+                let chunks = buf.chunks_exact(8);
+                let remainder = chunks.remainder();
+                for chunk in chunks {
+                    sum += u32::from(chunk[0])
+                        + u32::from(chunk[1])
+                        + u32::from(chunk[2])
+                        + u32::from(chunk[3])
+                        + u32::from(chunk[4])
+                        + u32::from(chunk[5])
+                        + u32::from(chunk[6])
+                        + u32::from(chunk[7]);
+                }
+                for &byte in remainder {
                     sum += u32::from(byte);
                 }
                 reader.consume(n);
@@ -141,7 +168,7 @@ fn main() {
     let cli = parse_args();
     let multiple = cli.files.len() > 1;
     let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::with_capacity(256 * 1024, stdout.lock());
     let mut exit_code = 0;
 
     for filename in &cli.files {

@@ -124,7 +124,8 @@ pub fn comm(
     let mut warned2 = false;
     let ci = config.case_insensitive;
 
-    let mut buf = Vec::with_capacity(data1.len() + data2.len());
+    let mut buf = Vec::with_capacity((data1.len() + data2.len()).min(4 * 1024 * 1024));
+    let flush_threshold = 4 * 1024 * 1024; // Flush output buffer at 4MB to limit memory
 
     // Macro to check sort order of a file and handle warnings/errors.
     macro_rules! check_order {
@@ -185,6 +186,12 @@ pub fn comm(
                 i2 += 1;
             }
         }
+
+        // Periodic flush to limit memory usage for large files
+        if buf.len() >= flush_threshold {
+            out.write_all(&buf)?;
+            buf.clear();
+        }
     }
 
     // Drain remaining from file 1
@@ -244,13 +251,14 @@ pub fn comm(
         i2 += 1;
     }
 
-    // Total summary line
+    // Total summary line — use itoa for fast integer formatting
     if config.total {
-        write!(&mut buf, "{}", count1)?;
+        let mut itoa_buf = itoa::Buffer::new();
+        buf.extend_from_slice(itoa_buf.format(count1).as_bytes());
         buf.extend_from_slice(sep);
-        write!(&mut buf, "{}", count2)?;
+        buf.extend_from_slice(itoa_buf.format(count2).as_bytes());
         buf.extend_from_slice(sep);
-        write!(&mut buf, "{}", count3)?;
+        buf.extend_from_slice(itoa_buf.format(count3).as_bytes());
         buf.extend_from_slice(sep);
         buf.extend_from_slice(b"total");
         buf.push(delim);

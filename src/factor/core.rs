@@ -125,34 +125,58 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
 }
 
 /// Pollard's rho algorithm to find a non-trivial factor of n.
-/// Uses Brent's cycle detection variant for efficiency.
+/// Uses Brent's cycle detection variant with batch GCD for efficiency.
+/// Batch GCD reduces the number of expensive GCD operations by ~100x.
 fn pollard_rho(n: u128) -> u128 {
     if n.is_multiple_of(2) {
         return 2;
     }
 
-    // We try multiple starting values and constants until we find a factor.
-    // Use a simple pseudo-random sequence based on the iteration count.
     for c_offset in 1u128..n {
         let c = c_offset;
         let mut x: u128 = c_offset.wrapping_mul(6364136223846793005).wrapping_add(1) % n;
         let mut y = x;
+
+        // Batch GCD: accumulate differences and check GCD every 128 iterations
+        let mut ys = x;
+        let mut q: u128 = 1;
+        let mut r: u128 = 1;
         let mut d: u128 = 1;
 
         while d == 1 {
-            // Brent's improvement: advance x, accumulate gcd in batches
-            x = mod_mul(x, x, n).wrapping_add(c) % n;
-            y = mod_mul(y, y, n).wrapping_add(c) % n;
-            y = mod_mul(y, y, n).wrapping_add(c) % n;
+            x = y;
+            for _ in 0..r {
+                y = mod_mul(y, y, n).wrapping_add(c) % n;
+            }
+            let mut k: u128 = 0;
+            while k < r && d == 1 {
+                ys = y;
+                let m = (r - k).min(128);
+                for _ in 0..m {
+                    y = mod_mul(y, y, n).wrapping_add(c) % n;
+                    q = mod_mul(q, x.abs_diff(y), n);
+                }
+                d = gcd(q, n);
+                k += m;
+            }
+            r *= 2;
+        }
 
-            d = gcd(x.abs_diff(y), n);
+        if d == n {
+            // Backtrack: find the exact factor
+            loop {
+                ys = mod_mul(ys, ys, n).wrapping_add(c) % n;
+                d = gcd(x.abs_diff(ys), n);
+                if d > 1 {
+                    break;
+                }
+            }
         }
 
         if d != n {
             return d;
         }
     }
-    // Fallback: should not reach here for composite numbers
     n
 }
 
@@ -234,12 +258,29 @@ pub fn factorize(n: u128) -> Vec<u128> {
 }
 
 /// Format a factorization result as "NUMBER: FACTOR FACTOR ..." matching GNU factor output.
+/// Uses stack-allocated buffer to avoid heap allocations for the common case.
 pub fn format_factors(n: u128) -> String {
     let factors = factorize(n);
-    if factors.is_empty() {
-        format!("{}:", n)
+    // Pre-allocate with estimated capacity to avoid reallocation
+    let mut result = String::with_capacity(64);
+    // Use itoa for fast u64 formatting when possible, fall back to Display for u128
+    if n <= u64::MAX as u128 {
+        let mut buf = itoa::Buffer::new();
+        result.push_str(buf.format(n as u64));
     } else {
-        let factor_strs: Vec<String> = factors.iter().map(|f| f.to_string()).collect();
-        format!("{}: {}", n, factor_strs.join(" "))
+        use std::fmt::Write;
+        let _ = write!(result, "{}", n);
     }
+    result.push(':');
+    for f in &factors {
+        result.push(' ');
+        if *f <= u64::MAX as u128 {
+            let mut buf = itoa::Buffer::new();
+            result.push_str(buf.format(*f as u64));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(result, "{}", f);
+        }
+    }
+    result
 }

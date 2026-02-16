@@ -348,8 +348,147 @@ fn seek_output_file(file: &mut File, seek_blocks: u64, block_size: usize) -> io:
     Ok(())
 }
 
+/// Check if any data conversion options are enabled.
+fn has_conversions(conv: &DdConv) -> bool {
+    conv.lcase || conv.ucase || conv.swab || conv.sync
+}
+
+/// Fast path: use copy_file_range when both input and output are files
+/// and no conversions are needed. This is zero-copy in the kernel.
+#[cfg(target_os = "linux")]
+fn try_copy_file_range_dd(config: &DdConfig) -> Option<io::Result<DdStats>> {
+    // Only usable when both are files, no conversions, and ibs == obs
+    if config.input.is_none() || config.output.is_none() {
+        return None;
+    }
+    if has_conversions(&config.conv) || config.ibs != config.obs {
+        return None;
+    }
+
+    let start_time = Instant::now();
+    let in_path = config.input.as_ref().unwrap();
+    let out_path = config.output.as_ref().unwrap();
+
+    let in_file = match File::open(in_path) {
+        Ok(f) => f,
+        Err(e) => return Some(Err(e)),
+    };
+
+    let mut out_opts = OpenOptions::new();
+    out_opts.write(true);
+    if config.conv.excl {
+        out_opts.create_new(true);
+    } else if !config.conv.nocreat {
+        out_opts.create(true);
+    }
+    if !config.conv.notrunc && !config.conv.excl {
+        out_opts.truncate(true);
+    }
+
+    let out_file = match out_opts.open(out_path) {
+        Ok(f) => f,
+        Err(e) => return Some(Err(e)),
+    };
+
+    use std::os::unix::io::AsRawFd;
+    let in_fd = in_file.as_raw_fd();
+    let out_fd = out_file.as_raw_fd();
+
+    // Handle skip
+    let skip_bytes = config.skip * config.ibs as u64;
+    let seek_bytes = config.seek * config.obs as u64;
+    let mut in_off: i64 = skip_bytes as i64;
+    let mut out_off: i64 = seek_bytes as i64;
+
+    let mut stats = DdStats::default();
+    let block_size = config.ibs;
+
+    // Determine total bytes to copy
+    let total_to_copy = if let Some(count) = config.count {
+        Some(count * block_size as u64)
+    } else {
+        None
+    };
+
+    let mut bytes_remaining = total_to_copy;
+    loop {
+        let chunk = match bytes_remaining {
+            Some(r) if r == 0 => break,
+            Some(r) => r.min(block_size as u64 * 1024) as usize, // copy in large chunks
+            None => block_size * 1024,
+        };
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                in_fd,
+                &mut in_off as *mut i64,
+                out_fd,
+                &mut out_off as *mut i64,
+                chunk,
+                0u32,
+            )
+        };
+
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL)
+                || err.raw_os_error() == Some(libc::ENOSYS)
+                || err.raw_os_error() == Some(libc::EXDEV)
+            {
+                return None; // Fall back to regular copy
+            }
+            return Some(Err(err));
+        }
+        if ret == 0 {
+            break;
+        }
+
+        let copied = ret as u64;
+        stats.bytes_copied += copied;
+
+        // Track block stats
+        let full_blocks = copied / block_size as u64;
+        let partial = copied % block_size as u64;
+        stats.records_in_full += full_blocks;
+        stats.records_out_full += full_blocks;
+        if partial > 0 {
+            stats.records_in_partial += 1;
+            stats.records_out_partial += 1;
+        }
+
+        if let Some(ref mut r) = bytes_remaining {
+            *r = r.saturating_sub(copied);
+        }
+    }
+
+    // fsync / fdatasync
+    if config.conv.fsync {
+        if let Err(e) = out_file.sync_all() {
+            return Some(Err(e));
+        }
+    } else if config.conv.fdatasync {
+        if let Err(e) = out_file.sync_data() {
+            return Some(Err(e));
+        }
+    }
+
+    if config.status != StatusLevel::None {
+        print_stats(&stats, start_time.elapsed());
+    }
+
+    Some(Ok(stats))
+}
+
 /// Perform the dd copy operation.
 pub fn dd_copy(config: &DdConfig) -> io::Result<DdStats> {
+    // Try zero-copy fast path on Linux
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(result) = try_copy_file_range_dd(config) {
+            return result;
+        }
+    }
     let start_time = Instant::now();
 
     let mut input_file: Option<File> = None;
@@ -471,13 +610,37 @@ pub fn dd_copy(config: &DdConfig) -> io::Result<DdStats> {
         let effective_len = if config.conv.sync { config.ibs } else { n };
         apply_conversions(&mut ibuf[..effective_len], &config.conv);
 
-        // Buffer output and flush when we have enough for a full output block
+        // Buffer output and flush when we have enough for a full output block.
+        // Use efficient buffer management: write directly from ibuf when possible,
+        // only buffer when ibs != obs.
+        if config.ibs == config.obs && obuf.is_empty() {
+            // Fast path: ibs == obs, write directly
+            output.write_all(&ibuf[..effective_len])?;
+            if effective_len == config.obs {
+                stats.records_out_full += 1;
+            } else {
+                stats.records_out_partial += 1;
+            }
+            stats.bytes_copied += effective_len as u64;
+            // Skip the drain loop below since we wrote directly
+            continue;
+        }
+
         obuf.extend_from_slice(&ibuf[..effective_len]);
-        while obuf.len() >= config.obs {
-            output.write_all(&obuf[..config.obs])?;
+        let mut consumed = 0;
+        while obuf.len() - consumed >= config.obs {
+            output.write_all(&obuf[consumed..consumed + config.obs])?;
             stats.records_out_full += 1;
             stats.bytes_copied += config.obs as u64;
-            obuf.drain(..config.obs);
+            consumed += config.obs;
+        }
+        if consumed > 0 {
+            // Shift remaining bytes to front (more efficient than drain for large buffers)
+            let remaining = obuf.len() - consumed;
+            if remaining > 0 {
+                obuf.copy_within(consumed.., 0);
+            }
+            obuf.truncate(remaining);
         }
     }
 

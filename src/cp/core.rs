@@ -340,6 +340,44 @@ pub fn copy_file(src: &Path, dst: &Path, config: &CpConfig) -> io::Result<()> {
         return Ok(());
     }
 
+    // Try reflink (FICLONE ioctl) for instant CoW copy on btrfs/XFS.
+    #[cfg(target_os = "linux")]
+    {
+        if matches!(config.reflink, ReflinkMode::Auto | ReflinkMode::Always) {
+            use std::os::unix::io::AsRawFd;
+            const FICLONE: libc::c_ulong = 0x40049409;
+
+            if let Ok(src_file) = std::fs::File::open(src) {
+                let dst_file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dst);
+                if let Ok(dst_file) = dst_file {
+                    let ret = unsafe {
+                        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
+                    };
+                    if ret == 0 {
+                        preserve_attributes(src, dst, config)?;
+                        return Ok(());
+                    }
+                    if config.reflink == ReflinkMode::Always {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!(
+                                "failed to clone '{}' to '{}': {}",
+                                src.display(),
+                                dst.display(),
+                                io::Error::last_os_error()
+                            ),
+                        ));
+                    }
+                    // Auto mode: fall through to other copy methods
+                }
+            }
+        }
+    }
+
     // Try Linux copy_file_range for zero-copy.
     #[cfg(target_os = "linux")]
     {
