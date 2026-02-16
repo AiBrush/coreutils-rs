@@ -309,13 +309,11 @@ fn rm_recursive_parallel(
                 }
                 success.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-        } else {
-            if let Err(e) = std::fs::remove_file(&child_path) {
-                if !config.force {
-                    eprintln!("rm: cannot remove '{}': {}", child_path.display(), e);
-                }
-                success.store(false, std::sync::atomic::Ordering::Relaxed);
+        } else if let Err(e) = std::fs::remove_file(&child_path) {
+            if !config.force {
+                eprintln!("rm: cannot remove '{}': {}", child_path.display(), e);
             }
+            success.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }

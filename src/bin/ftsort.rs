@@ -82,8 +82,8 @@ fn run(input: &str, source_name: &str) -> i32 {
     let mut removed = vec![false; total];
 
     // Seed queue with initial zero-degree nodes
-    for id in 0..total {
-        if in_deg[id] == 0 {
+    for (id, &deg) in in_deg.iter().enumerate().take(total) {
+        if deg == 0 {
             queue.push_back(id);
         }
     }
