@@ -477,7 +477,7 @@ sha1 = "0.10"
 md-5 = "0.10"
 
 # Digest trait (for generic hash interface used by md-5/sha2)
-digest = "0.10"
+digest = "0.11"
 
 # Base64 (SIMD-accelerated)
 base64-simd = "0.8"
