@@ -42,19 +42,12 @@ fn main() {
     }
 
     if args.len() != 2 {
-        eprintln!(
-            "{}: missing operand{}",
-            TOOL_NAME,
-            if args.is_empty() {
-                ""
-            } else if args.len() == 1 {
-                " after the first argument"
-            } else {
-                ""
-            }
-        );
         if args.len() > 2 {
             eprintln!("{}: extra operand '{}'", TOOL_NAME, args[2]);
+        } else if args.len() == 1 {
+            eprintln!("{}: missing operand after '{}'", TOOL_NAME, args[0]);
+        } else {
+            eprintln!("{}: missing operand", TOOL_NAME);
         }
         eprintln!("Try '{} --help' for more information.", TOOL_NAME);
         process::exit(1);
