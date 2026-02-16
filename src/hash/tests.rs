@@ -92,7 +92,11 @@ fn test_hash_bytes_matches_reader() {
     let data = b"The quick brown fox jumps over the lazy dog\n";
     for algo in [
         HashAlgorithm::Md5,
+        HashAlgorithm::Sha1,
+        HashAlgorithm::Sha224,
         HashAlgorithm::Sha256,
+        HashAlgorithm::Sha384,
+        HashAlgorithm::Sha512,
         HashAlgorithm::Blake2b,
     ] {
         let from_bytes = hash_bytes(algo, data);
@@ -723,6 +727,176 @@ fn test_check_file_empty_lines_skipped() {
 #[test]
 fn test_algorithm_names() {
     assert_eq!(HashAlgorithm::Md5.name(), "MD5");
+    assert_eq!(HashAlgorithm::Sha1.name(), "SHA1");
+    assert_eq!(HashAlgorithm::Sha224.name(), "SHA224");
     assert_eq!(HashAlgorithm::Sha256.name(), "SHA256");
+    assert_eq!(HashAlgorithm::Sha384.name(), "SHA384");
+    assert_eq!(HashAlgorithm::Sha512.name(), "SHA512");
     assert_eq!(HashAlgorithm::Blake2b.name(), "BLAKE2b");
+}
+
+// ── SHA-1 tests ──────────────────────────────────────────────────────
+
+#[test]
+fn test_sha1_empty() {
+    let hash = hash_reader(HashAlgorithm::Sha1, Cursor::new(b"")).unwrap();
+    assert_eq!(hash, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+}
+
+#[test]
+fn test_sha1_hello_newline() {
+    let hash = hash_reader(HashAlgorithm::Sha1, Cursor::new(b"hello\n")).unwrap();
+    assert_eq!(hash, "f572d396fae9206628714fb2ce00f72e94f2258f");
+}
+
+#[test]
+fn test_hash_bytes_sha1_empty() {
+    let hash = hash_bytes(HashAlgorithm::Sha1, b"");
+    assert_eq!(hash, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+}
+
+#[test]
+fn test_hash_bytes_sha1_hello() {
+    let hash = hash_bytes(HashAlgorithm::Sha1, b"hello\n");
+    assert_eq!(hash, "f572d396fae9206628714fb2ce00f72e94f2258f");
+}
+
+// ── SHA-224 tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_sha224_empty() {
+    let hash = hash_reader(HashAlgorithm::Sha224, Cursor::new(b"")).unwrap();
+    assert_eq!(
+        hash,
+        "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+    );
+}
+
+#[test]
+fn test_sha224_hello_newline() {
+    let hash = hash_reader(HashAlgorithm::Sha224, Cursor::new(b"hello\n")).unwrap();
+    assert_eq!(
+        hash,
+        "2d6d67d91d0badcdd06cbbba1fe11538a68a37ec9c2e26457ceff12b"
+    );
+}
+
+#[test]
+fn test_hash_bytes_sha224_empty() {
+    let hash = hash_bytes(HashAlgorithm::Sha224, b"");
+    assert_eq!(
+        hash,
+        "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+    );
+}
+
+// ── SHA-384 tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_sha384_empty() {
+    let hash = hash_reader(HashAlgorithm::Sha384, Cursor::new(b"")).unwrap();
+    assert_eq!(
+        hash,
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da\
+         274edebfe76f65fbd51ad2f14898b95b"
+    );
+}
+
+#[test]
+fn test_sha384_hello_newline() {
+    let hash = hash_reader(HashAlgorithm::Sha384, Cursor::new(b"hello\n")).unwrap();
+    assert_eq!(
+        hash,
+        "1d0f284efe3edea4b9ca3bd514fa134b17eae361ccc7a1eefeff801b9bd6604e\
+         01f21f6bf249ef030599f0c218f2ba8c"
+    );
+}
+
+#[test]
+fn test_hash_bytes_sha384_empty() {
+    let hash = hash_bytes(HashAlgorithm::Sha384, b"");
+    assert_eq!(
+        hash,
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da\
+         274edebfe76f65fbd51ad2f14898b95b"
+    );
+}
+
+// ── SHA-512 tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_sha512_empty() {
+    let hash = hash_reader(HashAlgorithm::Sha512, Cursor::new(b"")).unwrap();
+    assert_eq!(
+        hash,
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+         47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    );
+}
+
+#[test]
+fn test_sha512_hello_newline() {
+    let hash = hash_reader(HashAlgorithm::Sha512, Cursor::new(b"hello\n")).unwrap();
+    assert_eq!(
+        hash,
+        "e7c22b994c59d9cf2b48e549b1e24666636045930d3da7c1acb299d1c3b7f931\
+         f94aae41edda2c2b207a36e10f8bcb8d45223e54878f5b316e7ce3b6bc019629"
+    );
+}
+
+#[test]
+fn test_hash_bytes_sha512_empty() {
+    let hash = hash_bytes(HashAlgorithm::Sha512, b"");
+    assert_eq!(
+        hash,
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+         47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    );
+}
+
+// ── hash_file tests for new algorithms ───────────────────────────────
+
+#[test]
+fn test_hash_file_sha1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.txt");
+    std::fs::write(&path, b"hello\n").unwrap();
+    let hash = hash_file(HashAlgorithm::Sha1, &path).unwrap();
+    assert_eq!(hash, "f572d396fae9206628714fb2ce00f72e94f2258f");
+}
+
+#[test]
+fn test_hash_file_sha512() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.txt");
+    std::fs::write(&path, b"hello\n").unwrap();
+    let hash = hash_file(HashAlgorithm::Sha512, &path).unwrap();
+    assert_eq!(
+        hash,
+        "e7c22b994c59d9cf2b48e549b1e24666636045930d3da7c1acb299d1c3b7f931\
+         f94aae41edda2c2b207a36e10f8bcb8d45223e54878f5b316e7ce3b6bc019629"
+    );
+}
+
+// ── parse_check_line tests for new SHA tag formats ───────────────────
+
+#[test]
+fn test_parse_check_line_bsd_sha1() {
+    let (hash, file) =
+        parse_check_line("SHA1 (test.txt) = da39a3ee5e6b4b0d3255bfef95601890afd80709").unwrap();
+    assert_eq!(hash, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    assert_eq!(file, "test.txt");
+}
+
+#[test]
+fn test_parse_check_line_bsd_sha512() {
+    let (hash, file) = parse_check_line(
+        "SHA512 (file.bin) = cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+    )
+    .unwrap();
+    assert_eq!(
+        hash,
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    );
+    assert_eq!(file, "file.bin");
 }

@@ -1,0 +1,82 @@
+// ftrue — exit with status 0
+//
+// GNU true accepts and ignores all arguments except --help and --version.
+
+const TOOL_NAME: &str = "true";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn main() {
+    // true always exits 0, even with unrecognized args.
+    // Only --help and --version produce output (and still exit 0).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "--help" => {
+                println!("Usage: {} [ignored command line arguments]", TOOL_NAME);
+                println!("  or:  {} OPTION", TOOL_NAME);
+                println!("Exit with a status code indicating success.");
+                println!();
+                println!("      --help     display this help and exit");
+                println!("      --version  output version information and exit");
+            }
+            "--version" => {
+                println!("{} (fcoreutils) {}", TOOL_NAME, VERSION);
+            }
+            _ => {}
+        }
+    }
+    // Always exit 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    fn cmd() -> Command {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop(); // remove test binary name
+        path.pop(); // remove deps/
+        path.push("ftrue");
+        Command::new(path)
+    }
+
+    #[test]
+    fn test_true_exit_code() {
+        let output = cmd().output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn test_true_ignores_args() {
+        let output = cmd().args(["foo", "bar", "--baz"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    #[test]
+    fn test_true_help() {
+        let output = cmd().arg("--help").output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(!output.stdout.is_empty());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Exit with a status code indicating success"));
+    }
+
+    #[test]
+    fn test_true_version() {
+        let output = cmd().arg("--version").output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("true"));
+        assert!(stdout.contains("fcoreutils"));
+    }
+
+    #[test]
+    fn test_true_matches_gnu() {
+        let gnu = Command::new("true").output();
+        if let Ok(gnu) = gnu {
+            let ours = cmd().output().unwrap();
+            assert_eq!(ours.status.code(), gnu.status.code(), "Exit code mismatch");
+        }
+    }
+}

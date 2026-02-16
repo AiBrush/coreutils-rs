@@ -111,6 +111,206 @@ path = "src/bin/fpaste.rs"
 name = "fnl"
 path = "src/bin/fnl.rs"
 
+[[bin]]
+name = "ftrue"
+path = "src/bin/ftrue.rs"
+
+[[bin]]
+name = "ffalse"
+path = "src/bin/ffalse.rs"
+
+[[bin]]
+name = "flink"
+path = "src/bin/flink.rs"
+
+[[bin]]
+name = "funlink"
+path = "src/bin/funlink.rs"
+
+[[bin]]
+name = "fsync"
+path = "src/bin/fsync.rs"
+
+[[bin]]
+name = "fhostid"
+path = "src/bin/fhostid.rs"
+
+[[bin]]
+name = "flogname"
+path = "src/bin/flogname.rs"
+
+[[bin]]
+name = "fwhoami"
+path = "src/bin/fwhoami.rs"
+
+[[bin]]
+name = "ftty"
+path = "src/bin/ftty.rs"
+
+[[bin]]
+name = "fnproc"
+path = "src/bin/fnproc.rs"
+
+[[bin]]
+name = "farch"
+path = "src/bin/farch.rs"
+
+[[bin]]
+name = "fprintenv"
+path = "src/bin/fprintenv.rs"
+
+[[bin]]
+name = "fpwd"
+path = "src/bin/fpwd.rs"
+
+[[bin]]
+name = "fmkfifo"
+path = "src/bin/fmkfifo.rs"
+
+[[bin]]
+name = "frmdir"
+path = "src/bin/frmdir.rs"
+
+[[bin]]
+name = "fyes"
+path = "src/bin/fyes.rs"
+
+[[bin]]
+name = "fbasename"
+path = "src/bin/fbasename.rs"
+
+[[bin]]
+name = "fdirname"
+path = "src/bin/fdirname.rs"
+
+[[bin]]
+name = "freadlink"
+path = "src/bin/freadlink.rs"
+
+[[bin]]
+name = "frealpath"
+path = "src/bin/frealpath.rs"
+
+[[bin]]
+name = "fpathchk"
+path = "src/bin/fpathchk.rs"
+
+[[bin]]
+name = "fsleep"
+path = "src/bin/fsleep.rs"
+
+[[bin]]
+name = "fnice"
+path = "src/bin/fnice.rs"
+
+[[bin]]
+name = "fnohup"
+path = "src/bin/fnohup.rs"
+
+[[bin]]
+name = "fgroups"
+path = "src/bin/fgroups.rs"
+
+[[bin]]
+name = "funame"
+path = "src/bin/funame.rs"
+
+[[bin]]
+name = "fmktemp"
+path = "src/bin/fmktemp.rs"
+
+[[bin]]
+name = "fmknod"
+path = "src/bin/fmknod.rs"
+
+[[bin]]
+name = "fmkdir"
+path = "src/bin/fmkdir.rs"
+
+[[bin]]
+name = "fuptime"
+path = "src/bin/fuptime.rs"
+
+[[bin]]
+name = "ftruncate"
+path = "src/bin/ftruncate.rs"
+
+[[bin]]
+name = "ftouch"
+path = "src/bin/ftouch.rs"
+
+[[bin]]
+name = "fln"
+path = "src/bin/fln.rs"
+
+[[bin]]
+name = "fsha1sum"
+path = "src/bin/fsha1sum.rs"
+
+[[bin]]
+name = "fsha224sum"
+path = "src/bin/fsha224sum.rs"
+
+[[bin]]
+name = "fsha384sum"
+path = "src/bin/fsha384sum.rs"
+
+[[bin]]
+name = "fsha512sum"
+path = "src/bin/fsha512sum.rs"
+
+[[bin]]
+name = "fsum"
+path = "src/bin/fsum.rs"
+
+[[bin]]
+name = "fcksum"
+path = "src/bin/fcksum.rs"
+
+[[bin]]
+name = "fbase32"
+path = "src/bin/fbase32.rs"
+
+[[bin]]
+name = "fbasenc"
+path = "src/bin/fbasenc.rs"
+
+[[bin]]
+name = "fid"
+path = "src/bin/fid.rs"
+
+[[bin]]
+name = "fenv"
+path = "src/bin/fenv.rs"
+
+[[bin]]
+name = "ftimeout"
+path = "src/bin/ftimeout.rs"
+
+[[bin]]
+name = "ftee"
+path = "src/bin/ftee.rs"
+
+[[bin]]
+name = "fchroot"
+path = "src/bin/fchroot.rs"
+
+[[bin]]
+name = "fseq"
+path = "src/bin/fseq.rs"
+
+[[bin]]
+name = "ftsort"
+path = "src/bin/ftsort.rs"
+
+[[bin]]
+name = "fshuf"
+path = "src/bin/fshuf.rs"
+
+[[bin]]
+name = "fdircolors"
+path = "src/bin/fdircolors.rs"
+
 [dependencies]
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "cargo"] }
@@ -129,6 +329,9 @@ blake2b_simd = "1"
 
 # SHA-256 fallback for Apple targets (ring 0.17 doesn't compile on macOS aarch64)
 sha2 = "0.10"
+
+# SHA-1 hashing
+sha1 = "0.10"
 
 # MD5 hashing (ring doesn't support MD5)
 md-5 = "0.10"
@@ -188,6 +391,7 @@ ring = "0.17"
 # Enable ASM acceleration for hash crates on non-MSVC targets
 # (sha2-asm/md5-asm use .S assembly files that MSVC cl.exe can't compile)
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
+sha1 = { version = "0.10", features = ["asm"] }
 sha2 = { version = "0.10", features = ["asm"] }
 md-5 = { version = "0.10", features = ["asm"] }
 

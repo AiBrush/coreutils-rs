@@ -9,22 +9,22 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/AiBrush/coreutils-rs)](https://github.com/AiBrush/coreutils-rs/releases)
 
-High-performance GNU coreutils replacement in Rust — 21 tools and counting. SIMD-accelerated, drop-in compatible, cross-platform.
+High-performance GNU coreutils replacement in Rust — 71 tools and counting. SIMD-accelerated, drop-in compatible, cross-platform.
 
-## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.5.8, Linux, hyperfine)
+## Performance ([independent benchmarks](https://github.com/AiBrush/coreutils-rs-independent-test) v0.6.2, Linux, hyperfine)
 
 | Tool | Speedup vs GNU | Speedup vs uutils |
 |------|---------------:|-------------------:|
-| wc | **34.2x** | 20.7x |
-| sort | **17.7x** | 16.6x |
-| uniq | **14.9x** | 6.0x |
-| tr | **7.2x** | 7.1x |
-| base64 | **6.8x** | 7.1x |
-| cut | **6.2x** | 3.7x |
-| tac | **3.8x** | 2.0x |
+| wc | **31.4x** | 18.9x |
+| sort | **17.3x** | 16.0x |
+| uniq | **16.4x** | 6.0x |
+| base64 | **7.5x** | 7.0x |
+| cut | **6.6x** | 3.5x |
+| tr | **6.6x** | 6.6x |
+| tac | **3.9x** | 2.0x |
 | md5sum | **1.4x** | 1.3x |
-| b2sum | **1.3x** | 1.2x |
-| sha256sum | **1.0x** | 4.8x |
+| b2sum | **1.3x** | 1.3x |
+| sha256sum | **1.0x** | 3.9x |
 
 ## Tools
 
@@ -58,6 +58,61 @@ High-performance GNU coreutils replacement in Rust — 21 tools and counting. SI
 | nl | `fnl` | Number lines of files (mmap, section delimiters, regex) |
 | comm | `fcomm` | Compare sorted files line by line (mmap, SIMD) |
 | join | `fjoin` | Join lines of two sorted files on a common field (mmap) |
+
+### GNU Utility Tools (50 tools)
+
+| Tool | Binary | Description |
+|------|--------|-------------|
+| base32 | `fbase32` | RFC 4648 base32 encoding/decoding |
+| basenc | `fbasenc` | Multi-format encoder/decoder (base64, base32, base16, base2, z85) |
+| sha1sum | `fsha1sum` | SHA-1 checksums |
+| sha224sum | `fsha224sum` | SHA-224 checksums |
+| sha384sum | `fsha384sum` | SHA-384 checksums |
+| sha512sum | `fsha512sum` | SHA-512 checksums |
+| sum | `fsum` | BSD/SysV checksums |
+| cksum | `fcksum` | CRC-32 checksums |
+| ln | `fln` | Create hard and symbolic links |
+| touch | `ftouch` | Change file timestamps |
+| truncate | `ftruncate` | Shrink or extend file sizes |
+| mkdir | `fmkdir` | Create directories |
+| rmdir | `frmdir` | Remove empty directories |
+| mkfifo | `fmkfifo` | Create named pipes (FIFOs) |
+| mknod | `fmknod` | Create special files |
+| mktemp | `fmktemp` | Create temporary files/directories |
+| link | `flink` | Create hard link (low-level) |
+| unlink | `funlink` | Remove file (low-level) |
+| basename | `fbasename` | Strip directory and suffix from paths |
+| dirname | `fdirname` | Strip last path component |
+| readlink | `freadlink` | Print symlink targets |
+| realpath | `frealpath` | Resolve absolute paths |
+| pathchk | `fpathchk` | Validate path names |
+| seq | `fseq` | Generate number sequences |
+| shuf | `fshuf` | Random permutations of input |
+| tsort | `ftsort` | Topological sorting |
+| tee | `ftee` | Read stdin, write to stdout and files |
+| yes | `fyes` | Output a string repeatedly |
+| id | `fid` | Print user and group IDs |
+| groups | `fgroups` | Print group memberships |
+| whoami | `fwhoami` | Print effective user name |
+| logname | `flogname` | Print login name |
+| uname | `funame` | Print system information |
+| uptime | `fuptime` | System uptime and load averages |
+| arch | `farch` | Print machine architecture |
+| hostid | `fhostid` | Print host identifier |
+| tty | `ftty` | Print terminal name |
+| nproc | `fnproc` | Print number of processors |
+| pwd | `fpwd` | Print working directory |
+| printenv | `fprintenv` | Print environment variables |
+| env | `fenv` | Run program with modified environment |
+| timeout | `ftimeout` | Run command with time limit |
+| nice | `fnice` | Run with modified scheduling priority |
+| nohup | `fnohup` | Run immune to hangups |
+| sleep | `fsleep` | Delay for specified time |
+| sync | `fsync` | Flush filesystem caches |
+| chroot | `fchroot` | Change root directory |
+| true | `ftrue` | Exit with status 0 |
+| false | `ffalse` | Exit with status 1 |
+| dircolors | `fdircolors` | Setup LS_COLORS environment variable |
 
 ## Installation
 

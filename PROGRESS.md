@@ -1,15 +1,17 @@
 # coreutils-rs Progress
 
-## Current Status: 21 Tools Complete
+## Current Status: 71 Tools Complete
 
-21 GNU coreutils replacements are fully implemented and tested.
+71 GNU coreutils replacements are fully implemented and tested.
 Each tool is a drop-in replacement with byte-identical GNU output.
 
-**10 performance-optimized tools** with independent benchmarks (v0.5.8): wc, cut, base64, sha256sum, md5sum, b2sum, sort, tr, uniq, tac.
+**10 performance-optimized tools** with independent benchmarks (v0.6.2): wc, cut, base64, sha256sum, md5sum, b2sum, sort, tr, uniq, tac.
 
 **11 additional tools** added in v0.6.x: head, tail, cat, rev, expand, unexpand, fold, paste, nl, comm, join.
 
-**Compatibility: 820/826 (99.3%)** on independent test suite (v0.5.8).
+**50 GNU utility tools** added in v0.7.x: encoding, hashing, file operations, path utilities, text processing, system information, process/environment, and more.
+
+**Compatibility: 820/826 (99.3%)** on independent test suite (v0.6.2).
 
 ## Tool Checklist
 
@@ -221,3 +223,71 @@ Each tool is a drop-in replacement with byte-identical GNU output.
 - **Added `MADV_WILLNEED`** — triggers aggressive kernel readahead immediately after mmap
 - **Increased parallel chunk min** from 512KB to 1MB — reduces rayon scheduling overhead
 - **Increased streaming fallback buffer** from 256KB to 2MB — matches huge page boundaries
+
+## GNU Utility Tools (50 tools, v0.7.x)
+
+### Encoding/Decoding
+- [x] base32 (`fbase32`) — RFC 4648 base32 encoding/decoding
+- [x] basenc (`fbasenc`) — Multi-format encoder/decoder (base64, base32, base16, base2, z85)
+
+### Hash Utilities
+- [x] sha1sum (`fsha1sum`) — SHA-1 checksums
+- [x] sha224sum (`fsha224sum`) — SHA-224 checksums
+- [x] sha384sum (`fsha384sum`) — SHA-384 checksums
+- [x] sha512sum (`fsha512sum`) — SHA-512 checksums
+- [x] sum (`fsum`) — BSD/SysV checksums
+- [x] cksum (`fcksum`) — CRC-32 checksums
+
+### File Operations
+- [x] ln (`fln`) — Create hard and symbolic links
+- [x] touch (`ftouch`) — Change file timestamps
+- [x] truncate (`ftruncate`) — Shrink or extend file sizes
+- [x] mkdir (`fmkdir`) — Create directories
+- [x] rmdir (`frmdir`) — Remove empty directories
+- [x] mkfifo (`fmkfifo`) — Create named pipes (FIFOs)
+- [x] mknod (`fmknod`) — Create special files
+- [x] mktemp (`fmktemp`) — Create temporary files/directories
+- [x] link (`flink`) — Create hard link (low-level)
+- [x] unlink (`funlink`) — Remove file (low-level)
+
+### Path Utilities
+- [x] basename (`fbasename`) — Strip directory and suffix from paths
+- [x] dirname (`fdirname`) — Strip last path component
+- [x] readlink (`freadlink`) — Print symlink targets
+- [x] realpath (`frealpath`) — Resolve absolute paths
+- [x] pathchk (`fpathchk`) — Validate path names
+
+### Text/Data Processing
+- [x] seq (`fseq`) — Generate number sequences
+- [x] shuf (`fshuf`) — Random permutations of input
+- [x] tsort (`ftsort`) — Topological sorting
+- [x] tee (`ftee`) — Read stdin, write to stdout and files
+- [x] yes (`fyes`) — Output a string repeatedly
+
+### System Information
+- [x] id (`fid`) — Print user and group IDs
+- [x] groups (`fgroups`) — Print group memberships
+- [x] whoami (`fwhoami`) — Print effective user name
+- [x] logname (`flogname`) — Print login name
+- [x] uname (`funame`) — Print system information
+- [x] uptime (`fuptime`) — System uptime and load averages
+- [x] arch (`farch`) — Print machine architecture
+- [x] hostid (`fhostid`) — Print host identifier
+- [x] tty (`ftty`) — Print terminal name
+- [x] nproc (`fnproc`) — Print number of processors
+- [x] pwd (`fpwd`) — Print working directory
+- [x] printenv (`fprintenv`) — Print environment variables
+
+### Process/Environment
+- [x] env (`fenv`) — Run program with modified environment
+- [x] timeout (`ftimeout`) — Run command with time limit
+- [x] nice (`fnice`) — Run with modified scheduling priority
+- [x] nohup (`fnohup`) — Run immune to hangups
+- [x] sleep (`fsleep`) — Delay for specified time
+- [x] sync (`fsync`) — Flush filesystem caches
+- [x] chroot (`fchroot`) — Change root directory
+
+### Other Utilities
+- [x] true (`ftrue`) — Exit with status 0
+- [x] false (`ffalse`) — Exit with status 1
+- [x] dircolors (`fdircolors`) — Setup LS_COLORS environment variable
