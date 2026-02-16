@@ -139,10 +139,12 @@ fn main() {
 
     if command_start.is_none() || command_start.unwrap() >= args.len() {
         // No command — print current niceness + adjustment
-        // SAFETY: getpriority with PRIO_PROCESS and 0 (current process) is always valid
+        // SAFETY: getpriority with PRIO_PROCESS and 0 (current process) is always valid.
+        // getpriority() can legitimately return -1, so we must clear errno first
+        // and check it after the call to detect real errors.
         clear_errno();
         let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-        if std::io::Error::last_os_error().raw_os_error() != Some(0) && get_errno() != 0 {
+        if current == -1 && get_errno() != 0 {
             eprintln!("{}: cannot get niceness", TOOL_NAME);
             process::exit(125);
         }

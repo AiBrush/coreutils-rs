@@ -174,18 +174,41 @@ fn mktime_local(
     tm.tm_sec = second as i32;
     tm.tm_isdst = -1;
 
+    // Clear errno before calling mktime, since -1 is both a valid time_t
+    // (1969-12-31 23:59:59 UTC) and the error return value.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *libc::__error() = 0;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            *libc::__errno_location() = 0;
+        }
+    }
+
     let t = unsafe { libc::mktime(&mut tm) };
     if t == -1 {
-        // mktime returns -1 on error, but -1 is also a valid time_t
-        // (1969-12-31 23:59:59 UTC). Verify by checking if the normalized
-        // tm fields match our input.
-        if tm.tm_year != year - 1900
-            || tm.tm_mon != month as i32 - 1
-            || tm.tm_mday != day as i32
-            || tm.tm_hour != hour as i32
-            || tm.tm_min != minute as i32
-            || tm.tm_sec != second as i32
-        {
+        // Check errno to distinguish error from valid -1 timestamp
+        let errno = unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                *libc::__errno_location()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                *libc::__error()
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                *libc::__errno_location()
+            }
+        };
+        if errno != 0 {
             return Err("invalid time value".to_string());
         }
     }

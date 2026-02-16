@@ -107,7 +107,7 @@ fn format_number(fmt: &str, value: f64) -> String {
     // Parse width
     let mut width: usize = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        width = width * 10 + (bytes[i] - b'0') as usize;
+        width = width.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
         i += 1;
     }
 
@@ -115,9 +115,9 @@ fn format_number(fmt: &str, value: f64) -> String {
     let mut precision: Option<usize> = None;
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
-        let mut prec = 0;
+        let mut prec: usize = 0;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
-            prec = prec * 10 + (bytes[i] - b'0') as usize;
+            prec = prec.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
             i += 1;
         }
         precision = Some(prec);
@@ -523,7 +523,7 @@ fn main() {
         if increment > 0.0 {
             loop {
                 let val = first + step as f64 * increment;
-                if val > last * (1.0 + f64::EPSILON) {
+                if val > last {
                     break;
                 }
                 if !is_first {
@@ -542,7 +542,7 @@ fn main() {
         } else {
             loop {
                 let val = first + step as f64 * increment;
-                if val < last * (1.0 + f64::EPSILON) && val < last - f64::EPSILON.abs() {
+                if val < last {
                     break;
                 }
                 if !is_first {

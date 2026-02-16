@@ -203,6 +203,7 @@ fn base64_encode(data: &[u8], alphabet: &[u8; 64]) -> String {
             result.push(b'=');
         }
     }
+    // SAFETY: result contains only bytes from the base64 alphabet (ASCII subset), guaranteed valid UTF-8
     unsafe { String::from_utf8_unchecked(result) }
 }
 
@@ -336,6 +337,7 @@ fn base32_encode(data: &[u8], alphabet: &[u8; 32]) -> String {
         }
     }
 
+    // SAFETY: result contains only bytes from the base32 alphabet (ASCII subset), guaranteed valid UTF-8
     unsafe { String::from_utf8_unchecked(result) }
 }
 
@@ -413,6 +415,7 @@ fn base16_encode(data: &[u8]) -> String {
         result.push(HEX_CHARS[(b >> 4) as usize]);
         result.push(HEX_CHARS[(b & 0x0F) as usize]);
     }
+    // SAFETY: result contains only hex digit bytes ('0'-'9', 'A'-'F'), guaranteed valid UTF-8
     unsafe { String::from_utf8_unchecked(result) }
 }
 
@@ -465,6 +468,7 @@ fn base2msbf_encode(data: &[u8]) -> String {
             result.push(if (b >> i) & 1 == 1 { b'1' } else { b'0' });
         }
     }
+    // SAFETY: result contains only b'0' and b'1' bytes, guaranteed valid UTF-8
     unsafe { String::from_utf8_unchecked(result) }
 }
 
@@ -504,6 +508,7 @@ fn base2lsbf_encode(data: &[u8]) -> String {
             result.push(if (b >> i) & 1 == 1 { b'1' } else { b'0' });
         }
     }
+    // SAFETY: result contains only b'0' and b'1' bytes, guaranteed valid UTF-8
     unsafe { String::from_utf8_unchecked(result) }
 }
 
@@ -579,6 +584,7 @@ fn z85_encode(data: &[u8]) -> Result<String, String> {
         result.extend_from_slice(&chars);
     }
 
+    // SAFETY: result contains only bytes from the Z85 alphabet (ASCII subset), guaranteed valid UTF-8
     Ok(unsafe { String::from_utf8_unchecked(result) })
 }
 
@@ -626,9 +632,7 @@ fn z85_decode(input: &[u8], ignore_garbage: bool) -> Result<Vec<u8>, String> {
 fn wrap_output(encoded: &str, wrap: usize) -> String {
     if wrap == 0 || encoded.is_empty() {
         let mut s = encoded.to_string();
-        if !s.is_empty() {
-            s.push('\n');
-        }
+        s.push('\n');
         return s;
     }
 
@@ -1292,7 +1296,8 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"").unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
-        assert!(output.stdout.is_empty());
+        // GNU basenc outputs a newline even for empty input
+        assert_eq!(output.stdout, b"\n");
     }
 
     // ---- Unit tests for encoding functions ----

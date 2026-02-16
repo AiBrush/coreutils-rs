@@ -148,45 +148,47 @@ fn main() {
     let mut stdout_writer = BufWriter::new(stdout.lock());
 
     loop {
-        let buf = match reader.fill_buf() {
-            Ok(buf) => {
-                if buf.is_empty() {
-                    break;
+        let len = {
+            let buf = match reader.fill_buf() {
+                Ok(buf) => {
+                    if buf.is_empty() {
+                        break;
+                    }
+                    buf
                 }
-                buf.to_vec()
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                eprintln!("{}: read error: {}", TOOL_NAME, e);
-                process::exit(1);
-            }
-        };
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("{}: read error: {}", TOOL_NAME, e);
+                    process::exit(1);
+                }
+            };
 
-        let len = buf.len();
-
-        // Write to stdout
-        if let Err(e) = stdout_writer.write_all(&buf) {
-            if handle_write_error(TOOL_NAME, "standard output", &e, output_error) {
-                process::exit(1);
-            }
-            exit_code = 1;
-        }
-
-        // Write to each file
-        let mut to_remove = Vec::new();
-        for (idx, (path, writer)) in outputs.iter_mut().enumerate() {
-            if let Err(e) = writer.write_all(&buf) {
-                if handle_write_error(TOOL_NAME, path, &e, output_error) {
+            // Write to stdout
+            if let Err(e) = stdout_writer.write_all(buf) {
+                if handle_write_error(TOOL_NAME, "standard output", &e, output_error) {
                     process::exit(1);
                 }
                 exit_code = 1;
-                to_remove.push(idx);
             }
-        }
-        // Remove failed outputs (iterate in reverse to preserve indices)
-        for idx in to_remove.into_iter().rev() {
-            outputs.remove(idx);
-        }
+
+            // Write to each file
+            let mut to_remove = Vec::new();
+            for (idx, (path, writer)) in outputs.iter_mut().enumerate() {
+                if let Err(e) = writer.write_all(buf) {
+                    if handle_write_error(TOOL_NAME, path, &e, output_error) {
+                        process::exit(1);
+                    }
+                    exit_code = 1;
+                    to_remove.push(idx);
+                }
+            }
+            // Remove failed outputs (iterate in reverse to preserve indices)
+            for idx in to_remove.into_iter().rev() {
+                outputs.remove(idx);
+            }
+
+            buf.len()
+        };
 
         reader.consume(len);
     }
