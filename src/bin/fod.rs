@@ -8,9 +8,7 @@ use std::io::{self, Read};
 use std::process;
 
 use coreutils_rs::common::reset_sigpipe;
-use coreutils_rs::od::{
-    od_process, parse_format_type, AddressRadix, OdConfig, OutputFormat,
-};
+use coreutils_rs::od::{AddressRadix, OdConfig, OutputFormat, od_process, parse_format_type};
 
 const TOOL_NAME: &str = "od";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -154,10 +152,7 @@ fn main() {
                                 if i < args.len() {
                                     args[i].clone()
                                 } else {
-                                    eprintln!(
-                                        "{}: option requires an argument -- 't'",
-                                        TOOL_NAME
-                                    );
+                                    eprintln!("{}: option requires an argument -- 't'", TOOL_NAME);
                                     process::exit(1);
                                 }
                             } else {
@@ -245,10 +240,13 @@ fn main() {
         for path in &operands {
             if path == "-" {
                 let mut buf = Vec::new();
-                io::stdin().lock().read_to_end(&mut buf).unwrap_or_else(|e| {
-                    eprintln!("{}: standard input: {}", TOOL_NAME, e);
-                    process::exit(1);
-                });
+                io::stdin()
+                    .lock()
+                    .read_to_end(&mut buf)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{}: standard input: {}", TOOL_NAME, e);
+                        process::exit(1);
+                    });
                 combined.extend_from_slice(&buf);
             } else {
                 match File::open(path) {
