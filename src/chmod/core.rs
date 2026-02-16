@@ -359,7 +359,19 @@ fn process_entry(path: &Path, mode_str: &str, config: &ChmodConfig) -> Result<()
 }
 
 /// Walk a directory recursively, applying the mode to each entry.
+/// Uses rayon for parallel processing when verbose/changes output is not needed.
 fn walk_dir(dir: &Path, mode_str: &str, config: &ChmodConfig, had_error: &mut bool) {
+    // For non-verbose mode, use parallel traversal with rayon
+    if !config.verbose && !config.changes {
+        let error_flag = std::sync::atomic::AtomicBool::new(false);
+        walk_dir_parallel(dir, mode_str, config, &error_flag);
+        if error_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            *had_error = true;
+        }
+        return;
+    }
+
+    // Sequential path for verbose/changes mode (output ordering matters)
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -385,7 +397,6 @@ fn walk_dir(dir: &Path, mode_str: &str, config: &ChmodConfig, had_error: &mut bo
 
         let entry_path = entry.path();
 
-        // Don't follow symlinks
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) => {
@@ -423,4 +434,49 @@ fn walk_dir(dir: &Path, mode_str: &str, config: &ChmodConfig, had_error: &mut bo
             walk_dir(&entry_path, mode_str, config, had_error);
         }
     }
+}
+
+/// Parallel directory walk using rayon for non-verbose chmod operations.
+fn walk_dir_parallel(
+    dir: &Path,
+    mode_str: &str,
+    config: &ChmodConfig,
+    had_error: &std::sync::atomic::AtomicBool,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if !config.quiet {
+                eprintln!("chmod: cannot open directory '{}': {}", dir.display(), e);
+            }
+            had_error.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+
+    use rayon::prelude::*;
+    entries.par_iter().for_each(|entry| {
+        let entry_path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => {
+                had_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        if file_type.is_symlink() {
+            return;
+        }
+
+        if process_entry(&entry_path, mode_str, config).is_err() {
+            had_error.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if file_type.is_dir() {
+            walk_dir_parallel(&entry_path, mode_str, config, had_error);
+        }
+    });
 }

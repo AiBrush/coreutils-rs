@@ -146,8 +146,15 @@ pub fn install_file(src: &Path, dst: &Path, config: &InstallConfig) -> io::Resul
         }
     }
 
-    // Copy file
-    fs::copy(src, dst)?;
+    // Copy file — use optimized path on Linux
+    #[cfg(target_os = "linux")]
+    {
+        optimized_copy(src, dst)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fs::copy(src, dst)?;
+    }
 
     // Set mode
     #[cfg(unix)]
@@ -203,6 +210,16 @@ fn files_are_identical(a: &Path, b: &Path) -> io::Result<bool> {
     // Quick check: different sizes means different
     if meta_a.len() != meta_b.len() {
         return Ok(false);
+    }
+
+    // For large files, use mmap to avoid double allocation
+    #[cfg(target_os = "linux")]
+    if meta_a.len() > 1024 * 1024 {
+        let file_a = fs::File::open(a)?;
+        let file_b = fs::File::open(b)?;
+        let mmap_a = unsafe { memmap2::MmapOptions::new().map(&file_a)? };
+        let mmap_b = unsafe { memmap2::MmapOptions::new().map(&file_b)? };
+        return Ok(mmap_a[..] == mmap_b[..]);
     }
 
     let data_a = fs::read(a)?;
@@ -305,6 +322,66 @@ fn preserve_times(src: &Path, dst: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Optimized file copy on Linux: try FICLONE (CoW reflink), then copy_file_range,
+/// then fall back to fs::copy.
+#[cfg(target_os = "linux")]
+fn optimized_copy(src: &Path, dst: &Path) -> io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let src_file = fs::File::open(src)?;
+    let src_meta = src_file.metadata()?;
+    let file_size = src_meta.len();
+
+    // Create destination with same permissions initially
+    let dst_file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+
+    // Try FICLONE first (instant CoW copy on btrfs/XFS/OCFS2)
+    const FICLONE: libc::c_ulong = 0x40049409;
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    if ret == 0 {
+        return Ok(file_size);
+    }
+
+    // Try copy_file_range for zero-copy in-kernel copy
+    let mut off_in: i64 = 0;
+    let mut off_out: i64 = 0;
+    let mut remaining = file_size;
+    let mut used_cfr = false;
+
+    while remaining > 0 {
+        let chunk = remaining.min(1 << 30) as usize; // 1GB max per call
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src_file.as_raw_fd(),
+                &mut off_in as *mut i64,
+                dst_file.as_raw_fd(),
+                &mut off_out as *mut i64,
+                chunk,
+                0u32,
+            )
+        };
+        if n <= 0 {
+            if !used_cfr {
+                // copy_file_range not supported, fall back
+                drop(dst_file);
+                drop(src_file);
+                return fs::copy(src, dst);
+            }
+            // Partial failure after some success — this is an error
+            return Err(io::Error::last_os_error());
+        }
+        used_cfr = true;
+        remaining -= n as u64;
+    }
+
+    Ok(file_size)
 }
 
 /// Strip symbol tables from a binary using an external strip program.

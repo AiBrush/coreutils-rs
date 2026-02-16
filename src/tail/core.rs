@@ -217,8 +217,36 @@ fn tail_lines_streaming_file(
         return Ok(true);
     }
 
-    // Read backward in chunks to find N lines from the end
-    const CHUNK: u64 = 65536;
+    // Try mmap for backward scanning — avoids heap allocations entirely
+    // and lets the kernel page in only the portion we scan.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_size as libc::size_t,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                fd,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED {
+            // Advise sequential read from the end
+            let _ = unsafe { libc::madvise(ptr, file_size as libc::size_t, libc::MADV_SEQUENTIAL) };
+            let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_size as usize) };
+            let result = tail_lines(data, n, delimiter, out);
+            unsafe {
+                libc::munmap(ptr, file_size as libc::size_t);
+            }
+            return result.map(|_| true);
+        }
+    }
+
+    // Fallback: read backward in chunks to find N lines from the end
+    const CHUNK: u64 = 262144;
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut pos = file_size;
     let mut count = 0u64;
@@ -234,25 +262,22 @@ fn tail_lines_streaming_file(
         let mut buf = vec![0u8; read_len];
         reader.read_exact(&mut buf)?;
 
-        // Count delimiters backward in this chunk
+        // Count delimiters backward in this chunk using SIMD
         let search_end = if pos == file_size && !buf.is_empty() && buf[buf.len() - 1] == delimiter {
             buf.len() - 1
         } else {
             buf.len()
         };
 
-        for i in (0..search_end).rev() {
-            if buf[i] == delimiter {
-                count += 1;
-                if count == n {
-                    // Found the start point: write from buf[i+1..] + all subsequent chunks
-                    out.write_all(&buf[i + 1..])?;
-                    for chunk in chunks.iter().rev() {
-                        out.write_all(chunk)?;
-                    }
-                    found_start = true;
-                    break;
+        for rpos in memrchr_iter(delimiter, &buf[..search_end]) {
+            count += 1;
+            if count == n {
+                out.write_all(&buf[rpos + 1..])?;
+                for chunk in chunks.iter().rev() {
+                    out.write_all(chunk)?;
                 }
+                found_start = true;
+                break;
             }
         }
 
@@ -306,8 +331,8 @@ fn tail_lines_from_streaming_file(
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let mut reader = io::BufReader::with_capacity(65536, file);
-            let mut buf = [0u8; 65536];
+            let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
+            let mut buf = [0u8; 262144];
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -322,8 +347,8 @@ fn tail_lines_from_streaming_file(
     }
 
     let skip = n - 1;
-    let mut reader = io::BufReader::with_capacity(65536, file);
-    let mut buf = [0u8; 65536];
+    let mut reader = io::BufReader::with_capacity(1024 * 1024, file);
+    let mut buf = [0u8; 262144];
     let mut count = 0u64;
     let mut skipping = true;
 

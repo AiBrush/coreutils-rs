@@ -25,11 +25,7 @@ fn print_version() {
 }
 
 fn run(input: &str, source_name: &str) -> i32 {
-    let mut all_nodes: Vec<String> = Vec::new();
-    let mut edges: Vec<(String, String)> = Vec::new();
-    let mut seen_nodes: HashSet<String> = HashSet::new();
-
-    // Parse tokens from input
+    // Parse tokens
     let tokens: Vec<&str> = input.split_whitespace().collect();
 
     if !tokens.len().is_multiple_of(2) {
@@ -40,51 +36,56 @@ fn run(input: &str, source_name: &str) -> i32 {
         return 1;
     }
 
+    // Use integer node IDs to avoid string cloning throughout the algorithm
+    let mut node_names: Vec<String> = Vec::new();
+    let mut name_to_id: HashMap<String, usize> = HashMap::new();
+
+    let get_id = |name: &str, names: &mut Vec<String>, map: &mut HashMap<String, usize>| -> usize {
+        use std::collections::hash_map::Entry;
+        match map.entry(name.to_string()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = names.len();
+                names.push(e.key().clone());
+                *e.insert(id)
+            }
+        }
+    };
+
+    let mut edge_pairs: Vec<(usize, usize)> = Vec::with_capacity(tokens.len() / 2);
     for pair in tokens.chunks(2) {
-        let from = pair[0].to_string();
-        let to = pair[1].to_string();
-
-        if seen_nodes.insert(from.clone()) {
-            all_nodes.push(from.clone());
-        }
-        if seen_nodes.insert(to.clone()) {
-            all_nodes.push(to.clone());
-        }
-
-        edges.push((from, to));
+        let from = get_id(pair[0], &mut node_names, &mut name_to_id);
+        let to = get_id(pair[1], &mut node_names, &mut name_to_id);
+        edge_pairs.push((from, to));
     }
 
-    // Build graph (all_nodes is already deduplicated via seen_nodes)
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    let mut in_deg: HashMap<String, usize> = HashMap::new();
+    let total = node_names.len();
 
-    for node in &all_nodes {
-        adj.entry(node.clone()).or_default();
-        in_deg.entry(node.clone()).or_insert(0);
-    }
+    // Build graph using integer IDs — Vec-based adjacency for cache locality
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); total];
+    let mut in_deg: Vec<usize> = vec![0; total];
+    let mut edge_set: HashSet<(usize, usize)> = HashSet::with_capacity(edge_pairs.len());
 
-    let mut edge_set: HashSet<(String, String)> = HashSet::new();
-    for (from, to) in &edges {
-        if from != to && edge_set.insert((from.clone(), to.clone())) {
-            adj.entry(from.clone()).or_default().push(to.clone());
-            *in_deg.entry(to.clone()).or_insert(0) += 1;
+    for &(from, to) in &edge_pairs {
+        if from != to && edge_set.insert((from, to)) {
+            adj[from].push(to);
+            in_deg[to] += 1;
         }
     }
 
-    let total = all_nodes.len();
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, stdout.lock());
 
     // Incremental Kahn's algorithm with cycle breaking (matches GNU behavior)
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
     let mut processed = 0usize;
     let mut has_cycle = false;
-    let mut removed: HashSet<String> = HashSet::new();
+    let mut removed = vec![false; total];
 
     // Seed queue with initial zero-degree nodes
-    for node in &all_nodes {
-        if in_deg.get(node).copied().unwrap_or(0) == 0 {
-            queue.push_back(node.clone());
+    for (id, &deg) in in_deg.iter().enumerate().take(total) {
+        if deg == 0 {
+            queue.push_back(id);
         }
     }
 
@@ -92,26 +93,22 @@ fn run(input: &str, source_name: &str) -> i32 {
         // Phase 1: process all zero-degree nodes
         while let Some(node) = queue.pop_front() {
             processed += 1;
-            removed.insert(node.clone());
-            let _ = writeln!(out, "{node}");
-            if let Some(neighbors) = adj.get(&node) {
-                let mut new_zeros = Vec::new();
-                for nb in neighbors {
-                    if removed.contains(nb) {
-                        continue;
-                    }
-                    if let Some(d) = in_deg.get_mut(nb)
-                        && *d > 0
-                    {
-                        *d -= 1;
-                        if *d == 0 {
-                            new_zeros.push(nb.clone());
-                        }
+            removed[node] = true;
+            let _ = writeln!(out, "{}", node_names[node]);
+            let mut new_zeros = Vec::new();
+            for &nb in &adj[node] {
+                if removed[nb] {
+                    continue;
+                }
+                if in_deg[nb] > 0 {
+                    in_deg[nb] -= 1;
+                    if in_deg[nb] == 0 {
+                        new_zeros.push(nb);
                     }
                 }
-                for n in new_zeros.into_iter().rev() {
-                    queue.push_back(n);
-                }
+            }
+            for n in new_zeros.into_iter().rev() {
+                queue.push_back(n);
             }
         }
 
@@ -122,61 +119,41 @@ fn run(input: &str, source_name: &str) -> i32 {
         // Phase 2: cycle detected — find and report one cycle, then break it
         has_cycle = true;
 
-        // Find the first unprocessed node in input order
-        let start = all_nodes
-            .iter()
-            .find(|n| !removed.contains(*n))
-            .unwrap()
-            .clone();
+        let start = (0..total).find(|&n| !removed[n]).unwrap();
+        let cycle = find_cycle(start, &adj, &removed);
 
-        // Find the cycle by following edges from start using DFS
-        let cycle = find_cycle(&start, &adj, &removed);
-
+        let _ = out.flush();
         eprintln!("{}: {}: input contains a loop:", TOOL_NAME, source_name);
-        for member in &cycle {
-            eprintln!("{}: {member}", TOOL_NAME);
+        for &member in &cycle {
+            eprintln!("{}: {}", TOOL_NAME, node_names[member]);
         }
 
-        // Break the cycle: force the first cycle member's in-degree to 0
-        if let Some(d) = in_deg.get_mut(&cycle[0]) {
-            *d = 0;
-        }
-        queue.push_back(cycle[0].clone());
+        in_deg[cycle[0]] = 0;
+        queue.push_back(cycle[0]);
     }
 
+    let _ = out.flush();
     if has_cycle { 1 } else { 0 }
 }
 
 /// Find a cycle starting from `start` by following edges via DFS.
-/// Returns the cycle members in order.
-fn find_cycle(
-    start: &str,
-    adj: &HashMap<String, Vec<String>>,
-    removed: &HashSet<String>,
-) -> Vec<String> {
-    // Follow edges from start to find a cycle
-    let mut visited: HashMap<String, usize> = HashMap::new();
-    let mut path: Vec<String> = Vec::new();
+/// Uses integer node IDs for efficiency.
+fn find_cycle(start: usize, adj: &[Vec<usize>], removed: &[bool]) -> Vec<usize> {
+    let mut visited: HashMap<usize, usize> = HashMap::new();
+    let mut path: Vec<usize> = Vec::new();
 
-    let mut current = start.to_string();
+    let mut current = start;
     loop {
         if let Some(&idx) = visited.get(&current) {
-            // Found the cycle: extract from idx to end of path
             return path[idx..].to_vec();
         }
-        visited.insert(current.clone(), path.len());
-        path.push(current.clone());
+        visited.insert(current, path.len());
+        path.push(current);
 
-        // Follow the first non-removed successor
-        let next = adj
-            .get(&current)
-            .and_then(|neighbors| neighbors.iter().find(|n| !removed.contains(*n)));
+        let next = adj[current].iter().find(|&&n| !removed[n]);
         match next {
-            Some(n) => current = n.clone(),
-            None => {
-                // No successor — shouldn't happen in a cycle, return just the node
-                return vec![start.to_string()];
-            }
+            Some(&n) => current = n,
+            None => return vec![start],
         }
     }
 }

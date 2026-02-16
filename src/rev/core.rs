@@ -10,7 +10,9 @@ pub fn rev_bytes(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
     }
 
     // Pre-allocate output buffer same size as input
-    let mut output = Vec::with_capacity(data.len());
+    // Use 256KB flush threshold for batched output
+    const FLUSH_THRESHOLD: usize = 256 * 1024;
+    let mut output = Vec::with_capacity(data.len().min(FLUSH_THRESHOLD * 2));
     let mut start = 0;
 
     for pos in memchr::memchr_iter(b'\n', data) {
@@ -18,6 +20,12 @@ pub fn rev_bytes(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
         reverse_line(line, &mut output);
         output.push(b'\n');
         start = pos + 1;
+
+        // Flush in batches for large files
+        if output.len() >= FLUSH_THRESHOLD {
+            out.write_all(&output)?;
+            output.clear();
+        }
     }
 
     // Handle last line without trailing newline
@@ -26,7 +34,10 @@ pub fn rev_bytes(data: &[u8], out: &mut impl Write) -> std::io::Result<()> {
         reverse_line(line, &mut output);
     }
 
-    out.write_all(&output)
+    if !output.is_empty() {
+        out.write_all(&output)?;
+    }
+    Ok(())
 }
 
 /// Reverse a single line (without the newline delimiter).
@@ -44,13 +55,13 @@ fn reverse_line(line: &[u8], output: &mut Vec<u8>) {
         output.extend_from_slice(line);
         output[start..].reverse();
     } else {
-        // UTF-8 path: reverse by characters
-        // Use unsafe from_utf8_unchecked only if valid UTF-8, otherwise reverse bytes
+        // UTF-8 path: reverse by characters without intermediate Vec
         match std::str::from_utf8(line) {
             Ok(s) => {
-                // Reverse chars
-                let chars: Vec<char> = s.chars().rev().collect();
-                for ch in chars {
+                // Pre-reserve space
+                output.reserve(line.len());
+                // Write reversed chars directly
+                for ch in s.chars().rev() {
                     let mut buf = [0u8; 4];
                     let encoded = ch.encode_utf8(&mut buf);
                     output.extend_from_slice(encoded.as_bytes());

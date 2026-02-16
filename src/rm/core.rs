@@ -157,7 +157,20 @@ pub fn rm_path(path: &Path, config: &RmConfig) -> Result<bool, io::Error> {
 }
 
 /// Recursively remove a directory tree.
+/// Uses parallel removal via rayon when not in interactive mode.
 fn rm_recursive(path: &Path, config: &RmConfig, root_dev: u64) -> Result<bool, io::Error> {
+    // For non-interactive mode, use parallel recursive removal
+    if config.interactive == InteractiveMode::Never && !config.verbose {
+        let success = std::sync::atomic::AtomicBool::new(true);
+        rm_recursive_parallel(path, config, root_dev, &success);
+        // Remove the directory itself after children are removed
+        if let Err(e) = std::fs::remove_dir(path) {
+            eprintln!("rm: cannot remove '{}': {}", path.display(), e);
+            return Ok(false);
+        }
+        return Ok(success.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     let mut success = true;
 
     let entries = match std::fs::read_dir(path) {
@@ -243,4 +256,64 @@ fn rm_recursive(path: &Path, config: &RmConfig, root_dev: u64) -> Result<bool, i
     }
 
     Ok(success)
+}
+
+/// Parallel recursive removal for non-interactive, non-verbose mode.
+fn rm_recursive_parallel(
+    path: &Path,
+    config: &RmConfig,
+    root_dev: u64,
+    success: &std::sync::atomic::AtomicBool,
+) {
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            if !config.force {
+                eprintln!("rm: cannot remove '{}': {}", path.display(), e);
+            }
+            success.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+
+    use rayon::prelude::*;
+    entries.par_iter().for_each(|entry| {
+        let child_path = entry.path();
+        let child_meta = match std::fs::symlink_metadata(&child_path) {
+            Ok(m) => m,
+            Err(e) => {
+                if !config.force {
+                    eprintln!("rm: cannot remove '{}': {}", child_path.display(), e);
+                }
+                success.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        #[cfg(unix)]
+        let skip_fs = config.one_file_system && child_meta.dev() != root_dev;
+        #[cfg(not(unix))]
+        let skip_fs = false;
+
+        if skip_fs {
+            return;
+        }
+
+        if child_meta.is_dir() {
+            rm_recursive_parallel(&child_path, config, root_dev, success);
+            if let Err(e) = std::fs::remove_dir(&child_path) {
+                if !config.force {
+                    eprintln!("rm: cannot remove '{}': {}", child_path.display(), e);
+                }
+                success.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if let Err(e) = std::fs::remove_file(&child_path) {
+            if !config.force {
+                eprintln!("rm: cannot remove '{}': {}", child_path.display(), e);
+            }
+            success.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }
