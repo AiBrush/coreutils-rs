@@ -349,6 +349,7 @@ fn seek_output_file(file: &mut File, seek_blocks: u64, block_size: usize) -> io:
 }
 
 /// Check if any data conversion options are enabled.
+#[cfg(target_os = "linux")]
 fn has_conversions(conv: &DdConv) -> bool {
     conv.lcase || conv.ucase || conv.swab || conv.sync
 }
