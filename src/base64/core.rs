@@ -20,22 +20,23 @@ fn num_cpus() -> usize {
 const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
 /// Minimum data size for parallel no-wrap encoding (16MB).
-/// For 10MB benchmark files, sequential encoding is faster because
-/// Rayon pool init (~200-500µs on first use) and thread dispatch overhead
-/// exceeds the benefit of parallel encoding at this size.
+/// For single-file CLI usage (typical benchmark), the Rayon pool is cold
+/// on first use (~200-500µs init). At 10MB, sequential encoding is faster
+/// because pool init + dispatch overhead exceeds the parallel benefit.
+/// Note: multi-file callers pay pool init only once; subsequent files would
+/// benefit from a lower threshold (~2MB). Optimized for single-file CLI.
 const PARALLEL_NOWRAP_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Minimum data size for parallel wrapped encoding (12MB).
-/// For 10MB benchmark files, sequential encoding is faster because
-/// Rayon pool init + thread dispatch overhead exceeds the benefit.
+/// Same cold-pool reasoning as PARALLEL_NOWRAP_THRESHOLD above.
 /// The sequential encode_wrapped_expand path with backward expansion
 /// eliminates per-group overhead from L1-scatter chunking.
 const PARALLEL_WRAPPED_THRESHOLD: usize = 12 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (1MB of base64 data).
-/// Lower threshold than encode because decode is more compute-intensive.
-/// Rayon's persistent thread pool (~10µs dispatch after first use)
-/// makes parallel decode beneficial even at 1MB.
+/// Lower threshold than encode because decode is more compute-intensive
+/// and benefits from parallelism at smaller sizes. After first use, the
+/// Rayon pool is warm (~10µs dispatch), making 1MB a good crossover point.
 const PARALLEL_DECODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Hint HUGEPAGE for large output buffers on Linux.
@@ -217,7 +218,8 @@ fn encode_wrapped_expand(
     hint_hugepage(&mut buf);
 
     // One SIMD encode call for the entire input (no chunking overhead)
-    let _ = BASE64_ENGINE.encode(data, buf[..enc_len].as_out());
+    let encoded = BASE64_ENGINE.encode(data, buf[..enc_len].as_out());
+    debug_assert_eq!(encoded.len(), enc_len, "encode wrote unexpected length");
 
     // Expand backward to insert newlines — shifts only ~1.3% of data
     expand_backward(buf.as_mut_ptr(), enc_len, out_len, wrap_col);
