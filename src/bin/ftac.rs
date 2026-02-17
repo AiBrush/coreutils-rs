@@ -1,4 +1,3 @@
-#[cfg(not(target_os = "linux"))]
 use std::io::BufWriter;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -48,6 +47,9 @@ impl Write for VmspliceWriter {
                 iov_base: buf.as_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
             };
+            // SAFETY: vmsplice with flags=0 borrows user pages via get_user_pages_fast().
+            // The data must remain valid until the pipe reader consumes it.
+            // This is safe for mmap'd file data which outlives the pipe drain.
             let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
             if n >= 0 {
                 return Ok(n as usize);
@@ -70,11 +72,12 @@ impl Write for VmspliceWriter {
                 iov_base: buf.as_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
             };
+            // SAFETY: same as write() — pages borrowed, not gifted. Data must outlive pipe drain.
             let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
             if n > 0 {
                 buf = &buf[n as usize..];
             } else if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -394,8 +397,17 @@ fn main() {
     #[cfg(target_os = "linux")]
     let had_error = {
         let mut writer = VmspliceWriter::new();
-        let zerocopy = is_byte_sep && writer.is_pipe;
-        run(&cli, &files, &mut writer, zerocopy)
+        if writer.is_pipe {
+            let zerocopy = is_byte_sep;
+            run(&cli, &files, &mut writer, zerocopy)
+        } else if is_byte_sep {
+            run(&cli, &files, &mut &*writer.raw, false)
+        } else {
+            let mut bw = BufWriter::with_capacity(16 * 1024 * 1024, &*writer.raw);
+            let err = run(&cli, &files, &mut bw, false);
+            let _ = bw.flush();
+            err
+        }
     };
     #[cfg(all(unix, not(target_os = "linux")))]
     let had_error = {
