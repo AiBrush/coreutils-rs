@@ -21,8 +21,8 @@ const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
 /// Minimum data size for parallel no-wrap encoding (16MB).
 /// For 10MB benchmark files, sequential encoding is faster because
-/// Rayon pool init (~200-500µs) and thread dispatch overhead exceeds
-/// the benefit of parallel encoding at this size.
+/// Rayon pool init (~200-500µs on first use) and thread dispatch overhead
+/// exceeds the benefit of parallel encoding at this size.
 const PARALLEL_NOWRAP_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Minimum data size for parallel wrapped encoding (12MB).
@@ -33,8 +33,9 @@ const PARALLEL_NOWRAP_THRESHOLD: usize = 16 * 1024 * 1024;
 const PARALLEL_WRAPPED_THRESHOLD: usize = 12 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (1MB of base64 data).
-/// Lower threshold lets parallel decode kick in for 1MB benchmark files.
-/// With rayon's pre-warmed thread pool, dispatch overhead is negligible.
+/// Lower threshold than encode because decode is more compute-intensive.
+/// Rayon's persistent thread pool (~10µs dispatch after first use)
+/// makes parallel decode beneficial even at 1MB.
 const PARALLEL_DECODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Hint HUGEPAGE for large output buffers on Linux.
@@ -191,9 +192,10 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 fn encode_wrapped_expand(
     data: &[u8],
     wrap_col: usize,
-    _bytes_per_line: usize,
+    bytes_per_line: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    debug_assert!(bytes_per_line % 3 == 0);
     let enc_len = BASE64_ENGINE.encoded_length(data.len());
     if enc_len == 0 {
         return Ok(());
@@ -203,7 +205,9 @@ fn encode_wrapped_expand(
     let rem = enc_len % wrap_col;
     let out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
 
-    // Single allocation: encode into first enc_len bytes, expand backward to out_len
+    // Single allocation: encode into first enc_len bytes, expand backward to out_len.
+    // SAFETY: buf[..enc_len] is initialized by BASE64_ENGINE.encode below.
+    // buf[enc_len..out_len] is written by expand_backward before write_all reads it.
     let mut buf: Vec<u8> = Vec::with_capacity(out_len);
     #[allow(clippy::uninit_vec)]
     unsafe {
