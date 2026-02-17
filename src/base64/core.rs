@@ -195,7 +195,7 @@ fn encode_wrapped_expand(
     bytes_per_line: usize,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    debug_assert!(bytes_per_line % 3 == 0);
+    debug_assert!(bytes_per_line.is_multiple_of(3));
     let enc_len = BASE64_ENGINE.encoded_length(data.len());
     if enc_len == 0 {
         return Ok(());
@@ -236,6 +236,7 @@ fn encode_wrapped_expand(
 ///
 /// Uses a full output buffer for vmsplice safety: vmsplice maps user pages
 /// into the pipe buffer, so the buffer must stay valid until the reader consumes.
+#[allow(dead_code)]
 fn encode_wrapped_scatter(
     data: &[u8],
     wrap_col: usize,
