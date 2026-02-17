@@ -2258,81 +2258,55 @@ fn single_field1_parallel(
 /// Optimizations:
 /// - Contiguous run tracking: consecutive no-delimiter lines are batched into
 ///   a single buf_extend (one memcpy instead of one per line).
-/// - Deferred field output: records delimiter position, outputs field+newline
-///   together via fused buf_extend_byte on newline (saves one len load/store
-///   per line vs separate buf_extend + buf_push).
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
     buf.reserve(data.len());
     let base = data.as_ptr();
     let mut line_start: usize = 0;
-    // Position of first delimiter on current line (usize::MAX = not found yet).
-    // Defers field output until newline, enabling fused buf_extend_byte.
-    let mut first_delim: usize = usize::MAX;
-    // Start of contiguous run of unchanged lines (no delimiter).
-    let mut run_start: usize = 0;
+    let mut found_delim = false;
 
     for pos in memchr::memchr2_iter(delim, line_delim, data) {
         let byte = unsafe { *base.add(pos) };
         if byte == line_delim {
-            if first_delim != usize::MAX {
-                // Line has delimiter — flush run, write field + newline together.
-                if run_start < line_start {
-                    unsafe {
-                        buf_extend(
-                            buf,
-                            std::slice::from_raw_parts(base.add(run_start), line_start - run_start),
-                        );
-                    }
-                }
-                // Fused: field content + newline in one operation
-                unsafe {
-                    buf_extend_byte(
-                        buf,
-                        std::slice::from_raw_parts(base.add(line_start), first_delim - line_start),
-                        line_delim,
-                    );
-                }
-                first_delim = usize::MAX;
-                run_start = pos + 1;
-            }
-            // else: no delimiter on this line — part of contiguous run, skip copy.
-            line_start = pos + 1;
-        } else if first_delim == usize::MAX {
-            // First delimiter on this line — just record position (defer output).
-            first_delim = pos;
-        }
-        // Subsequent delimiters on same line: ignore
-    }
-
-    // Flush remaining data
-    if run_start < data.len() {
-        if first_delim != usize::MAX {
-            // Last line has delimiter but no trailing newline.
-            // Flush run up to this line, then output field content (no newline).
-            if run_start < line_start {
+            if !found_delim {
+                // No delimiter on this line — output entire line including newline
                 unsafe {
                     buf_extend(
                         buf,
-                        std::slice::from_raw_parts(base.add(run_start), line_start - run_start),
+                        std::slice::from_raw_parts(base.add(line_start), pos + 1 - line_start),
                     );
                 }
+            } else {
+                // Delimiter was found earlier — just add the line terminator
+                unsafe { buf_push(buf, line_delim) };
             }
+            line_start = pos + 1;
+            found_delim = false;
+        } else if !found_delim {
+            // First delimiter on this line — output from line_start to here
+            found_delim = true;
             unsafe {
                 buf_extend(
                     buf,
-                    std::slice::from_raw_parts(base.add(line_start), first_delim - line_start),
-                );
-            }
-        } else {
-            // Remaining data is part of contiguous run — flush entire run
-            unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(run_start), data.len() - run_start),
+                    std::slice::from_raw_parts(base.add(line_start), pos - line_start),
                 );
             }
         }
+        // Subsequent delimiters: ignore
+    }
+
+    // Handle last line (no trailing newline)
+    if line_start < data.len() {
+        if !found_delim {
+            // No delimiter — output remaining data as-is
+            unsafe {
+                buf_extend(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), data.len() - line_start),
+                );
+            }
+        }
+        // If found_delim: field already output, no trailing newline to add
     }
 }
 

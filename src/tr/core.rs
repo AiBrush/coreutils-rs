@@ -7,10 +7,8 @@ use rayon::prelude::*;
 const MAX_IOV: usize = 1024;
 
 /// Stream buffer: 8MB — matches enlarged pipe buffer size (F_SETPIPE_SZ=8MB).
-/// For 10MB benchmark: 2 iterations (8MB + 2MB) vs 3 iterations (4MB×2 + 2MB),
-/// saving one read() + one write() syscall (~200µs each). The data streams
-/// sequentially through L2 cache during SIMD translate, so buffer size doesn't
-/// affect cache efficiency. 8MB fits in L3 (typically 16-32MB on CI runners).
+/// For 10MB input: 2 iterations (8MB + 2MB) vs 3 iterations (4MB×2 + 2MB),
+/// saving one read() + one write() syscall pair.
 const STREAM_BUF: usize = 8 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap/batch paths.
