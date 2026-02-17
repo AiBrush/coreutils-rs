@@ -1,10 +1,12 @@
 use memchr::memchr_iter;
 use std::io::{self, BufRead, IoSlice, Write};
 
-/// Minimum file size for parallel processing (2MB).
-/// Uses Rayon's persistent thread pool for low-overhead dispatch (~10µs).
-/// For data >= 2MB with 4 cores, the parallel savings (~3ms) far exceed overhead.
-const PARALLEL_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum file size for parallel processing (16MB).
+/// For 10MB benchmark files, the split_for_scope scan (~300µs) + rayon dispatch
+/// overhead exceeds the parallel benefit. Sequential memchr2_iter is faster
+/// because it avoids the redundant full-data scan for chunk boundaries.
+/// 16MB ensures only genuinely large files use parallel processing.
+const PARALLEL_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Max iovec entries per writev call (Linux default).
 const MAX_IOV: usize = 1024;
@@ -155,6 +157,21 @@ unsafe fn buf_push(buf: &mut Vec<u8>, b: u8) {
         let len = buf.len();
         *buf.as_mut_ptr().add(len) = b;
         buf.set_len(len + 1);
+    }
+}
+
+/// Append a slice + a single trailing byte to buf without capacity checks.
+/// Fused operation saves one len load/store vs separate buf_extend + buf_push.
+/// Hot path for field extraction: copies field content + newline in one call.
+/// Caller MUST ensure buf has enough remaining capacity.
+#[inline(always)]
+unsafe fn buf_extend_byte(buf: &mut Vec<u8>, data: &[u8], b: u8) {
+    unsafe {
+        let len = buf.len();
+        let ptr = buf.as_mut_ptr().add(len);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        *ptr.add(data.len()) = b;
+        buf.set_len(len + data.len() + 1);
     }
 }
 
@@ -980,9 +997,10 @@ fn process_single_field(
 ) -> io::Result<()> {
     let target_idx = target - 1;
 
-    // For single-field extraction, parallelize at 2MB+ to match PARALLEL_THRESHOLD.
-    // The 10MB benchmark regressed from ~7x to ~5.3x when this was set to 32MB.
-    const FIELD_PARALLEL_MIN: usize = 2 * 1024 * 1024;
+    // For single-field extraction, parallelize at 16MB+ to match PARALLEL_THRESHOLD.
+    // For 10MB: the split_for_scope scan (~300µs) is redundant work — the processing
+    // already scans with memchr2_iter. Sequential is faster because it does ONE scan.
+    const FIELD_PARALLEL_MIN: usize = 16 * 1024 * 1024;
 
     if delim != line_delim {
         // Field 1 fast path: memchr2 single-pass scan.
@@ -2236,7 +2254,10 @@ fn single_field1_parallel(
 /// Uses a single memchr2_iter pass over the entire chunk to find both delimiters
 /// and newlines. This eliminates the per-line memchr function call overhead
 /// (~5-10ns per call × 2 calls per line) that dominates for short-field data.
-/// For 100MB with 1M lines: saves ~10-20ms of function call setup overhead.
+///
+/// Optimizations:
+/// - Contiguous run tracking: consecutive no-delimiter lines are batched into
+///   a single buf_extend (one memcpy instead of one per line).
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
     buf.reserve(data.len());
@@ -2262,20 +2283,22 @@ fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8
             line_start = pos + 1;
             found_delim = false;
         } else if !found_delim {
-            // First delimiter on this line — output field 1
+            // First delimiter on this line — output from line_start to here
+            found_delim = true;
             unsafe {
                 buf_extend(
                     buf,
                     std::slice::from_raw_parts(base.add(line_start), pos - line_start),
                 );
             }
-            found_delim = true;
         }
-        // Subsequent delimiters on same line: ignore
+        // Subsequent delimiters: ignore
     }
-    // Handle trailing data without final line_delim
+
+    // Handle last line (no trailing newline)
     if line_start < data.len() {
         if !found_delim {
+            // No delimiter — output remaining data as-is
             unsafe {
                 buf_extend(
                     buf,
@@ -2283,6 +2306,7 @@ fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8
                 );
             }
         }
+        // If found_delim: field already output, no trailing newline to add
     }
 }
 
@@ -2408,14 +2432,12 @@ fn extract_single_field_line(
     if target_idx == 0 {
         match memchr::memchr(delim, line) {
             Some(pos) => unsafe {
-                buf_extend(buf, std::slice::from_raw_parts(base, pos));
-                buf_push(buf, line_delim);
+                buf_extend_byte(buf, std::slice::from_raw_parts(base, pos), line_delim);
             },
             None => {
                 if !suppress {
                     unsafe {
-                        buf_extend(buf, line);
-                        buf_push(buf, line_delim);
+                        buf_extend_byte(buf, line, line_delim);
                     }
                 }
             }
@@ -2432,11 +2454,11 @@ fn extract_single_field_line(
         has_delim = true;
         if field_idx == target_idx {
             unsafe {
-                buf_extend(
+                buf_extend_byte(
                     buf,
                     std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                    line_delim,
                 );
-                buf_push(buf, line_delim);
             }
             return;
         }
@@ -2447,8 +2469,7 @@ fn extract_single_field_line(
     if !has_delim {
         if !suppress {
             unsafe {
-                buf_extend(buf, line);
-                buf_push(buf, line_delim);
+                buf_extend_byte(buf, line, line_delim);
             }
         }
         return;
@@ -2456,11 +2477,11 @@ fn extract_single_field_line(
 
     if field_idx == target_idx {
         unsafe {
-            buf_extend(
+            buf_extend_byte(
                 buf,
                 std::slice::from_raw_parts(base.add(field_start), len - field_start),
+                line_delim,
             );
-            buf_push(buf, line_delim);
         }
     } else {
         unsafe { buf_push(buf, line_delim) };

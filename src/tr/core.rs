@@ -6,11 +6,10 @@ use rayon::prelude::*;
 /// Linux UIO_MAXIOV is 1024; we use that as our batch limit.
 const MAX_IOV: usize = 1024;
 
-/// Stream buffer: 4MB — fits in L3 cache for optimal translate throughput.
-/// Each read chunk is processed and written immediately for pipelining:
-/// while ftr processes chunk N, upstream cat writes chunk N+1 to the pipe.
-/// 4MB matches pipe buffer sizes and avoids large-buffer allocation overhead.
-const STREAM_BUF: usize = 4 * 1024 * 1024;
+/// Stream buffer: 8MB — matches enlarged pipe buffer size (F_SETPIPE_SZ=8MB).
+/// For 10MB input: 2 iterations (8MB + 2MB) vs 3 iterations (4MB×2 + 2MB),
+/// saving one read() + one write() syscall pair.
+const STREAM_BUF: usize = 8 * 1024 * 1024;
 
 /// Minimum data size to engage rayon parallel processing for mmap/batch paths.
 /// For 10MB benchmark files, parallel tr translate was a 105% REGRESSION
