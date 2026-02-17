@@ -56,6 +56,86 @@ impl io::Read for RawStdin {
     }
 }
 
+/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
+/// When stdout is a pipe, vmsplice references user-space pages directly
+/// in the pipe buffer (no kernel memcpy). Falls back to regular write
+/// for non-pipe fds (files, terminals).
+///
+/// SAFETY: Only safe for data in mmap pages (pinned by get_user_pages).
+/// Do NOT use for heap-allocated buffers that may be freed/reused.
+#[cfg(target_os = "linux")]
+struct VmspliceWriter {
+    raw: ManuallyDrop<std::fs::File>,
+    is_pipe: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl VmspliceWriter {
+    fn new() -> Self {
+        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let is_pipe = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        Self { raw, is_pipe }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Write for VmspliceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write(buf);
+        }
+        loop {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            self.is_pipe = false;
+            return (&*self.raw).write(buf);
+        }
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write_all(buf);
+        }
+        while !buf.is_empty() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                buf = &buf[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.is_pipe = false;
+                return (&*self.raw).write_all(buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Cli {
     complement: bool,
     delete: bool,
@@ -338,8 +418,8 @@ fn main() {
             // the pipe reader releases its references.
             #[cfg(target_os = "linux")]
             {
-                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw_out)
+                let mut out = VmspliceWriter::new();
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut out)
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
