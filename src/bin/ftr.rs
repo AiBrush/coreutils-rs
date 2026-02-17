@@ -432,11 +432,12 @@ fn main() {
                 tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
             }
         } else if let Some(mm) = try_mmap_stdin_with_threshold(0) {
-            // Fallback: read-only mmap + separate buffer translate
+            // Fallback: read-only mmap + separate buffer translate.
+            // vmsplice is safe: output references mmap pages (pinned).
             #[cfg(target_os = "linux")]
             {
-                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                tr::translate_mmap_readonly(&set1, &set2, &mm, &mut *raw_out)
+                let mut out = VmspliceWriter::new();
+                tr::translate_mmap_readonly(&set1, &set2, &mm, &mut out)
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -490,14 +491,14 @@ fn main() {
 
     if let Some(m) = mmap {
         // File-redirected stdin: use batch path with mmap data.
-        // Use raw write (not vmsplice) because delete/squeeze functions create
-        // intermediate heap buffers. With vmsplice, freed heap pages can be reused
-        // by the allocator before the pipe reader reads them, causing data corruption.
+        // vmsplice is safe here: mmap _mmap functions write slices of the
+        // original mmap data (delete/squeeze output subsets of input).
+        // The mmap pages are pinned and live until process exit.
         let data = FileData::Mmap(m);
         #[cfg(target_os = "linux")]
         let result = {
-            let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-            run_mmap_mode(&cli, set1_str, &data, &mut *raw_out)
+            let mut out = VmspliceWriter::new();
+            run_mmap_mode(&cli, set1_str, &data, &mut out)
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let result = run_mmap_mode(&cli, set1_str, &data, &mut *raw);
