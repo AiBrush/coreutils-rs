@@ -43,32 +43,6 @@ pub fn tac_bytes_owned(
     tac_bytes(data, separator, before, out)
 }
 
-/// Zero-copy tac: builds IoSlice entries pointing into input data, writes via
-/// write_vectored. Designed for vmsplice-backed writers where write_vectored
-/// maps user pages directly into the pipe (no copy).
-/// For large data (>= PARALLEL_THRESHOLD), falls back to parallel contiguous buffers.
-pub fn tac_bytes_zerocopy(
-    data: &[u8],
-    separator: u8,
-    before: bool,
-    out: &mut impl Write,
-) -> io::Result<()> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    if data.len() >= PARALLEL_THRESHOLD {
-        if !before {
-            tac_bytes_after_contiguous(data, separator, out)
-        } else {
-            tac_bytes_before_contiguous(data, separator, out)
-        }
-    } else if !before {
-        tac_bytes_after_zerocopy(data, separator, out)
-    } else {
-        tac_bytes_before_zerocopy(data, separator, out)
-    }
-}
-
 /// Collect multi-byte separator positions with pre-allocated Vec.
 #[inline]
 fn collect_positions_str(data: &[u8], separator: &[u8]) -> Vec<usize> {
@@ -290,79 +264,6 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
         buf.extend_from_slice(&data[..end]);
     }
     out.write_all(&buf)
-}
-
-/// Zero-copy after-separator mode: builds IoSlice entries pointing directly into
-/// input data, writes via write_vectored. Eliminates the 10MB contiguous buffer
-/// allocation and copy. With a vmsplice-backed writer, this is fully zero-copy:
-/// mmap pages are mapped directly into the pipe.
-fn tac_bytes_after_zerocopy(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Forward scan for separator positions
-    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 64);
-    for pos in memchr::memchr_iter(sep, data) {
-        positions.push(pos);
-    }
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
-    // Build IoSlice entries in reverse order, flushing in batches
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
-    for &pos in positions.iter().rev() {
-        let rec_start = pos + 1;
-        if rec_start < end {
-            slices.push(IoSlice::new(&data[rec_start..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
-            }
-        }
-        end = rec_start;
-    }
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
-}
-
-/// Zero-copy before-separator mode: builds IoSlice entries pointing directly
-/// into input data.
-fn tac_bytes_before_zerocopy(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    // Forward scan for separator positions
-    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 64);
-    for pos in memchr::memchr_iter(sep, data) {
-        positions.push(pos);
-    }
-
-    if positions.is_empty() {
-        return out.write_all(data);
-    }
-
-    // Build IoSlice entries in reverse order, flushing in batches
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
-    for &pos in positions.iter().rev() {
-        if pos < end {
-            slices.push(IoSlice::new(&data[pos..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
-            }
-        }
-        end = pos;
-    }
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
 }
 
 /// Reverse records using a multi-byte string separator.

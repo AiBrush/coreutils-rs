@@ -1,5 +1,4 @@
-use std::io::BufWriter;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
 #[cfg(unix)]
@@ -13,109 +12,6 @@ use memmap2::MmapOptions;
 use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
-
-/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
-/// When stdout is a pipe, vmsplice references user-space pages directly
-/// in the pipe buffer (no kernel memcpy). Falls back to regular write
-/// for non-pipe fds (files, terminals).
-#[cfg(target_os = "linux")]
-struct VmspliceWriter {
-    raw: ManuallyDrop<std::fs::File>,
-    is_pipe: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl VmspliceWriter {
-    fn new() -> Self {
-        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let is_pipe = unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
-        };
-        Self { raw, is_pipe }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Write for VmspliceWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write(buf);
-        }
-        loop {
-            let iov = libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            // SAFETY: vmsplice with flags=0 borrows user pages via get_user_pages_fast().
-            // The data must remain valid until the pipe reader consumes it.
-            // This is safe for mmap'd file data which outlives the pipe drain.
-            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            self.is_pipe = false;
-            return (&*self.raw).write(buf);
-        }
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write_all(buf);
-        }
-        while !buf.is_empty() {
-            let iov = libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            // SAFETY: same as write() — pages borrowed, not gifted. Data must outlive pipe drain.
-            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n > 0 {
-                buf = &buf[n as usize..];
-            } else if n == 0 {
-                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-            } else {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                self.is_pipe = false;
-                return (&*self.raw).write_all(buf);
-            }
-        }
-        Ok(())
-    }
-
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        if !self.is_pipe || bufs.is_empty() {
-            return (&*self.raw).write_vectored(bufs);
-        }
-        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
-        // so &[IoSlice] has the same memory layout as &[iovec].
-        loop {
-            let count = bufs.len().min(1024);
-            let iovs = bufs.as_ptr() as *const libc::iovec;
-            let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            self.is_pipe = false;
-            return (&*self.raw).write_vectored(bufs);
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 struct Cli {
     before: bool,
@@ -268,7 +164,7 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     mmap
 }
 
-fn run(cli: &Cli, files: &[String], out: &mut impl Write, zerocopy: bool) -> bool {
+fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
     let mut had_error = false;
 
     for filename in files {
@@ -331,13 +227,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write, zerocopy: bool) -> boo
         } else if let Some(ref sep) = cli.separator {
             let bytes: &[u8] = &data;
             tac::tac_string_separator(bytes, sep.as_bytes(), cli.before, out)
-        } else if zerocopy && matches!(data, FileData::Mmap(_)) {
-            // Zero-copy path: IoSlice pointing into mmap data → vmsplice to pipe.
-            // Only safe for mmap data — mmap pages are file-backed and remain in
-            // the page cache after process exit, so the pipe reader can still read them.
-            // Heap Vec pages are freed on exit, causing the pipe reader to see zeroes.
-            let bytes: &[u8] = &data;
-            tac::tac_bytes_zerocopy(bytes, b'\n', cli.before, out)
         } else if let FileData::Owned(ref mut owned) = data {
             tac::tac_bytes_owned(owned, b'\n', cli.before, out)
         } else {
@@ -392,33 +281,23 @@ fn main() {
 
     let is_byte_sep = !cli.regex && cli.separator.is_none();
 
-    // On Linux: VmspliceWriter for all output. When stdout is a pipe, vmsplice
-    // maps user pages directly into the pipe (zero-copy). For byte-separator
-    // + pipe, the zerocopy path builds IoSlice entries from mmap data instead
-    // of allocating + copying a 10MB contiguous buffer.
-    #[cfg(target_os = "linux")]
-    let had_error = {
-        let mut writer = VmspliceWriter::new();
-        if writer.is_pipe {
-            let zerocopy = is_byte_sep;
-            run(&cli, &files, &mut writer, zerocopy)
-        } else if is_byte_sep {
-            run(&cli, &files, &mut &*writer.raw, false)
-        } else {
-            let mut bw = BufWriter::with_capacity(16 * 1024 * 1024, &*writer.raw);
-            let err = run(&cli, &files, &mut bw, false);
-            let _ = bw.flush();
-            err
-        }
-    };
-    #[cfg(all(unix, not(target_os = "linux")))]
+    // Byte-separator path: contiguous buffer + single write_all is fastest
+    // for 10MB files with high line density (~244K lines). One write(2)
+    // syscall beats ~238 batched writev calls (EXP-010).
+    // Non-byte-sep paths use BufWriter for buffered output.
+    //
+    // NOTE: VmspliceWriter is NOT used for tac because tac builds temporary
+    // buffers (contiguous reversed output) that are freed when the process
+    // exits. vmsplice maps user pages into the pipe without copying, so the
+    // pipe reader would read freed memory after process exit.
+    #[cfg(unix)]
     let had_error = {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
         if is_byte_sep {
-            run(&cli, &files, &mut &*raw, false)
+            run(&cli, &files, &mut &*raw)
         } else {
             let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, &*raw);
-            let err = run(&cli, &files, &mut writer, false);
+            let err = run(&cli, &files, &mut writer);
             let _ = writer.flush();
             err
         }
@@ -429,10 +308,10 @@ fn main() {
         let lock = stdout.lock();
         if is_byte_sep {
             let mut writer = lock;
-            run(&cli, &files, &mut writer, false)
+            run(&cli, &files, &mut writer)
         } else {
             let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, lock);
-            let err = run(&cli, &files, &mut writer, false);
+            let err = run(&cli, &files, &mut writer);
             let _ = writer.flush();
             err
         }
