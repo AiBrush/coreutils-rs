@@ -7,7 +7,7 @@ use rayon::prelude::*;
 /// is paid every time. For 10MB files, single-threaded scan (0.3ms) is faster
 /// than rayon init + parallel scan. Only use parallelism for genuinely large
 /// files where multi-core scanning and copying pays off.
-const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
+pub const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// Maximum IoSlice entries per write_vectored batch.
 /// Used by string/regex separator paths.

@@ -386,10 +386,15 @@ fn run_byte_sep_vmsplice(cli: &Cli, files: &[String], writer: &mut VmspliceWrite
             }
         };
 
-        // Enable vmsplice only for mmap-backed data (pages survive until process exit).
-        // For heap-allocated Vec data, fall back to regular write(2) to prevent
-        // use-after-free when Vec drops before pipe reader consumes all data.
-        writer.is_pipe = pipe_enabled && matches!(&data, FileData::Mmap(_));
+        // Enable vmsplice only for mmap-backed data below the parallel threshold.
+        // - Mmap pages survive until process exit, safe for vmsplice.
+        // - Files >= PARALLEL_THRESHOLD use the parallel path which builds
+        //   intermediate Vec<u8> chunk buffers — those are heap-allocated and
+        //   may be freed before the pipe reader consumes all data.
+        // - FileData::Owned (pipe stdin) is heap-allocated, also unsafe.
+        writer.is_pipe = pipe_enabled
+            && matches!(&data, FileData::Mmap(_))
+            && data.len() < tac::PARALLEL_THRESHOLD;
 
         let result = if let FileData::Owned(ref mut owned) = data {
             tac::tac_bytes_owned(owned, b'\n', cli.before, writer)
