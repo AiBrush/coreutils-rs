@@ -61,8 +61,11 @@ impl io::Read for RawStdin {
 /// in the pipe buffer (no kernel memcpy). Falls back to regular write
 /// for non-pipe fds (files, terminals).
 ///
-/// SAFETY: Only safe for data in mmap pages (pinned by get_user_pages).
-/// Do NOT use for heap-allocated buffers that may be freed/reused.
+/// SAFETY: The buffer passed to write/write_all must remain valid (not freed
+/// or mutated) until the pipe reader has consumed all referenced pages.
+/// Only safe when `buf` points into pages that will not be freed or mutated
+/// after vmsplice returns (e.g., MAP_PRIVATE mmap pages that are fully
+/// translated and no longer modified). Never use with heap Vec buffers.
 #[cfg(target_os = "linux")]
 struct VmspliceWriter {
     raw: ManuallyDrop<std::fs::File>,
@@ -93,13 +96,18 @@ impl Write for VmspliceWriter {
                 iov_len: buf.len(),
             };
             let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n >= 0 {
+            if n > 0 {
                 return Ok(n as usize);
+            }
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
             }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            // Permanent fallback: non-transient errors (ENOSPC, EINVAL) indicate
+            // vmsplice can't work on this fd. EAGAIN won't occur (no O_NONBLOCK).
             self.is_pipe = false;
             return (&*self.raw).write(buf);
         }
