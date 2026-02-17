@@ -2250,63 +2250,57 @@ fn single_field1_parallel(
     write_ioslices(out, &slices)
 }
 
-/// Extract field 1 from a chunk using memchr2_iter single-pass SIMD scanning.
-/// Uses a single memchr2_iter pass over the entire chunk to find both delimiters
-/// and newlines. This eliminates the per-line memchr function call overhead
-/// (~5-10ns per call × 2 calls per line) that dominates for short-field data.
+/// Two-level scan for field-1 extraction: outer memchr(newline) + inner memchr(delimiter).
 ///
-/// Optimizations:
-/// - Contiguous run tracking: consecutive no-delimiter lines are batched into
-///   a single buf_extend (one memcpy instead of one per line).
+/// Key insight: memchr2(delim, newline) iterates over ALL delimiters AND newlines.
+/// For a 10MB CSV with 10 fields/line (~100K lines), that's ~1M events (900K
+/// delimiters + 100K newlines). For field-1, we only need the FIRST delimiter
+/// per line. Two-level processes ~200K events: 100K newlines (outer) + 100K
+/// inner memchr calls that each scan only ~10 bytes to find the first delimiter.
+/// This is ~5x fewer loop iterations with nearly the same total bytes scanned.
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
     buf.reserve(data.len());
     let base = data.as_ptr();
     let mut line_start: usize = 0;
-    let mut found_delim = false;
 
-    for pos in memchr::memchr2_iter(delim, line_delim, data) {
-        let byte = unsafe { *base.add(pos) };
-        if byte == line_delim {
-            if !found_delim {
-                // No delimiter on this line — output entire line including newline
-                unsafe {
-                    buf_extend(
-                        buf,
-                        std::slice::from_raw_parts(base.add(line_start), pos + 1 - line_start),
-                    );
-                }
-            } else {
-                // Delimiter was found earlier — just add the line terminator
-                unsafe { buf_push(buf, line_delim) };
+    for end_pos in memchr_iter(line_delim, data) {
+        let line_len = end_pos - line_start;
+        let line = unsafe { std::slice::from_raw_parts(base.add(line_start), line_len) };
+        if let Some(dp) = memchr::memchr(delim, line) {
+            // Has delimiter: output field (up to delimiter) + newline
+            unsafe {
+                buf_extend_byte(
+                    buf,
+                    std::slice::from_raw_parts(base.add(line_start), dp),
+                    line_delim,
+                );
             }
-            line_start = pos + 1;
-            found_delim = false;
-        } else if !found_delim {
-            // First delimiter on this line — output from line_start to here
-            found_delim = true;
+        } else {
+            // No delimiter: output entire line + newline
             unsafe {
                 buf_extend(
                     buf,
-                    std::slice::from_raw_parts(base.add(line_start), pos - line_start),
+                    std::slice::from_raw_parts(base.add(line_start), line_len + 1),
                 );
             }
         }
-        // Subsequent delimiters: ignore
+        line_start = end_pos + 1;
     }
 
-    // Handle last line (no trailing newline)
+    // Handle last line without trailing newline
     if line_start < data.len() {
-        if !found_delim {
-            // No delimiter — output remaining data as-is
+        let remaining =
+            unsafe { std::slice::from_raw_parts(base.add(line_start), data.len() - line_start) };
+        if let Some(dp) = memchr::memchr(delim, remaining) {
+            // Has delimiter: output field only (no trailing newline)
             unsafe {
-                buf_extend(
-                    buf,
-                    std::slice::from_raw_parts(base.add(line_start), data.len() - line_start),
-                );
+                buf_extend(buf, std::slice::from_raw_parts(base.add(line_start), dp));
             }
+        } else {
+            // No delimiter: output remaining data as-is
+            unsafe { buf_extend(buf, remaining) };
         }
-        // If found_delim: field already output, no trailing newline to add
     }
 }
 
