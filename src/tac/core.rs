@@ -4,18 +4,18 @@ use rayon::prelude::*;
 
 /// Threshold for parallel processing (64MB).
 /// Each benchmark invocation is a fresh process, so rayon pool init (~0.5-1ms)
-/// is paid every time. For 10MB files, single-threaded memrchr scan (0.3ms) is
-/// faster than rayon init + parallel scan. Only use parallelism for genuinely
-/// large files where multi-core scanning pays off.
+/// is paid every time. For 10MB files, single-threaded scan (0.3ms) is faster
+/// than rayon init + parallel scan. Only use parallelism for genuinely large
+/// files where multi-core scanning and copying pays off.
 const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// Maximum IoSlice entries per write_vectored batch.
-/// Matches Linux UIO_MAXIOV limit (1024).
+/// Used by string/regex separator paths.
 const IOSLICE_BATCH_SIZE: usize = 1024;
 
 /// Reverse records separated by a single byte.
-/// For large data (>= 64MB): parallel forward SIMD scan + zero-copy IoSlice output.
-/// For small data: single-threaded backward SIMD scan + IoSlice batches.
+/// For large data (>= 64MB): parallel chunk-local reversal with contiguous buffers.
+/// For small data: single-threaded forward SIMD scan + contiguous output buffer.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -54,156 +54,203 @@ fn collect_positions_str(data: &[u8], separator: &[u8]) -> Vec<usize> {
     positions
 }
 
-/// Parallel forward scan to collect all separator positions.
-/// Splits data into chunks, each processed by a rayon worker thread.
-/// Returns per-chunk position vectors in chunk order (positions are absolute).
-fn parallel_scan_positions(data: &[u8], sep: u8) -> Vec<Vec<usize>> {
+/// Parallel chunk-local reversal for after-separator mode.
+/// Splits data into N chunks at newline boundaries, each chunk independently
+/// scans forward and builds a reversed output buffer in parallel, then writes
+/// chunk buffers in reverse order. Eliminates IoSlice overhead and reduces
+/// syscalls to N (one per chunk).
+fn tac_bytes_after_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     let n_threads = rayon::current_num_threads().max(1);
-    let chunk_size = (data.len() + n_threads - 1) / n_threads;
+    let chunk_size = data.len() / n_threads;
 
-    (0..n_threads)
+    // Find chunk boundaries at separator positions
+    let mut boundaries = Vec::with_capacity(n_threads + 1);
+    boundaries.push(0);
+    for i in 1..n_threads {
+        let target = i * chunk_size;
+        if target >= data.len() {
+            break;
+        }
+        // In after mode, separator ends a record; boundary is right after separator
+        let boundary = memchr::memchr(sep, &data[target..])
+            .map(|p| target + p + 1)
+            .unwrap_or(data.len());
+        if boundary < data.len() {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries.push(data.len());
+    boundaries.dedup();
+    let n_chunks = boundaries.len() - 1;
+
+    // Each chunk: forward scan for positions, build reversed output buffer
+    let reversed_chunks: Vec<Vec<u8>> = (0..n_chunks)
         .into_par_iter()
         .map(|i| {
-            let start = i * chunk_size;
-            if start >= data.len() {
+            let start = boundaries[i];
+            let end = boundaries[i + 1];
+            let chunk = &data[start..end];
+            if chunk.is_empty() {
                 return Vec::new();
             }
-            let end = (start + chunk_size).min(data.len());
-            let chunk = &data[start..end];
-            let estimated = chunk.len() / 40 + 64;
-            let mut positions = Vec::with_capacity(estimated);
+
+            // Collect separator positions within chunk
+            let mut positions: Vec<usize> = Vec::with_capacity(chunk.len() / 40 + 64);
             for pos in memchr::memchr_iter(sep, chunk) {
-                positions.push(start + pos);
+                positions.push(pos);
             }
-            positions
+
+            // Build reversed output buffer
+            let mut buf = Vec::with_capacity(chunk.len());
+            let mut end_pos = chunk.len();
+            for &pos in positions.iter().rev() {
+                let rec_start = pos + 1;
+                if rec_start < end_pos {
+                    buf.extend_from_slice(&chunk[rec_start..end_pos]);
+                }
+                end_pos = rec_start;
+            }
+            if end_pos > 0 {
+                buf.extend_from_slice(&chunk[..end_pos]);
+            }
+            buf
         })
-        .collect()
-}
+        .collect();
 
-/// Zero-copy parallel after-separator mode: parallel forward SIMD scan to collect
-/// separator positions, then zero-copy reverse output via IoSlice batches pointing
-/// directly into the input data. No output buffer allocation needed.
-///
-/// vs old contiguous-copy approach for 100MB:
-/// - Old: alloc 100MB + parallel scan+copy (200MB bandwidth) + 1 write_all
-/// - New: parallel scan only (100MB bandwidth) + ~2500 write_vectored (zero-copy)
-/// Eliminates 100MB allocation and 100MB of copy bandwidth.
-fn tac_bytes_after_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let chunk_positions = parallel_scan_positions(data, sep);
-
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
-
-    for positions in chunk_positions.iter().rev() {
-        for &pos in positions.iter().rev() {
-            let rec_start = pos + 1;
-            if rec_start < end {
-                slices.push(IoSlice::new(&data[rec_start..end]));
-                if slices.len() >= IOSLICE_BATCH_SIZE {
-                    write_all_vectored(out, &slices)?;
-                    slices.clear();
-                }
-            }
-            end = rec_start;
+    // Write chunks in reverse order (last chunk first = correct tac order)
+    for chunk in reversed_chunks.iter().rev() {
+        if !chunk.is_empty() {
+            out.write_all(chunk)?;
         }
-    }
-
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
     }
     Ok(())
 }
 
-/// Zero-copy parallel before-separator mode.
+/// Parallel chunk-local reversal for before-separator mode.
+/// Same approach as after mode but separator attaches to the START of each record.
 fn tac_bytes_before_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
-    let chunk_positions = parallel_scan_positions(data, sep);
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = data.len() / n_threads;
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
-
-    for positions in chunk_positions.iter().rev() {
-        for &pos in positions.iter().rev() {
-            if pos < end {
-                slices.push(IoSlice::new(&data[pos..end]));
-                if slices.len() >= IOSLICE_BATCH_SIZE {
-                    write_all_vectored(out, &slices)?;
-                    slices.clear();
-                }
-            }
-            end = pos;
+    // Find chunk boundaries at separator positions
+    let mut boundaries = Vec::with_capacity(n_threads + 1);
+    boundaries.push(0);
+    for i in 1..n_threads {
+        let target = i * chunk_size;
+        if target >= data.len() {
+            break;
+        }
+        // In before mode, separator starts a record; boundary is AT the separator
+        let boundary = memchr::memchr(sep, &data[target..])
+            .map(|p| target + p)
+            .unwrap_or(data.len());
+        if boundary > 0 && boundary < data.len() {
+            boundaries.push(boundary);
         }
     }
+    boundaries.push(data.len());
+    boundaries.dedup();
+    let n_chunks = boundaries.len() - 1;
 
-    if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
-    }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
+    // Each chunk: forward scan for positions, build reversed output buffer
+    let reversed_chunks: Vec<Vec<u8>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|i| {
+            let start = boundaries[i];
+            let end = boundaries[i + 1];
+            let chunk = &data[start..end];
+            if chunk.is_empty() {
+                return Vec::new();
+            }
+
+            // Collect separator positions within chunk
+            let mut positions: Vec<usize> = Vec::with_capacity(chunk.len() / 40 + 64);
+            for pos in memchr::memchr_iter(sep, chunk) {
+                positions.push(pos);
+            }
+
+            // Build reversed output buffer (before mode: separator at start of record)
+            let mut buf = Vec::with_capacity(chunk.len());
+            let mut end_pos = chunk.len();
+            for &pos in positions.iter().rev() {
+                if pos < end_pos {
+                    buf.extend_from_slice(&chunk[pos..end_pos]);
+                }
+                end_pos = pos;
+            }
+            if end_pos > 0 {
+                buf.extend_from_slice(&chunk[..end_pos]);
+            }
+            buf
+        })
+        .collect();
+
+    // Write chunks in reverse order
+    for chunk in reversed_chunks.iter().rev() {
+        if !chunk.is_empty() {
+            out.write_all(chunk)?;
+        }
     }
     Ok(())
 }
 
-/// Zero-copy after-separator mode: streaming IoSlice directly from input data.
-/// No buffer allocation — scans backward and emits IoSlice batches of 1024.
+/// After-separator mode for small files: forward SIMD scan + contiguous buffer.
+/// Forward memchr_iter is faster than backward memrchr_iter, and a single
+/// contiguous output buffer eliminates IoSlice overhead and reduces syscalls to 1.
 fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
+    // Forward scan for separator positions
+    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 64);
+    for pos in memchr::memchr_iter(sep, data) {
+        positions.push(pos);
+    }
 
-    for pos in memchr::memrchr_iter(sep, data) {
+    // Build contiguous reversed output
+    let mut buf = Vec::with_capacity(data.len());
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
-            slices.push(IoSlice::new(&data[rec_start..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
-            }
+            buf.extend_from_slice(&data[rec_start..end]);
         }
         end = rec_start;
     }
-
     if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
+        buf.extend_from_slice(&data[..end]);
     }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
+
+    out.write_all(&buf)
 }
 
-/// Zero-copy before-separator mode: streaming IoSlice directly from input data.
+/// Before-separator mode for small files: forward SIMD scan + contiguous buffer.
 fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
 
-    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
-    let mut end = data.len();
+    // Forward scan for separator positions
+    let mut positions: Vec<usize> = Vec::with_capacity(data.len() / 40 + 64);
+    for pos in memchr::memchr_iter(sep, data) {
+        positions.push(pos);
+    }
 
-    for pos in memchr::memrchr_iter(sep, data) {
+    // Build contiguous reversed output (before mode: separator at start of record)
+    let mut buf = Vec::with_capacity(data.len());
+    let mut end = data.len();
+    for &pos in positions.iter().rev() {
         if pos < end {
-            slices.push(IoSlice::new(&data[pos..end]));
-            if slices.len() >= IOSLICE_BATCH_SIZE {
-                write_all_vectored(out, &slices)?;
-                slices.clear();
-            }
+            buf.extend_from_slice(&data[pos..end]);
         }
         end = pos;
     }
-
     if end > 0 {
-        slices.push(IoSlice::new(&data[..end]));
+        buf.extend_from_slice(&data[..end]);
     }
-    if !slices.is_empty() {
-        write_all_vectored(out, &slices)?;
-    }
-    Ok(())
+
+    out.write_all(&buf)
 }
 
 /// Reverse records using a multi-byte string separator.
