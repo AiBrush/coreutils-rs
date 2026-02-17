@@ -2,19 +2,19 @@ use std::io::{self, IoSlice, Write};
 
 use rayon::prelude::*;
 
-/// Threshold for parallel processing (64MB).
-/// Each benchmark invocation is a fresh process, so rayon pool init (~0.5-1ms)
-/// is paid every time. For 10MB files, single-threaded scan (0.3ms) is faster
-/// than rayon init + parallel scan. Only use parallelism for genuinely large
-/// files where multi-core scanning and copying pays off.
-const PARALLEL_THRESHOLD: usize = 64 * 1024 * 1024;
+/// Threshold for parallel processing (8MB).
+/// With pre-warmed Rayon pool (~0ms init overhead), the parallel chunk-local
+/// reversal approach works well even for 10MB files. Each of 4 threads processes
+/// ~2.5MB independently (scan + copy), which is large enough for efficient
+/// parallelism.
+const PARALLEL_THRESHOLD: usize = 8 * 1024 * 1024;
 
 /// Maximum IoSlice entries per write_vectored batch.
 /// Used by string/regex separator paths.
 const IOSLICE_BATCH_SIZE: usize = 1024;
 
 /// Reverse records separated by a single byte.
-/// For large data (>= 64MB): parallel chunk-local reversal with contiguous buffers.
+/// For large data (>= 8MB): parallel chunk-local reversal with contiguous buffers.
 /// For small data: single-threaded forward SIMD scan + contiguous output buffer.
 pub fn tac_bytes(data: &[u8], separator: u8, before: bool, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
