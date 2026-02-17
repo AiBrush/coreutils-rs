@@ -19,21 +19,24 @@ fn num_cpus() -> usize {
 /// keeping peak buffer allocation reasonable (~10.7MB for the output).
 const NOWRAP_CHUNK: usize = 8 * 1024 * 1024 - (8 * 1024 * 1024 % 3);
 
-/// Minimum data size for parallel no-wrap encoding (2MB).
-/// With rayon's persistent thread pool (~10µs dispatch), the break-even
-/// for parallel encoding is lower than with per-call thread creation.
-/// At 2MB+, the parallel speedup easily amortizes dispatch overhead.
-const PARALLEL_NOWRAP_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Minimum data size for parallel no-wrap encoding (16MB).
+/// For single-file CLI usage (typical benchmark), the Rayon pool is cold
+/// on first use (~200-500µs init). At 10MB, sequential encoding is faster
+/// because pool init + dispatch overhead exceeds the parallel benefit.
+/// Note: multi-file callers pay pool init only once; subsequent files would
+/// benefit from a lower threshold (~2MB). Optimized for single-file CLI.
+const PARALLEL_NOWRAP_THRESHOLD: usize = 16 * 1024 * 1024;
 
-/// Minimum data size for parallel wrapped encoding (1MB).
-/// With rayon's persistent thread pool (~10µs dispatch) + pre-warming,
-/// parallel encoding benefits even at 1MB. For 1MB input, 2 threads
-/// each handle ~0.5MB, saving ~0.1ms vs sequential (~25% improvement).
-const PARALLEL_WRAPPED_THRESHOLD: usize = 1024 * 1024;
+/// Minimum data size for parallel wrapped encoding (12MB).
+/// Same cold-pool reasoning as PARALLEL_NOWRAP_THRESHOLD above.
+/// The sequential encode_wrapped_expand path with backward expansion
+/// eliminates per-group overhead from L1-scatter chunking.
+const PARALLEL_WRAPPED_THRESHOLD: usize = 12 * 1024 * 1024;
 
 /// Minimum data size for parallel decoding (1MB of base64 data).
-/// Lower threshold lets parallel decode kick in for 1MB benchmark files.
-/// With rayon's pre-warmed thread pool, dispatch overhead is negligible.
+/// Lower threshold than encode because decode is more compute-intensive
+/// and benefits from parallelism at smaller sizes. After first use, the
+/// Rayon pool is warm (~10µs dispatch), making 1MB a good crossover point.
 const PARALLEL_DECODE_THRESHOLD: usize = 1024 * 1024;
 
 /// Hint HUGEPAGE for large output buffers on Linux.
@@ -156,7 +159,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     }
 
     if bytes_per_line.is_multiple_of(3) {
-        return encode_wrapped_scatter(data, wrap_col, bytes_per_line, out);
+        return encode_wrapped_expand(data, wrap_col, bytes_per_line, out);
     }
 
     // Fallback for non-3-aligned bytes_per_line: use fuse_wrap approach
@@ -182,6 +185,48 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
     out.write_all(&out_buf[..n])
 }
 
+/// Encode with backward expansion: single contiguous SIMD encode, then expand
+/// in-place to insert newlines. The encode is done in one call (no chunking),
+/// which eliminates per-group function call overhead from L1-scatter.
+/// The backward expansion only shifts data by ~1.3% (1 byte per 76 for wrap_col=76),
+/// and for most lines the shift exceeds wrap_col so memmove uses the fast memcpy path.
+fn encode_wrapped_expand(
+    data: &[u8],
+    wrap_col: usize,
+    bytes_per_line: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    debug_assert!(bytes_per_line.is_multiple_of(3));
+    let enc_len = BASE64_ENGINE.encoded_length(data.len());
+    if enc_len == 0 {
+        return Ok(());
+    }
+
+    let num_full = enc_len / wrap_col;
+    let rem = enc_len % wrap_col;
+    let out_len = num_full * (wrap_col + 1) + if rem > 0 { rem + 1 } else { 0 };
+
+    // Single allocation: encode into first enc_len bytes, expand backward to out_len.
+    // SAFETY: buf[..enc_len] is initialized by BASE64_ENGINE.encode below.
+    // buf[enc_len..out_len] is written by expand_backward before write_all reads it.
+    let mut buf: Vec<u8> = Vec::with_capacity(out_len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(out_len);
+    }
+    #[cfg(target_os = "linux")]
+    hint_hugepage(&mut buf);
+
+    // One SIMD encode call for the entire input (no chunking overhead)
+    let encoded = BASE64_ENGINE.encode(data, buf[..enc_len].as_out());
+    debug_assert_eq!(encoded.len(), enc_len, "encode wrote unexpected length");
+
+    // Expand backward to insert newlines — shifts only ~1.3% of data
+    expand_backward(buf.as_mut_ptr(), enc_len, out_len, wrap_col);
+
+    out.write_all(&buf[..out_len])
+}
+
 /// L1-scatter encode: encode groups of lines into a small L1-cached temp buffer,
 /// then scatter-copy each line to its final position in the output buffer with
 /// newline insertion. Each output byte is written exactly once — no read-back
@@ -193,6 +238,7 @@ fn encode_wrapped(data: &[u8], wrap_col: usize, out: &mut impl Write) -> io::Res
 ///
 /// Uses a full output buffer for vmsplice safety: vmsplice maps user pages
 /// into the pipe buffer, so the buffer must stay valid until the reader consumes.
+#[allow(dead_code)]
 fn encode_wrapped_scatter(
     data: &[u8],
     wrap_col: usize,
@@ -351,7 +397,6 @@ fn scatter_lines(
 /// For wrap_col=76: shift is ~1.3% (1 byte per 76), so most copies are
 /// non-overlapping and the memmove fast-path (memcpy) is used.
 #[inline]
-#[allow(dead_code)]
 fn expand_backward(ptr: *mut u8, enc_len: usize, out_len: usize, wrap_col: usize) {
     let num_full = enc_len / wrap_col;
     let rem = enc_len % wrap_col;
