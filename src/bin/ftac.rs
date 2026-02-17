@@ -279,9 +279,9 @@ fn main() {
 
     let is_byte_sep = !cli.regex && cli.separator.is_none();
 
-    // All file data is read into Vec (not mmap'd), so use raw write for output.
-    // No vmsplice: all data is on anonymous heap pages, which are unsafe for
-    // vmsplice (CONFIG_INIT_ON_FREE may zero freed anonymous pages).
+    // File data is read into Vec; stdin may be mmap'd or Vec.
+    // Use raw write(2) — vmsplice is unsafe for heap-allocated Vec data
+    // (anonymous pages may be freed/zeroed before pipe reader consumes them).
     #[cfg(unix)]
     let had_error = {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
