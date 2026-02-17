@@ -9,8 +9,52 @@ use coreutils_rs::common::io::FileData;
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tr;
 
-// Note: VmspliceWriter and RawStdin removed — all paths now use raw write(2)
-// for simplicity. The mmap paths use ManuallyDrop<File> for raw fd output.
+/// Raw stdin reader for zero-overhead pipe reads on Linux.
+/// Bypasses Rust's StdinLock (mutex + 8KB BufReader) for direct libc::read(0).
+///
+/// SAFETY: Caller must ensure no other code reads from fd 0 (stdin) while
+/// this struct is alive. Do not mix with `io::stdin()` on the same code path.
+/// This is the exclusive reader of fd 0 for its lifetime.
+#[cfg(target_os = "linux")]
+struct RawStdin;
+
+/// Create a stdin reader and execute body with it.
+/// On Linux, uses RawStdin for zero-overhead reads.
+/// On other platforms, uses Rust's StdinLock.
+/// Uses a macro because tr functions take `impl Read` (requires Sized),
+/// which is incompatible with `dyn Read`.
+macro_rules! with_stdin_reader {
+    ($reader:ident => $body:expr) => {{
+        #[cfg(target_os = "linux")]
+        {
+            let mut $reader = RawStdin;
+            $body
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stdin = io::stdin();
+            let mut $reader = stdin.lock();
+            $body
+        }
+    }};
+}
+
+#[cfg(target_os = "linux")]
+impl io::Read for RawStdin {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let ret = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if ret >= 0 {
+                return Ok(ret as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
 
 struct Cli {
     complement: bool,
@@ -333,8 +377,7 @@ fn main() {
             // locked reader, and the internal buffer is overwritten each iteration.
             #[cfg(target_os = "linux")]
             {
-                let stdin = io::stdin();
-                let mut reader = stdin.lock();
+                let mut reader = RawStdin;
                 let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
                 tr::translate(&set1, &set2, &mut reader, &mut *raw_out)
             }
@@ -434,9 +477,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        tr::delete_squeeze(&delete_set, &set2, &mut reader, writer)
+        with_stdin_reader!(reader => tr::delete_squeeze(&delete_set, &set2, &mut reader, writer))
     } else if cli.delete {
         if cli.sets.len() > 1 {
             eprintln!("tr: extra operand '{}'", cli.sets[1]);
@@ -450,9 +491,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        tr::delete(&delete_set, &mut reader, writer)
+        with_stdin_reader!(reader => tr::delete(&delete_set, &mut reader, writer))
     } else if cli.squeeze && cli.sets.len() < 2 {
         let set1 = tr::parse_set(set1_str);
         let squeeze_set = if cli.complement {
@@ -460,9 +499,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             set1
         };
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        tr::squeeze(&squeeze_set, &mut reader, writer)
+        with_stdin_reader!(reader => tr::squeeze(&squeeze_set, &mut reader, writer))
     } else if cli.squeeze {
         let set2_str = &cli.sets[1];
         let mut set1 = tr::parse_set(set1_str);
@@ -476,9 +513,7 @@ fn run_streaming_mode(cli: &Cli, set1_str: &str, writer: &mut impl Write) -> io:
         } else {
             tr::expand_set2(set2_str, set1.len())
         };
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        tr::translate_squeeze(&set1, &set2, &mut reader, writer)
+        with_stdin_reader!(reader => tr::translate_squeeze(&set1, &set2, &mut reader, writer))
     } else {
         eprintln!("tr: missing operand after '{}'", set1_str);
         eprintln!("Two strings must be given when translating.");
