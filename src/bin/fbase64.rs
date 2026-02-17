@@ -313,9 +313,9 @@ fn process_stdin_linux(cli: &Cli) -> io::Result<()> {
     if let Ok(Some(splice_mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
         let mut out = VmspliceWriter::new();
         return if cli.decode {
-            b64::decode_to_writer(&*splice_mmap, cli.ignore_garbage, &mut out)
+            b64::decode_to_writer(&splice_mmap, cli.ignore_garbage, &mut out)
         } else {
-            b64::encode_to_writer(&*splice_mmap, cli.wrap, &mut out)
+            b64::encode_to_writer(&splice_mmap, cli.wrap, &mut out)
         };
     }
 

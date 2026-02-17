@@ -456,7 +456,7 @@ fn main() {
         let result = {
             if let Ok(Some(splice_mmap)) = coreutils_rs::common::io::splice_stdin_to_mmap() {
                 let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                run_mmap_mode(&cli, set1_str, &*splice_mmap, &mut *raw_out)
+                run_mmap_mode(&cli, set1_str, &splice_mmap, &mut *raw_out)
             } else {
                 let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
                 run_streaming_mode(&cli, set1_str, &mut *raw_out)

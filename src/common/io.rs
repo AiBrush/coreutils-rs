@@ -500,6 +500,13 @@ pub struct VmspliceWriter {
 }
 
 #[cfg(target_os = "linux")]
+impl Default for VmspliceWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl VmspliceWriter {
     pub fn new() -> Self {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
