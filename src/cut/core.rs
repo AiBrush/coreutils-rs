@@ -2458,14 +2458,12 @@ fn extract_single_field_line(
     if target_idx == 0 {
         match memchr::memchr(delim, line) {
             Some(pos) => unsafe {
-                buf_extend(buf, std::slice::from_raw_parts(base, pos));
-                buf_push(buf, line_delim);
+                buf_extend_byte(buf, std::slice::from_raw_parts(base, pos), line_delim);
             },
             None => {
                 if !suppress {
                     unsafe {
-                        buf_extend(buf, line);
-                        buf_push(buf, line_delim);
+                        buf_extend_byte(buf, line, line_delim);
                     }
                 }
             }
@@ -2482,11 +2480,11 @@ fn extract_single_field_line(
         has_delim = true;
         if field_idx == target_idx {
             unsafe {
-                buf_extend(
+                buf_extend_byte(
                     buf,
                     std::slice::from_raw_parts(base.add(field_start), pos - field_start),
+                    line_delim,
                 );
-                buf_push(buf, line_delim);
             }
             return;
         }
@@ -2497,8 +2495,7 @@ fn extract_single_field_line(
     if !has_delim {
         if !suppress {
             unsafe {
-                buf_extend(buf, line);
-                buf_push(buf, line_delim);
+                buf_extend_byte(buf, line, line_delim);
             }
         }
         return;
@@ -2506,11 +2503,11 @@ fn extract_single_field_line(
 
     if field_idx == target_idx {
         unsafe {
-            buf_extend(
+            buf_extend_byte(
                 buf,
                 std::slice::from_raw_parts(base.add(field_start), len - field_start),
+                line_delim,
             );
-            buf_push(buf, line_delim);
         }
     } else {
         unsafe { buf_push(buf, line_delim) };
