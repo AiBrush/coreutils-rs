@@ -1010,7 +1010,7 @@ fn process_single_field(
             // Faster than writev/IoSlice for moderate data because it produces
             // one contiguous buffer → one write syscall, and avoids IoSlice
             // allocation overhead for high-delimiter-density data.
-            let mut buf = Vec::with_capacity(data.len());
+            let mut buf = Vec::with_capacity(data.len() + 1);
             single_field1_to_buf(data, delim, line_delim, &mut buf);
             if !buf.is_empty() {
                 out.write_all(&buf)?;
@@ -2233,7 +2233,7 @@ fn single_field1_parallel(
     rayon::scope(|s| {
         for (chunk, result) in chunks.iter().zip(results.iter_mut()) {
             s.spawn(move |_| {
-                result.reserve(chunk.len());
+                result.reserve(chunk.len() + 1);
                 single_field1_to_buf(chunk, delim, line_delim, result);
             });
         }
