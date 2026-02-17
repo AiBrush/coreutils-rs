@@ -94,6 +94,7 @@ impl Write for VmspliceWriter {
         // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
         // so &[IoSlice] has the same memory layout as &[iovec].
         // Direct pointer cast eliminates Vec allocation + copy per call.
+        // bufs may exceed UIO_MAXIOV (1024); .min(1024) below handles the split.
         loop {
             let count = bufs.len().min(1024);
             let iovs = bufs.as_ptr() as *const libc::iovec;
