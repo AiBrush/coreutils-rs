@@ -43,20 +43,21 @@ impl Write for VmspliceWriter {
         if !self.is_pipe || buf.is_empty() {
             return (&*self.raw).write(buf);
         }
-        let iov = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
+        loop {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
+                continue;
             }
             self.is_pipe = false;
-            (&*self.raw).write(buf)
+            return (&*self.raw).write(buf);
         }
     }
 
@@ -93,18 +94,19 @@ impl Write for VmspliceWriter {
         // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
         // so &[IoSlice] has the same memory layout as &[iovec].
         // Direct pointer cast eliminates Vec allocation + copy per call.
-        let count = bufs.len().min(1024);
-        let iovs = bufs.as_ptr() as *const libc::iovec;
-        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
+        loop {
+            let count = bufs.len().min(1024);
+            let iovs = bufs.as_ptr() as *const libc::iovec;
+            let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
+                continue;
             }
             self.is_pipe = false;
-            (&*self.raw).write_vectored(bufs)
+            return (&*self.raw).write_vectored(bufs);
         }
     }
 
