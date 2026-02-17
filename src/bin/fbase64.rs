@@ -10,7 +10,7 @@ use std::process;
 use memmap2::MmapOptions;
 
 use coreutils_rs::base64::core as b64;
-use coreutils_rs::common::io::read_file;
+use coreutils_rs::common::io::read_file_direct;
 use coreutils_rs::common::io_error_msg;
 
 /// Raw stdin reader for zero-overhead pipe reads on Linux.
@@ -310,15 +310,14 @@ fn process_stdin(cli: &Cli, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn process_file(filename: &str, cli: &Cli, out: &mut impl Write) -> io::Result<()> {
+    // Use read() instead of mmap for file inputs.
+    // read() is faster because page faults for the user buffer happen in-kernel
+    // (batched PTE allocation), while mmap triggers per-page user-space faults
+    // (~1-2µs each, totaling ~2.5-5ms for 10MB on CI runners).
+    let data = read_file_direct(Path::new(filename))?;
     if cli.decode {
-        // Use mmap (read-only) + decode_to_writer instead of read_file_vec + decode_mmap_inplace.
-        // This saves ~2-5ms on 13.5MB: mmap with HUGEPAGE has ~0.5ms overhead vs ~5ms for read().
-        // decode_to_writer handles immutable data via try_decode_uniform_lines (copies to local
-        // buffers) and SIMD gap-copy fallback (allocates clean Vec), never modifying the input.
-        let data = read_file(Path::new(filename))?;
         b64::decode_to_writer(&data, cli.ignore_garbage, out)
     } else {
-        let data = read_file(Path::new(filename))?;
         b64::encode_to_writer(&data, cli.wrap, out)
     }
 }

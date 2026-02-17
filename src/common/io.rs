@@ -201,6 +201,30 @@ pub fn read_file_mmap(path: &Path) -> io::Result<FileData> {
     }
 }
 
+/// Read a file always using read() syscall (no mmap).
+/// Faster than mmap for 10MB files: read() handles page faults in-kernel
+/// with batched PTE allocation (~0.5ms), while mmap triggers ~2560
+/// user-space minor faults (~1-2µs each = 2.5-5ms on CI runners).
+pub fn read_file_direct(path: &Path) -> io::Result<FileData> {
+    let file = open_noatime(path)?;
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+
+    if len > 0 && metadata.file_type().is_file() {
+        let mut buf = vec![0u8; len as usize];
+        let n = read_full(&mut &file, &mut buf)?;
+        buf.truncate(n);
+        Ok(FileData::Owned(buf))
+    } else if !metadata.file_type().is_file() {
+        let mut buf = Vec::new();
+        let mut reader = file;
+        reader.read_to_end(&mut buf)?;
+        Ok(FileData::Owned(buf))
+    } else {
+        Ok(FileData::Owned(Vec::new()))
+    }
+}
+
 /// Get file size without reading it (for byte-count-only optimization).
 pub fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())

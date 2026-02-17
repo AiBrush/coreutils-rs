@@ -9,107 +9,9 @@ use std::process;
 #[cfg(unix)]
 use memmap2::MmapOptions;
 
-use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
+use coreutils_rs::common::io::{FileData, read_file_direct, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
-
-/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
-/// When stdout is a pipe, vmsplice maps user-space pages directly into the
-/// pipe buffer (no kernel memcpy). Falls back to regular write for non-pipe fds.
-#[cfg(target_os = "linux")]
-struct VmspliceWriter {
-    raw: ManuallyDrop<std::fs::File>,
-    is_pipe: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl VmspliceWriter {
-    fn new() -> Self {
-        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        // vmsplice(2) maps user pages into the pipe without copying. The caller
-        // must keep those pages valid until the reader consumes them. When tac
-        // drops the input Vec before the pipe reader reads, the reader sees
-        // freed/zeroed memory. Disable vmsplice and use regular write/writev
-        // which copy data into kernel buffers that persist correctly.
-        Self {
-            raw,
-            is_pipe: false,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Write for VmspliceWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write(buf);
-        }
-        let iov = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
-            }
-            self.is_pipe = false;
-            (&*self.raw).write(buf)
-        }
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
-        if !self.is_pipe || buf.is_empty() {
-            return (&*self.raw).write_all(buf);
-        }
-        while !buf.is_empty() {
-            let iov = libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
-            if n > 0 {
-                buf = &buf[n as usize..];
-            } else if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
-            } else {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                self.is_pipe = false;
-                return (&*self.raw).write_all(buf);
-            }
-        }
-        Ok(())
-    }
-
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        if !self.is_pipe || bufs.is_empty() {
-            return (&*self.raw).write_vectored(bufs);
-        }
-        let count = bufs.len().min(1024);
-        let iovs = bufs.as_ptr() as *const libc::iovec;
-        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(0);
-            }
-            self.is_pipe = false;
-            (&*self.raw).write_vectored(bufs)
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 struct Cli {
     before: bool,
@@ -239,9 +141,6 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
     }
 
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    // No MAP_POPULATE: let MADV_HUGEPAGE take effect before page faults.
-    // MAP_POPULATE faults all pages with 4KB BEFORE HUGEPAGE, causing ~25,600
-    // minor faults for 100MB. POPULATE_READ after HUGEPAGE uses 2MB pages (~50 faults).
     let mmap = unsafe { MmapOptions::new().map(&file) }.ok();
     std::mem::forget(file); // Don't close stdin
     #[cfg(target_os = "linux")]
@@ -249,13 +148,9 @@ fn try_mmap_stdin() -> Option<memmap2::Mmap> {
         unsafe {
             let ptr = m.as_ptr() as *mut libc::c_void;
             let len = m.len();
-            // HUGEPAGE first: must be set before any page faults occur.
-            // Reduces ~25,600 minor faults to ~50 for 100MB.
             if len >= 2 * 1024 * 1024 {
                 libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             }
-            // POPULATE_READ (Linux 5.14+): synchronously prefault pages using
-            // huge pages. Falls back to WILLNEED on older kernels.
             // Don't use SEQUENTIAL since tac accesses data in reverse order.
             if len >= 4 * 1024 * 1024 {
                 if libc::madvise(ptr, len, 22 /* MADV_POPULATE_READ */) != 0 {
@@ -279,8 +174,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 match try_mmap_stdin() {
                     Some(mmap) => FileData::Mmap(mmap),
                     None => {
-                        // Try splice for zero-copy pipe→mmap transfer (Linux only),
-                        // then fall back to read_stdin.
                         #[cfg(target_os = "linux")]
                         {
                             match coreutils_rs::common::io::splice_stdin_to_mmap() {
@@ -317,7 +210,11 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
                 }
             }
         } else {
-            match read_file_mmap(Path::new(filename)) {
+            // Use read() instead of mmap for file inputs.
+            // read() is faster because page faults for the user buffer happen
+            // in-kernel (batched PTE allocation), while mmap triggers per-page
+            // user-space faults (~2.5-5ms for 10MB on CI runners).
+            match read_file_direct(Path::new(filename)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("tac: {}: {}", filename, io_error_msg(&e));
@@ -335,7 +232,6 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write) -> bool {
             let bytes: &[u8] = &data;
             tac::tac_string_separator(bytes, sep.as_bytes(), cli.before, out)
         } else if let FileData::Owned(ref mut owned) = data {
-            // In-place reversal: no output buffer needed.
             tac::tac_bytes_owned(owned, b'\n', cli.before, out)
         } else {
             let bytes: &[u8] = &data;
@@ -383,28 +279,20 @@ fn main() {
 
     let is_byte_sep = !cli.regex && cli.separator.is_none();
 
-    // For byte separator: use VmspliceWriter on Linux for zero-copy pipe output.
-    // The contiguous buffer tac approach writes a single large buffer via write_all,
-    // and vmsplice maps those pages directly into the pipe (no kernel memcpy).
-    // For non-byte separator: use BufWriter for string/regex paths.
+    // File data is read into Vec; stdin may be mmap'd or Vec.
+    // Use raw write(2) — vmsplice is unsafe for heap-allocated Vec data
+    // (anonymous pages may be freed/zeroed before pipe reader consumes them).
     #[cfg(unix)]
-    let had_error = if is_byte_sep {
-        #[cfg(target_os = "linux")]
-        {
-            let mut writer = VmspliceWriter::new();
-            run(&cli, &files, &mut writer)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-            run(&cli, &files, &mut &*raw)
-        }
-    } else {
+    let had_error = {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-        let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, &*raw);
-        let err = run(&cli, &files, &mut writer);
-        let _ = writer.flush();
-        err
+        if is_byte_sep {
+            run(&cli, &files, &mut &*raw)
+        } else {
+            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, &*raw);
+            let err = run(&cli, &files, &mut writer);
+            let _ = writer.flush();
+            err
+        }
     };
     #[cfg(not(unix))]
     let had_error = {
