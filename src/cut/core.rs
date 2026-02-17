@@ -2330,7 +2330,7 @@ fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8
     // and here (no safe buf.* calls in the loop body). Both pointers are in the
     // same allocation, and out_ptr >= buf.as_ptr() by construction.
     unsafe {
-        debug_assert!(out_ptr >= buf.as_ptr());
+        debug_assert!(out_ptr as *const u8 >= buf.as_ptr());
         buf.set_len(out_ptr.offset_from(buf.as_ptr()) as usize);
     }
 }
