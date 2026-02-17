@@ -2256,6 +2256,7 @@ fn single_field1_parallel(
 ///   a single buf_extend (one memcpy instead of one per line).
 #[inline]
 fn single_field1_to_buf(data: &[u8], delim: u8, line_delim: u8, buf: &mut Vec<u8>) {
+    debug_assert_ne!(delim, line_delim, "delim and line_delim must differ");
     // Reserve data.len() + 1: output ≤ input for all lines except potentially
     // the last line without trailing newline, where we add a newline (GNU compat).
     buf.reserve(data.len() + 1);
