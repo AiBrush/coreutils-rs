@@ -331,9 +331,11 @@ fn run(cli: &Cli, files: &[String], out: &mut impl Write, zerocopy: bool) -> boo
         } else if let Some(ref sep) = cli.separator {
             let bytes: &[u8] = &data;
             tac::tac_string_separator(bytes, sep.as_bytes(), cli.before, out)
-        } else if zerocopy {
-            // Zero-copy path: IoSlice pointing into data → vmsplice to pipe.
-            // Eliminates the 10MB contiguous buffer allocation + copy.
+        } else if zerocopy && matches!(data, FileData::Mmap(_)) {
+            // Zero-copy path: IoSlice pointing into mmap data → vmsplice to pipe.
+            // Only safe for mmap data — mmap pages are file-backed and remain in
+            // the page cache after process exit, so the pipe reader can still read them.
+            // Heap Vec pages are freed on exit, causing the pipe reader to see zeroes.
             let bytes: &[u8] = &data;
             tac::tac_bytes_zerocopy(bytes, b'\n', cli.before, out)
         } else if let FileData::Owned(ref mut owned) = data {
