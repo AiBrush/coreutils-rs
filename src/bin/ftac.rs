@@ -13,6 +13,109 @@ use coreutils_rs::common::io::{FileData, read_file_mmap, read_stdin};
 use coreutils_rs::common::io_error_msg;
 use coreutils_rs::tac;
 
+/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
+/// When stdout is a pipe, vmsplice references user-space pages directly
+/// in the pipe buffer (no kernel memcpy). Falls back to regular write
+/// for non-pipe fds (files, terminals).
+///
+/// SAFETY: vmsplice without SPLICE_F_GIFT maps user pages into the pipe.
+/// Pages MUST remain valid until the pipe reader consumes them.
+/// This is safe for mmap data (pages live until process exit) and for
+/// the tac byte-separator path where IoSlices point directly at mmap pages.
+#[cfg(target_os = "linux")]
+struct VmspliceWriter {
+    raw: ManuallyDrop<std::fs::File>,
+    is_pipe: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl VmspliceWriter {
+    fn new() -> Self {
+        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let is_pipe = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        Self { raw, is_pipe }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Write for VmspliceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write(buf);
+        }
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write(buf)
+        }
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write_all(buf);
+        }
+        while !buf.is_empty() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                buf = &buf[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.is_pipe = false;
+                return (&*self.raw).write_all(buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if !self.is_pipe || bufs.is_empty() {
+            return (&*self.raw).write_vectored(bufs);
+        }
+        // SAFETY: IoSlice is #[repr(transparent)] over iovec on Unix,
+        // so &[IoSlice] has the same memory layout as &[iovec].
+        // Direct pointer cast eliminates Vec allocation + copy per call.
+        let count = bufs.len().min(1024);
+        let iovs = bufs.as_ptr() as *const libc::iovec;
+        let n = unsafe { libc::vmsplice(1, iovs, count, 0) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            self.is_pipe = false;
+            (&*self.raw).write_vectored(bufs)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Cli {
     before: bool,
     regex: bool,
@@ -281,10 +384,25 @@ fn main() {
 
     let is_byte_sep = !cli.regex && cli.separator.is_none();
 
-    // File data is read into Vec; stdin may be mmap'd or Vec.
-    // Use raw write(2) — vmsplice is unsafe for heap-allocated Vec data
-    // (anonymous pages may be freed/zeroed before pipe reader consumes them).
-    #[cfg(unix)]
+    // Byte-separator path: IoSlices point directly at mmap pages (zero-copy).
+    // On Linux, use VmspliceWriter to vmsplice those pages into the pipe
+    // (eliminates kernel memcpy from writev). Safe because mmap pages live
+    // until process exit.
+    // Non-byte-sep paths use BufWriter for buffered output.
+    #[cfg(target_os = "linux")]
+    let had_error = {
+        if is_byte_sep {
+            let mut writer = VmspliceWriter::new();
+            run(&cli, &files, &mut writer)
+        } else {
+            let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, &*raw);
+            let err = run(&cli, &files, &mut writer);
+            let _ = writer.flush();
+            err
+        }
+    };
+    #[cfg(all(unix, not(target_os = "linux")))]
     let had_error = {
         let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
         if is_byte_sep {
