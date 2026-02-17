@@ -56,6 +56,94 @@ impl io::Read for RawStdin {
     }
 }
 
+/// Writer that uses vmsplice(2) for zero-copy pipe output on Linux.
+/// When stdout is a pipe, vmsplice references user-space pages directly
+/// in the pipe buffer (no kernel memcpy). Falls back to regular write
+/// for non-pipe fds (files, terminals).
+///
+/// SAFETY: The buffer passed to write/write_all must remain valid (not freed
+/// or mutated) until the pipe reader has consumed all referenced pages.
+/// Only safe when `buf` points into pages that will not be freed or mutated
+/// after vmsplice returns (e.g., MAP_PRIVATE mmap pages that are fully
+/// translated and no longer modified). Never use with heap Vec buffers.
+#[cfg(target_os = "linux")]
+struct VmspliceWriter {
+    raw: ManuallyDrop<std::fs::File>,
+    is_pipe: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl VmspliceWriter {
+    fn new() -> Self {
+        let raw = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+        let is_pipe = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(1, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        Self { raw, is_pipe }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Write for VmspliceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write(buf);
+        }
+        loop {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                return Ok(n as usize);
+            }
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Permanent fallback: non-transient errors (ENOSPC, EINVAL) indicate
+            // vmsplice can't work on this fd. EAGAIN won't occur (no O_NONBLOCK).
+            self.is_pipe = false;
+            return (&*self.raw).write(buf);
+        }
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        if !self.is_pipe || buf.is_empty() {
+            return (&*self.raw).write_all(buf);
+        }
+        while !buf.is_empty() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let n = unsafe { libc::vmsplice(1, &iov, 1, 0) };
+            if n > 0 {
+                buf = &buf[n as usize..];
+            } else if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice wrote 0"));
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.is_pipe = false;
+                return (&*self.raw).write_all(buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Cli {
     complement: bool,
     delete: bool,
@@ -338,8 +426,8 @@ fn main() {
             // the pipe reader releases its references.
             #[cfg(target_os = "linux")]
             {
-                let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut *raw_out)
+                let mut out = VmspliceWriter::new();
+                tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut out)
             }
             #[cfg(all(unix, not(target_os = "linux")))]
             {
@@ -352,7 +440,10 @@ fn main() {
                 tr::translate_mmap_inplace(&set1, &set2, &mut mm_mut, &mut lock)
             }
         } else if let Some(mm) = try_mmap_stdin_with_threshold(0) {
-            // Fallback: read-only mmap + separate buffer translate
+            // Fallback: read-only mmap + separate buffer translate.
+            // MUST use raw write (not vmsplice) — translate_mmap_readonly calls
+            // translate_to_separate_buf which allocates a heap Vec. With vmsplice,
+            // the heap pages could be freed/reused before the pipe reader reads them.
             #[cfg(target_os = "linux")]
             {
                 let mut raw_out = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
@@ -410,9 +501,10 @@ fn main() {
 
     if let Some(m) = mmap {
         // File-redirected stdin: use batch path with mmap data.
-        // Use raw write (not vmsplice) because delete/squeeze functions create
-        // intermediate heap buffers. With vmsplice, freed heap pages can be reused
-        // by the allocator before the pipe reader reads them, causing data corruption.
+        // MUST use raw write (not vmsplice) — delete/squeeze functions create
+        // intermediate heap buffers (alloc_uninit_vec, Vec<Vec<u8>>). With vmsplice,
+        // freed heap pages can be reused by the allocator before the pipe reader
+        // reads them, causing data corruption.
         let data = FileData::Mmap(m);
         #[cfg(target_os = "linux")]
         let result = {
