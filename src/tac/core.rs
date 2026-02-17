@@ -194,9 +194,10 @@ fn tac_bytes_before_contiguous(data: &[u8], sep: u8, out: &mut impl Write) -> io
     Ok(())
 }
 
-/// After-separator mode for small files: forward SIMD scan + contiguous buffer.
-/// Forward memchr_iter is faster than backward memrchr_iter, and a single
-/// contiguous output buffer eliminates IoSlice overhead and reduces syscalls to 1.
+/// After-separator mode for small files: forward SIMD scan + zero-copy writev.
+/// Forward memchr_iter is faster than backward memrchr_iter.
+/// Uses IoSlice pointing directly at input data — eliminates the 10MB buffer copy
+/// that the contiguous buffer approach required.
 fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -208,24 +209,31 @@ fn tac_bytes_after(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()>
         positions.push(pos);
     }
 
-    // Build contiguous reversed output
-    let mut buf = Vec::with_capacity(data.len());
+    // Zero-copy output: IoSlice refs point directly at input data
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         let rec_start = pos + 1;
         if rec_start < end {
-            buf.extend_from_slice(&data[rec_start..end]);
+            slices.push(IoSlice::new(&data[rec_start..end]));
+            if slices.len() >= IOSLICE_BATCH_SIZE {
+                write_all_vectored(out, &slices)?;
+                slices.clear();
+            }
         }
         end = rec_start;
     }
     if end > 0 {
-        buf.extend_from_slice(&data[..end]);
+        slices.push(IoSlice::new(&data[..end]));
     }
-
-    out.write_all(&buf)
+    if !slices.is_empty() {
+        write_all_vectored(out, &slices)?;
+    }
+    Ok(())
 }
 
-/// Before-separator mode for small files: forward SIMD scan + contiguous buffer.
+/// Before-separator mode for small files: forward SIMD scan + zero-copy writev.
+/// Uses IoSlice pointing directly at input data — eliminates the buffer copy.
 fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -237,20 +245,26 @@ fn tac_bytes_before(data: &[u8], sep: u8, out: &mut impl Write) -> io::Result<()
         positions.push(pos);
     }
 
-    // Build contiguous reversed output (before mode: separator at start of record)
-    let mut buf = Vec::with_capacity(data.len());
+    // Zero-copy output: IoSlice refs point directly at input data
+    let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOSLICE_BATCH_SIZE);
     let mut end = data.len();
     for &pos in positions.iter().rev() {
         if pos < end {
-            buf.extend_from_slice(&data[pos..end]);
+            slices.push(IoSlice::new(&data[pos..end]));
+            if slices.len() >= IOSLICE_BATCH_SIZE {
+                write_all_vectored(out, &slices)?;
+                slices.clear();
+            }
         }
         end = pos;
     }
     if end > 0 {
-        buf.extend_from_slice(&data[..end]);
+        slices.push(IoSlice::new(&data[..end]));
     }
-
-    out.write_all(&buf)
+    if !slices.is_empty() {
+        write_all_vectored(out, &slices)?;
+    }
+    Ok(())
 }
 
 /// Reverse records using a multi-byte string separator.
