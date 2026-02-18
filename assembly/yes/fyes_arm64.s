@@ -87,6 +87,21 @@ _start:
     ldr     x20, [sp]              // x20 = argc
     add     x21, sp, #8            // x21 = &argv[0]
 
+    // Block SIGPIPE so write() returns -EPIPE instead of killing us.
+    // Without this, `yes | head` under bash's pipefail exits with code 141.
+    // rt_sigprocmask(SIG_BLOCK=0, &sigset, NULL, 8)
+    // SIGPIPE=13; sigset bit = 1<<(13-1) = 1<<12 = 0x1000
+    sub     sp, sp, #16
+    mov     x0, #0x1000            // sigset: bit 12 = SIGPIPE
+    str     x0, [sp]
+    mov     x0, #0                 // SIG_BLOCK
+    mov     x1, sp                 // &new_set
+    mov     x2, #0                 // NULL (old_set)
+    mov     x3, #8                 // sigsetsize
+    mov     w8, #135               // SYS_RT_SIGPROCMASK
+    svc     #0
+    add     sp, sp, #16
+
     cmp     x20, #2
     b.lt    .default_path           // argc < 2: no args, output "y\n"
 
