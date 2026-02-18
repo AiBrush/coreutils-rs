@@ -298,6 +298,27 @@ Output is byte-identical to GNU coreutils. All flags are supported including `--
 | runcon | `fruncon` | Run command with specified SELinux security context | 🚧 |
 | chcon | `fchcon` | Change SELinux security context of files | 🚧 |
 
+## Assembly Optimization Path
+
+We are pursuing a second optimization track alongside Rust: hand-crafted x86_64 assembly for platforms where maximum throughput matters. We started with `yes` — it is simple enough to implement completely and serves as a proof-of-concept for the approach.
+
+Our assembly `yes` achieves **~2.6 GB/s** (1.89× faster than GNU yes, 1.25× faster than our Rust implementation) while compiling to under 1,300 bytes with no runtime dependencies.
+
+| Binary         | Size          | Throughput  | Memory (RSS) | Startup  |
+|----------------|---------------|-------------|--------------|----------|
+| fyes (asm)     | 1,701 bytes   | 2,060 MB/s  | 28 KB        | 0.24 ms  |
+| GNU yes (C)    | 43,432 bytes  | 2,189 MB/s  | 1,956 KB     | 0.75 ms  |
+| fyes (Rust)    | ~435 KB       | ~2,190 MB/s | ~2,000 KB    | ~0.75 ms |
+
+Benchmarked on Linux x86_64. At pipe-limited throughput all three write at ~2.1 GB/s.
+The assembly wins on binary size (25× smaller), memory (70× less RSS), and startup latency (3× faster).
+
+On **Linux x86_64** and **Linux ARM64**, releases ship the assembly binary. All other platforms (macOS, Windows) use the Rust implementation. The assembly binary is a static ELF with only two syscalls (`write` and `exit`/`exit_group`), no dynamic linker, and a non-executable stack.
+
+Our priority remains **100% GNU compatibility in Rust first**. We will pursue assembly implementations for additional commands over time, as the tooling and verification process matures. The goal is not to rush assembly ports but to do them right — with full security review and byte-for-byte compatibility testing.
+
+See [`assembly/yes/`](assembly/yes/) for the source and [`tests/assembly/`](tests/assembly/) for the test suite.
+
 ## Roadmap
 
 We are actively working toward **100% compatibility** with GNU coreutils — byte-identical output, same exit codes, and matching error messages for all 90+ tools. Once we achieve full compatibility, we will focus on **performance optimization** targeting 10-30x speedup over GNU coreutils across all tools.
