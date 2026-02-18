@@ -38,6 +38,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-v2-${{ matrix.os }}
+      - name: Install nasm (Linux x86_64 only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y --no-install-recommends nasm
       - name: Build binaries
         run: cargo build --release
       - name: Run tests
@@ -46,6 +49,34 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Check formatting
         run: cargo fmt -- --check
+      - name: Build and test assembly fyes (Linux x86_64 only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd assembly/yes
+          python3 build.py --no-verify
+          python3 ../../tests/assembly/fyes_vs_yes_tests.py --test-only
+
+  test-assembly-arm64:
+    name: Test assembly fyes (Linux ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build ARM64 assembly fyes
+        run: |
+          as -o /tmp/fyes_arm64.o assembly/yes/fyes_arm64.s
+          ld -static -s -e _start -o /tmp/fyes_arm64 /tmp/fyes_arm64.o
+          chmod +x /tmp/fyes_arm64
+      - name: Smoke-test ARM64 assembly fyes
+        run: |
+          # Default output
+          /tmp/fyes_arm64 | head -5
+          # Custom arg
+          /tmp/fyes_arm64 hello | head -3
+          # --help exits 0
+          /tmp/fyes_arm64 --help
+          # --version exits 0
+          /tmp/fyes_arm64 --version
+          echo "All ARM64 assembly fyes smoke tests passed."
 
   benchmarks:
     name: Benchmarks

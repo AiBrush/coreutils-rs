@@ -148,6 +148,10 @@ jobs:
               ;;
           esac
 
+      - name: Install nasm (Linux x86_64 only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: sudo apt-get install -y --no-install-recommends nasm
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -157,14 +161,29 @@ jobs:
           mkdir -p release
           BINDIR="target/${{ matrix.target }}/release"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
+            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum fyes; do
               cp "${BINDIR}/${bin}.exe" release/ 2>/dev/null || true
             done
             7z a fcoreutils-${{ matrix.target }}.zip release/*
           else
-            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum; do
+            for bin in fwc fcut fbase64 fsha256sum fsort ftr funiq fb2sum ftac fmd5sum fyes; do
               cp "${BINDIR}/${bin}" release/ 2>/dev/null || true
             done
+            # On Linux x86_64: replace the Rust fyes with the NASM flat-binary assembly.
+            if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+              cd assembly/yes
+              python3 build.py -o ../../release/fyes --no-verify \
+                && echo "Assembly fyes (x86_64) built and placed in release/" \
+                || echo "Assembly build failed — shipping Rust fyes instead"
+              cd ../..
+            fi
+            # On Linux ARM64: replace the Rust fyes with the GNU-assembler ELF binary.
+            if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+              as -o /tmp/fyes_arm64.o assembly/yes/fyes_arm64.s \
+                && ld -static -s -e _start -o release/fyes /tmp/fyes_arm64.o \
+                && echo "Assembly fyes (aarch64) built and placed in release/" \
+                || echo "Assembly build failed — shipping Rust fyes instead"
+            fi
             tar -czf fcoreutils-${{ matrix.target }}.tar.gz -C release .
           fi
 
