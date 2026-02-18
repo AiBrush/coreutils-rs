@@ -172,7 +172,7 @@ jobs:
             # On Linux x86_64: replace the Rust fyes with the NASM flat-binary assembly.
             if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
               cd assembly/yes
-              python3 build.py -o ../../release/fyes --no-verify \
+              python3 build.py -o ../../release/fyes \
                 && echo "Assembly fyes (x86_64) built and placed in release/" \
                 || echo "Assembly build failed — shipping Rust fyes instead"
               cd ../..
