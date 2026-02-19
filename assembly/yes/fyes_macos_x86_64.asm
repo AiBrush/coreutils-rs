@@ -286,7 +286,7 @@ _start:
     sub     rcx, r10
     jle     .fill_done
     cmp     rcx, r9
-    jle     .fill_copy
+    jl      .fill_done             ; not enough room for a full line → stop
     mov     rcx, r9
 
 .fill_copy:
@@ -333,9 +333,7 @@ _start:
     syscall
     jc      .write_error            ; carry flag = macOS error
 
-    ; Success: rax = bytes written
-    test    rax, rax
-    jle     .exit                   ; unexpected zero/negative -> exit
+    ; rax = bytes written (always >= 1 after carry-clear on macOS)
     add     rsi, rax                ; advance pointer
     sub     rdx, rax                ; decrease remaining
     jg      .write_loop             ; partial write: continue
@@ -359,6 +357,8 @@ _start:
 ;  build.py replaces everything between @@DATA_START@@ and @@DATA_END@@
 ;  with byte-identical data from the system's GNU yes (if available).
 ; ############################################################################
+
+section __TEXT,__const
 
 ; @@DATA_START@@
 help_text:      db 0x55, 0x73, 0x61, 0x67, 0x65, 0x3a, 0x20, 0x79, 0x65, 0x73, 0x20, 0x5b, 0x53, 0x54, 0x52, 0x49

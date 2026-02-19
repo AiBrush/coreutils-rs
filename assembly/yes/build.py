@@ -143,9 +143,9 @@ def detect_system_yes(target):
         print("  [info] GNU yes not found; using built-in defaults", file=sys.stderr)
         return None
 
-    # Always call with bare basename so argv[0]=="yes" (not "/usr/bin/yes").
-    # If yes_bin is a full path like "/opt/homebrew/bin/gyes", use basename.
-    yes_cmd = os.path.basename(yes_bin)
+    # Use yes_bin directly — subprocess.run with a list passes the full path
+    # as argv[0], which is fine since GNU yes derives its program name from it.
+    yes_cmd = yes_bin
 
     help_out, _, _ = capture([yes_cmd, "--help"])
     ver_out, _, _  = capture([yes_cmd, "--version"])
