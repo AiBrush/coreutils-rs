@@ -1,47 +1,53 @@
 // ============================================================================
-//  fyes_arm64.s — GNU-compatible "yes" in AArch64 Linux assembly
+//  fyes_arm64.s -- GNU-compatible "yes" in AArch64 Linux assembly
 //
 //  Drop-in replacement for GNU coreutils `yes` for ARM64 Linux.
 //  Produces a small static ELF binary with no runtime dependencies.
 //
-//  BUILD:
+//  BUILD (manual):
 //    as -o fyes_arm64.o fyes_arm64.s
 //    ld -static -s -e _start -o fyes_arm64 fyes_arm64.o
 //
+//  BUILD (recommended -- auto-detects your system's yes output):
+//    python3 build.py --target linux-arm64
+//
 //  COMPATIBILITY:
-//    - --help / --version recognized in argv[1]
-//    - "--" in argv[1] stripped (subsequent "--" included in output)
+//    - --help / --version recognized in ALL argv entries (GNU permutation)
+//    - "--" terminates option processing; first "--" stripped from output
 //    - Unrecognized long options (--foo): error to stderr, exit 1
 //    - Invalid short options (-x): error to stderr, exit 1
 //    - Bare "-" is a literal string, not an option
 //    - SIGPIPE/EPIPE: clean exit 0
 //    - EINTR on write: automatic retry
+//    - Partial writes: tracked and continued (not restarted from buffer top)
 //
-//  SYSCALLS (only 2):
+//  SYSCALLS (only 3):
 //    write (64): output to stdout/stderr
 //    exit_group (94): terminate process
+//    rt_sigprocmask (135): block SIGPIPE
 //
 //  REGISTER CONVENTIONS (main execution):
-//    x19 = write buffer pointer (saved for write loop)
+//    x19 = write buffer base pointer
 //    x20 = argc
 //    x21 = &argv[0] pointer
-//    x22 = write byte count (for write loop)
-//    x23 = scratch / option string save
+//    x22 = write byte count per iteration
+//    x23 = scratch / saved option string for error messages
 //    x24 = argbuf base pointer
 //    x25 = line length (bytes in argbuf including \n)
-//    x26 = argv scan pointer (build_line)
-//    x27 = "any arg included" flag
+//    x26 = current write pointer (write loop) / argv scan (build_line)
+//    x27 = remaining write bytes (write loop) / "any arg" flag (build_line)
 //    x28 = bytes filled in buf
 // ============================================================================
 
-    .set    SYS_WRITE,      64
-    .set    SYS_EXIT_GROUP, 94
-    .set    STDOUT,         1
-    .set    STDERR,         2
-    .set    BUFSZ,          16384
-    .set    ARGBUFSZ,       2097152
+    .set    SYS_WRITE,           64
+    .set    SYS_EXIT_GROUP,      94
+    .set    SYS_RT_SIGPROCMASK,  135
+    .set    STDOUT,              1
+    .set    STDERR,              2
+    .set    BUFSZ,               16384
+    .set    ARGBUFSZ,            2097152
 
-// ======================== BSS — zero-initialized buffers =====================
+// ======================== BSS -- zero-initialized buffers ====================
     .section .bss
     .balign 4096
 buf:
@@ -53,6 +59,7 @@ argbuf:
 // ======================== Read-only data =====================================
     .section .rodata
 
+// @@DATA_START@@
 help_text:
     .ascii  "Usage: yes [STRING]...\n"
     .ascii  "  or:  yes OPTION\n"
@@ -77,6 +84,7 @@ err_inval_pre:
 err_suffix:
     .ascii  "'\nTry 'yes --help' for more information.\n"
     .set    err_suffix_len, . - err_suffix
+// @@DATA_END@@
 
 // ======================== Code ===============================================
     .section .text
@@ -88,42 +96,64 @@ _start:
     add     x21, sp, #8            // x21 = &argv[0]
 
     // Block SIGPIPE so write() returns -EPIPE instead of killing us.
-    // Without this, `yes | head` under bash's pipefail exits with code 141.
     // rt_sigprocmask(SIG_BLOCK=0, &sigset, NULL, 8)
     // SIGPIPE=13; sigset bit = 1<<(13-1) = 1<<12 = 0x1000
     sub     sp, sp, #16
     mov     x0, #0x1000            // sigset: bit 12 = SIGPIPE
     str     x0, [sp]
-    mov     x0, #0                 // SIG_BLOCK
+    mov     x0, #0                 // SIG_BLOCK (Linux = 0)
     mov     x1, sp                 // &new_set
     mov     x2, #0                 // NULL (old_set)
     mov     x3, #8                 // sigsetsize
-    mov     w8, #135               // SYS_RT_SIGPROCMASK
+    mov     w8, #SYS_RT_SIGPROCMASK
     svc     #0
     add     sp, sp, #16
 
     cmp     x20, #2
-    b.lt    .default_path           // argc < 2: no args, output "y\n"
+    b.lt    .default_path          // argc < 2: no args, output "y\n"
 
-    // ---- Check argv[1] for options ----
-    ldr     x0, [x21, #8]          // x0 = argv[1]
+    // ================================================================
+    //  PASS 1: Option Validation (GNU permutation)
+    //
+    //  GNU yes uses parse_gnu_standard_options_only(), which checks
+    //  EVERY argv entry for --help/--version, even after non-option
+    //  arguments.  "--" terminates option checking.
+    //
+    //  Register usage in this section:
+    //    x9  = "past --" flag (0 = still checking options)
+    //    x10 = pointer to current argv entry
+    //    x0  = current argument string pointer
+    //    w1  = byte comparison temporary
+    // ================================================================
+
+    mov     w9, #0                 // x9 = 0: not past "--" yet
+    add     x10, x21, #8          // x10 = &argv[1] (skip program name)
+
+.opt_loop:
+    ldr     x0, [x10]             // x0 = current argv string pointer
+    cbz     x0, .opt_done         // NULL pointer? end of argv
+
+    tbnz    w9, #0, .opt_next     // already past "--"? skip checking
+
+    // --- Check if this arg starts with '-' ---
     ldrb    w1, [x0]
     cmp     w1, #'-'
-    b.ne    .build_line             // doesn't start with '-': normal arg
+    b.ne    .opt_next             // doesn't start with '-': not an option
 
     ldrb    w1, [x0, #1]
-    cbz     w1, .build_line         // just "-" alone: literal string
+    cbz     w1, .opt_next         // just "-" alone: literal string, not option
 
+    // --- Starts with '-'. Is it a long option (--xxx)? ---
     cmp     w1, #'-'
-    b.ne    .err_short_opt          // single dash + char (e.g. "-n"): invalid
+    b.ne    .err_short_opt        // single '-' + char (e.g. "-n"): invalid option
 
-    // Starts with "--"
+    // Starts with "--". Is it exactly "--" (end-of-options marker)?
     ldrb    w1, [x0, #2]
-    cbz     w1, .build_line         // exactly "--": separator, build from rest
+    cbz     w1, .opt_set_past     // exactly "--": set flag, stop checking
 
     // ---- Check "--help" byte-by-byte ----
     cmp     w1, #'h'
-    b.ne    .chk_version
+    b.ne    .p1_chk_version
     ldrb    w1, [x0, #3]
     cmp     w1, #'e'
     b.ne    .err_long_opt
@@ -137,9 +167,9 @@ _start:
     cbz     w1, .do_help
     b       .err_long_opt
 
-.chk_version:
+.p1_chk_version:
     // ---- Check "--version" byte-by-byte ----
-    cmp     w1, #'v'               // w1 still has [x0, #2]
+    cmp     w1, #'v'
     b.ne    .err_long_opt
     ldrb    w1, [x0, #3]
     cmp     w1, #'e'
@@ -163,6 +193,16 @@ _start:
     cbz     w1, .do_version
     b       .err_long_opt
 
+.opt_set_past:
+    mov     w9, #1                 // set "past --" flag
+.opt_next:
+    add     x10, x10, #8          // advance to next argv entry
+    b       .opt_loop
+
+.opt_done:
+    // All argv entries validated -- no errors found.
+    b       .build_line
+
 // ======================== --help =============================================
 .do_help:
     mov     x0, #STDOUT
@@ -183,7 +223,8 @@ _start:
 
 // ======================== Error: unrecognized long option (--foo) =============
 .err_long_opt:
-    ldr     x23, [x21, #8]         // x23 = save argv[1] pointer
+    // x0 = pointer to the offending option string (e.g. "--foo")
+    mov     x23, x0                // save option string pointer
 
     mov     x0, #STDERR
     adr     x1, err_unrec_pre
@@ -214,8 +255,8 @@ _start:
 
 // ======================== Error: invalid short option (-x) ===================
 .err_short_opt:
-    ldr     x0, [x21, #8]          // argv[1]
-    ldrb    w23, [x0, #1]          // save option char
+    // x0 = pointer to the offending option string (e.g. "-n")
+    ldrb    w23, [x0, #1]         // save option char (e.g. 'n')
 
     mov     x0, #STDERR
     adr     x1, err_inval_pre
@@ -224,13 +265,13 @@ _start:
     svc     #0
 
     // Write the single option char from the stack
-    strb    w23, [sp, #-16]!       // push char (16-byte aligned)
+    strb    w23, [sp, #-16]!      // push char (16-byte aligned)
     mov     x0, #STDERR
     mov     x1, sp
     mov     x2, #1
     mov     w8, #SYS_WRITE
     svc     #0
-    add     sp, sp, #16            // pop
+    add     sp, sp, #16           // pop
 
     mov     x0, #STDERR
     adr     x1, err_suffix
@@ -242,48 +283,51 @@ _start:
 // ======================== Default "y\n" fast path ============================
 .default_path:
     adr     x0, buf
-    mov     x1, #(BUFSZ / 2)       // 8192 halfwords
-    mov     w2, #0x0A79             // "y\n" as little-endian halfword
+    mov     x1, #(BUFSZ / 2)      // 8192 halfwords
+    mov     w2, #0x0A79            // "y\n" as little-endian halfword
 .fill_default:
     strh    w2, [x0], #2
     subs    x1, x1, #1
     b.ne    .fill_default
 
-    adr     x19, buf                // x19 = write source
-    mov     x22, #BUFSZ             // x22 = bytes per write
-    b       .write_loop
+    adr     x19, buf               // x19 = write source
+    mov     x22, #BUFSZ            // x22 = bytes per write
+    b       .write_outer
 
 // ======================== Build output line from argv =========================
 //
 // Join argv[1..] with spaces into argbuf, append \n.
-// Skip first "--" if argv[1] is exactly "--".
+// Skip first "--" encountered anywhere in argv (x12 flag).
 // Fill buf with repeated copies, then enter write loop.
 .build_line:
-    adr     x24, argbuf             // x24 = argbuf base
-    mov     x0, x24                 // x0 = write cursor
-    mov     x25, #0                 // x25 = bytes written
-    mov     w27, #0                 // w27 = "any arg included" flag
+    adr     x24, argbuf            // x24 = argbuf base
+    mov     x0, x24                // x0 = write cursor
+    mov     x25, #0                // x25 = bytes written
+    mov     w27, #0                // w27 = "any arg included" flag
+    mov     w12, #0                // w12 = "--" skip flag
 
     // x26 = pointer to current argv slot (start at argv[1])
-    add     x26, x21, #8           // x26 = &argv[1]
-
-    // Check if argv[1] is exactly "--" and skip it
-    ldr     x1, [x26]
-    ldrb    w2, [x1]
-    cmp     w2, #'-'
-    b.ne    .bl_loop
-    ldrb    w2, [x1, #1]
-    cmp     w2, #'-'
-    b.ne    .bl_loop
-    ldrb    w2, [x1, #2]
-    cbnz    w2, .bl_loop
-    // argv[1] is exactly "--", skip it
-    add     x26, x26, #8          // advance to argv[2]
+    add     x26, x21, #8          // x26 = &argv[1]
 
 .bl_loop:
     ldr     x1, [x26], #8         // x1 = current arg, advance ptr
     cbz     x1, .bl_done          // NULL = end of argv
 
+    // Check if this is exactly "--" and we should skip it (first one only)
+    cbnz    w12, .bl_include       // already skipped a "--"? include this
+    ldrb    w2, [x1]
+    cmp     w2, #'-'
+    b.ne    .bl_include
+    ldrb    w2, [x1, #1]
+    cmp     w2, #'-'
+    b.ne    .bl_include
+    ldrb    w2, [x1, #2]
+    cbnz    w2, .bl_include        // not exactly "--": include it
+    // First "--": skip it
+    mov     w12, #1
+    b       .bl_loop
+
+.bl_include:
     // Space separator before arg (unless first)
     cbz     w27, .bl_first
 
@@ -297,15 +341,15 @@ _start:
     b       .bl_copy
 
 .bl_first:
-    mov     w27, #1                 // mark: started including args
+    mov     w27, #1                // mark: started including args
 
 .bl_copy:
     mov     x9, #(ARGBUFSZ - 2)
     cmp     x25, x9
     b.ge    .bl_skip_rest
-    ldrb    w2, [x1], #1           // load byte from arg
-    cbz     w2, .bl_loop           // null -> next arg
-    strb    w2, [x0], #1           // store in argbuf
+    ldrb    w2, [x1], #1          // load byte from arg
+    cbz     w2, .bl_loop          // null -> next arg
+    strb    w2, [x0], #1          // store in argbuf
     add     x25, x25, #1
     b       .bl_copy
 
@@ -315,27 +359,27 @@ _start:
     b       .bl_loop
 
 .bl_done:
-    cbz     w27, .default_path     // no args included -> default
+    cbz     w27, .default_path    // no args included -> default
 
     // Append newline
     mov     w2, #'\n'
     strb    w2, [x0]
-    add     x25, x25, #1          // x25 = total line length
+    add     x25, x25, #1         // x25 = total line length
 
     // ---- Fill buf with repeated copies of the line ----
-    adr     x19, buf                // x19 = buf base (write source)
-    mov     x0, x19                 // x0 = destination cursor
-    mov     x28, #0                 // x28 = bytes filled
+    adr     x19, buf               // x19 = buf base (write source)
+    mov     x0, x19                // x0 = destination cursor
+    mov     x28, #0                // x28 = bytes filled
 
 .fill_loop:
     mov     x2, #BUFSZ
-    sub     x2, x2, x28           // remaining space
-    cmp     x2, x25               // room for another complete line?
+    sub     x2, x2, x28          // remaining space
+    cmp     x2, x25              // room for another complete line?
     b.lt    .fill_done
 
     // Copy one line from argbuf to buf
-    mov     x3, x25               // bytes to copy
-    mov     x4, x24               // source = argbuf base
+    mov     x3, x25              // bytes to copy
+    mov     x4, x24              // source = argbuf base
 .fill_copy:
     cbz     x3, .fill_next
     ldrb    w5, [x4], #1
@@ -352,35 +396,48 @@ _start:
     cbz     x28, .long_line
 
     // Round down to complete lines
-    udiv    x2, x28, x25          // complete lines
-    mul     x22, x2, x25          // x22 = complete lines * line_len
+    udiv    x2, x28, x25         // complete lines
+    mul     x22, x2, x25         // x22 = complete lines * line_len
     // x19 already = buf base
-    b       .write_loop
+    b       .write_outer
 
 .long_line:
-    mov     x19, x24               // write from argbuf
-    mov     x22, x25               // write count = line length
+    mov     x19, x24              // write from argbuf
+    mov     x22, x25              // write count = line length
 
 // ======================== Write loop =========================================
 //
 // Hot loop: write x22 bytes from x19 to stdout forever.
-// x19 = buffer pointer (callee-saved, survives syscalls)
-// x22 = byte count (callee-saved, survives syscalls)
+// Handles partial writes by tracking position with x26/x27.
+//
+// x19 = buffer base pointer (constant across iterations)
+// x22 = total byte count per buffer cycle (constant)
+// x26 = current write pointer (advances on partial writes)
+// x27 = remaining bytes to write (decreases on partial writes)
+.write_outer:
+    mov     x26, x19              // current ptr = buffer start
+    mov     x27, x22              // remaining = full count
+
 .write_loop:
     mov     x0, #STDOUT
-    mov     x1, x19               // buffer
-    mov     x2, x22               // count
+    mov     x1, x26               // buffer position
+    mov     x2, x27               // remaining count
     mov     w8, #SYS_WRITE
     svc     #0
 
-    // Check for -EINTR: x0 == -4 means cmn(x0, 4) sets Z
+    // Check for EINTR: x0 == -4 means cmn(x0, 4) sets Z
     cmn     x0, #4
-    b.eq    .write_loop            // retry on EINTR
+    b.eq    .write_loop            // retry on EINTR (same position)
 
+    // Check for error (zero or negative = EPIPE, etc.)
     cmp     x0, #0
-    b.gt    .write_loop            // positive: bytes written, keep going
+    b.le    .exit_ok               // exit cleanly
 
-    // Zero or negative (EPIPE, error) -> exit 0
+    // Success: x0 = bytes written (may be partial)
+    add     x26, x26, x0          // advance write pointer
+    subs    x27, x27, x0          // decrease remaining
+    b.gt    .write_loop            // partial write: continue
+    b       .write_outer           // full buffer written: restart
 
 // ======================== Exit helpers =======================================
 .exit_ok:
