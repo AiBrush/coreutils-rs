@@ -148,9 +148,15 @@ jobs:
               ;;
           esac
 
-      - name: Install nasm (Linux x86_64 only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: sudo apt-get install -y --no-install-recommends nasm
+      - name: Install nasm (Linux x86_64 and macOS x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          if [[ "$OSTYPE" == "linux"* ]]; then
+            sudo apt-get install -y --no-install-recommends nasm binutils-aarch64-linux-gnu
+          else
+            brew install nasm 2>/dev/null || true
+          fi
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -172,17 +178,34 @@ jobs:
             # On Linux x86_64: replace the Rust fyes with the NASM flat-binary assembly.
             if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
               cd assembly/yes
-              python3 build.py -o ../../release/fyes \
-                && echo "Assembly fyes (x86_64) built and placed in release/" \
+              python3 build.py --target linux-x86_64 -o ../../release/fyes \
+                && echo "Assembly fyes (linux-x86_64) built and placed in release/" \
                 || echo "Assembly build failed — shipping Rust fyes instead"
               cd ../..
             fi
-            # On Linux ARM64: replace the Rust fyes with the GNU-assembler ELF binary.
+            # On Linux ARM64: use build.py for patched + assembled ARM64 binary.
             if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-              as -o /tmp/fyes_arm64.o assembly/yes/fyes_arm64.s \
-                && ld -static -s -e _start -o release/fyes /tmp/fyes_arm64.o \
-                && echo "Assembly fyes (aarch64) built and placed in release/" \
+              cd assembly/yes
+              python3 build.py --target linux-arm64 -o ../../release/fyes \
+                && echo "Assembly fyes (linux-arm64) built and placed in release/" \
                 || echo "Assembly build failed — shipping Rust fyes instead"
+              cd ../..
+            fi
+            # On macOS x86_64: build Mach-O assembly binary.
+            if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+              cd assembly/yes
+              python3 build.py --target macos-x86_64 -o ../../release/fyes \
+                && echo "Assembly fyes (macos-x86_64) built and placed in release/" \
+                || echo "Assembly build failed — shipping Rust fyes instead"
+              cd ../..
+            fi
+            # On macOS ARM64: build Mach-O ARM64 assembly binary.
+            if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+              cd assembly/yes
+              python3 build.py --target macos-arm64 -o ../../release/fyes \
+                && echo "Assembly fyes (macos-arm64) built and placed in release/" \
+                || echo "Assembly build failed — shipping Rust fyes instead"
+              cd ../..
             fi
             tar -czf fcoreutils-${{ matrix.target }}.tar.gz -C release .
           fi

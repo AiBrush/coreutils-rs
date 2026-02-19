@@ -1,7 +1,7 @@
 # fyes — Assembly Implementation of `yes`
 
-A drop-in replacement for GNU coreutils `yes` written in pure x86_64 Linux assembly.
-Produces a static ELF binary under 1,300 bytes with zero runtime dependencies.
+A drop-in replacement for GNU coreutils `yes` in pure assembly.
+Supported on Linux x86_64, Linux ARM64, macOS x86_64, and macOS ARM64.
 
 ## Performance
 
@@ -16,94 +16,158 @@ Benchmarked on Linux x86_64 (Debian), writing to a pipe (pipe-limited throughput
 At pipe-limited throughput all three binaries write at essentially the same rate (~2.1 GB/s).
 The assembly wins on **binary size** (25× smaller), **memory** (70× less RSS), and **startup** (3× faster).
 
-## Build
+## Quick Build
 
-Requires `nasm` and `python3`. The build script auto-detects your system's GNU yes
-output (help text, version text, error message format) and patches it into the binary
-so `--help` and `--version` are byte-identical to the system's `yes`.
+The `build.py` script auto-detects your platform, captures help/version text from your
+system's GNU `yes`, patches it into the binary, and verifies byte-identical output.
 
 ```bash
-# Auto-detect and build (recommended)
+# Auto-detect platform and build (recommended)
 python3 build.py
+
+# Explicit target
+python3 build.py --target linux-x86_64
+python3 build.py --target linux-arm64
+python3 build.py --target macos-x86_64
+python3 build.py --target macos-arm64
 
 # Custom output name
 python3 build.py -o /usr/local/bin/fyes
 
-# Detect only (show what would be embedded, don't build)
+# Just detect what would be embedded (no build)
 python3 build.py --detect
 ```
 
-Manual build (uses default help/version text already in the asm):
+## Platform Support
 
+### Linux x86_64 (`fyes.asm`)
+Uses NASM flat binary format (`nasm -f bin`) with fixed virtual addresses (`org 0x400000`).
+Produces a ~1,700 byte **static ELF** with zero runtime dependencies.
+
+Requirements: `nasm`
+
+Manual build:
 ```bash
-nasm -f bin fyes.asm -o fyes
-chmod +x fyes
+nasm -f bin fyes.asm -o fyes && chmod +x fyes
 ```
 
-## Security
+### Linux ARM64 (`fyes_arm64.s`)
+Uses GNU assembler (GAS) + linker. Produces a small **static ELF** binary.
+Compatible with native ARM64 hosts and aarch64-linux-gnu cross-toolchain.
 
-All security audit findings have been addressed:
+Requirements: `binutils-aarch64-linux-gnu` (for cross-build on x86_64)
 
-- **ARGBUF bounds checking**: argument buffer overflow prevented — stops copying 2 bytes before end, leaving room for the trailing `\n`
-- **fill_loop clamped to BUFSZ exactly**: no overshoot into adjacent buffer space
-- **PT_GNU_STACK header**: marks stack non-executable (NX bit)
-- **EINTR retry in write loop**: handles interrupted syscalls without data loss
-- **No dynamic linking**: immune to `LD_PRELOAD` attacks — no interpreter, no `libc`
-- **Minimal syscall surface**: only `write(2)` and `exit(2)` — no `open`, `mmap`, `brk`, or `socket`
-- **No RWX segments**: W⊕X policy enforced in ELF program headers
+Manual build:
+```bash
+aarch64-linux-gnu-as -o fyes_arm64.o fyes_arm64.s
+aarch64-linux-gnu-ld -static -s -e _start -o fyes fyes_arm64.o
+```
+
+### macOS x86_64 (`fyes_macos_x86_64.asm`)
+Uses NASM Mach-O format (`nasm -f macho64`) + Apple linker.
+Produces a **Mach-O dynamic executable** linked against libSystem.
+No libc functions are called; all output via direct BSD syscalls.
+
+Requirements: `nasm` (`brew install nasm`), Xcode command line tools
+
+Manual build:
+```bash
+nasm -f macho64 fyes_macos_x86_64.asm -o fyes_macos.o
+SDK=$(xcrun --show-sdk-path)
+ld -arch x86_64 -o fyes fyes_macos.o -lSystem \
+   -syslibroot $SDK -e _start -macosx_version_min 10.14
+```
+
+### macOS ARM64 (`fyes_macos_arm64.s`)
+Uses Apple's assembler (`as`) + Apple linker.
+Produces a **Mach-O ARM64 executable** for Apple Silicon.
+Uses `svc #0x80` with `x16` register for macOS BSD syscalls.
+
+Requirements: Xcode command line tools
+
+Manual build:
+```bash
+SDK=$(xcrun --show-sdk-path)
+as -arch arm64 -o fyes_macos_arm64.o fyes_macos_arm64.s
+ld -arch arm64 -o fyes fyes_macos_arm64.o -lSystem \
+   -syslibroot $SDK -e _start -macosx_version_min 11.0
+```
+
+### Windows
+Uses the Rust implementation (`src/bin/fyes.rs`).
 
 ## GNU Compatibility
 
-Behavior is byte-identical to GNU coreutils `yes`:
+All assembly implementations produce byte-identical output to GNU coreutils `yes`:
 
 - Default output: `y\n` repeated forever
 - Multiple arguments: joined with spaces, `\n`-terminated, repeated
-- `--help` / `--version`: detected from system `yes` and embedded verbatim
+- `--help` / `--version`: detected from system GNU `yes` and embedded verbatim
 - `--` end-of-options: first `--` stripped, subsequent `--` included in output
+- GNU permutation: `--help`/`--version` recognized **anywhere** in argv (e.g. `yes foo --help bar`)
 - Unrecognized long options (`--foo`): error to stderr, exit 1
 - Invalid short options (`-x`): error to stderr, exit 1
 - Bare `-` is a literal string, not an option
 - SIGPIPE / EPIPE: clean exit 0
+- Partial writes: tracked and continued (no line corruption)
 
-## Platform Support
+## Security Properties
 
-### x86_64 (fyes.asm)
-The x86_64 implementation uses NASM flat binary format (`nasm -f bin`)
-with fixed virtual addresses (`org 0x400000`). It produces a ~1,700 byte static ELF
-with no dependencies.
+| Property               | Linux x86_64 | Linux ARM64 | macOS x86_64 | macOS ARM64 |
+|------------------------|:---:|:---:|:---:|:---:|
+| Static binary          | ✅  | ✅  | —   | —   |
+| No libc calls          | ✅  | ✅  | ✅  | ✅  |
+| NX stack               | ✅  | ✅  | ✅  | ✅  |
+| No RWX segments        | ✅  | ✅  | ✅  | ✅  |
+| SIGPIPE blocked        | ✅  | ✅  | ✅  | ✅  |
+| ARGBUF bounds check    | ✅  | ✅  | ✅  | ✅  |
+| EINTR retry            | ✅  | ✅  | ✅  | ✅  |
+| Partial write safe     | ✅  | ✅  | ✅  | ✅  |
 
-### ARM64 / AArch64 (fyes_arm64.s)
-The ARM64 implementation uses GNU assembler (GAS) format. Build with:
+## macOS Syscall ABI Differences
 
-```bash
-as -o fyes_arm64.o fyes_arm64.s
-ld -static -s -e _start -o fyes_arm64 fyes_arm64.o
-```
+The macOS assembly implementations handle key ABI differences from Linux:
 
-It produces a small static ELF binary using only two syscalls (`write` and `exit_group`).
-
-### Other platforms
-macOS, Windows, and other architectures use the Rust implementation (`src/bin/fyes.rs`),
-which achieves ~1.51x the throughput of GNU yes with full cross-platform support.
+| Feature              | Linux x86_64/ARM64 | macOS x86_64 | macOS ARM64 |
+|----------------------|-------------------|--------------|-------------|
+| Syscall instruction  | `syscall`/`svc #0` | `syscall`   | `svc #0x80` |
+| Syscall number reg   | rax / x8          | rax          | x16         |
+| Error indication     | negative rax/x0   | carry flag   | carry flag  |
+| SIG_BLOCK constant   | 0                 | 1            | 1           |
+| sigset_t size        | 64-bit            | 32-bit       | 32-bit      |
+| `write` syscall #    | 1 / 64            | 0x2000004    | 4           |
+| `exit` syscall #     | 60 / 94           | 0x2000001    | 1           |
 
 ## Testing
 
 ```bash
-# Run the full test and benchmark suite (requires ./fyes to be built first)
-python3 build.py               # build first
+# Build and run full test suite (Linux x86_64)
+python3 build.py
 python3 ../../tests/assembly/fyes_vs_yes_tests.py
 
-# Tests only (skip benchmarks)
+# Test only (no benchmarks)
 python3 ../../tests/assembly/fyes_vs_yes_tests.py --test-only
 
-# Benchmarks only
+# Benchmark only
 python3 ../../tests/assembly/fyes_vs_yes_tests.py --bench-only
 ```
 
 ## Architecture
 
-The binary uses a fixed two-segment layout:
-- `0x400000`: code + read-only data (ELF + program headers + text + help/version/error strings)
-- `0x500000`: runtime buffers (16 KB write buffer + 2 MB argument assembly buffer)
+**Linux x86_64** uses a fixed two-segment flat ELF layout:
+- `0x400000`: code + read-only data (ELF headers + text + help/version/error strings)
+- `0x500000`: runtime BSS buffers (16 KB write buffer + 2 MB argument buffer)
 
-See the extensive comments in `fyes.asm` for a full walkthrough of every design decision.
+**Linux ARM64** / **macOS** use standard ELF/Mach-O layouts with linker-managed sections:
+- `.text` / `__TEXT,__text`: code
+- `.rodata` / `__TEXT,__const`: help/version/error strings
+- `.bss` / `__DATA,__bss`: runtime buffers (zero-initialized)
+
+All implementations use the same algorithm:
+1. Block SIGPIPE at startup
+2. PASS 1: scan all argv for `--help`/`--version`/bad options (GNU permutation)
+3. Build output line from args into argbuf (joined with spaces + `\n`)
+4. Fill write buffer with repeated complete copies of the output line
+5. Write loop: write the buffer forever, tracking partial writes
+
+See inline comments in each `.asm`/`.s` file for full implementation details.
